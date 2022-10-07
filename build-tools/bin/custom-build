@@ -1,0 +1,41 @@
+#!/bin/bash -xe
+
+# Obtain build path from brazil
+BUILD_PATH=$(brazil-path package-build-root)
+
+# `bb clean` logic
+if [ "$1" == "clean" ]; then
+    rm -rf ${BUILD_PATH}/bdist.* ${BUILD_PATH}/pip ${BUILD_PATH}/transformers-neuronx
+    env TOOL_VERBOSE=true python-3p-tool "$@"
+    exit
+fi
+
+# Obtain src/runtimefarm paths from brazil
+SRC_PATH=$(brazil-path package-src-root)
+RUNTIMEFARM_PATH=$(brazil-path ht2-build.runtimefarm)
+
+# Create transformers-neuronx build folder and copy Python source files there
+BUILD_PATH_TN=${BUILD_PATH}/transformers-neuronx
+mkdir -p ${BUILD_PATH_TN}
+cp ${SRC_PATH}/setup.py ${BUILD_PATH_TN}/
+cp -r ${SRC_PATH}/src ${BUILD_PATH_TN}/
+BUILD_TN_SRC_TN=${BUILD_PATH_TN}/src/transformers_neuronx
+
+# Run Python3PBuildTool build
+env TOOL_VERBOSE=true python-3p-tool "$@"
+
+# Copy transformers-neuronx build folder to site-packages
+PYVER=$(python -c 'from sys import version_info as vi; print(f"{vi.major}.{vi.minor}")')
+SITE_PACKAGES_SUFFIX="lib/python${PYVER}/site-packages"
+cp -r ${BUILD_TN_SRC_TN} ${BUILD_PATH}/${SITE_PACKAGES_SUFFIX}/
+
+# Build wheel
+cd ${BUILD_PATH_TN}
+export PYTHONPATH=${RUNTIMEFARM_PATH}/${SITE_PACKAGES_SUFFIX}
+python setup.py bdist_wheel --dist-dir ${BUILD_PATH}/pip/public/transformers-neuronx
+
+# Run some tests
+if [ "$1" == "release" ]; then
+    export PYTHONPATH="$(brazil-path testrun.runtimefarm)/${SITE_PACKAGES_SUFFIX}:${BUILD_PATH}/${SITE_PACKAGES_SUFFIX}"
+    python -m unittest discover -v ${SRC_PATH}/test/
+fi
