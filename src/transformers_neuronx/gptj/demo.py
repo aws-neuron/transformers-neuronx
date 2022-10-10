@@ -12,5 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from . import ops
-ops.init()
+from transformers_neuronx.gpt_demo import demo
+from transformers_neuronx.gptj.model import GPTJForSampling
+
+
+def main():
+    demo('EleutherAI/gpt-j-6B', GPTJForSampling)
