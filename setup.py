@@ -12,12 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
+from datetime import datetime
 from setuptools import setup, PEP420PackageFinder
+
+
+def get_version():
+    version = os.environ['TRANSFORMERS_NEURONX_VERSION']
+    today = datetime.today().strftime('%Y%m%d')
+    return version.replace('.x', f'.{today}')
 
 
 setup(
     name='transformers-neuronx',
-    version='0.0.0',
+    version=get_version(),
     classifiers=[
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',
