@@ -21,6 +21,12 @@ cp ${SRC_PATH}/setup.py ${BUILD_PATH_TN}/
 cp -r ${SRC_PATH}/src ${BUILD_PATH_TN}/
 BUILD_TN_SRC_TN=${BUILD_PATH_TN}/src/transformers_neuronx
 
+# Version
+VERSION=$(brazil-path pkg.namefullversion)
+VERSION=${VERSION#*-}
+VERSION=${VERSION%.*}
+export TRANSFORMERS_NEURONX_VERSION=${VERSION#*-}
+
 # Run Python3PBuildTool build
 env TOOL_VERBOSE=true python-3p-tool "$@"
 
