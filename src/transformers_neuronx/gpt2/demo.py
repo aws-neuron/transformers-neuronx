@@ -12,5 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from . import ops
-ops.init()
+from transformers_neuronx.gpt_demo import demo
+from transformers_neuronx.gpt2.model import GPT2ForSampling
+
+
+def main():
+    demo('gpt2', GPT2ForSampling)

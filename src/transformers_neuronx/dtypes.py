@@ -12,5 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from . import ops
-ops.init()
+import torch
+
+
+def to_torch_dtype(dtype):
+    mapping = {
+        'f32': torch.float32,
+        'f16': torch.float16,
+        'bf16': torch.bfloat16,
+    }
+    return mapping[dtype]
