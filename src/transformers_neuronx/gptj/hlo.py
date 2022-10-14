@@ -17,29 +17,13 @@ from transformers_neuronx import hlo
 
 
 def build_gptj_block_kernel(config):
-    n_embd = config.n_embd
-    n_head = config.n_head
-    n_pos = config.n_positions
-    n_active_tokens = config.n_active_tokens
-    batch_size = config.batch_size
-    intermediate_dim = config.intermediate_dim
-    amp = config.amp
-    tp_degree = config.tp_degree
-    block = gen_scribable_block(n_embd, n_head, n_pos, n_active_tokens,
-                                batch_size, intermediate_dim, amp, tp_degree)
-    return compiler.build_kernel(block, tp_degree)
+    block = gen_scribable_block(config)
+    return compiler.build_kernel(block, config.tp_degree)
 
 
 def build_lm_head_kernel(config):
-    n_embd = config.n_embd
-    vocab_size = config.vocab_size
-    n_active_tokens = config.n_active_tokens
-    batch_size = config.batch_size
-    amp = config.amp
-    tp_degree = config.tp_degree
-    ln_lm_head = gen_scribable_ln_lm_head(n_embd, vocab_size, n_active_tokens,
-                                          batch_size, amp, tp_degree)
-    return compiler.build_kernel(ln_lm_head, tp_degree)
+    ln_lm_head = gen_scribable_ln_lm_head(config)
+    return compiler.build_kernel(ln_lm_head, config.tp_degree)
 
 
 def attention(hidden, q_weight, k_weight, v_weight, out_weight, pos_embd,
@@ -156,7 +140,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
           attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight,
           pos_embd, key_cache, value_cache, cache_offset, mask,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-          n_heads, tp_degree):
+          config):
     dtype = hidden.dtype
     scribe = hidden.scribe
     ln_1_weight = hlo.transfer_with_static_ring(ln_1_weight)
@@ -171,7 +155,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
     attn_output, out_key_cache, out_value_cache = attention(
         ln_hidden, attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight,
         pos_embd, in_key_cache, in_value_cache, cache_offset, mask,
-        n_heads=n_heads, tp_degree=tp_degree,
+        n_heads=config.n_head, tp_degree=config.tp_degree,
     )
     out_hidden = dtype[hidden.sizes].Add(attn_output, hidden)
     mlp_in_weight = hlo.transfer_with_static_ring(mlp_in_weight)
@@ -179,7 +163,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
     mlp_out_weight = hlo.transfer_with_static_ring(mlp_out_weight)
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
     mlp_hidden = hlo.mlp(ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                         tp_degree=tp_degree)
+                         tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
     out_hidden.set_alias_to(hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
@@ -188,8 +172,15 @@ def block(hidden, ln_1_weight, ln_1_bias,
     return root_shape.Tuple(out_hidden, out_key_cache, out_value_cache)
 
 
-def gen_scribable_block(embed_dim, n_heads, n_positions, n_active_tokens,
-                        batch_size, intermediate_dim, amp, tp_degree):
+def gen_scribable_block(config):
+    embed_dim = config.n_embd
+    n_heads = config.n_head
+    n_positions = config.n_positions
+    n_active_tokens = config.n_active_tokens
+    batch_size = config.batch_size
+    intermediate_dim = config.intermediate_dim
+    amp = config.amp
+    tp_degree = config.tp_degree
     head_dim = embed_dim // n_heads
     attn_dim_tp = embed_dim // tp_degree
     n_heads_tp = n_heads // tp_degree
@@ -217,7 +208,7 @@ def gen_scribable_block(embed_dim, n_heads, n_positions, n_active_tokens,
         return block(hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
                      attn_out_weight, pos_embd, key_cache, value_cache, cache_offset, mask,
                      mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                     n_heads=n_heads, tp_degree=tp_degree)
+                     config)
 
     return scribable
 
@@ -248,7 +239,13 @@ def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
     return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
 
-def gen_scribable_ln_lm_head(embed_dim, vocab_size, n_active_tokens, batch_size, amp, tp_degree):
+def gen_scribable_ln_lm_head(config):
+    embed_dim = config.n_embd
+    vocab_size = config.vocab_size
+    n_active_tokens = config.n_active_tokens
+    batch_size = config.batch_size
+    amp = config.amp
+    tp_degree = config.tp_degree
     if vocab_size % tp_degree:
         vocab_size = (vocab_size // tp_degree + 1) * tp_degree
     vocab_size_tp = vocab_size // tp_degree
