@@ -47,7 +47,17 @@ setup(
             'LICENSE',
         ],
     },
-    install_requires=['torch-neuron'],  # TODO: point to torch-neuronx
+    entry_points = {
+        'console_scripts': [
+            'gpt2_demo=transformers_neuronx.gpt2.demo:main',
+            'gptj_demo=transformers_neuronx.gptj.demo:main',
+        ],
+    },
+    install_requires=[
+        'accelerate',
+        'torch-neuron',  # TODO: point to torch-neuronx
+        'transformers',
+    ],
     python_requires='>=3.7',
     package_dir={'': 'src'},
 )
