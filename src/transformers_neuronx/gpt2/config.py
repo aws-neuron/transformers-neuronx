@@ -16,6 +16,7 @@
 class GPT2Config:
 
     def __init__(self, config, batch_size, n_active_tokens, amp, tp_degree, **kwargs):
+        self.activation_function = config.activation_function
         self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
         self.n_head = config.n_head
