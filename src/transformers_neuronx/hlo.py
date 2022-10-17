@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import math
+from transformers_neuronx import activations
 
 
 def layer_norm(hidden, weight, bias):
@@ -68,29 +68,6 @@ def dot00_add1(lhs, rhs, bias):
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
-def new_gelu(hidden):
-    dtype = hidden.dtype
-    sizes = hidden.sizes
-    input_input = dtype[sizes].Multiply(hidden, hidden)
-    input_pow_3 = dtype[sizes].Multiply(input_input, hidden)
-    scale = dtype.Constant(constant_value=0.044715)
-    scale_br = dtype[sizes].Broadcast(scale, dimensions=[])
-    mul = dtype[sizes].Multiply(input_pow_3, scale_br)
-    add = dtype[sizes].Add(mul, hidden)
-    sqrt_2_over_pi = dtype.Constant(constant_value=math.sqrt(2.0 / math.pi))
-    sqrt_2_over_pi_br = dtype[sizes].Broadcast(sqrt_2_over_pi, dimensions=[])
-    mul2 = dtype[sizes].Multiply(add, sqrt_2_over_pi_br)
-    tanh = dtype[sizes].Tanh(mul2)
-    one = dtype.Constant(constant_value=1.0)
-    one_br = dtype[sizes].Broadcast(one, dimensions=[])
-    add1 = dtype[sizes].Add(tanh, one_br)
-    mul3 = dtype[sizes].Multiply(add1, hidden)
-    half = dtype.Constant(constant_value=0.5)
-    half_br = dtype[sizes].Broadcast(half, dimensions=[])
-    output = dtype[sizes].Multiply(mul3, half_br)
-    return output
-
-
 def gen_add_func(dtype):
 
     def add_func(scribe):
@@ -121,7 +98,7 @@ def gen_max_func(dtype):
     return max_func
 
 
-def mlp(hidden, in_weight, in_bias, out_weight, out_bias, tp_degree):
+def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
@@ -139,7 +116,7 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, tp_degree):
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
     hidden = dot00_add0(in_weight, hidden, in_bias)
-    hidden = new_gelu(hidden)
+    hidden = getattr(activations, activation_function)(hidden)
     hidden = dot00_add0(out_weight, hidden, out_bias)
     hidden = dtype[hidden_sizes].Reshape(hidden)
     replica_groups = [list(range(tp_degree))]

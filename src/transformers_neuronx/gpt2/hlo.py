@@ -163,7 +163,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
     out_ln_hidden = hlo.layer_norm(out_hidden, ln_2_weight, ln_2_bias)
     mlp_hidden = hlo.mlp(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                         tp_degree=config.tp_degree)
+                         activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
     out_value_cache.set_alias_to(value_cache, must=True)
