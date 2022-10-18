@@ -19,7 +19,7 @@ from transformers import AutoTokenizer
 from transformers_neuronx import dtypes
 
 
-def demo(model_name, model_cls):
+def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
     parser.add_argument('--amp', default='f32', choices=['f32', 'f16', 'bf16'])
     subparsers = parser.add_subparsers()
@@ -38,19 +38,16 @@ def demo(model_name, model_cls):
     run_parser.add_argument('--print_latency', action='store_true')
     args = parser.parse_args()
     if args.which == save_name:
-        save(args, model_name)
+        save(args, model_name, amp_callback)
     elif args.which == run_name:
         run(args, model_name, model_cls)
 
 
-def save(args, model_name):
+def save(args, model_name, amp_callback):
     model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
-    dtype = dtypes.to_torch_dtype(args.amp)
-    # cast attention and mlp to low precisions only; layernorms stay as f32
-    for block in model.transformer.h:
-        block.attn.to(dtype)
-        block.mlp.to(dtype)
-    model.lm_head.to(dtype)
+    if args.amp != 'f32':
+        dtype = dtypes.to_torch_dtype(args.amp)
+        amp_callback(model, dtype)
     model.save_pretrained(args.save, max_shard_size='100GB')
 
 
