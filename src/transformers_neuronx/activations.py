@@ -36,3 +36,11 @@ def gelu_new(hidden):
     half_br = dtype[sizes].Broadcast(half, dimensions=[])
     output = dtype[sizes].Multiply(mul3, half_br)
     return output
+
+
+def relu(hidden):
+    dtype = hidden.dtype
+    sizes = hidden.sizes
+    zero = dtype.Constant(constant_value=0.0)
+    zero_br = dtype[sizes].Broadcast(zero, dimensions=[])
+    return dtype[sizes].Maximum(hidden, zero_br)

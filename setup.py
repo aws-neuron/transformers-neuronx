@@ -51,6 +51,7 @@ setup(
         'console_scripts': [
             'gpt2_demo=transformers_neuronx.gpt2.demo:main',
             'gptj_demo=transformers_neuronx.gptj.demo:main',
+            'opt_demo=transformers_neuronx.opt.demo:main',
         ],
     },
     install_requires=[
