@@ -45,6 +45,8 @@ class GPT2ForSampling(module.PretrainedModel):
         self.gpt2_params = None
 
     def to_neuron(self):
+        if self.gpt2_kernel is not None:
+            self.gpt2_kernel.load()
         for idx, block in enumerate(self.transformer.h):
             block.to_neuron()
         self.ln_lm_head.to_neuron()
@@ -194,6 +196,8 @@ class GPT2Block(module.LowMemoryModule):
         self.value_cache = None
 
     def to_neuron(self):
+        if self.kernel is not None:
+            self.kernel.load()
         manipulator = parallel.TensorManipulator(self.config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
@@ -285,6 +289,8 @@ class GPT2LnLmHead:
         self.vocab_pad = ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
 
     def to_neuron(self):
+        if self.kernel is not None:
+            self.kernel.load()
         duplicate = self.manipulator.duplicate
         shard_along = self.manipulator.shard_along
         self.ln_f_weight = duplicate(self.ln_f.weight.detach())
