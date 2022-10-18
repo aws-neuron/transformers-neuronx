@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from transformers_neuronx import utils
+
 
 class GPT2Config:
 
@@ -24,11 +26,7 @@ class GPT2Config:
         self.n_positions = config.n_positions
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
-        for key, value in kwargs.items():
-            if not hasattr(self, key):
-                raise KeyError(f'Found invalid key "{key}".')
-            if value is not None:
-                setattr(self, key, value)
+        utils.maybe_override_attributes(self, kwargs)
         self.intermediate_dim = self.n_embd * 4
         self.batch_size = batch_size
         self.n_active_tokens = n_active_tokens
