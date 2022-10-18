@@ -21,6 +21,7 @@ from pyhlo import xla_data_pb2
 from pyhlo.scribe import HloScribe
 from pyhlo.constant.serialize_torch import serialize_torch
 from torch_neuron.proto import metaneff_pb2
+from transformers_neuronx import ops
 from transformers_neuronx import parallel
 
 
@@ -123,8 +124,11 @@ class Kernel:
         metaneff_bytes = metaneff.SerializeToString()
         model_cls = torch.classes.neuron.Model
         self.models = [model_cls(neff_bytes, metaneff_bytes) for _ in range(tp_degree)]
-        parallel.parallel_load(self.models)
         self.executor = parallel.Executor(tp_degree)
+
+    def load(self):
+        ops.init()
+        parallel.parallel_load(self.models)
 
     def __call__(self, inputs):
         return self.executor.execute(self.models, *inputs)
