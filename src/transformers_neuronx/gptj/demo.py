@@ -14,7 +14,8 @@
 # ==============================================================================
 from transformers_neuronx.gpt_demo import demo
 from transformers_neuronx.gptj.model import GPTJForSampling
+from transformers_neuronx.gptj.demo import amp_callback
 
 
 def main():
-    demo('EleutherAI/gpt-j-6B', GPTJForSampling)
+    demo('EleutherAI/gpt-j-6B', GPTJForSampling, amp_callback)
