@@ -17,4 +17,12 @@ from transformers_neuronx.gpt2.model import GPT2ForSampling
 
 
 def main():
-    demo('gpt2', GPT2ForSampling)
+    demo('gpt2', GPT2ForSampling, amp_callback)
+
+
+def amp_callback(model, dtype):
+    # cast attention and mlp to low precisions only; layernorms stay as f32
+    for block in model.transformer.h:
+        block.attn.to(dtype)
+        block.mlp.to(dtype)
+    model.lm_head.to(dtype)
