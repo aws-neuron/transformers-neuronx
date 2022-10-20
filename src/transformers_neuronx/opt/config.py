@@ -20,7 +20,7 @@ from transformers_neuronx.gpt2.config import GPT2Config
 
 class OPTConfig:
 
-    def __init__(self, config, n_positions, batch_size, n_active_tokens, amp, tp_degree, **kwargs):
+    def __init__(self, config, n_positions, batch_size, amp, tp_degree, **kwargs):
         if not config.do_layer_norm_before:
             raise NotImplementedError('do_layer_norm_before=False not implemented')
         warnings.warn(f'torch_dtype={config.torch_dtype} ignored in favor of amp={amp}')
@@ -37,7 +37,6 @@ class OPTConfig:
         utils.maybe_override_attributes(self, kwargs)
         self.n_positions = n_positions
         self.batch_size = batch_size
-        self.n_active_tokens = n_active_tokens
         self.amp = amp
         self.tp_degree = tp_degree
 
@@ -55,7 +54,6 @@ def opt_config_to_gpt2_config(config):
     gpt2_config.vocab_size = config.vocab_size
     gpt2_config.eos_token_id = config.eos_token_id
     batch_size = config.batch_size
-    n_active_tokens = config.n_active_tokens
     amp = config.amp
     tp_degree = config.tp_degree
-    return GPT2Config(gpt2_config, batch_size, n_active_tokens, amp, tp_degree)
+    return GPT2Config(gpt2_config, batch_size, amp, tp_degree)

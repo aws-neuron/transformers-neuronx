@@ -17,7 +17,7 @@ from transformers_neuronx import utils
 
 class GPT2Config:
 
-    def __init__(self, config, batch_size, n_active_tokens, amp, tp_degree, **kwargs):
+    def __init__(self, config, batch_size, amp, tp_degree, **kwargs):
         self.activation_function = config.activation_function
         self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
@@ -29,6 +29,5 @@ class GPT2Config:
         utils.maybe_override_attributes(self, kwargs)
         self.intermediate_dim = self.n_embd * 4
         self.batch_size = batch_size
-        self.n_active_tokens = n_active_tokens
         self.amp = amp
         self.tp_degree = tp_degree
