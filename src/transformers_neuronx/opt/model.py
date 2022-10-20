@@ -24,30 +24,40 @@ from transformers_neuronx.opt.config import OPTConfig
 
 class OPTForSampling(module.PretrainedModel):
 
-    def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2,
+    def __init__(self, config, batch_size=1, init_n_active_tokens=8, amp='f32', tp_degree=2,
                  n_positions=2048, unroll=False, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         self.opt_kernel = None
+        self.opt_init_kernel = None
         if unroll:
             block_kernel = None
             ln_lm_head_kernel = None
-            self.opt_kernel = hlo.build_opt_kernel(config)
+            block_init_kernel = None
+            ln_lm_head_init_kernel = None
+            self.opt_kernel = hlo.build_opt_kernel(config, n_active_tokens=1)
+            self.opt_init_kernel = hlo.build_opt_kernel(config, init_n_active_tokens)
         else:
-            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens)
-            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens)
-        self.model = OPTModel(config, block_kernel)
+            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens=1)
+            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
+            block_init_kernel = hlo.build_opt_block_kernel(config, init_n_active_tokens)
+            ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
+        self.init_n_active_tokens = init_n_active_tokens
+        self.model = OPTModel(config, block_kernel, block_init_kernel)
         dtype = dtypes.to_torch_dtype(config.amp)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
         self.config = config
         ln_f = self.model.decoder.final_layer_norm
-        self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_f, self.lm_head)
+        self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_lm_head_init_kernel,
+                                       ln_f, self.lm_head)
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
         self.opt_params = None
 
     def to_neuron(self):
         if self.opt_kernel is not None:
             self.opt_kernel.load()
+        if self.opt_init_kernel is not None:
+            self.opt_init_kernel.load()
         for idx, block in enumerate(self.model.decoder.layers):
             block.to_neuron()
         self.ln_lm_head.to_neuron()
@@ -87,6 +97,60 @@ class OPTForSampling(module.PretrainedModel):
         self.opt_params.extend(ln_lm_head_params)
 
     def forward(self, input_ids, cache_offset, mask):
+        this_length = input_ids.shape[-1]
+        if this_length > 1:
+            return self._forward_init_dynamic_shape(input_ids, cache_offset, mask)
+        return self._forward_one_token(input_ids, cache_offset, mask)
+
+    def _forward_init_dynamic_shape(self, input_ids, cache_offset, mask):
+        this_length = input_ids.shape[-1]
+        init_n_active_tokens = self.init_n_active_tokens
+        init_length = this_length // init_n_active_tokens * init_n_active_tokens
+        for cur_len in range(0, init_length, init_n_active_tokens):
+            next_len = cur_len + init_n_active_tokens
+            input_ids_slice = input_ids[:, cur_len:next_len]
+            cache_offset_slice = cache_offset[cur_len:next_len]
+            mask_slice = mask[cur_len:next_len]
+            logits = self._forward_init(input_ids_slice, cache_offset_slice, mask_slice)
+        for cur_len in range(init_length, this_length):
+            next_len = cur_len + 1
+            input_ids_slice = input_ids[:, cur_len:next_len]
+            cache_offset_slice = cache_offset[cur_len:next_len]
+            mask_slice = mask[cur_len:next_len]
+            logits = self._forward_one_token(input_ids_slice, cache_offset_slice, mask_slice)
+        return logits
+
+    def _forward_init(self, input_ids, cache_offset, mask):
+        if self.opt_kernel is None:
+            return self._forward_init_layered(input_ids, cache_offset, mask)
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        inputs_cores = hidden, cache_offset, mask, *self.opt_params
+        logits, *_ = self.opt_init_kernel(inputs_cores)
+        return self._process_outputs(logits)
+
+    def _forward_init_layered(self, input_ids, cache_offset, mask):
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        for block in self.model.decoder.layers:
+            hidden = block.forward_init(hidden, cache_offset, mask)
+        logits = self.ln_lm_head.call_init(hidden)
+        return self._process_outputs(logits)
+
+    def _forward_one_token(self, input_ids, cache_offset, mask):
+        if self.opt_kernel is None:
+            return self._forward_one_token_layered(input_ids, cache_offset, mask)
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        inputs_cores = hidden, cache_offset, mask, *self.opt_params
+        logits, *_ = self.opt_kernel(inputs_cores)
+        return self._process_outputs(logits)
+
+    def _forward_one_token_layered(self, input_ids, cache_offset, mask):
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        for block in self.model.decoder.layers:
+            hidden = block(hidden, cache_offset, mask)
+        logits = self.ln_lm_head(hidden)
+        return self._process_outputs(logits)
+
+    def _process_inputs(self, input_ids, cache_offset, mask):
         inputs_embeds = self.model.decoder.embed_tokens(input_ids)
         past_length = cache_offset[0].item()
         this_length = input_ids.shape[-1]
@@ -101,13 +165,9 @@ class OPTForSampling(module.PretrainedModel):
         hidden = duplicate(hidden)
         cache_offset = duplicate(cache_offset)
         mask = duplicate(mask)
-        if self.opt_kernel is None:
-            for block in self.model.decoder.layers:
-                hidden = block(hidden, cache_offset, mask)
-            logits = self.ln_lm_head(hidden)
-        else:
-            inputs_cores = hidden, cache_offset, mask, *self.opt_params
-            logits, *_ = self.opt_kernel(inputs_cores)
+        return hidden, cache_offset, mask
+
+    def _process_outputs(self, logits):
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
@@ -124,16 +184,10 @@ class OPTForSampling(module.PretrainedModel):
         start = input_ids.shape[1]
 
         # populate key/value caches according to the prompt text
-        for cur_len in range(start):
-            print('cur_len=', cur_len)
-            next_len = cur_len + 1
-
-            # forward pass to get next token
-            inputs = input_ids[:, cur_len:next_len]
-            cache_offset = torch.as_tensor([cur_len], dtype=torch.int32)
-            mask = torch.zeros([1, config.n_positions])
-            mask[:, :next_len] = 1.0
-            next_token_scores = self(inputs, cache_offset, mask)
+        cache_offset = torch.arange(start, dtype=torch.int32)
+        mask = torch.ones([start, config.n_positions])
+        mask = torch.tril(mask)
+        next_token_scores = self(input_ids, cache_offset, mask)
 
         # auto-regressive generation
         tokens = [input_ids]
@@ -169,7 +223,7 @@ class OPTForSampling(module.PretrainedModel):
 
 class OPTDecoder(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernel):
+    def __init__(self, config, block_kernel, block_init_kernel):
         super().__init__()
         self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size,
                                                       padding_idx=config.pad_token_id)
@@ -177,15 +231,15 @@ class OPTDecoder(module.LowMemoryModule):
                                                              config.hidden_size)
         self.layers = module.LowMemoryModuleList()
         for _ in range(config.num_hidden_layers):
-            self.layers.append(OPTBlock(config, block_kernel))
+            self.layers.append(OPTBlock(config, block_kernel, block_init_kernel))
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
 
 
 class OPTModel(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernel):
+    def __init__(self, config, block_kernel, block_init_kernel):
         super().__init__()
-        self.decoder = OPTDecoder(config, block_kernel)
+        self.decoder = OPTDecoder(config, block_kernel, block_init_kernel)
 
 
 class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
@@ -205,7 +259,7 @@ class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
 
 class OPTBlock(module.LowMemoryModule):
 
-    def __init__(self, config, kernel):
+    def __init__(self, config, kernel, init_kernel):
         super().__init__()
         self.self_attn_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.self_attn = OPTAttention(config)
@@ -215,6 +269,7 @@ class OPTBlock(module.LowMemoryModule):
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.config = config
         self.kernel = kernel
+        self.init_kernel = init_kernel
         self.ln_1_weight = None
         self.ln_1_bias = None
         self.attn_q_weight = None
@@ -234,6 +289,8 @@ class OPTBlock(module.LowMemoryModule):
     def to_neuron(self):
         if self.kernel is not None:
             self.kernel.load()
+        if self.init_kernel is not None:
+            self.init_kernel.load()
         manipulator = parallel.TensorManipulator(self.config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
@@ -293,6 +350,11 @@ class OPTBlock(module.LowMemoryModule):
     def forward(self, hidden, cache_offset, mask):
         inputs_cores = [hidden, cache_offset, mask, *self.params]
         hidden, self.key_cache, self.value_cache = self.kernel(inputs_cores)
+        return hidden
+
+    def forward_init(self, hidden, cache_offset, mask):
+        inputs_cores = [hidden, cache_offset, mask, *self.params]
+        hidden, self.key_cache, self.value_cache = self.init_kernel(inputs_cores)
         return hidden
 
 
