@@ -122,22 +122,24 @@ class OPTForSampling(module.PretrainedModel):
         min_length = max_length = top_k = sequence_length
         self.reset()
         start = input_ids.shape[1]
-        inputs = input_ids[:, 0:1]
-        tokens = [input_ids]
-        # auto-regressive generation
-        for cur_len in range(1, max_length):
+
+        # populate key/value caches according to the prompt text
+        for cur_len in range(start):
             print('cur_len=', cur_len)
-            offset = cur_len - 1
-            seq_len = cur_len
-            mask = torch.zeros([1, config.n_positions])
-            mask[:, :cur_len] = 1.0
+            next_len = cur_len + 1
 
             # forward pass to get next token
-            cache_offset = torch.as_tensor([offset], dtype=torch.int32)
+            inputs = input_ids[:, cur_len:next_len]
+            cache_offset = torch.as_tensor([cur_len], dtype=torch.int32)
+            mask = torch.zeros([1, config.n_positions])
+            mask[:, :next_len] = 1.0
             next_token_scores = self(inputs, cache_offset, mask)
-            if cur_len < start:
-                inputs = input_ids[:, cur_len:cur_len+1]
-                continue
+
+        # auto-regressive generation
+        tokens = [input_ids]
+        for cur_len in range(start, max_length):
+            print('cur_len=', cur_len)
+            next_len = cur_len + 1
 
             # pre-process distribution
             if cur_len < min_length:
@@ -156,6 +158,12 @@ class OPTForSampling(module.PretrainedModel):
             # stop when eos_token is found
             if (inputs == config.eos_token_id).all():
                 break
+
+            # forward pass to get next token
+            cache_offset = torch.as_tensor([cur_len], dtype=torch.int32)
+            mask = torch.zeros([1, config.n_positions])
+            mask[:, :next_len] = 1.0
+            next_token_scores = self(inputs, cache_offset, mask)
         return torch.cat(tokens, dim=-1)
 
 
