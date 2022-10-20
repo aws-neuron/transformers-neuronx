@@ -187,6 +187,8 @@ def gen_scribable_block(config, n_active_tokens):
     def scribable(scribe):
         pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
         hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
+        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
+        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
         ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
         ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
         attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
@@ -200,8 +202,6 @@ def gen_scribable_block(config, n_active_tokens):
         cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
         key_cache = pbuilder(cache_shape)
         value_cache = pbuilder(cache_shape)
-        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
-        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
         ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
         ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
         mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])

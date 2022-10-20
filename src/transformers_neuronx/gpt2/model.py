@@ -194,6 +194,7 @@ class GPT2Block(module.LowMemoryModule):
         self.mlp_out_bias = None
         self.key_cache = None
         self.value_cache = None
+        self.params = None
 
     def to_neuron(self):
         if self.kernel is not None:
@@ -243,14 +244,14 @@ class GPT2Block(module.LowMemoryModule):
         self.key_cache = manipulator.shard_along(self.key_cache, dim=2)
         self.value_cache = torch.zeros(cache_shape, dtype=dtype)
         self.value_cache = manipulator.shard_along(self.value_cache, dim=2)
-
-    def forward(self, hidden, cache_offset, mask):
-        inputs_cores = \
-            hidden, self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias, \
+        self.params = self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias, \
             self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias, \
             self.attn_out_weight, self.attn_out_bias, self.key_cache, self.value_cache, \
-            cache_offset, mask, self.ln_2_weight, self.ln_2_bias, \
-            self.mlp_in_weight, self.mlp_in_bias, self.mlp_out_weight, self.mlp_out_bias
+            self.ln_2_weight, self.ln_2_bias, self.mlp_in_weight, self.mlp_in_bias, \
+            self.mlp_out_weight, self.mlp_out_bias
+
+    def forward(self, hidden, cache_offset, mask):
+        inputs_cores = [hidden, cache_offset, mask, *self.params]
         hidden, self.key_cache, self.value_cache = self.kernel(inputs_cores)
         return hidden
 
