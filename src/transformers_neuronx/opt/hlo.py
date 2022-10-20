@@ -28,4 +28,4 @@ def build_lm_head_kernel(config, n_active_tokens):
 
 def build_opt_kernel(config, n_active_tokens):
     config = opt_config_to_gpt2_config(config)
-    return gpt2_hlo.build_gpt2_kernel(config)
+    return gpt2_hlo.build_gpt2_kernel(config, n_active_tokens)

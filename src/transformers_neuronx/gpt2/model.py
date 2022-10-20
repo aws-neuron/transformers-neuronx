@@ -40,7 +40,7 @@ class GPT2ForSampling(module.PretrainedModel):
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
         self.config = config
         ln_f = self.transformer.ln_f
-        self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_f, self.lm_head)
+        self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, None, ln_f, self.lm_head)
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
         self.gpt2_params = None
 
@@ -277,8 +277,9 @@ class GPT2MLP(module.LowMemoryModule):
 
 class GPT2LnLmHead:
 
-    def __init__(self, config, kernel, ln_f, lm_head):
+    def __init__(self, config, kernel, init_kernel, ln_f, lm_head):
         self.kernel = kernel
+        self.init_kernel = init_kernel
         self.ln_f = ln_f
         self.lm_head = lm_head
         self.ln_f_weight = None
@@ -292,6 +293,8 @@ class GPT2LnLmHead:
     def to_neuron(self):
         if self.kernel is not None:
             self.kernel.load()
+        if self.init_kernel is not None:
+            self.init_kernel.load()
         duplicate = self.manipulator.duplicate
         shard_along = self.manipulator.shard_along
         self.ln_f_weight = duplicate(self.ln_f.weight.detach())
@@ -304,4 +307,9 @@ class GPT2LnLmHead:
     def __call__(self, hidden):
         inputs = hidden, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight
         logits, = self.kernel(inputs)
+        return logits
+
+    def call_init(self, hidden):
+        inputs = hidden, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight
+        logits, = self.init_kernel(inputs)
         return logits
