@@ -16,16 +16,16 @@ from transformers_neuronx.gpt2 import hlo as gpt2_hlo
 from transformers_neuronx.opt.config import opt_config_to_gpt2_config
 
 
-def build_opt_block_kernel(config):
+def build_opt_block_kernel(config, n_active_tokens):
     config = opt_config_to_gpt2_config(config)
-    return gpt2_hlo.build_gpt2_block_kernel(config)
+    return gpt2_hlo.build_gpt2_block_kernel(config, n_active_tokens)
 
 
-def build_lm_head_kernel(config):
+def build_lm_head_kernel(config, n_active_tokens):
     config = opt_config_to_gpt2_config(config)
-    return gpt2_hlo.build_lm_head_kernel(config)
+    return gpt2_hlo.build_lm_head_kernel(config, n_active_tokens)
 
 
-def build_opt_kernel(config):
+def build_opt_kernel(config, n_active_tokens):
     config = opt_config_to_gpt2_config(config)
     return gpt2_hlo.build_gpt2_kernel(config)

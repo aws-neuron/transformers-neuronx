@@ -27,15 +27,15 @@ class OPTForSampling(module.PretrainedModel):
     def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2,
                  n_positions=2048, unroll=False, **kwargs):
         super().__init__()
-        config = OPTConfig(config, n_positions, batch_size, n_active_tokens, amp, tp_degree, **kwargs)
+        config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         self.opt_kernel = None
         if unroll:
             block_kernel = None
             ln_lm_head_kernel = None
             self.opt_kernel = hlo.build_opt_kernel(config)
         else:
-            block_kernel = hlo.build_opt_block_kernel(config)
-            ln_lm_head_kernel = hlo.build_lm_head_kernel(config)
+            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens)
+            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens)
         self.model = OPTModel(config, block_kernel)
         dtype = dtypes.to_torch_dtype(config.amp)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)

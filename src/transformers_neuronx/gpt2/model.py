@@ -26,15 +26,15 @@ class GPT2ForSampling(module.PretrainedModel):
     def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2,
                  unroll=False, **kwargs):
         super().__init__()
-        config = GPT2Config(config, batch_size, n_active_tokens, amp, tp_degree, **kwargs)
+        config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         self.gpt2_kernel = None
         if unroll:
             block_kernel = None
             ln_lm_head_kernel = None
-            self.gpt2_kernel = hlo.build_gpt2_kernel(config)
+            self.gpt2_kernel = hlo.build_gpt2_kernel(config, n_active_tokens)
         else:
-            block_kernel = hlo.build_gpt2_block_kernel(config)
-            ln_lm_head_kernel = hlo.build_lm_head_kernel(config)
+            block_kernel = hlo.build_gpt2_block_kernel(config, n_active_tokens)
+            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens)
         self.transformer = GPT2Transformer(config, block_kernel)
         dtype = dtypes.to_torch_dtype(config.amp)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
