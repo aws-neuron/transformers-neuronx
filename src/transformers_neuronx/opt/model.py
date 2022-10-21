@@ -28,23 +28,35 @@ class OPTForSampling(module.PretrainedModel):
                  n_positions=2048, unroll=False, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
-        self.opt_kernel = None
-        self.opt_init_kernel = None
+        # power-of-2 bucket sizes
+        n_positions_list = []
+        bucket_size = 128
+        while bucket_size < n_positions:
+            n_positions_list.append(bucket_size)
+            bucket_size *= 2
+        n_positions_list.append(n_positions)
+        self.n_positions_list = n_positions_list
+        self.active_n_positions_index = None
+        self.opt_kernels = None
+        self.opt_init_kernels = None
         if unroll:
-            block_kernel = None
+            block_kernels = None
             ln_lm_head_kernel = None
-            block_init_kernel = None
+            block_init_kernels = None
             ln_lm_head_init_kernel = None
-            self.opt_kernel = hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=n_positions)
-            self.opt_init_kernel = hlo.build_opt_kernel(config, init_n_active_tokens, n_positions)
+            self.opt_kernels = [hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=npos)
+                                for npos in n_positions_list]
+            self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
+                                     for npos in n_positions_list]
         else:
-            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens=1,
-                                                      n_positions=n_positions)
+            block_kernels = [hlo.build_opt_block_kernel(config, n_active_tokens=1, n_positions=npos)
+                             for npos in n_positions_list]
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            block_init_kernel = hlo.build_opt_block_kernel(config, init_n_active_tokens, n_positions)
+            block_init_kernels = [hlo.build_opt_block_kernel(config, init_n_active_tokens, npos)
+                                  for npos in n_positions_list]
             ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
         self.init_n_active_tokens = init_n_active_tokens
-        self.model = OPTModel(config, block_kernel, block_init_kernel)
+        self.model = OPTModel(config, block_kernels, block_init_kernels)
         dtype = dtypes.to_torch_dtype(config.amp)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
         self.config = config
@@ -54,23 +66,24 @@ class OPTForSampling(module.PretrainedModel):
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
         self.opt_caches = None
         self.opt_params = None
+        self.active_opt_kernel = None
+        self.active_opt_init_kernel = None
 
     def to_neuron(self):
-        if self.opt_kernel is not None:
-            self.opt_kernel.load()
-        if self.opt_init_kernel is not None:
-            self.opt_init_kernel.load()
+        if self.opt_kernels is not None:
+            for kernel in self.opt_kernels:
+                kernel.load()
+        if self.opt_init_kernels is not None:
+            for kernel in self.opt_init_kernels:
+                kernel.load()
         for idx, block in enumerate(self.model.decoder.layers):
             block.to_neuron()
         self.ln_lm_head.to_neuron()
 
     def reset(self):
         for block in self.model.decoder.layers:
-            block.reset()
-        self.opt_caches = []
-        for block in self.model.decoder.layers:
-            self.opt_caches.append(block.key_cache)
-            self.opt_caches.append(block.value_cache)
+            block.reset(self.n_positions_list)
+        self.activate_n_positions_index(0)
         self.opt_params = []
         for block in self.model.decoder.layers:
             block_params = [
@@ -101,10 +114,25 @@ class OPTForSampling(module.PretrainedModel):
         self.opt_params.extend(ln_lm_head_params)
 
     def forward(self, input_ids, cache_offset, mask):
+        last_offset = cache_offset[-1].item()
+        n_positions_index = find_first_ge_index(self.n_positions_list, last_offset)
+        if n_positions_index != self.active_n_positions_index:
+            self.activate_n_positions_index(n_positions_index)
         this_length = input_ids.shape[-1]
         if this_length > 1:
             return self._forward_init_dynamic_shape(input_ids, cache_offset, mask)
         return self._forward_one_token(input_ids, cache_offset, mask)
+
+    def activate_n_positions_index(self, n_positions_index):
+        self.opt_caches = []
+        for block in self.model.decoder.layers:
+            block.activate_n_positions_index(n_positions_index)
+            self.opt_caches.append(block.active_key_cache)
+            self.opt_caches.append(block.active_value_cache)
+        self.active_n_positions_index = n_positions_index
+        if self.opt_kernels is not None:
+            self.active_opt_kernel = self.opt_kernels[n_positions_index]
+            self.active_opt_init_kernel = self.opt_init_kernels[n_positions_index]
 
     def _forward_init_dynamic_shape(self, input_ids, cache_offset, mask):
         this_length = input_ids.shape[-1]
@@ -125,11 +153,11 @@ class OPTForSampling(module.PretrainedModel):
         return logits
 
     def _forward_init(self, input_ids, cache_offset, mask):
-        if self.opt_kernel is None:
+        if self.opt_kernels is None:
             return self._forward_init_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
         inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
-        logits, *_ = self.opt_init_kernel(inputs_cores)
+        logits, *_ = self.active_opt_init_kernel(inputs_cores)
         return self._process_outputs(logits)
 
     def _forward_init_layered(self, input_ids, cache_offset, mask):
@@ -140,11 +168,11 @@ class OPTForSampling(module.PretrainedModel):
         return self._process_outputs(logits)
 
     def _forward_one_token(self, input_ids, cache_offset, mask):
-        if self.opt_kernel is None:
+        if self.opt_kernels is None:
             return self._forward_one_token_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
         inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
-        logits, *_ = self.opt_kernel(inputs_cores)
+        logits, *_ = self.active_opt_kernel(inputs_cores)
         return self._process_outputs(logits)
 
     def _forward_one_token_layered(self, input_ids, cache_offset, mask):
@@ -155,6 +183,8 @@ class OPTForSampling(module.PretrainedModel):
         return self._process_outputs(logits)
 
     def _process_inputs(self, input_ids, cache_offset, mask):
+        active_n_positions = self.n_positions_list[self.active_n_positions_index]
+        mask = mask[:, :active_n_positions].contiguous()
         inputs_embeds = self.model.decoder.embed_tokens(input_ids)
         past_length = cache_offset[0].item()
         this_length = input_ids.shape[-1]
@@ -183,7 +213,8 @@ class OPTForSampling(module.PretrainedModel):
     def sample(self, input_ids, sequence_length):
         config = self.config
         filter_value = -float('inf')
-        min_length = max_length = top_k = sequence_length
+        min_length = max_length = sequence_length
+        top_k = 50
         self.reset()
         start = input_ids.shape[1]
 
@@ -225,9 +256,13 @@ class OPTForSampling(module.PretrainedModel):
         return torch.cat(tokens, dim=-1)
 
 
+def find_first_ge_index(values, target):
+    return next(idx for idx, val in enumerate(values) if val >= target)
+
+
 class OPTDecoder(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernel, block_init_kernel):
+    def __init__(self, config, block_kernels, block_init_kernels):
         super().__init__()
         self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size,
                                                       padding_idx=config.pad_token_id)
@@ -235,15 +270,15 @@ class OPTDecoder(module.LowMemoryModule):
                                                              config.hidden_size)
         self.layers = module.LowMemoryModuleList()
         for _ in range(config.num_hidden_layers):
-            self.layers.append(OPTBlock(config, block_kernel, block_init_kernel))
+            self.layers.append(OPTBlock(config, block_kernels, block_init_kernels))
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
 
 
 class OPTModel(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernel, block_init_kernel):
+    def __init__(self, config, block_kernels, block_init_kernels):
         super().__init__()
-        self.decoder = OPTDecoder(config, block_kernel, block_init_kernel)
+        self.decoder = OPTDecoder(config, block_kernels, block_init_kernels)
 
 
 class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
@@ -263,7 +298,7 @@ class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
 
 class OPTBlock(module.LowMemoryModule):
 
-    def __init__(self, config, kernel, init_kernel):
+    def __init__(self, config, kernels, init_kernels):
         super().__init__()
         self.self_attn_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.self_attn = OPTAttention(config)
@@ -272,8 +307,10 @@ class OPTBlock(module.LowMemoryModule):
         self.fc2 = module.LowMemoryLazyLinear(config.ffn_dim, dtype=dtype)
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.config = config
-        self.kernel = kernel
-        self.init_kernel = init_kernel
+        self.kernels = kernels
+        self.init_kernels = init_kernels
+        self.active_kernel = None
+        self.active_init_kernel = None
         self.ln_1_weight = None
         self.ln_1_bias = None
         self.attn_q_weight = None
@@ -288,13 +325,17 @@ class OPTBlock(module.LowMemoryModule):
         self.mlp_out_bias = None
         self.key_cache = None
         self.value_cache = None
+        self.active_key_cache = None
+        self.active_value_cache = None
         self.params = None
 
     def to_neuron(self):
-        if self.kernel is not None:
-            self.kernel.load()
-        if self.init_kernel is not None:
-            self.init_kernel.load()
+        if self.kernels is not None:
+            for kernel in self.kernels:
+                kernel.load()
+        if self.init_kernels is not None:
+            for kernel in self.init_kernels:
+                kernel.load()
         manipulator = parallel.TensorManipulator(self.config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
@@ -332,35 +373,53 @@ class OPTBlock(module.LowMemoryModule):
         fc1.weight = UninitializedParameter()
         fc2.weight = UninitializedParameter()
 
-    def reset(self):
+    def reset(self, n_positions_list):
         config = self.config
         manipulator = parallel.TensorManipulator(config.tp_degree)
+        slice_on_nc = manipulator.slice_on_nc
         n_positions = config.n_positions
         batch_size = config.batch_size
         n_head = config.num_attention_heads
         s_head = config.hidden_size // n_head
         cache_shape = [n_positions, batch_size, n_head, s_head]
         dtype = dtypes.to_torch_dtype(config.amp)
-        self.key_cache = torch.zeros(cache_shape, dtype=dtype)
-        self.key_cache = manipulator.shard_along(self.key_cache, dim=2)
-        self.value_cache = torch.zeros(cache_shape, dtype=dtype)
-        self.value_cache = manipulator.shard_along(self.value_cache, dim=2)
+        key_cache = torch.zeros(cache_shape, dtype=dtype)
+        key_cache = manipulator.shard_along(key_cache, dim=2)
+        self.key_cache = key_cache
+        self.key_cache_slices = [slice_on_nc(key_cache, 0, start=0, end=npos, step=1)
+                                 for npos in n_positions_list]
+        value_cache = torch.zeros(cache_shape, dtype=dtype)
+        value_cache = manipulator.shard_along(value_cache, dim=2)
+        self.value_cache = value_cache
+        self.value_cache_slices = [slice_on_nc(value_cache, 0, start=0, end=npos, step=1)
+                                   for npos in n_positions_list]
         self.params = [
             self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias,
             self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias,
             self.attn_out_weight, self.attn_out_bias, self.ln_2_weight, self.ln_2_bias,
             self.mlp_in_weight, self.mlp_in_bias, self.mlp_out_weight, self.mlp_out_bias,
         ]
+        self.activate_n_positions_index(0)
 
     def forward(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, self.key_cache, self.value_cache, *self.params]
-        hidden, self.key_cache, self.value_cache = self.kernel(inputs_cores)
+        inputs_cores = [hidden, cache_offset, mask, self.active_key_cache, self.active_value_cache,
+                        *self.params]
+        hidden, *_ = self.active_kernel(inputs_cores)
         return hidden
 
     def forward_init(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, self.key_cache, self.value_cache, *self.params]
-        hidden, self.key_cache, self.value_cache = self.init_kernel(inputs_cores)
+        inputs_cores = [hidden, cache_offset, mask, self.active_key_cache, self.active_value_cache,
+                        *self.params]
+        hidden, *_ = self.active_init_kernel(inputs_cores)
         return hidden
+
+    def activate_n_positions_index(self, n_positions_index):
+        self.active_key_cache = self.key_cache_slices[n_positions_index]
+        self.active_value_cache = self.value_cache_slices[n_positions_index]
+        if self.kernels is not None:
+            self.active_kernel = self.kernels[n_positions_index]
+        if self.init_kernels is not None:
+            self.active_init_kernel = self.init_kernels[n_positions_index]
 
 
 class OPTAttention(module.LowMemoryModule):
