@@ -27,13 +27,14 @@ class GPT2ForSampling(module.PretrainedModel):
                  unroll=False, **kwargs):
         super().__init__()
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
+        n_positions = config.n_positions
         self.gpt2_kernel = None
         if unroll:
             block_kernel = None
             ln_lm_head_kernel = None
-            self.gpt2_kernel = hlo.build_gpt2_kernel(config, n_active_tokens)
+            self.gpt2_kernel = hlo.build_gpt2_kernel(config, n_active_tokens, n_positions)
         else:
-            block_kernel = hlo.build_gpt2_block_kernel(config, n_active_tokens)
+            block_kernel = hlo.build_gpt2_block_kernel(config, n_active_tokens, n_positions)
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens)
         self.transformer = GPT2Transformer(config, block_kernel)
         dtype = dtypes.to_torch_dtype(config.amp)
