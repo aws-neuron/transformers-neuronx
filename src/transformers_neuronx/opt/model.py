@@ -52,6 +52,7 @@ class OPTForSampling(module.PretrainedModel):
         self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_lm_head_init_kernel,
                                        ln_f, self.lm_head)
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
+        self.opt_caches = None
         self.opt_params = None
 
     def to_neuron(self):
@@ -66,6 +67,10 @@ class OPTForSampling(module.PretrainedModel):
     def reset(self):
         for block in self.model.decoder.layers:
             block.reset()
+        self.opt_caches = []
+        for block in self.model.decoder.layers:
+            self.opt_caches.append(block.key_cache)
+            self.opt_caches.append(block.value_cache)
         self.opt_params = []
         for block in self.model.decoder.layers:
             block_params = [
@@ -79,8 +84,6 @@ class OPTForSampling(module.PretrainedModel):
                 block.attn_v_bias,
                 block.attn_out_weight,
                 block.attn_out_bias,
-                block.key_cache,
-                block.value_cache,
                 block.ln_2_weight,
                 block.ln_2_bias,
                 block.mlp_in_weight,
@@ -125,7 +128,7 @@ class OPTForSampling(module.PretrainedModel):
         if self.opt_kernel is None:
             return self._forward_init_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        inputs_cores = hidden, cache_offset, mask, *self.opt_params
+        inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
         logits, *_ = self.opt_init_kernel(inputs_cores)
         return self._process_outputs(logits)
 
@@ -140,7 +143,7 @@ class OPTForSampling(module.PretrainedModel):
         if self.opt_kernel is None:
             return self._forward_one_token_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        inputs_cores = hidden, cache_offset, mask, *self.opt_params
+        inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
         logits, *_ = self.opt_kernel(inputs_cores)
         return self._process_outputs(logits)
 
@@ -342,19 +345,20 @@ class OPTBlock(module.LowMemoryModule):
         self.key_cache = manipulator.shard_along(self.key_cache, dim=2)
         self.value_cache = torch.zeros(cache_shape, dtype=dtype)
         self.value_cache = manipulator.shard_along(self.value_cache, dim=2)
-        self.params = self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias, \
-            self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias, \
-            self.attn_out_weight, self.attn_out_bias, self.key_cache, self.value_cache, \
-            self.ln_2_weight, self.ln_2_bias, self.mlp_in_weight, self.mlp_in_bias, \
-            self.mlp_out_weight, self.mlp_out_bias
+        self.params = [
+            self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias,
+            self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias,
+            self.attn_out_weight, self.attn_out_bias, self.ln_2_weight, self.ln_2_bias,
+            self.mlp_in_weight, self.mlp_in_bias, self.mlp_out_weight, self.mlp_out_bias,
+        ]
 
     def forward(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, *self.params]
+        inputs_cores = [hidden, cache_offset, mask, self.key_cache, self.value_cache, *self.params]
         hidden, self.key_cache, self.value_cache = self.kernel(inputs_cores)
         return hidden
 
     def forward_init(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, *self.params]
+        inputs_cores = [hidden, cache_offset, mask, self.key_cache, self.value_cache, *self.params]
         hidden, self.key_cache, self.value_cache = self.init_kernel(inputs_cores)
         return hidden
 
