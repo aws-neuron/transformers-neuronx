@@ -16,8 +16,8 @@ from transformers_neuronx import compiler
 from transformers_neuronx import hlo
 
 
-def build_gpt2_block_kernel(config, n_active_tokens):
-    block = gen_scribable_block(config, n_active_tokens)
+def build_gpt2_block_kernel(config, n_active_tokens, n_positions):
+    block = gen_scribable_block(config, n_active_tokens, n_positions)
     return compiler.build_kernel(block, config.tp_degree)
 
 
@@ -26,8 +26,8 @@ def build_lm_head_kernel(config, n_active_tokens):
     return compiler.build_kernel(ln_lm_head, config.tp_degree)
 
 
-def build_gpt2_kernel(config, n_active_tokens):
-    gpt2 = gen_scribable_gpt2(config, n_active_tokens)
+def build_gpt2_kernel(config, n_active_tokens, n_positions):
+    gpt2 = gen_scribable_gpt2(config, n_active_tokens, n_positions)
     return compiler.build_kernel(gpt2, config.tp_degree)
 
 
@@ -170,10 +170,9 @@ def block(hidden, ln_1_weight, ln_1_bias,
     return out_hidden, out_key_cache, out_value_cache
 
 
-def gen_scribable_block(config, n_active_tokens):
+def gen_scribable_block(config, n_active_tokens, n_positions):
     embed_dim = config.n_embd
     n_heads = config.n_head
-    n_positions = config.n_positions
     batch_size = config.batch_size
     intermediate_dim = config.intermediate_dim
     amp = config.amp
@@ -294,10 +293,9 @@ def gpt2(hidden, cache_offset, mask, blocks_params, ln_lm_head_params, config):
     return scribe.tuple(*root_shapes).Tuple(*outputs)
 
 
-def gen_scribable_gpt2(config, n_active_tokens):
+def gen_scribable_gpt2(config, n_active_tokens, n_positions):
     embed_dim = config.n_embd
     n_heads = config.n_head
-    n_positions = config.n_positions
     batch_size = config.batch_size
     intermediate_dim = config.intermediate_dim
     amp = config.amp

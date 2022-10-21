@@ -35,12 +35,13 @@ class OPTForSampling(module.PretrainedModel):
             ln_lm_head_kernel = None
             block_init_kernel = None
             ln_lm_head_init_kernel = None
-            self.opt_kernel = hlo.build_opt_kernel(config, n_active_tokens=1)
-            self.opt_init_kernel = hlo.build_opt_kernel(config, init_n_active_tokens)
+            self.opt_kernel = hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=n_positions)
+            self.opt_init_kernel = hlo.build_opt_kernel(config, init_n_active_tokens, n_positions)
         else:
-            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens=1)
+            block_kernel = hlo.build_opt_block_kernel(config, n_active_tokens=1,
+                                                      n_positions=n_positions)
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            block_init_kernel = hlo.build_opt_block_kernel(config, init_n_active_tokens)
+            block_init_kernel = hlo.build_opt_block_kernel(config, init_n_active_tokens, n_positions)
             ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
         self.init_n_active_tokens = init_n_active_tokens
         self.model = OPTModel(config, block_kernel, block_init_kernel)
