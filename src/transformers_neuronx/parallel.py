@@ -56,6 +56,9 @@ class TensorManipulator:
     def unshard_along(self, sharded_tensors, dim):
         return torch.cat(cpu(sharded_tensors), dim=dim)
 
+    def slice_on_nc(self, tensors, dim, start, end, step):
+        return [ops.slice(ts, dim, start, end, step) for ts in tensors]
+
 
 def to_nc(sharded_tensors):
     return [ops.to_nc(ts, ordinal) for ordinal, ts in enumerate(sharded_tensors)]
