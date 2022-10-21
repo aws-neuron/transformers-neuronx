@@ -43,6 +43,7 @@ class GPT2ForSampling(module.PretrainedModel):
         ln_f = self.transformer.ln_f
         self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, None, ln_f, self.lm_head)
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
+        self.gpt2_caches = None
         self.gpt2_params = None
 
     def to_neuron(self):
@@ -55,6 +56,10 @@ class GPT2ForSampling(module.PretrainedModel):
     def reset(self):
         for block in self.transformer.h:
             block.reset()
+        self.gpt2_caches = []
+        for block in self.transformer.h:
+            self.gpt2_caches.append(block.key_cache)
+            self.gpt2_caches.append(block.value_cache)
         self.gpt2_params = []
         for block in self.transformer.h:
             block_params = [
@@ -68,8 +73,6 @@ class GPT2ForSampling(module.PretrainedModel):
                 block.attn_v_bias,
                 block.attn_out_weight,
                 block.attn_out_bias,
-                block.key_cache,
-                block.value_cache,
                 block.ln_2_weight,
                 block.ln_2_bias,
                 block.mlp_in_weight,
@@ -106,7 +109,7 @@ class GPT2ForSampling(module.PretrainedModel):
                 hidden = block(hidden, cache_offset, mask)
             logits = self.ln_lm_head(hidden)
         else:
-            inputs_cores = hidden, cache_offset, mask, *self.gpt2_params
+            inputs_cores = hidden, cache_offset, mask, *self.gpt2_caches, *self.gpt2_params
             logits, *_ = self.gpt2_kernel(inputs_cores)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
@@ -245,14 +248,15 @@ class GPT2Block(module.LowMemoryModule):
         self.key_cache = manipulator.shard_along(self.key_cache, dim=2)
         self.value_cache = torch.zeros(cache_shape, dtype=dtype)
         self.value_cache = manipulator.shard_along(self.value_cache, dim=2)
-        self.params = self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias, \
-            self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias, \
-            self.attn_out_weight, self.attn_out_bias, self.key_cache, self.value_cache, \
-            self.ln_2_weight, self.ln_2_bias, self.mlp_in_weight, self.mlp_in_bias, \
-            self.mlp_out_weight, self.mlp_out_bias
+        self.params = [
+            self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias,
+            self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias,
+            self.attn_out_weight, self.attn_out_bias, self.ln_2_weight, self.ln_2_bias,
+            self.mlp_in_weight, self.mlp_in_bias, self.mlp_out_weight, self.mlp_out_bias,
+        ]
 
     def forward(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, *self.params]
+        inputs_cores = [hidden, cache_offset, mask, self.key_cache, self.value_cache, *self.params]
         hidden, self.key_cache, self.value_cache = self.kernel(inputs_cores)
         return hidden
 
