@@ -66,7 +66,7 @@ def run(args, model_name, model_cls):
         input_ids = torch.as_tensor([encoded_text])
         input_ids = torch.cat([input_ids for _ in range(args.batch_size)], dim=0)
         print('running model.sample')
-        generated_sequence = model.sample(input_ids, sequence_length=128)
+        generated_sequence = model.sample(input_ids, sequence_length=args.n_positions)
         print('generated_sequence=', generated_sequence)
         outputs = [tokenizer.decode(gen_seq) for gen_seq in generated_sequence]
     print(outputs)
