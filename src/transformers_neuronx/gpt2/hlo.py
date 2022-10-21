@@ -188,6 +188,9 @@ def gen_scribable_block(config, n_active_tokens, n_positions):
         hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
         mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
+        cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+        key_cache = pbuilder(cache_shape)
+        value_cache = pbuilder(cache_shape)
         ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
         ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
         attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
@@ -198,9 +201,6 @@ def gen_scribable_block(config, n_active_tokens, n_positions):
         attn_v_bias = pbuilder([attn_dim_tp])
         attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
         attn_out_bias = pbuilder([embed_dim])
-        cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
-        key_cache = pbuilder(cache_shape)
-        value_cache = pbuilder(cache_shape)
         ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
         ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
         mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
@@ -267,16 +267,16 @@ def gen_scribable_ln_lm_head(config, n_active_tokens):
     return scribable
 
 
-def gpt2(hidden, cache_offset, mask, blocks_params, ln_lm_head_params, config):
+def gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config):
     scribe = hidden.scribe
     dtype = hidden.dtype
     outputs = []
-    for block_params in blocks_params:
+    for (key_cache, value_cache), block_params in zip(blocks_caches, blocks_params):
         (
             ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
             attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
-            attn_out_weight, attn_out_bias, key_cache, value_cache,
-            ln_2_weight, ln_2_bias, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
+            mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
         ) = block_params
         hidden, out_key_cache, out_value_cache = block(
             hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
@@ -316,6 +316,12 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
         mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
 
+        def gen_block_caches():
+            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+            key_cache = pbuilder(cache_shape)
+            value_cache = pbuilder(cache_shape)
+            return key_cache, value_cache
+
         def gen_block_params():
             ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
             ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
@@ -327,9 +333,6 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
             attn_v_bias = pbuilder([attn_dim_tp])
             attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
             attn_out_bias = pbuilder([embed_dim])
-            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
-            key_cache = pbuilder(cache_shape)
-            value_cache = pbuilder(cache_shape)
             ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
             ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
             mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
@@ -339,8 +342,8 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
             return (
                 ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
                 attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
-                attn_out_weight, attn_out_bias, key_cache, value_cache,
-                ln_2_weight, ln_2_bias, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+                attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
+                mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             )
 
         def gen_ln_lm_head_params():
@@ -349,8 +352,9 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
             lm_head_weight = pbuilder([embed_dim, vocab_size_tp])
             return ln_f_weight, ln_f_bias, lm_head_weight
 
+        blocks_caches = [gen_block_caches() for _ in range(n_layer)]
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
-        return gpt2(hidden, cache_offset, mask, blocks_params, ln_lm_head_params, config)
+        return gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
 
     return scribable
