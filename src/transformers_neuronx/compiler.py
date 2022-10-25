@@ -47,7 +47,7 @@ def build_kernel(py_func, tp_degree):
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
     metaneff = hlo2metaneff(hlo_module)
-    return Kernel(neff_bytes, metaneff, tp_degree)
+    return Kernel(hlo_module, neff_bytes, metaneff, tp_degree)
 
 
 def dump_proto(proto, path):
@@ -64,7 +64,7 @@ def hlo2metaneff(hlo_module):
             tensor = target.add()
             tensor.name = name.encode()
             tensor.shape[:] = shape.dimensions
-            tensor.data_type = dtype_converter(shape.element_type)
+            tensor.data_type = dtype_converter.hlo2metaneff(shape.element_type)
 
     # TODO: read names from hlo_module
     input_names = [f'input{idx}' for idx in range(len(prog_shape.parameters))]
@@ -87,40 +87,45 @@ class DataTypeConverter:
 
     def __init__(self):
         name_mapping = '''
-            PRED UINT8
-            S8 INT8
-            S16 INT16
-            S32 INT32
-            S64 INT64
-            U8 UINT8
-            U16 UINT16
-            U32 INT32
-            U64 INT64
-            F16 FLOAT16
-            F32 FLOAT
-            F64 DOUBLE
-            BF16 BFLOAT16
+            PRED    UINT8       bool
+            S8      INT8        int8
+            S16     INT16       int16
+            S32     INT32       int32
+            S64     INT64       int64
+            U8      UINT8       uint8
+            U16     UINT16      int16
+            U32     INT32       int32
+            U64     INT64       int64
+            F16     FLOAT16     float16
+            F32     FLOAT       float32
+            F64     DOUBLE      float64
+            BF16    BFLOAT16    bfloat16
         '''
         name_mapping = dedent(name_mapping)
         name_mapping = name_mapping.lstrip().strip()
-        self.mapping = {}
+        self.hlo2metaneff_mapping = {}
+        self.hlo2torch_mapping = {}
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
-            pname, dname = line.split()
+            pname, dname, tname = line.split()
             primitive_type = getattr(xla_data_pb2.PrimitiveType, pname)
             metaneff_dtype = getattr(metaneff_pb2.MetaTensor.DataType, dname)
-            self.mapping[primitive_type] = metaneff_dtype
+            torch_dtype = getattr(torch, tname)
+            self.hlo2metaneff_mapping[primitive_type] = metaneff_dtype
+            self.hlo2torch_mapping[primitive_type] = torch_dtype
 
-    def __call__(self, primitive_type):
-        if primitive_type not in self.mapping:
-            name = xla_data_pb2.PrimitiveType.Name(primitive_type)
-            raise NotImplementedError(name)
-        return self.mapping[primitive_type]
+    def hlo2metaneff(self, primitive_type):
+        return self.hlo2metaneff_mapping[primitive_type]
+
+    def hlo2torch(self, primitive_type):
+        return self.hlo2torch_mapping[primitive_type]
 
 
 class Kernel:
 
-    def __init__(self, neff_bytes, metaneff, tp_degree):
+    def __init__(self, hlo_module, neff_bytes, metaneff, tp_degree):
+        self.hlo_module = hlo_module
+        self.neff_bytes = neff_bytes
         metaneff_bytes = metaneff.SerializeToString()
         model_cls = torch.classes.neuron.Model
         self.models = [model_cls(neff_bytes, metaneff_bytes) for _ in range(tp_degree)]
@@ -132,3 +137,28 @@ class Kernel:
 
     def __call__(self, inputs):
         return self.executor.execute(self.models, *inputs)
+
+    def profile_start(self, profile_dir):
+        for model, ntff_path in zip(self.models, self._ntff_paths(profile_dir)):
+            ops.profile_start(model, ntff_path)
+
+    def profile_stop(self, profile_dir):
+        for model, ntff_path in zip(self.models, self._ntff_paths(profile_dir)):
+            ops.profile_stop(ntff_path)
+
+    def _ntff_paths(self, profile_dir):
+        paths = []
+        for idx in range(len(self.models)):
+            filename = f'{self.hlo_module.name}.{idx:03d}.ntff'
+            paths.append(os.path.join(profile_dir, filename))
+        return paths
+
+
+def gen_zero_inputs(hlo_module):
+    dtype_converter = DataTypeConverter()
+    inputs = []
+    for param in hlo_module.host_program_shape.parameters:
+        shape = list(param.dimensions)
+        dtype = dtype_converter.hlo2torch(param.element_type)
+        inputs.append(torch.zeros(shape, dtype=dtype))
+    return inputs
