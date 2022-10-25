@@ -120,6 +120,8 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
     out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
     output = dtype[hidden_r_sizes].Add(output, out_bias)
     output = dtype[hidden_sizes].Reshape(output)
+    if tp_degree == 1:
+        return output, cached_keys, cached_values
     replica_groups = [list(range(tp_degree))]
     add_func = hlo.gen_add_func(dtype)
     output = dtype[hidden_sizes].AllReduce(output, replica_groups=replica_groups, to_apply=add_func)
