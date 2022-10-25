@@ -119,6 +119,8 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden = getattr(activations, activation_function)(hidden)
     hidden = dot00_add0(out_weight, hidden, out_bias)
     hidden = dtype[hidden_sizes].Reshape(hidden)
+    if tp_degree == 1:
+        return hidden
     replica_groups = [list(range(tp_degree))]
     add_func = gen_add_func(dtype)
     hidden = dtype[hidden_sizes].AllReduce(hidden, replica_groups=replica_groups, to_apply=add_func)
