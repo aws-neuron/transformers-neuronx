@@ -38,7 +38,7 @@ class GPT2ForSampling(module.PretrainedModel):
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens)
         self.transformer = GPT2Transformer(config, block_kernel)
         dtype = dtypes.to_torch_dtype(config.amp)
-        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
+        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.config = config
         ln_f = self.transformer.ln_f
         self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, None, ln_f, self.lm_head)
@@ -47,6 +47,8 @@ class GPT2ForSampling(module.PretrainedModel):
         self.gpt2_params = None
 
     def to_neuron(self):
+        self.transformer.wte.materialize()
+        self.transformer.wpe.materialize()
         if self.gpt2_kernel is not None:
             self.gpt2_kernel.load()
         for idx, block in enumerate(self.transformer.h):
@@ -207,10 +209,13 @@ class GPT2Block(module.LowMemoryModule):
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
+        self.ln_1.materialize()
         self.ln_1_weight = duplicate(self.ln_1.weight.detach())
         self.ln_1_bias = duplicate(self.ln_1.bias.detach())
         c_attn = self.attn.c_attn
+        c_attn.materialize()
         c_proj = self.attn.c_proj
+        c_proj.materialize()
         c_attn_weight = c_attn.weight.detach()
         c_attn_bias = c_attn.bias.detach()
         n_embd = self.config.n_embd
@@ -224,10 +229,13 @@ class GPT2Block(module.LowMemoryModule):
         self.attn_out_bias = primary_only(c_proj.bias.detach())
         c_attn.weight = UninitializedParameter()
         c_proj.weight = UninitializedParameter()
+        self.ln_2.materialize()
         self.ln_2_weight = duplicate(self.ln_2.weight.detach())
         self.ln_2_bias = duplicate(self.ln_2.bias.detach())
         c_fc = self.mlp.c_fc
+        c_fc.materialize()
         c_proj = self.mlp.c_proj
+        c_proj.materialize()
         self.mlp_in_weight = shard_along(c_fc.weight.detach(), dim=1)
         self.mlp_in_bias = shard_along(c_fc.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(c_proj.weight.detach(), dim=0)
@@ -302,8 +310,10 @@ class GPT2LnLmHead:
             self.init_kernel.load()
         duplicate = self.manipulator.duplicate
         shard_along = self.manipulator.shard_along
+        self.ln_f.materialize()
         self.ln_f_weight = duplicate(self.ln_f.weight.detach())
         self.ln_f_bias = duplicate(self.ln_f.bias.detach())
+        self.lm_head.materialize()
         lm_head_weight = self.lm_head.weight.detach()
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
         self.lm_head_weight = shard_along(lm_head_weight.T, dim=1)
