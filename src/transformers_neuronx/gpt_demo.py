@@ -22,6 +22,7 @@ from transformers_neuronx import dtypes
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
     parser.add_argument('--amp', default='f32', choices=['f32', 'f16', 'bf16'])
+    parser.add_argument('--model_name', default=None)
     subparsers = parser.add_subparsers()
     save_name = 'save'
     save_parser = subparsers.add_parser(save_name)
@@ -37,6 +38,8 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--unroll', action='store_true')
     run_parser.add_argument('--print_latency', action='store_true')
     args = parser.parse_args()
+    if args.model_name is not None:
+        model_name = args.model_name
     if args.which == save_name:
         save(args, model_name, amp_callback)
     elif args.which == run_name:
