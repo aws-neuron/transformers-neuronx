@@ -25,21 +25,7 @@ from transformers_neuronx.opt.hlo import build_opt_block_kernel
 class OPTCompilerTest(TestCase):
 
     def test_opt_kernel(self):
-        config = PretrainedConfig(
-            activation_function='relu',
-            do_layer_norm_before=True,
-            eos_token_id=2,
-            ffn_dim=3072,
-            hidden_size=768,
-            max_position_embeddings=2048,
-            num_attention_heads=12,
-            num_hidden_layers=12,
-            pad_token_id=1,
-            torch_dtype='float16',
-            vocab_size=50272,
-            word_embed_proj_dim=768,
-        )
-        config = OPTConfig(config, n_positions=2048, batch_size=4, amp='f16', tp_degree=2)
+        config = opt_125m_config(batch_size=4)
         warmup_steps = 2
         timing_steps = 10
         profile_dir = os.environ.get('NEURON_PROFILE', None)
@@ -72,3 +58,39 @@ class OPTCompilerTest(TestCase):
         for tensor_cores in zero_outputs:
             for tensor in tensor_cores:
                 self.assertEqual((tensor * tensor).sum(), 0.0)
+
+
+def opt_125m_config(batch_size):
+    config = PretrainedConfig(
+        activation_function='relu',
+        do_layer_norm_before=True,
+        eos_token_id=2,
+        ffn_dim=3072,
+        hidden_size=768,
+        max_position_embeddings=2048,
+        num_attention_heads=12,
+        num_hidden_layers=12,
+        pad_token_id=1,
+        torch_dtype='float16',
+        vocab_size=50272,
+        word_embed_proj_dim=768,
+    )
+    return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=2)
+
+
+def opt_13b_config(batch_size):
+    config = PretrainedConfig(
+        activation_function='relu',
+        do_layer_norm_before=True,
+        eos_token_id=2,
+        ffn_dim=20480,
+        hidden_size=5120,
+        max_position_embeddings=2048,
+        num_attention_heads=40,
+        num_hidden_layers=40,
+        pad_token_id=1,
+        torch_dtype='float16',
+        vocab_size=50272,
+        word_embed_proj_dim=5120,
+    )
+    return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=2)
