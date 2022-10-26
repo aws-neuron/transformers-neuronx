@@ -37,6 +37,7 @@ class GPTJForSampling(module.PretrainedModel):
         self.manipulator = parallel.TensorManipulator(config.tp_degree)
 
     def to_neuron(self):
+        self.transformer.wte.materialize()
         for idx, block in enumerate(self.transformer.h):
             block.to_neuron()
         self.ln_lm_head.to_neuron()
@@ -172,9 +173,14 @@ class GPTJBlock(module.LowMemoryModule):
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
+        self.ln_1.materialize()
         self.ln_1_weight = duplicate(self.ln_1.weight.detach())
         self.ln_1_bias = duplicate(self.ln_1.bias.detach())
         attn = self.attn
+        attn.q_proj.materialize()
+        attn.k_proj.materialize()
+        attn.v_proj.materialize()
+        attn.out_proj.materialize()
         self.attn_q_weight = shard_along(attn.q_proj.weight.detach().T, dim=1)
         self.attn_k_weight = shard_along(attn.k_proj.weight.detach().T, dim=1)
         self.attn_v_weight = shard_along(attn.v_proj.weight.detach().T, dim=1)
@@ -184,6 +190,8 @@ class GPTJBlock(module.LowMemoryModule):
         attn.v_proj.weight = UninitializedParameter()
         attn.out_proj.weight = UninitializedParameter()
         mlp = self.mlp
+        mlp.fc_in.materialize()
+        mlp.fc_out.materialize()
         self.mlp_in_weight = shard_along(mlp.fc_in.weight.detach().T, dim=1)
         self.mlp_in_bias = shard_along(mlp.fc_in.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(mlp.fc_out.weight.detach().T, dim=0)
@@ -253,8 +261,10 @@ class GPTJLnLmHead:
             self.kernel.load()
         duplicate = self.manipulator.duplicate
         shard_along = self.manipulator.shard_along
+        self.ln_f.materialize()
         self.ln_f_weight = duplicate(self.ln_f.weight.detach())
         self.ln_f_bias = duplicate(self.ln_f.bias.detach())
+        self.lm_head.materialize()
         self.lm_head_weight = shard_along(self.lm_head.weight.detach().T, dim=1)
         self.lm_head_bias = shard_along(self.lm_head.bias.detach(), dim=0)
         self.lm_head.weight = UninitializedParameter()

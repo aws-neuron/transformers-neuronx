@@ -17,6 +17,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers_neuronx import dtypes
+from transformers_neuronx.module import save_pretrained_split
 
 
 def demo(model_name, model_cls, amp_callback):
@@ -51,7 +52,7 @@ def save(args, model_name, amp_callback):
     if args.amp != 'f32':
         dtype = dtypes.to_torch_dtype(args.amp)
         amp_callback(model, dtype)
-    model.save_pretrained(args.save, max_shard_size='100GB')
+    save_pretrained_split(model, args.save)
 
 
 def run(args, model_name, model_cls):

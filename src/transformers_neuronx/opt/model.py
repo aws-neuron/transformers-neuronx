@@ -58,7 +58,7 @@ class OPTForSampling(module.PretrainedModel):
         self.init_n_active_tokens = init_n_active_tokens
         self.model = OPTModel(config, block_kernels, block_init_kernels)
         dtype = dtypes.to_torch_dtype(config.amp)
-        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype)
+        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.config = config
         ln_f = self.model.decoder.final_layer_norm
         self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_lm_head_init_kernel,
@@ -70,6 +70,8 @@ class OPTForSampling(module.PretrainedModel):
         self.active_opt_init_kernel = None
 
     def to_neuron(self):
+        self.model.decoder.embed_tokens.materialize()
+        self.model.decoder.embed_positions.materialize()
         if self.opt_kernels is not None:
             for kernel in self.opt_kernels:
                 kernel.load()
@@ -340,12 +342,17 @@ class OPTBlock(module.LowMemoryModule):
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
+        self.self_attn_layer_norm.materialize()
         self.ln_1_weight = duplicate(self.self_attn_layer_norm.weight.detach())
         self.ln_1_bias = duplicate(self.self_attn_layer_norm.bias.detach())
         q_proj = self.self_attn.q_proj
         k_proj = self.self_attn.k_proj
         v_proj = self.self_attn.v_proj
         out_proj = self.self_attn.out_proj
+        q_proj.materialize()
+        k_proj.materialize()
+        v_proj.materialize()
+        out_proj.materialize()
         self.attn_q_weight = shard_along(q_proj.weight.detach().T, dim=1)
         self.attn_q_bias = shard_along(q_proj.bias.detach(), dim=0)
         self.attn_k_weight = shard_along(k_proj.weight.detach().T, dim=1)
@@ -362,10 +369,13 @@ class OPTBlock(module.LowMemoryModule):
         v_proj.bias = UninitializedParameter()
         out_proj.weight = UninitializedParameter()
         out_proj.bias = UninitializedParameter()
+        self.final_layer_norm.materialize()
         self.ln_2_weight = duplicate(self.final_layer_norm.weight.detach())
         self.ln_2_bias = duplicate(self.final_layer_norm.bias.detach())
         fc1 = self.fc1
         fc2 = self.fc2
+        fc1.materialize()
+        fc2.materialize()
         self.mlp_in_weight = shard_along(fc1.weight.detach().T, dim=1)
         self.mlp_in_bias = shard_along(fc1.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(fc2.weight.detach().T, dim=0)
