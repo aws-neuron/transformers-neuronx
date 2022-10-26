@@ -78,6 +78,8 @@ class OPTForSampling(module.PretrainedModel):
         if self.opt_init_kernels is not None:
             for kernel in self.opt_init_kernels:
                 kernel.load()
+        first_block, *_ = self.model.decoder.layers
+        first_block.maybe_load_kernels()
         for idx, block in enumerate(self.model.decoder.layers):
             block.to_neuron()
         self.ln_lm_head.to_neuron()
@@ -332,12 +334,6 @@ class OPTBlock(module.LowMemoryModule):
         self.params = None
 
     def to_neuron(self):
-        if self.kernels is not None:
-            for kernel in self.kernels:
-                kernel.load()
-        if self.init_kernels is not None:
-            for kernel in self.init_kernels:
-                kernel.load()
         manipulator = parallel.TensorManipulator(self.config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
@@ -382,6 +378,14 @@ class OPTBlock(module.LowMemoryModule):
         self.mlp_out_bias = primary_only(fc2.bias.detach())
         fc1.weight = UninitializedParameter()
         fc2.weight = UninitializedParameter()
+
+    def maybe_load_kernels(self):
+        if self.kernels is not None:
+            for kernel in self.kernels:
+                kernel.load()
+        if self.init_kernels is not None:
+            for kernel in self.init_kernels:
+                kernel.load()
 
     def reset(self, n_positions_list):
         config = self.config
