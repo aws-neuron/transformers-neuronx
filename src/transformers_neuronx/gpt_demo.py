@@ -38,7 +38,7 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--batch_size', type=int, default=4)
     run_parser.add_argument('--n_positions', type=int, default=128)
     run_parser.add_argument('--tp_degree', type=int, default=2)
-    run_parser.add_argument('--unroll', action='store_true')
+    run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--print_latency', action='store_true')
     args = parser.parse_args()
     if args.model_name is not None:

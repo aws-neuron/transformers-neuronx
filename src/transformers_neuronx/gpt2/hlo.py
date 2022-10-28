@@ -31,6 +31,11 @@ def build_gpt2_kernel(config, n_active_tokens, n_positions):
     return compiler.build_kernel(gpt2, config.tp_degree)
 
 
+def build_gpt2_multi_block_kernel(config, n_active_tokens, n_positions, n_blocks):
+    multi_block = gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks)
+    return compiler.build_kernel(multi_block, config.tp_degree)
+
+
 def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias,
               cached_keys, cached_values, cache_offset, mask,
               n_heads, tp_degree):
@@ -358,5 +363,89 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
         return gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
+
+    return scribable
+
+
+def multi_block(hidden, cache_offset, mask, blocks_caches, blocks_params, config):
+    scribe = hidden.scribe
+    input_hidden = hidden
+    outputs = []
+    for (key_cache, value_cache), block_params in zip(blocks_caches, blocks_params):
+        (
+            ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
+            attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
+            attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
+            mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+        ) = block_params
+        hidden, out_key_cache, out_value_cache = block(
+            hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
+            attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
+            attn_out_weight, attn_out_bias, key_cache, value_cache, cache_offset, mask,
+            ln_2_weight, ln_2_bias, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            config)
+        outputs.append(out_key_cache)
+        outputs.append(out_value_cache)
+    hidden.set_alias_to(input_hidden)
+    outputs.insert(0, hidden)
+    root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+    return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+
+def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
+    embed_dim = config.n_embd
+    n_heads = config.n_head
+    batch_size = config.batch_size
+    intermediate_dim = config.intermediate_dim
+    amp = config.amp
+    tp_degree = config.tp_degree
+    vocab_size = config.vocab_size
+    head_dim = embed_dim // n_heads
+    attn_dim_tp = embed_dim // tp_degree
+    n_heads_tp = n_heads // tp_degree
+    intermediate_dim_tp = intermediate_dim // tp_degree
+    if vocab_size % tp_degree:
+        vocab_size = (vocab_size // tp_degree + 1) * tp_degree
+    vocab_size_tp = vocab_size // tp_degree
+
+    def scribable(scribe):
+        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
+        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
+        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
+
+        def gen_block_caches():
+            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+            key_cache = pbuilder(cache_shape)
+            value_cache = pbuilder(cache_shape)
+            return key_cache, value_cache
+
+        def gen_block_params():
+            ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_q_bias = pbuilder([attn_dim_tp])
+            attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_k_bias = pbuilder([attn_dim_tp])
+            attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_v_bias = pbuilder([attn_dim_tp])
+            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            attn_out_bias = pbuilder([embed_dim])
+            ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
+            mlp_in_bias = pbuilder([intermediate_dim_tp])
+            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
+            mlp_out_bias = pbuilder([embed_dim])
+            return (
+                ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
+                attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
+                attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
+                mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            )
+
+        blocks_caches = [gen_block_caches() for _ in range(n_blocks)]
+        blocks_params = [gen_block_params() for _ in range(n_blocks)]
+        return multi_block(hidden, cache_offset, mask, blocks_caches, blocks_params, config)
 
     return scribable
