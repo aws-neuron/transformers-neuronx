@@ -13,10 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import json
-import math
 import os
 import re
-import time
 import torch
 from transformers import AutoConfig
 
@@ -114,7 +112,7 @@ class LowMemoryLazyLinear(torch.nn.LazyLinear, LowMemoryModule): ...
 class PretrainedModel(LowMemoryModule):
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_path, *model_args, print_latency=False, **kwargs):
+    def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
         state_dict_path = os.path.join(pretrained_model_path, 'pytorch_model.bin')
@@ -123,21 +121,4 @@ class PretrainedModel(LowMemoryModule):
         else:
             state_dict = torch.load(state_dict_path)
             model.load_state_dict_low_memory(state_dict)
-        if print_latency:
-            latency_printer = LatencyPrinter()
-            model.register_forward_pre_hook(latency_printer.pre_hook)
-            model.register_forward_hook(latency_printer.hook)
         return model
-
-
-class LatencyPrinter:
-
-    def __init__(self):
-        self.start = None
-
-    def pre_hook(self, *args):
-        self.start = time.time()
-
-    def hook(self, *args):
-        latency_ms = math.ceil((time.time() - self.start) * 1000)
-        print(f'Latency: {latency_ms} ms')
