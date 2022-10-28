@@ -68,6 +68,7 @@ class OPTForSampling(module.PretrainedModel):
         self.opt_params = None
         self.active_opt_kernel = None
         self.active_opt_init_kernel = None
+        self.to_neuron_hooks = []
 
     def to_neuron(self):
         self.model.decoder.embed_tokens.materialize()
@@ -82,6 +83,8 @@ class OPTForSampling(module.PretrainedModel):
         first_block.maybe_load_kernels()
         for idx, block in enumerate(self.model.decoder.layers):
             block.to_neuron()
+            for hook in self.to_neuron_hooks:
+                hook(idx)
         self.ln_lm_head.to_neuron()
 
     def reset(self):
@@ -258,6 +261,9 @@ class OPTForSampling(module.PretrainedModel):
             mask[:, :next_len] = 1.0
             next_token_scores = self(inputs, cache_offset, mask)
         return torch.cat(tokens, dim=-1)
+
+    def register_to_neuron_hook(self, hook):
+        self.to_neuron_hooks.append(hook)
 
 
 def find_first_ge_index(values, target):
