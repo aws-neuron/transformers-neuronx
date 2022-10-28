@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import argparse
+import math
+import time
 import torch
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
@@ -62,7 +64,11 @@ def run(args, model_name, model_cls):
     print(f'running {model_cls.__name__}.from_pretrained')
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                      unroll=args.unroll, print_latency=args.print_latency)
+                                      unroll=args.unroll)
+    if args.print_latency:
+        latency_printer = LatencyPrinter()
+        model.register_forward_pre_hook(latency_printer.pre_hook)
+        model.register_forward_hook(latency_printer.hook)
     if hasattr(model, 'register_to_neuron_hook'):
         model.register_to_neuron_hook(lambda idx: print(f'done to_neuron layer {idx}'))
     print('running model.to_neuron')
@@ -76,3 +82,16 @@ def run(args, model_name, model_cls):
         print('generated_sequence=', generated_sequence)
         outputs = [tokenizer.decode(gen_seq) for gen_seq in generated_sequence]
     print(outputs)
+
+
+class LatencyPrinter:
+
+    def __init__(self):
+        self.start = None
+
+    def pre_hook(self, *args):
+        self.start = time.time()
+
+    def hook(self, *args):
+        latency_ms = math.ceil((time.time() - self.start) * 1000)
+        print(f'Latency: {latency_ms} ms')
