@@ -25,7 +25,7 @@ from transformers_neuronx.opt.config import OPTConfig
 class OPTForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, init_n_active_tokens=8, amp='f32', tp_degree=2,
-                 n_positions=2048, unroll=False, **kwargs):
+                 n_positions=2048, unroll=None, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         # power-of-2 bucket sizes
@@ -39,24 +39,38 @@ class OPTForSampling(module.PretrainedModel):
         self.active_n_positions_index = None
         self.opt_kernels = None
         self.opt_init_kernels = None
-        if unroll:
-            block_kernels = None
-            ln_lm_head_kernel = None
-            block_init_kernels = None
-            ln_lm_head_init_kernel = None
-            self.opt_kernels = [hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=npos)
-                                for npos in n_positions_list]
-            self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
-                                     for npos in n_positions_list]
-        else:
+        block_kernels = None
+        ln_lm_head_kernel = None
+        block_init_kernels = None
+        ln_lm_head_init_kernel = None
+        n_blocks = unroll
+        if unroll is None:
             block_kernels = [hlo.build_opt_block_kernel(config, n_active_tokens=1, n_positions=npos)
                              for npos in n_positions_list]
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
             block_init_kernels = [hlo.build_opt_block_kernel(config, init_n_active_tokens, npos)
                                   for npos in n_positions_list]
             ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
+        elif unroll == config.num_hidden_layers:
+            self.opt_kernels = [hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=npos)
+                                for npos in n_positions_list]
+            self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
+                                     for npos in n_positions_list]
+        else:
+            if config.num_hidden_layers % unroll != 0:
+                raise ValueError(
+                    f'unroll={unroll} does not divide num_hidden_layers={config.num_hidden_layers}')
+            block_kernels = [hlo.build_opt_multi_block_kernel(config, 1, npos, n_blocks)
+                             for npos in n_positions_list]
+            block_init_kernels = []
+            for npos in n_positions_list:
+                kernel = hlo.build_opt_multi_block_kernel(config, init_n_active_tokens, npos,
+                                                          n_blocks)
+                block_init_kernels.append(kernel)
+            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
+            ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
         self.init_n_active_tokens = init_n_active_tokens
-        self.model = OPTModel(config, block_kernels, block_init_kernels)
+        self.model = OPTModel(config, block_kernels, block_init_kernels, n_blocks=n_blocks)
         dtype = dtypes.to_torch_dtype(config.amp)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.config = config
@@ -81,6 +95,9 @@ class OPTForSampling(module.PretrainedModel):
                 kernel.load()
         first_block, *_ = self.model.decoder.layers
         first_block.maybe_load_kernels()
+        if self.model.decoder.multi_blocks is not None:
+            first_multi_block, *_ = self.model.decoder.multi_blocks
+            first_multi_block.maybe_load_kernels()
         for idx, block in enumerate(self.model.decoder.layers):
             block.to_neuron()
             for hook in self.to_neuron_hooks:
@@ -91,6 +108,9 @@ class OPTForSampling(module.PretrainedModel):
         for block in self.model.decoder.layers:
             block.reset(self.n_positions_list)
         self.activate_n_positions_index(0)
+        if self.model.decoder.multi_blocks is not None:
+            for multi_block in self.model.decoder.multi_blocks:
+                multi_block.reset()
         self.opt_params = []
         for block in self.model.decoder.layers:
             block_params = [
@@ -136,6 +156,9 @@ class OPTForSampling(module.PretrainedModel):
             block.activate_n_positions_index(n_positions_index)
             self.opt_caches.append(block.active_key_cache)
             self.opt_caches.append(block.active_value_cache)
+        if self.model.decoder.multi_blocks is not None:
+            for multi_block in self.model.decoder.multi_blocks:
+                multi_block.activate_n_positions_index(n_positions_index)
         self.active_n_positions_index = n_positions_index
         if self.opt_kernels is not None:
             self.active_opt_kernel = self.opt_kernels[n_positions_index]
@@ -160,6 +183,8 @@ class OPTForSampling(module.PretrainedModel):
         return logits
 
     def _forward_init(self, input_ids, cache_offset, mask):
+        if self.model.decoder.multi_blocks is not None:
+            return self._forward_init_multi_block(input_ids, cache_offset, mask)
         if self.opt_kernels is None:
             return self._forward_init_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
@@ -174,7 +199,16 @@ class OPTForSampling(module.PretrainedModel):
         logits = self.ln_lm_head.call_init(hidden)
         return self._process_outputs(logits)
 
+    def _forward_init_multi_block(self, input_ids, cache_offset, mask):
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        for multi_block in self.model.decoder.multi_blocks:
+            hidden = multi_block.call_init(hidden, cache_offset, mask)
+        logits = self.ln_lm_head.call_init(hidden)
+        return self._process_outputs(logits)
+
     def _forward_one_token(self, input_ids, cache_offset, mask):
+        if self.model.decoder.multi_blocks is not None:
+            return self._forward_one_token_multi_block(input_ids, cache_offset, mask)
         if self.opt_kernels is None:
             return self._forward_one_token_layered(input_ids, cache_offset, mask)
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
@@ -186,6 +220,13 @@ class OPTForSampling(module.PretrainedModel):
         hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
         for block in self.model.decoder.layers:
             hidden = block(hidden, cache_offset, mask)
+        logits = self.ln_lm_head(hidden)
+        return self._process_outputs(logits)
+
+    def _forward_one_token_multi_block(self, input_ids, cache_offset, mask):
+        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
+        for multi_block in self.model.decoder.multi_blocks:
+            hidden = multi_block(hidden, cache_offset, mask)
         logits = self.ln_lm_head(hidden)
         return self._process_outputs(logits)
 
@@ -272,23 +313,34 @@ def find_first_ge_index(values, target):
 
 class OPTDecoder(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernels, block_init_kernels):
+    def __init__(self, config, block_kernels, block_init_kernels, n_blocks):
         super().__init__()
         self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size,
                                                       padding_idx=config.pad_token_id)
         self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings,
                                                              config.hidden_size)
         self.layers = module.LowMemoryModuleList()
+        enable_multi_block = n_blocks is not None and n_blocks < config.num_hidden_layers
         for _ in range(config.num_hidden_layers):
-            self.layers.append(OPTBlock(config, block_kernels, block_init_kernels))
+            block = OPTBlock(config, block_kernels, block_init_kernels)
+            if enable_multi_block:
+                block = OPTBlock(config, None, None)
+            self.layers.append(block)
+        self.multi_blocks = None
+        if enable_multi_block:
+            self.multi_blocks = []
+            for start in range(0, config.num_hidden_layers, n_blocks):
+                blocks = self.layers[start:start+n_blocks]
+                multi_block = OPTMultiBlock(config, blocks, block_kernels, block_init_kernels)
+                self.multi_blocks.append(multi_block)
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
 
 
 class OPTModel(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernels, block_init_kernels):
+    def __init__(self, config, block_kernels, block_init_kernels, n_blocks):
         super().__init__()
-        self.decoder = OPTDecoder(config, block_kernels, block_init_kernels)
+        self.decoder = OPTDecoder(config, block_kernels, block_init_kernels, n_blocks)
 
 
 class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
@@ -452,3 +504,68 @@ class OPTAttention(module.LowMemoryModule):
         self.k_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
         self.v_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
         self.out_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
+
+
+class OPTMultiBlock:
+
+    def __init__(self, config, blocks, kernels, init_kernels):
+        self.blocks = blocks
+        self.kernels = kernels
+        self.init_kernels = init_kernels
+        self.active_kernel = None
+        self.active_init_kernel = None
+        self.caches = None
+        self.params = None
+        self.manipulator = parallel.TensorManipulator(config.tp_degree)
+
+    def reset(self):
+        self.params = []
+        for block in self.blocks:
+            block_params = [
+                block.ln_1_weight,
+                block.ln_1_bias,
+                block.attn_q_weight,
+                block.attn_q_bias,
+                block.attn_k_weight,
+                block.attn_k_bias,
+                block.attn_v_weight,
+                block.attn_v_bias,
+                block.attn_out_weight,
+                block.attn_out_bias,
+                block.ln_2_weight,
+                block.ln_2_bias,
+                block.mlp_in_weight,
+                block.mlp_in_bias,
+                block.mlp_out_weight,
+                block.mlp_out_bias,
+            ]
+            self.params.extend(block_params)
+        self.activate_n_positions_index(0)
+
+    def maybe_load_kernels(self):
+        if self.kernels is not None:
+            for kernel in self.kernels:
+                kernel.load()
+        if self.init_kernels is not None:
+            for kernel in self.init_kernels:
+                kernel.load()
+
+    def __call__(self, hidden, cache_offset, mask):
+        inputs_cores = [hidden, cache_offset, mask, *self.caches, *self.params]
+        hidden, *_ = self.active_kernel(inputs_cores)
+        return hidden
+
+    def call_init(self, hidden, cache_offset, mask):
+        inputs_cores = [hidden, cache_offset, mask, *self.caches, *self.params]
+        hidden, *_ = self.active_init_kernel(inputs_cores)
+        return hidden
+
+    def activate_n_positions_index(self, n_positions_index):
+        if self.kernels is not None:
+            self.active_kernel = self.kernels[n_positions_index]
+        if self.init_kernels is not None:
+            self.active_init_kernel = self.init_kernels[n_positions_index]
+        self.caches = []
+        for block in self.blocks:
+            self.caches.append(block.active_key_cache)
+            self.caches.append(block.active_value_cache)
