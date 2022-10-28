@@ -63,6 +63,8 @@ def run(args, model_name, model_cls):
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
                                       unroll=args.unroll, print_latency=args.print_latency)
+    if hasattr(model, 'register_to_neuron_hook'):
+        model.register_to_neuron_hook(lambda idx: print(f'done to_neuron layer {idx}'))
     print('running model.to_neuron')
     model.to_neuron()
     with torch.inference_mode():
