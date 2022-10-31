@@ -25,7 +25,7 @@ from transformers_neuronx.opt.config import OPTConfig
 class OPTForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, init_n_active_tokens=8, amp='f32', tp_degree=2,
-                 n_positions=2048, unroll=None, **kwargs):
+                 n_positions=2048, unroll=None, fast_init=False, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         # power-of-2 bucket sizes
@@ -44,31 +44,35 @@ class OPTForSampling(module.PretrainedModel):
         block_init_kernels = None
         ln_lm_head_init_kernel = None
         n_blocks = unroll
+        self.fast_init = fast_init
         if unroll is None:
             block_kernels = [hlo.build_opt_block_kernel(config, n_active_tokens=1, n_positions=npos)
                              for npos in n_positions_list]
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            block_init_kernels = [hlo.build_opt_block_kernel(config, init_n_active_tokens, npos)
-                                  for npos in n_positions_list]
-            ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
+            if fast_init:
+                block_init_kernels = [hlo.build_opt_block_kernel(config, init_n_active_tokens, npos)
+                                      for npos in n_positions_list]
+                ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
         elif unroll == config.num_hidden_layers:
             self.opt_kernels = [hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=npos)
                                 for npos in n_positions_list]
-            self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
-                                     for npos in n_positions_list]
+            if fast_init:
+                self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
+                                         for npos in n_positions_list]
         else:
             if config.num_hidden_layers % unroll != 0:
                 raise ValueError(
                     f'unroll={unroll} does not divide num_hidden_layers={config.num_hidden_layers}')
             block_kernels = [hlo.build_opt_multi_block_kernel(config, 1, npos, n_blocks)
                              for npos in n_positions_list]
-            block_init_kernels = []
-            for npos in n_positions_list:
-                kernel = hlo.build_opt_multi_block_kernel(config, init_n_active_tokens, npos,
-                                                          n_blocks)
-                block_init_kernels.append(kernel)
             ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
+            if fast_init:
+                block_init_kernels = []
+                for npos in n_positions_list:
+                    kernel = hlo.build_opt_multi_block_kernel(config, init_n_active_tokens, npos,
+                                                              n_blocks)
+                    block_init_kernels.append(kernel)
+                ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
         self.init_n_active_tokens = init_n_active_tokens
         self.model = OPTModel(config, block_kernels, block_init_kernels, n_blocks=n_blocks)
         dtype = dtypes.to_torch_dtype(config.amp)
@@ -162,18 +166,21 @@ class OPTForSampling(module.PretrainedModel):
         self.active_n_positions_index = n_positions_index
         if self.opt_kernels is not None:
             self.active_opt_kernel = self.opt_kernels[n_positions_index]
+        if self.opt_init_kernels is not None:
             self.active_opt_init_kernel = self.opt_init_kernels[n_positions_index]
 
     def _forward_init_dynamic_shape(self, input_ids, cache_offset, mask):
         this_length = input_ids.shape[-1]
-        init_n_active_tokens = self.init_n_active_tokens
-        init_length = this_length // init_n_active_tokens * init_n_active_tokens
-        for cur_len in range(0, init_length, init_n_active_tokens):
-            next_len = cur_len + init_n_active_tokens
-            input_ids_slice = input_ids[:, cur_len:next_len]
-            cache_offset_slice = cache_offset[cur_len:next_len]
-            mask_slice = mask[cur_len:next_len]
-            logits = self._forward_init(input_ids_slice, cache_offset_slice, mask_slice)
+        init_length = 0
+        if self.fast_init:
+            init_n_active_tokens = self.init_n_active_tokens
+            init_length = this_length // init_n_active_tokens * init_n_active_tokens
+            for cur_len in range(0, init_length, init_n_active_tokens):
+                next_len = cur_len + init_n_active_tokens
+                input_ids_slice = input_ids[:, cur_len:next_len]
+                cache_offset_slice = cache_offset[cur_len:next_len]
+                mask_slice = mask[cur_len:next_len]
+                logits = self._forward_init(input_ids_slice, cache_offset_slice, mask_slice)
         for cur_len in range(init_length, this_length):
             next_len = cur_len + 1
             input_ids_slice = input_ids[:, cur_len:next_len]
