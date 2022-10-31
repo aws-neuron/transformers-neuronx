@@ -23,7 +23,8 @@ from transformers_neuronx.gptj.config import GPTJConfig
 
 class GPTJForSampling(module.PretrainedModel):
 
-    def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2, unroll=False, **kwargs):
+    def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2,
+                 unroll=False, fast_init=False, **kwargs):
         super().__init__()
         config = GPTJConfig(config, batch_size, n_active_tokens, amp, tp_degree, **kwargs)
         block_kernel = hlo.build_gptj_block_kernel(config)
