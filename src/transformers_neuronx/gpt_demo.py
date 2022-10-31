@@ -39,6 +39,7 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--n_positions', type=int, default=128)
     run_parser.add_argument('--tp_degree', type=int, default=2)
     run_parser.add_argument('--unroll', type=int, default=None)
+    run_parser.add_argument('--fast_init', action='store_true')
     run_parser.add_argument('--print_latency', action='store_true')
     args = parser.parse_args()
     if args.model_name is not None:
@@ -64,7 +65,7 @@ def run(args, model_name, model_cls):
     print(f'running {model_cls.__name__}.from_pretrained')
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                      unroll=args.unroll)
+                                      unroll=args.unroll, fast_init=args.fast_init)
     if args.print_latency:
         latency_printer = LatencyPrinter()
         model.register_forward_pre_hook(latency_printer.pre_hook)

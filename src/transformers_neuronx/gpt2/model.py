@@ -24,7 +24,7 @@ from transformers_neuronx.gpt2.config import GPT2Config
 class GPT2ForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, n_active_tokens=1, amp='f32', tp_degree=2,
-                 unroll=False, **kwargs):
+                 unroll=False, fast_init=False, **kwargs):
         super().__init__()
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         n_positions = config.n_positions
