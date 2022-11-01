@@ -155,10 +155,20 @@ class Kernel:
 
 
 def gen_zero_inputs(hlo_module):
+    return gen_randn_inputs(hlo_module, std=0)
+
+
+def gen_randn_inputs(hlo_module, std=0.01, int_func=torch.zeros, treat_as_int=None):
+    if treat_as_int is None:
+        treat_as_int = []
     dtype_converter = DataTypeConverter()
     inputs = []
-    for param in hlo_module.host_program_shape.parameters:
+    for idx, param in enumerate(hlo_module.host_program_shape.parameters):
         shape = list(param.dimensions)
         dtype = dtype_converter.hlo2torch(param.element_type)
-        inputs.append(torch.zeros(shape, dtype=dtype))
+        if std and dtype.is_floating_point and idx not in treat_as_int:
+            tensor = std * torch.randn(shape, dtype=dtype)
+        else:
+            tensor = int_func(shape, dtype=dtype)
+        inputs.append(tensor)
     return inputs
