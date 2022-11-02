@@ -30,6 +30,7 @@ def build_kernel(py_func, tp_degree):
     with tempfile.TemporaryDirectory() as tmpdir:
         dump_to = os.environ.get('NEURONX_DUMP_TO', None)
         if dump_to is not None:
+            dump_to = os.path.join(dump_to, f'{hlo_module.name}.{GlobalCounter()()}')
             os.makedirs(dump_to, exist_ok=True)
             tmpdir = dump_to
         hlo_module_path = os.path.join(tmpdir, 'hlo_module.pb')
@@ -48,6 +49,15 @@ def build_kernel(py_func, tp_degree):
             neff_bytes = f.read()
     metaneff = hlo2metaneff(hlo_module)
     return Kernel(hlo_module, neff_bytes, metaneff, tp_degree)
+
+
+class GlobalCounter:
+
+    _counter = 0
+
+    def __call__(self):
+        GlobalCounter._counter += 1
+        return GlobalCounter._counter
 
 
 def dump_proto(proto, path):
