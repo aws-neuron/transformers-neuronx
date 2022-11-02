@@ -39,7 +39,7 @@ def build_kernel(py_func, tp_degree):
         neff_path = f'{hlo_module_path}.neff'
         neff_path = os.path.realpath(neff_path)
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        '--fast-math=none', hlo_module_path, f'--output={neff_path}']
+                        '--auto-cast=none', hlo_module_path, f'--output={neff_path}']
         if dump_to is not None:
             command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
             command_line.append('--internal-print-after-all')
