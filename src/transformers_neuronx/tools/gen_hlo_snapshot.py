@@ -14,7 +14,7 @@
 # ==============================================================================
 import argparse
 import torch
-from pyhlo import hlo_pb2, xla_data_pb2
+from torch_neuronx.pyhlo import hlo_pb2, xla_data_pb2
 from transformers_neuronx import compiler
 
 
