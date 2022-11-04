@@ -17,10 +17,10 @@ import subprocess
 import tempfile
 from textwrap import dedent
 import torch
-from pyhlo import xla_data_pb2
-from pyhlo.scribe import HloScribe
-from pyhlo.constant.serialize_torch import serialize_torch
-from torch_neuron.proto import metaneff_pb2
+from torch_neuronx.pyhlo import xla_data_pb2
+from torch_neuronx.pyhlo.scribe import HloScribe
+from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
+from torch_neuronx.proto import metaneff_pb2
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
 

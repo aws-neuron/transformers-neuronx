@@ -58,7 +58,7 @@ setup(
     },
     install_requires=[
         'accelerate',
-        'torch-neuron',  # TODO: point to torch-neuronx
+        'torch-neuronx',
         'transformers',
     ],
     python_requires='>=3.7',
