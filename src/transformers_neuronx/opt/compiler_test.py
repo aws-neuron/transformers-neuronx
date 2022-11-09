@@ -19,19 +19,28 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers_neuronx import parallel
 from transformers_neuronx.compiler import gen_zero_inputs
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.opt.hlo import build_opt_block_kernel
+from transformers_neuronx.opt.hlo import build_opt_block_kernel, build_opt_multi_block_kernel
 
 
 class OPTCompilerTest(TestCase):
 
-    def test_opt_kernel(self):
+    def test_opt_125m_kernel(self):
         config = opt_125m_config(batch_size=4)
+        kernel = build_opt_block_kernel(config, n_active_tokens=1, n_positions=config.n_positions)
+        self.run_kernel(kernel)
+
+    def test_opt_6p7b_b12_u2(self):
+        config = opt_6p7b_config(batch_size=12)
+        kernel = build_opt_multi_block_kernel(config, n_active_tokens=1,
+                                              n_positions=config.n_positions, n_blocks=2)
+        self.run_kernel(kernel)
+
+    def run_kernel(self, kernel):
         warmup_steps = 2
         timing_steps = 10
         profile_dir = os.environ.get('NEURON_PROFILE', None)
-        kernel = build_opt_block_kernel(config, n_active_tokens=1, n_positions=config.n_positions)
         kernel.load()
-        manipulator = parallel.TensorManipulator(config.tp_degree)
+        manipulator = parallel.TensorManipulator(len(kernel.models))
         zero_inputs = gen_zero_inputs(kernel.hlo_module)
         zero_inputs = [manipulator.duplicate(tensor) for tensor in zero_inputs]
         for _ in range(warmup_steps):
@@ -74,6 +83,24 @@ def opt_125m_config(batch_size):
         torch_dtype='float16',
         vocab_size=50272,
         word_embed_proj_dim=768,
+    )
+    return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=2)
+
+
+def opt_6p7b_config(batch_size):
+    config = PretrainedConfig(
+        activation_function='relu',
+        do_layer_norm_before=True,
+        eos_token_id=2,
+        ffn_dim=16384,
+        hidden_size=4096,
+        max_position_embeddings=2048,
+        num_attention_heads=32,
+        num_hidden_layers=32,
+        pad_token_id=1,
+        torch_dtype='float16',
+        vocab_size=50272,
+        word_embed_proj_dim=4096,
     )
     return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=2)
 
