@@ -20,6 +20,7 @@ from transformers_neuronx import parallel
 from transformers_neuronx.compiler import gen_zero_inputs
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.opt.hlo import build_opt_block_kernel, build_opt_multi_block_kernel
+from transformers_neuronx.opt.hlo import build_opt_kernel
 
 
 class OPTCompilerTest(TestCase):
@@ -33,6 +34,28 @@ class OPTCompilerTest(TestCase):
         config = opt_6p7b_config(batch_size=12)
         kernel = build_opt_multi_block_kernel(config, n_active_tokens=1,
                                               n_positions=config.n_positions, n_blocks=2)
+        self.run_kernel(kernel)
+
+    def test_opt_66b_b1_u2_tp24(self):
+        config = opt_66b_config(batch_size=1)
+        kernel = build_opt_multi_block_kernel(config, n_active_tokens=1,
+                                              n_positions=config.n_positions, n_blocks=2)
+        self.run_kernel(kernel)
+
+    def test_opt_66b_b32_u2_tp24(self):
+        config = opt_66b_config(batch_size=32)
+        kernel = build_opt_multi_block_kernel(config, n_active_tokens=1,
+                                              n_positions=config.n_positions, n_blocks=2)
+        self.run_kernel(kernel)
+
+    def test_opt_66b_b1_u64_tp24(self):
+        config = opt_66b_config(batch_size=1)
+        kernel = build_opt_kernel(config, n_active_tokens=1, n_positions=config.n_positions)
+        self.run_kernel(kernel)
+
+    def test_opt_66b_b32_u64_tp24(self):
+        config = opt_66b_config(batch_size=32)
+        kernel = build_opt_kernel(config, n_active_tokens=1, n_positions=config.n_positions)
         self.run_kernel(kernel)
 
     def run_kernel(self, kernel):
@@ -121,3 +144,21 @@ def opt_13b_config(batch_size):
         word_embed_proj_dim=5120,
     )
     return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=2)
+
+
+def opt_66b_config(batch_size):
+    config = PretrainedConfig(
+        activation_function='relu',
+        do_layer_norm_before=True,
+        eos_token_id=2,
+        ffn_dim=36864,
+        hidden_size=9216,
+        max_position_embeddings=2048,
+        num_attention_heads=72,
+        num_hidden_layers=64,
+        pad_token_id=1,
+        torch_dtype='float16',
+        vocab_size=50272,
+        word_embed_proj_dim=9216,
+    )
+    return OPTConfig(config, n_positions=2048, batch_size=batch_size, amp='f16', tp_degree=24)
