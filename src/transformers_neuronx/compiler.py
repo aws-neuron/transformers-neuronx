@@ -42,7 +42,6 @@ def build_kernel(py_func, tp_degree):
                         '--auto-cast=none', hlo_module_path, f'--output={neff_path}']
         if dump_to is not None:
             command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-            command_line.append('--internal-print-after-all')
             command_line.append('--tensorizer-options=--dump-after-all=penguin')
         subprocess.check_call(command_line, cwd=tmpdir)
         with open(neff_path, 'rb') as f:
