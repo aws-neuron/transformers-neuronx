@@ -14,6 +14,7 @@
 # ==============================================================================
 import os
 import subprocess
+import tarfile
 import tempfile
 from textwrap import dedent
 import torch
@@ -152,8 +153,13 @@ class Kernel:
             ops.profile_start(model, ntff_path)
 
     def profile_stop(self, profile_dir):
-        for model, ntff_path in zip(self.models, self._ntff_paths(profile_dir)):
+        ntff_paths = self._ntff_paths(profile_dir)
+        for model, ntff_path in zip(self.models, ntff_paths):
             ops.profile_stop(ntff_path)
+        ntff_tar_path = os.path.join(profile_dir, f'{self.hlo_module.name}.ntff.tar')
+        with tarfile.open(ntff_tar_path, 'w|') as fp:
+            for idx, ntff_path in enumerate(ntff_paths):
+                fp.add(ntff_path, f'profile_rank_{idx}.ntff')
 
     def _ntff_paths(self, profile_dir):
         paths = []
