@@ -127,19 +127,23 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     return hidden
 
 
-def softmax(logits):
+def softmax(logits, dim=None):
+    rank = len(logits.sizes)
+    if dim is None:
+        dim = rank - 1
+    br_dims = [di for di in range(rank) if di != dim]
     dtype = logits.dtype
     constant_2 = dtype.Constant(constant_value=float('-inf'))
-    *reduce_sizes, _ = logits.sizes
+    reduce_sizes = [logits.sizes[di] for di in br_dims]
     max_func = gen_max_func(dtype)
-    reduce_7 = dtype[reduce_sizes].Reduce(logits, constant_2, dimensions=[3], to_apply=max_func)
-    broadcast_8 = dtype[logits.sizes].Broadcast(reduce_7, dimensions=[0,1,2])
+    reduce_7 = dtype[reduce_sizes].Reduce(logits, constant_2, dimensions=[dim], to_apply=max_func)
+    broadcast_8 = dtype[logits.sizes].Broadcast(reduce_7, dimensions=br_dims)
     subtract_9 = dtype[logits.sizes].Subtract(logits, broadcast_8)
     exp = dtype[logits.sizes].Exp(subtract_9)
     constant_11 = dtype.Constant(constant_value=0)
     add_func = gen_add_func(dtype)
-    reduce_16 = dtype[reduce_sizes].Reduce(exp, constant_11, dimensions=[3], to_apply=add_func)
-    broadcast_17 = dtype[logits.sizes].Broadcast(reduce_16, dimensions=[0,1,2])
+    reduce_16 = dtype[reduce_sizes].Reduce(exp, constant_11, dimensions=[dim], to_apply=add_func)
+    broadcast_17 = dtype[logits.sizes].Broadcast(reduce_16, dimensions=br_dims)
     return dtype[logits.sizes].Divide(exp, broadcast_17)
 
 
