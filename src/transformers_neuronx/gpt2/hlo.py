@@ -78,19 +78,18 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
 
     # compute self-attention: V x Softmax(QK^T)
     # Keep the attention weights computation in fp32 to avoid overflow issues
-    active_q = f32[active_sizes].Convert(active_q)
     scale_attn = d_head ** 0.5
-    scale = f32.Constant(constant_value=scale_attn)
-    scale_attn_br = f32[active_sizes].Broadcast(scale, dimensions=[])
-    active_q = f32[active_sizes].Divide(active_q, scale_attn_br)
-    cached_keys_f32 = f32[cached_keys.sizes].Convert(cached_keys)
+    scale = dtype.Constant(constant_value=scale_attn)
+    scale_attn_br = dtype[active_sizes].Broadcast(scale, dimensions=[])
+    active_q = dtype[active_sizes].Divide(active_q, scale_attn_br)
     dot_dims = dict(lhs_contracting_dimensions=[3],
                     lhs_batch_dimensions=[1, 2],
                     rhs_contracting_dimensions=[3],
                     rhs_batch_dimensions=[1, 2])
     score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
     # [a, b, 12, 64] mm [1024, b, 12, 64] -> [b, 12, a, 1024]
-    score = f32[score_sizes].Dot(active_q, cached_keys_f32, dot_dimension_numbers=dot_dims)
+    score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+    score = f32[score_sizes].Convert(score)
 
     mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
     score = f32[score_sizes].Multiply(score, mask_br)
