@@ -80,31 +80,18 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
     # Keep the attention weights computation in fp32 to avoid overflow issues
     scale_attn = d_head ** 0.5
     scale = dtype.Constant(constant_value=scale_attn)
-    scale_attn_br = dtype[active_q.sizes].Broadcast(scale, dimensions=[])
-    active_q = dtype[active_q.sizes].Divide(active_q, scale_attn_br)
+    scale_attn_br = dtype[active_sizes].Broadcast(scale, dimensions=[])
+    active_q = dtype[active_sizes].Divide(active_q, scale_attn_br)
+    dot_dims = dict(lhs_contracting_dimensions=[3],
+                    lhs_batch_dimensions=[1, 2],
+                    rhs_contracting_dimensions=[3],
+                    rhs_batch_dimensions=[1, 2])
+    score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
+    # [a, b, 12, 64] mm [1024, b, 12, 64] -> [b, 12, a, 1024]
+    score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+    score = f32[score_sizes].Convert(score)
 
-    if n_active_tokens == 1:
-        # [b, 12, 64] br [1024, b, 12, 64] mm [1024, b, 12, 64] -> [1024, b, 12, a]
-        active_q_br = dtype[cached_keys.sizes].Broadcast(active_q, dimensions=[0, 1, 2, 3])
-        score = dtype[cached_keys.sizes].Multiply(cached_keys, active_q_br)
-        zero = dtype.Constant(constant_value=0)
-        add_func = hlo.gen_add_func(dtype)
-        score_sizes = max_ctx_plus_n_active_tokens, n_seqs, n_heads_tp
-        score = dtype[score_sizes].Reduce(score, zero, dimensions=[3], to_apply=add_func)
-        score = f32[score_sizes].Convert(score)
-        mask = f32[max_ctx_plus_n_active_tokens].Reshape(mask)
-        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[0])
-    else:
-        # [a, b, 12, 64] mm [1024, b, 12, 64] -> [b, 12, a, 1024]
-        dot_dims = dict(lhs_contracting_dimensions=[3],
-                        lhs_batch_dimensions=[1, 2],
-                        rhs_contracting_dimensions=[3],
-                        rhs_batch_dimensions=[1, 2])
-        score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
-        score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
-        score = f32[score_sizes].Convert(score)
-        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
-
+    mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
     score = f32[score_sizes].Multiply(score, mask_br)
     one = f32.Constant(constant_value=1.0)
     ones_br = f32[mask.sizes].Broadcast(one, dimensions=[])
@@ -112,33 +99,22 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
     large_neg = f32.Constant(constant_value=-65536)
     large_neg_br = f32[add_mask.sizes].Broadcast(large_neg, dimensions=[])
     add_mask = f32[add_mask.sizes].Multiply(add_mask, large_neg_br)
-    if n_active_tokens == 1:
-        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[0])
-        score = f32[score_sizes].Add(score, add_mask_br)
-        probs = hlo.softmax(score, dim=0)
-        probs = dtype[score_sizes].Convert(probs)
-        # [1024, b, 12] br [1024, b, 12, 64] mm [1024, b, 12, 64] -> [a, b, 12, 64]
-        probs_br = dtype[cached_values.sizes].Broadcast(probs, dimensions=[0, 1, 2])
-        output = dtype[cached_values.sizes].Multiply(cached_values, probs_br)
-        output_sizes = n_seqs, n_heads_tp, d_head
-        zero = dtype.Constant(constant_value=0)
-        add_func = hlo.gen_add_func(dtype)
-        output = dtype[output_sizes].Reduce(output, zero, dimensions=[0], to_apply=add_func)
-    else:
-        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[2, 3])
-        score = f32[score_sizes].Add(score, add_mask_br)
-        probs = hlo.softmax(score, dim=3)
-        probs = dtype[score_sizes].Convert(probs)
-        dot_dims = dict(lhs_contracting_dimensions=[3],
-                        lhs_batch_dimensions=[0, 1],
-                        rhs_contracting_dimensions=[0],
-                        rhs_batch_dimensions=[1, 2])
-        output_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-        # [b, 12, a, 1024] mm [1024, b, 12, 64] -> [b, 12, a, 64]
-        output = dtype[output_sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
-        output_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-        # [b, 12, a, 64] -> [a, b, 12, 64]
-        output = dtype[output_sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+    add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[2, 3])
+    score = f32[score_sizes].Add(score, add_mask_br)
+
+    probs = hlo.softmax(score)
+    probs = dtype[score_sizes].Convert(probs)
+
+    dot_dims = dict(lhs_contracting_dimensions=[3],
+                    lhs_batch_dimensions=[0, 1],
+                    rhs_contracting_dimensions=[0],
+                    rhs_batch_dimensions=[1, 2])
+    sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+    # [b, 12, a, 1024] mm [1024, b, 12, 64] -> [b, 12, a, 64]
+    output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
+    sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+    # [b, 12, a, 64] -> [a, b, 12, 64]
+    output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
 
     output_sizes_2d = n_active_tokens*n_seqs, attn_size
     output = dtype[output_sizes_2d].Reshape(output)     # [a, b, 12, 64] -> [a*b, 768]
