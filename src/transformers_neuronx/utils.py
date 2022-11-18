@@ -19,3 +19,13 @@ def maybe_override_attributes(self, kwargs):
             raise KeyError(f'Found invalid key "{key}".')
         if value is not None:
             setattr(self, key, value)
+
+
+def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
+    sizes = []
+    bucket_size = min_bucket_size
+    while bucket_size < max_bucket_size:
+        sizes.append(bucket_size)
+        bucket_size *= 2
+    sizes.append(max_bucket_size)
+    return sizes

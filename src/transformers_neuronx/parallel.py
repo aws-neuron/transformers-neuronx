@@ -81,3 +81,46 @@ class Executor:
         cores_outputs = [fut.result() for fut in futures]
         outputs_cores = [list(outputs) for outputs in zip(*cores_outputs)]
         return outputs_cores
+
+
+class ParallelTensorManipulator:
+
+    def __init__(self, tp_degree):
+        self.tp_degree = tp_degree
+
+    def duplicate_on_cpu(self, tensor):
+        return [tensor for ordinal in range(self.tp_degree)]
+
+    def duplicate(self, tensor):
+        return ops.parallel_to_nc([tensor for ordinal in range(self.tp_degree)])
+
+    def shard_along(self, tensor, dim):
+        size = tensor.shape[dim]
+        shard_size = size // self.tp_degree
+        slices = [slice(None) for _ in tensor.shape]
+        tensors = []
+        for start in range(0, size, shard_size):
+            slices[dim] = slice(start, start+shard_size, 1)
+            shard = tensor[tuple(slices)].contiguous()
+            tensors.append(shard)
+        return ops.parallel_to_nc(tensors)
+
+    def primary_only(self, tensor):
+        tensors = [tensor]
+        tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.tp_degree))
+        return ops.parallel_to_nc(tensors)
+
+    def unshard_along(self, sharded_tensors, dim):
+        return torch.cat(ops.parallel_cpu(sharded_tensors), dim=dim)
+
+    def slice_on_nc(self, tensors, dim, start, end, step):
+        return ops.parallel_slice(tensors, dim, start, end, step)
+
+
+def layers_to_neuron(num_workers, layers, n_positions_list, to_neuron_hooks):
+    with ThreadPoolExecutor(num_workers) as pool:
+        futures = [pool.submit(layer.to_neuron, n_positions_list) for layer in layers]
+        for idx, future in enumerate(futures):
+            future.result()
+            for hook in to_neuron_hooks:
+                hook(idx)
