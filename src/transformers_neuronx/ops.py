@@ -45,6 +45,27 @@ def execute(model, inputs):
     return torch.ops.neuron._execute_neuron(model, inputs)
 
 
+def parallel_to_nc(tensors):
+    return torch.ops.neuron._parallel_to_neuron(tensors)
+
+
+def parallel_cpu(tensor):
+    return torch.ops.neuron._parallel_from_neuron(tensor)
+
+
+def parallel_write(tensor, tensors):
+    return torch.ops.neuron._parallel_write_neuron(tensor, tensors)
+
+
+def parallel_slice(tensor, dim, start, end, step):
+    return torch.ops.neuron._parallel_slice_neuron(tensor, dim, start, end, step)
+
+
+def parallel_run(parallel_model, parallel_inputs, parallel_outputs):
+    return torch.ops.neuron._parallel_run_neuron(
+        parallel_model, parallel_inputs, parallel_outputs)
+
+
 def profile_start(model, ntff):
     return torch.ops.neuron._profile_start_neuron(model, ntff)
 

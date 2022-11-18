@@ -26,8 +26,23 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 
 
+def compile_py_func(py_func):
+    return HloScribe(serialize_torch)(py_func).module_proto
+
+
 def build_kernel(py_func, tp_degree):
-    hlo_module = HloScribe(serialize_torch)(py_func).module_proto
+    hlo_module = compile_py_func(py_func)
+    neff_bytes = compile_hlo_module(hlo_module)
+    metaneff = hlo2metaneff(hlo_module)
+    return Kernel(hlo_module, neff_bytes, metaneff, tp_degree)
+
+
+def build_parallel_kernel(hlo_module, tp_degree):
+    neff_bytes = compile_hlo_module(hlo_module)
+    return ParallelKernel(hlo_module, neff_bytes, tp_degree)
+
+
+def compile_hlo_module(hlo_module):
     with tempfile.TemporaryDirectory() as tmpdir:
         dump_to = os.environ.get('NEURONX_DUMP_TO', None)
         if dump_to is not None:
@@ -47,8 +62,7 @@ def build_kernel(py_func, tp_degree):
         subprocess.check_call(command_line, cwd=tmpdir)
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
-    metaneff = hlo2metaneff(hlo_module)
-    return Kernel(hlo_module, neff_bytes, metaneff, tp_degree)
+    return neff_bytes
 
 
 class GlobalCounter:
@@ -76,21 +90,33 @@ def hlo2metaneff(hlo_module):
             tensor.shape[:] = shape.dimensions
             tensor.data_type = dtype_converter.hlo2metaneff(shape.element_type)
 
-    # TODO: read names from hlo_module
-    input_names = [f'input{idx}' for idx in range(len(prog_shape.parameters))]
+    input_names = find_input_names(hlo_module)
     metaneff = metaneff_pb2.MetaNeff()
     fill_with(metaneff.input_tensors, input_names, prog_shape.parameters)
+    output_names = find_output_names(hlo_module)
     if prog_shape.result.element_type == xla_data_pb2.PrimitiveType.TUPLE:
-        output_names = [f'output{idx}' for idx in range(len(prog_shape.result.tuple_shapes))]
         output_shapes = prog_shape.result.tuple_shapes
     else:
-        output_names = ['output0']
         output_shapes = [prog_shape.result]
     fill_with(metaneff.output_tensors, output_names, output_shapes)
     for entry in hlo_module.input_output_alias.entries:
         assert len(entry.parameter_shape_index) == 0
         metaneff.output_aliases_to[entry.output_shape_index[0]] = entry.parameter_number
     return metaneff
+
+
+def find_input_names(hlo_module):
+    # TODO: read names from hlo_module
+    prog_shape = hlo_module.host_program_shape
+    return [f'input{idx}' for idx in range(len(prog_shape.parameters))]
+
+
+def find_output_names(hlo_module):
+    # TODO: read names from hlo_module
+    prog_shape = hlo_module.host_program_shape
+    if prog_shape.result.element_type != xla_data_pb2.PrimitiveType.TUPLE:
+        return ['output0']
+    return [f'output{idx}' for idx in range(len(prog_shape.result.tuple_shapes))]
 
 
 class DataTypeConverter:
@@ -167,6 +193,48 @@ class Kernel:
             filename = f'{self.hlo_module.name}.{idx:03d}.ntff'
             paths.append(os.path.join(profile_dir, filename))
         return paths
+
+
+class ParallelMemory:
+
+    def __init__(self, hlo_module, tp_degree):
+        input_names = find_input_names(hlo_module)
+        output_names = find_output_names(hlo_module)
+        self.inputs = torch.classes.neuron.ParallelTensorSet(input_names, tp_degree)
+        self.outputs = torch.classes.neuron.ParallelTensorSet(output_names, tp_degree)
+
+    def init(self):
+        self.inputs.init()
+        self.outputs.init()
+
+
+class ParallelKernel:
+
+    def __init__(self, hlo_module, neff_bytes, tp_degree):
+        self.hlo_module = hlo_module
+        self.neff_bytes = neff_bytes
+        self.model = torch.classes.neuron.ParallelModel(neff_bytes, tp_degree)
+
+    def load(self):
+        ops.init()
+        self.model.load()
+
+    def __call__(self, memory):
+        return ops.parallel_run(self.model, memory.inputs, memory.outputs)
+
+
+def gen_zero_input(hlo_module, index):
+    shape_proto = hlo_module.host_program_shape.parameters[index]
+    shape = [dim for dim in shape_proto.dimensions]
+    dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
+    return torch.zeros(shape, dtype=dtype)
+
+
+def gen_zero_output(hlo_module, index):
+    shape_proto = hlo_module.host_program_shape.result.tuple_shapes[index]
+    shape = [dim for dim in shape_proto.dimensions]
+    dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
+    return torch.zeros(shape, dtype=dtype)
 
 
 def gen_zero_inputs(hlo_module):
