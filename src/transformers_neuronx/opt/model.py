@@ -14,231 +14,76 @@
 # ==============================================================================
 import torch
 from torch.nn.parameter import UninitializedParameter
+from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
+from transformers_neuronx import ops
 from transformers_neuronx import parallel
-from transformers_neuronx.gpt2.model import GPT2LnLmHead
+from transformers_neuronx import utils
 from transformers_neuronx.opt import hlo
 from transformers_neuronx.opt.config import OPTConfig
 
 
 class OPTForSampling(module.PretrainedModel):
 
-    def __init__(self, config, batch_size=1, init_n_active_tokens=8, amp='f32', tp_degree=2,
-                 n_positions=2048, unroll=None, fast_init=False, **kwargs):
+    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2, n_positions=2048,
+                 unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
-        # power-of-2 bucket sizes
-        n_positions_list = []
-        bucket_size = 128
-        while bucket_size < n_positions:
-            n_positions_list.append(bucket_size)
-            bucket_size *= 2
-        n_positions_list.append(n_positions)
-        self.n_positions_list = n_positions_list
-        self.active_n_positions_index = None
-        self.opt_kernels = None
-        self.opt_init_kernels = None
-        block_kernels = None
-        ln_lm_head_kernel = None
-        block_init_kernels = None
-        ln_lm_head_init_kernel = None
-        n_blocks = unroll
-        self.fast_init = fast_init
-        if unroll is None:
-            block_kernels = [hlo.build_opt_block_kernel(config, n_active_tokens=1, n_positions=npos)
-                             for npos in n_positions_list]
-            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            if fast_init:
-                block_init_kernels = [hlo.build_opt_block_kernel(config, init_n_active_tokens, npos)
-                                      for npos in n_positions_list]
-                ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
-        elif unroll == config.num_hidden_layers:
-            self.opt_kernels = [hlo.build_opt_kernel(config, n_active_tokens=1, n_positions=npos)
-                                for npos in n_positions_list]
-            if fast_init:
-                self.opt_init_kernels = [hlo.build_opt_kernel(config, init_n_active_tokens, npos)
-                                         for npos in n_positions_list]
-        else:
-            if config.num_hidden_layers % unroll != 0:
-                raise ValueError(
-                    f'unroll={unroll} does not divide num_hidden_layers={config.num_hidden_layers}')
-            block_kernels = [hlo.build_opt_multi_block_kernel(config, 1, npos, n_blocks)
-                             for npos in n_positions_list]
-            ln_lm_head_kernel = hlo.build_lm_head_kernel(config, n_active_tokens=1)
-            if fast_init:
-                block_init_kernels = []
-                for npos in n_positions_list:
-                    kernel = hlo.build_opt_multi_block_kernel(config, init_n_active_tokens, npos,
-                                                              n_blocks)
-                    block_init_kernels.append(kernel)
-                ln_lm_head_init_kernel = hlo.build_lm_head_kernel(config, init_n_active_tokens)
-        self.init_n_active_tokens = init_n_active_tokens
-        self.model = OPTModel(config, block_kernels, block_init_kernels, n_blocks=n_blocks)
-        dtype = dtypes.to_torch_dtype(config.amp)
-        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.config = config
-        ln_f = self.model.decoder.final_layer_norm
-        self.ln_lm_head = GPT2LnLmHead(config, ln_lm_head_kernel, ln_lm_head_init_kernel,
-                                       ln_f, self.lm_head)
-        self.manipulator = parallel.TensorManipulator(config.tp_degree)
-        self.opt_caches = None
-        self.opt_params = None
-        self.active_opt_kernel = None
-        self.active_opt_init_kernel = None
+        if unroll is None:
+            unroll = config.num_hidden_layers
+        self.init_n_active_tokens = init_n_active_tokens
+        dtype = dtypes.to_torch_dtype(config.amp)
+        self.model = OPTModel(config)
+        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
+        self.ln_lm_head = OPTLnLmHead(config, self.model.decoder.final_layer_norm, self.lm_head)
+        n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+        self.n_positions_list = n_positions_list
+        self.program = build_opt_program(config, 1, n_positions_list, unroll)
+        self.init_program = OPTProgramDoNothing()
+        if init_n_active_tokens is not None:
+            self.init_program = build_opt_program(config, init_n_active_tokens, n_positions_list, unroll)
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
         self.to_neuron_hooks = []
 
     def to_neuron(self):
-        self.model.decoder.embed_tokens.materialize()
-        self.model.decoder.embed_positions.materialize()
-        if self.opt_kernels is not None:
-            for kernel in self.opt_kernels:
-                kernel.load()
-        if self.opt_init_kernels is not None:
-            for kernel in self.opt_init_kernels:
-                kernel.load()
-        first_block, *_ = self.model.decoder.layers
-        first_block.maybe_load_kernels()
-        if self.model.decoder.multi_blocks is not None:
-            first_multi_block, *_ = self.model.decoder.multi_blocks
-            first_multi_block.maybe_load_kernels()
-        for idx, block in enumerate(self.model.decoder.layers):
-            block.to_neuron()
-            for hook in self.to_neuron_hooks:
-                hook(idx)
+        ops.init()
+        decoder = self.model.decoder
+        decoder.embed_tokens.materialize()
+        decoder.embed_positions.materialize()
+        parallel.layers_to_neuron(16, decoder.layers, self.n_positions_list, self.to_neuron_hooks)
         self.ln_lm_head.to_neuron()
+        self.program.setup(self)
+        self.init_program.setup(self)
 
     def reset(self):
-        for block in self.model.decoder.layers:
-            block.reset(self.n_positions_list)
-        self.activate_n_positions_index(0)
-        if self.model.decoder.multi_blocks is not None:
-            for multi_block in self.model.decoder.multi_blocks:
-                multi_block.reset()
-        self.opt_params = []
-        for block in self.model.decoder.layers:
-            block_params = [
-                block.ln_1_weight,
-                block.ln_1_bias,
-                block.attn_q_weight,
-                block.attn_q_bias,
-                block.attn_k_weight,
-                block.attn_k_bias,
-                block.attn_v_weight,
-                block.attn_v_bias,
-                block.attn_out_weight,
-                block.attn_out_bias,
-                block.ln_2_weight,
-                block.ln_2_bias,
-                block.mlp_in_weight,
-                block.mlp_in_bias,
-                block.mlp_out_weight,
-                block.mlp_out_bias,
-            ]
-            self.opt_params.extend(block_params)
-        ln_lm_head = self.ln_lm_head
-        ln_lm_head_params = [
-            ln_lm_head.ln_f_weight,
-            ln_lm_head.ln_f_bias,
-            ln_lm_head.lm_head_weight,
-        ]
-        self.opt_params.extend(ln_lm_head_params)
+        for layer in self.model.decoder.layers:
+            layer.reset()
 
     def forward(self, input_ids, cache_offset, mask):
         last_offset = cache_offset[-1].item()
-        n_positions_index = find_first_ge_index(self.n_positions_list, last_offset)
-        if n_positions_index != self.active_n_positions_index:
-            self.activate_n_positions_index(n_positions_index)
+        bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
-        if this_length > 1:
-            return self._forward_init_dynamic_shape(input_ids, cache_offset, mask)
-        return self._forward_one_token(input_ids, cache_offset, mask)
-
-    def activate_n_positions_index(self, n_positions_index):
-        self.opt_caches = []
-        for block in self.model.decoder.layers:
-            block.activate_n_positions_index(n_positions_index)
-            self.opt_caches.append(block.active_key_cache)
-            self.opt_caches.append(block.active_value_cache)
-        if self.model.decoder.multi_blocks is not None:
-            for multi_block in self.model.decoder.multi_blocks:
-                multi_block.activate_n_positions_index(n_positions_index)
-        self.active_n_positions_index = n_positions_index
-        if self.opt_kernels is not None:
-            self.active_opt_kernel = self.opt_kernels[n_positions_index]
-        if self.opt_init_kernels is not None:
-            self.active_opt_init_kernel = self.opt_init_kernels[n_positions_index]
-
-    def _forward_init_dynamic_shape(self, input_ids, cache_offset, mask):
-        this_length = input_ids.shape[-1]
-        init_length = 0
-        if self.fast_init:
-            init_n_active_tokens = self.init_n_active_tokens
-            init_length = this_length // init_n_active_tokens * init_n_active_tokens
-            for cur_len in range(0, init_length, init_n_active_tokens):
-                next_len = cur_len + init_n_active_tokens
-                input_ids_slice = input_ids[:, cur_len:next_len]
-                cache_offset_slice = cache_offset[cur_len:next_len]
-                mask_slice = mask[cur_len:next_len]
-                logits = self._forward_init(input_ids_slice, cache_offset_slice, mask_slice)
+        init_length = self.init_program.init_length(this_length, self.init_n_active_tokens)
+        init_step = self.init_program.init_step(self.init_n_active_tokens)
+        for cur_len in range(0, init_length, init_step):
+            slicing = slice(cur_len, cur_len + init_step)
+            inputs = input_ids[:, slicing], cache_offset[slicing], mask[slicing]
+            logits = self._run_program(self.init_program, bucket_id, *inputs)
         for cur_len in range(init_length, this_length):
-            next_len = cur_len + 1
-            input_ids_slice = input_ids[:, cur_len:next_len]
-            cache_offset_slice = cache_offset[cur_len:next_len]
-            mask_slice = mask[cur_len:next_len]
-            logits = self._forward_one_token(input_ids_slice, cache_offset_slice, mask_slice)
+            slicing = slice(cur_len, cur_len + 1)
+            inputs = input_ids[:, slicing], cache_offset[slicing], mask[slicing]
+            logits = self._run_program(self.program, bucket_id, *inputs)
+        logits = self.manipulator.unshard_along(logits, dim=0)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size]
+        logits = logits.transpose(0, -1)
+        logits = logits[:, -1, :]
         return logits
 
-    def _forward_init(self, input_ids, cache_offset, mask):
-        if self.model.decoder.multi_blocks is not None:
-            return self._forward_init_multi_block(input_ids, cache_offset, mask)
-        if self.opt_kernels is None:
-            return self._forward_init_layered(input_ids, cache_offset, mask)
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
-        logits, *_ = self.active_opt_init_kernel(inputs_cores)
-        return self._process_outputs(logits)
-
-    def _forward_init_layered(self, input_ids, cache_offset, mask):
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        for block in self.model.decoder.layers:
-            hidden = block.forward_init(hidden, cache_offset, mask)
-        logits = self.ln_lm_head.call_init(hidden)
-        return self._process_outputs(logits)
-
-    def _forward_init_multi_block(self, input_ids, cache_offset, mask):
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        for multi_block in self.model.decoder.multi_blocks:
-            hidden = multi_block.call_init(hidden, cache_offset, mask)
-        logits = self.ln_lm_head.call_init(hidden)
-        return self._process_outputs(logits)
-
-    def _forward_one_token(self, input_ids, cache_offset, mask):
-        if self.model.decoder.multi_blocks is not None:
-            return self._forward_one_token_multi_block(input_ids, cache_offset, mask)
-        if self.opt_kernels is None:
-            return self._forward_one_token_layered(input_ids, cache_offset, mask)
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        inputs_cores = hidden, cache_offset, mask, *self.opt_caches, *self.opt_params
-        logits, *_ = self.active_opt_kernel(inputs_cores)
-        return self._process_outputs(logits)
-
-    def _forward_one_token_layered(self, input_ids, cache_offset, mask):
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        for block in self.model.decoder.layers:
-            hidden = block(hidden, cache_offset, mask)
-        logits = self.ln_lm_head(hidden)
-        return self._process_outputs(logits)
-
-    def _forward_one_token_multi_block(self, input_ids, cache_offset, mask):
-        hidden, cache_offset, mask = self._process_inputs(input_ids, cache_offset, mask)
-        for multi_block in self.model.decoder.multi_blocks:
-            hidden = multi_block(hidden, cache_offset, mask)
-        logits = self.ln_lm_head(hidden)
-        return self._process_outputs(logits)
-
-    def _process_inputs(self, input_ids, cache_offset, mask):
-        active_n_positions = self.n_positions_list[self.active_n_positions_index]
+    def _run_program(self, program, bucket_id, input_ids, cache_offset, mask):
+        active_n_positions = self.n_positions_list[bucket_id]
         mask = mask[:, :active_n_positions].contiguous()
         inputs_embeds = self.model.decoder.embed_tokens(input_ids)
         past_length = cache_offset[0].item()
@@ -247,22 +92,15 @@ class OPTForSampling(module.PretrainedModel):
         position_ids = position_ids.unsqueeze(0).view(-1, this_length)
         position_embeds = self.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
-        dtype = dtypes.to_torch_dtype(self.config.amp)
-        hidden = hidden.to(dtype)
-        duplicate = self.manipulator.duplicate
-        hidden = duplicate(hidden)
-        cache_offset = duplicate(cache_offset)
-        mask = duplicate(mask)
-        return hidden, cache_offset, mask
-
-    def _process_outputs(self, logits):
-        logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
-        return logits
+        hidden = hidden.transpose(0, -1).contiguous()
+        hidden = hidden.to(self.program.buffers.hidden_buffer.dtype)
+        hidden = self.manipulator.duplicate_on_cpu(hidden)
+        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
+        mask = self.manipulator.duplicate_on_cpu(mask)
+        ops.parallel_write(program.buffers.hidden_buffer, hidden)
+        ops.parallel_write(program.buffers.cache_offset_buffer, cache_offset)
+        ops.parallel_write(program.buffers.mask_buffers[bucket_id], mask)
+        return program.run(bucket_id)
 
     @torch.no_grad()
     def sample(self, input_ids, sequence_length):
@@ -314,40 +152,46 @@ class OPTForSampling(module.PretrainedModel):
         self.to_neuron_hooks.append(hook)
 
 
+class OPTBuffers:
+
+    def __init__(self, opt_hlo_modules):
+        first_hlo_module, *_ = opt_hlo_modules
+        self.hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
+        self.cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
+        self.mask_buffers = [compiler.gen_zero_input(hlo, 2) for hlo in opt_hlo_modules]
+        self.logits_buffer = compiler.gen_zero_output(first_hlo_module, 0)
+
+    def to_neuron(self, manipulator):
+        duplicate = manipulator.duplicate
+        self.hidden_buffer = duplicate(self.hidden_buffer)
+        self.cache_offset_buffer = duplicate(self.cache_offset_buffer)
+        self.mask_buffers = [duplicate(mask_buffer) for mask_buffer in self.mask_buffers]
+        self.logits_buffer = duplicate(self.logits_buffer)
+
+
 def find_first_ge_index(values, target):
     return next(idx for idx, val in enumerate(values) if val >= target)
 
 
+class OPTModel(module.LowMemoryModule):
+
+    def __init__(self, config):
+        super().__init__()
+        self.decoder = OPTDecoder(config)
+
+
 class OPTDecoder(module.LowMemoryModule):
 
-    def __init__(self, config, block_kernels, block_init_kernels, n_blocks):
+    def __init__(self, config):
         super().__init__()
         self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size,
                                                       padding_idx=config.pad_token_id)
         self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings,
                                                              config.hidden_size)
         self.layers = module.LowMemoryModuleList()
-        enable_multi_block = n_blocks is not None and n_blocks < config.num_hidden_layers
         for _ in range(config.num_hidden_layers):
-            block = OPTBlock(config, block_kernels, block_init_kernels)
-            if enable_multi_block:
-                block = OPTBlock(config, None, None)
-            self.layers.append(block)
-        self.multi_blocks = None
-        if enable_multi_block:
-            self.multi_blocks = []
-            for start in range(0, config.num_hidden_layers, n_blocks):
-                blocks = self.layers[start:start+n_blocks]
-                multi_block = OPTMultiBlock(config, blocks, block_kernels, block_init_kernels)
-                self.multi_blocks.append(multi_block)
+            self.layers.append(OPTDecoderLayer(config))
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
-
-
-class OPTModel(module.LowMemoryModule):
-
-    def __init__(self, config, block_kernels, block_init_kernels, n_blocks):
-        super().__init__()
-        self.decoder = OPTDecoder(config, block_kernels, block_init_kernels, n_blocks)
 
 
 class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
@@ -365,9 +209,9 @@ class OPTLearnedPositionalEmbedding(module.LowMemoryEmbedding):
         return super().forward(position_ids + self.offset)
 
 
-class OPTBlock(module.LowMemoryModule):
+class OPTDecoderLayer(module.LowMemoryModule):
 
-    def __init__(self, config, kernels, init_kernels):
+    def __init__(self, config):
         super().__init__()
         self.self_attn_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.self_attn = OPTAttention(config)
@@ -376,10 +220,6 @@ class OPTBlock(module.LowMemoryModule):
         self.fc2 = module.LowMemoryLazyLinear(config.ffn_dim, dtype=dtype)
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.config = config
-        self.kernels = kernels
-        self.init_kernels = init_kernels
-        self.active_kernel = None
-        self.active_init_kernel = None
         self.ln_1_weight = None
         self.ln_1_bias = None
         self.attn_q_weight = None
@@ -393,13 +233,13 @@ class OPTBlock(module.LowMemoryModule):
         self.mlp_out_weight = None
         self.mlp_out_bias = None
         self.key_cache = None
+        self.key_cache_slices = None
         self.value_cache = None
-        self.active_key_cache = None
-        self.active_value_cache = None
-        self.params = None
+        self.value_cache_slices = None
 
-    def to_neuron(self):
-        manipulator = parallel.TensorManipulator(self.config.tp_degree)
+    def to_neuron(self, n_positions_list):
+        config = self.config
+        manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
@@ -444,17 +284,6 @@ class OPTBlock(module.LowMemoryModule):
         fc1.weight = UninitializedParameter()
         fc2.weight = UninitializedParameter()
 
-    def maybe_load_kernels(self):
-        if self.kernels is not None:
-            for kernel in self.kernels:
-                kernel.load()
-        if self.init_kernels is not None:
-            for kernel in self.init_kernels:
-                kernel.load()
-
-    def reset(self, n_positions_list):
-        config = self.config
-        manipulator = parallel.TensorManipulator(config.tp_degree)
         slice_on_nc = manipulator.slice_on_nc
         n_positions = config.n_positions
         batch_size = config.batch_size
@@ -472,33 +301,35 @@ class OPTBlock(module.LowMemoryModule):
         self.value_cache = value_cache
         self.value_cache_slices = [slice_on_nc(value_cache, 0, start=0, end=npos, step=1)
                                    for npos in n_positions_list]
-        self.params = [
-            self.ln_1_weight, self.ln_1_bias, self.attn_q_weight, self.attn_q_bias,
-            self.attn_k_weight, self.attn_k_bias, self.attn_v_weight, self.attn_v_bias,
-            self.attn_out_weight, self.attn_out_bias, self.ln_2_weight, self.ln_2_bias,
-            self.mlp_in_weight, self.mlp_in_bias, self.mlp_out_weight, self.mlp_out_bias,
+
+    def get_parameters(self):
+        return [
+            self.ln_1_weight,
+            self.ln_1_bias,
+            self.attn_q_weight,
+            self.attn_q_bias,
+            self.attn_k_weight,
+            self.attn_k_bias,
+            self.attn_v_weight,
+            self.attn_v_bias,
+            self.attn_out_weight,
+            self.attn_out_bias,
+            self.ln_2_weight,
+            self.ln_2_bias,
+            self.mlp_in_weight,
+            self.mlp_in_bias,
+            self.mlp_out_weight,
+            self.mlp_out_bias,
         ]
-        self.activate_n_positions_index(0)
 
-    def forward(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, self.active_key_cache, self.active_value_cache,
-                        *self.params]
-        hidden, *_ = self.active_kernel(inputs_cores)
-        return hidden
+    def get_cache_slices(self):
+        return [self.key_cache_slices, self.value_cache_slices]
 
-    def forward_init(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, self.active_key_cache, self.active_value_cache,
-                        *self.params]
-        hidden, *_ = self.active_init_kernel(inputs_cores)
-        return hidden
-
-    def activate_n_positions_index(self, n_positions_index):
-        self.active_key_cache = self.key_cache_slices[n_positions_index]
-        self.active_value_cache = self.value_cache_slices[n_positions_index]
-        if self.kernels is not None:
-            self.active_kernel = self.kernels[n_positions_index]
-        if self.init_kernels is not None:
-            self.active_init_kernel = self.init_kernels[n_positions_index]
+    def reset(self):
+        zero_cache = torch.zeros(self.key_cache.shape, dtype=self.key_cache.dtype)
+        zero_cache = [zero_cache for _ in range(self.config.tp_degree)]
+        ops.parallel_write(self.key_cache, zero_cache)
+        ops.parallel_write(self.value_cache, zero_cache)
 
 
 class OPTAttention(module.LowMemoryModule):
@@ -513,66 +344,170 @@ class OPTAttention(module.LowMemoryModule):
         self.out_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
 
 
-class OPTMultiBlock:
+class OPTLnLmHead:
 
-    def __init__(self, config, blocks, kernels, init_kernels):
-        self.blocks = blocks
-        self.kernels = kernels
-        self.init_kernels = init_kernels
-        self.active_kernel = None
-        self.active_init_kernel = None
-        self.caches = None
-        self.params = None
-        self.manipulator = parallel.TensorManipulator(config.tp_degree)
+    def __init__(self, config, ln_f, lm_head):
+        self.ln_f = ln_f
+        self.lm_head = lm_head
+        self.ln_f_weight = None
+        self.ln_f_bias = None
+        self.lm_head_weight = None
+        tp_degree = config.tp_degree
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+        vocab_size = config.vocab_size
+        self.vocab_pad = pad_vocab_size(vocab_size, tp_degree)
 
-    def reset(self):
-        self.params = []
-        for block in self.blocks:
-            block_params = [
-                block.ln_1_weight,
-                block.ln_1_bias,
-                block.attn_q_weight,
-                block.attn_q_bias,
-                block.attn_k_weight,
-                block.attn_k_bias,
-                block.attn_v_weight,
-                block.attn_v_bias,
-                block.attn_out_weight,
-                block.attn_out_bias,
-                block.ln_2_weight,
-                block.ln_2_bias,
-                block.mlp_in_weight,
-                block.mlp_in_bias,
-                block.mlp_out_weight,
-                block.mlp_out_bias,
-            ]
-            self.params.extend(block_params)
-        self.activate_n_positions_index(0)
+    def to_neuron(self):
+        manipulator = self.manipulator
+        self.ln_f.materialize()
+        self.ln_f_weight = manipulator.duplicate(self.ln_f.weight.detach())
+        self.ln_f_bias = manipulator.duplicate(self.ln_f.bias.detach())
+        self.lm_head.materialize()
+        lm_head_weight = self.lm_head.weight.detach()
+        lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
+        self.lm_head_weight = manipulator.shard_along(lm_head_weight.T, dim=1)
+        self.lm_head.weight = UninitializedParameter()
 
-    def maybe_load_kernels(self):
-        if self.kernels is not None:
-            for kernel in self.kernels:
-                kernel.load()
-        if self.init_kernels is not None:
-            for kernel in self.init_kernels:
-                kernel.load()
+    def get_parameters(self):
+        return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
 
-    def __call__(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, *self.caches, *self.params]
-        hidden, *_ = self.active_kernel(inputs_cores)
-        return hidden
 
-    def call_init(self, hidden, cache_offset, mask):
-        inputs_cores = [hidden, cache_offset, mask, *self.caches, *self.params]
-        hidden, *_ = self.active_init_kernel(inputs_cores)
-        return hidden
+def pad_vocab_size(vocab_size, tp_degree):
+    return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
 
-    def activate_n_positions_index(self, n_positions_index):
-        if self.kernels is not None:
-            self.active_kernel = self.kernels[n_positions_index]
-        if self.init_kernels is not None:
-            self.active_init_kernel = self.init_kernels[n_positions_index]
-        self.caches = []
-        for block in self.blocks:
-            self.caches.append(block.active_key_cache)
-            self.caches.append(block.active_value_cache)
+
+def build_opt_program(config, n_active, n_positions_list, n_layers):
+    hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos) for npos in n_positions_list]
+    buffers = OPTBuffers(hlo_modules)
+    if n_layers == config.num_hidden_layers:
+        return OPTProgramFullyUnrolled(config, hlo_modules, buffers)
+    else:
+        build_func = hlo.build_opt_multi_layer_hlo_module
+        hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
+        return OPTProgramPartiallyUnrolled(config, hlo_modules, n_layers, buffers)
+
+
+class OPTProgramDoNothing:
+
+    def setup(self, model):
+        pass
+
+    def init_length(self, this_length, init_n_active_tokens):
+        return 0
+
+    def init_step(self, init_n_active_tokens):
+        return 1
+
+    def run(self, bucket_id):
+        pass
+
+
+class OPTProgramBase:
+
+    def setup(self, model):
+        raise NotImplementedError(OPTProgramBase)
+
+    def init_length(self, this_length, init_n_active_tokens):
+        return this_length // init_n_active_tokens * init_n_active_tokens
+
+    def init_step(self, init_n_active_tokens):
+        return init_n_active_tokens
+
+    def run(self, bucket_id):
+        raise NotImplementedError(OPTProgramBase)
+
+
+class OPTProgramPartiallyUnrolled(OPTProgramBase):
+
+    def __init__(self, config, multi_layer_hlo_modules, n_layers, buffers):
+        num_hidden_layers = config.num_hidden_layers
+        if num_hidden_layers % n_layers:
+            raise ValueError(f'n_layers={n_layers} does not divide num_hidden_layers={num_hidden_layers}')
+        self.n_layers = n_layers
+        tp_degree = config.tp_degree
+        self.multi_layer_kernels = [compiler.build_parallel_kernel(hm, tp_degree)
+                                    for hm in multi_layer_hlo_modules]
+        head_hlo_module = hlo.build_lm_head_hlo_module(config, 1)
+        self.head_kernel = compiler.build_parallel_kernel(head_hlo_module, tp_degree)
+        self.multi_layers_memories = []
+        for _ in range(num_hidden_layers // n_layers):
+            memories = [compiler.ParallelMemory(hm, tp_degree) for hm in multi_layer_hlo_modules]
+            self.multi_layers_memories.append(memories)
+        self.head_memory = compiler.ParallelMemory(head_hlo_module, tp_degree)
+        self.buffers = buffers
+
+    def setup(self, model):
+        for kernel in self.multi_layer_kernels:
+            kernel.load()
+        self.head_kernel.load()
+        for memories in self.multi_layers_memories:
+            for memory in memories:
+                memory.init()
+        self.head_memory.init()
+        buffers = self.buffers
+        buffers.to_neuron(model.manipulator)
+        multi_layer_starts = range(0, model.config.num_hidden_layers, self.n_layers)
+        layers = model.model.decoder.layers
+        multi_layers = [layers[start:start+self.n_layers] for start in multi_layer_starts]
+        for memories, multi_layer in zip(self.multi_layers_memories, multi_layers):
+            cache_slices, params = cache_slices_and_parameters(multi_layer)
+            setup_opt_memories(memories, buffers, cache_slices, params, buffers.hidden_buffer)
+        head_inputs = [buffers.hidden_buffer, *model.ln_lm_head.get_parameters()]
+        for index, input_buffer in enumerate(head_inputs):
+            self.head_memory.inputs.add(index, input_buffer)
+        self.head_memory.outputs.add(0, buffers.logits_buffer)
+
+    def run(self, bucket_id):
+        for memories in self.multi_layers_memories:
+            self.multi_layer_kernels[bucket_id](memories[bucket_id])
+        self.head_kernel(self.head_memory)
+        return self.buffers.logits_buffer
+
+
+class OPTProgramFullyUnrolled(OPTProgramBase):
+
+    def __init__(self, config, opt_hlo_modules, buffers):
+        self.kernels = [compiler.build_parallel_kernel(hm, config.tp_degree) for hm in opt_hlo_modules]
+        self.memories = [compiler.ParallelMemory(hm, config.tp_degree) for hm in opt_hlo_modules]
+        self.buffers = buffers
+
+    def setup(self, model):
+        for kernel in self.kernels:
+            kernel.load()
+        for memory in self.memories:
+            memory.init()
+        cache_slices, params = cache_slices_and_parameters(model.model.decoder.layers)
+        params.extend(model.ln_lm_head.get_parameters())
+        buffers = self.buffers
+        buffers.to_neuron(model.manipulator)
+        setup_opt_memories(self.memories, buffers, cache_slices, params, buffers.logits_buffer)
+
+    def run(self, bucket_id):
+        self.kernels[bucket_id](self.memories[bucket_id])
+        return self.buffers.logits_buffer
+
+
+def cache_slices_and_parameters(layers):
+    cache_slices = []
+    params = []
+    for layer in layers:
+        cache_slices.extend(layer.get_cache_slices())
+        params.extend(layer.get_parameters())
+    return cache_slices, params
+
+
+def setup_opt_memories(memories, buffers, cache_slices, params, output_buffer):
+    for bucket_id, memory in enumerate(memories):
+        mask_buffer = buffers.mask_buffers[bucket_id]
+        input_buffers = [buffers.hidden_buffer, buffers.cache_offset_buffer, mask_buffer]
+        for index, input_buffer in enumerate(input_buffers):
+            memory.inputs.add(index, input_buffer)
+        cache_start_index = len(input_buffers)
+        for index, bucketed_caches in enumerate(cache_slices, start=cache_start_index):
+            memory.inputs.add(index, bucketed_caches[bucket_id])
+        param_start_index = cache_start_index + len(cache_slices)
+        for index, param in enumerate(params, start=param_start_index):
+            memory.inputs.add(index, param)
+        memory.outputs.add(0, output_buffer)
+        for index, bucketed_caches in enumerate(cache_slices, start=1):
+            memory.outputs.add(index, bucketed_caches[bucket_id])
