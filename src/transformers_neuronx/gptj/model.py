@@ -80,7 +80,6 @@ class GPTJForSampling(module.PretrainedModel):
         tokens = [input_ids]
         # auto-regressive generation
         for cur_len in range(1, max_length):
-            print('cur_len=', cur_len)
             offset = cur_len - 1
             seq_len = cur_len
             pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, seq_len=seq_len, offset=offset)

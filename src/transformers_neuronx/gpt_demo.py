@@ -89,7 +89,9 @@ class LatencyPrinter:
     def __init__(self):
         self.start = None
 
-    def pre_hook(self, *args):
+    def pre_hook(self, module, input):
+        _, cache_offset, _ = input
+        print(f'cache_offset: {cache_offset}')
         self.start = time.time()
 
     def hook(self, *args):
