@@ -52,7 +52,7 @@ setup(
             'gpt2_demo=transformers_neuronx.gpt2.demo:main',
             'gptj_demo=transformers_neuronx.gptj.demo:main',
             'opt_demo=transformers_neuronx.opt.demo:main',
-            'gen_random_opt_175b=transformers_neuronx.opt.gen_random_175b:main',
+            'opt_gen_random_pretrained=transformers_neuronx.opt.gen_random_pretrained:main',
             'gen_randn_hlo_snapshot=transformers_neuronx.tools.gen_hlo_snapshot:main_randn',
         ],
     },

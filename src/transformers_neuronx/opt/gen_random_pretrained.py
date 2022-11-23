@@ -16,13 +16,91 @@ import argparse
 import json
 import os
 import torch
+from transformers.models.opt import OPTConfig
 from transformers_neuronx.module import sanitize_file_name, _KEY_TO_FILENAME_JSON
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('name')
     parser.add_argument('save')
+    parser.add_argument('--empty', action='store_true')
     args = parser.parse_args()
+    gen_random_pretrained(args.name, args.save, args.empty)
+
+
+def gen_random_pretrained(model_name, save, empty=False):
+    if model_name == 'facebook/opt-175b':
+        config = opt_175b_config()
+    else:
+        config = OPTConfig.from_pretrained(model_name).to_dict()
+    os.makedirs(save, exist_ok=True)
+    with open(os.path.join(save, 'config.json'), 'w') as fp:
+        json.dump(config, fp, indent=2)
+    vocab_size = config['vocab_size']
+    hidden_size = config['hidden_size']
+    max_position_embeddings = config['max_position_embeddings']
+    ffn_dim = config['ffn_dim']
+    num_hidden_layers = config['num_hidden_layers']
+    init_std = config['init_std']
+    torch_dtype = config['torch_dtype']
+    name2shape = {
+        'model.decoder.embed_tokens.weight': [vocab_size, hidden_size],
+        'model.decoder.embed_positions.weight': [max_position_embeddings + 2, hidden_size],
+        'model.decoder.final_layer_norm.weight': [hidden_size],
+        'model.decoder.final_layer_norm.bias': [hidden_size],
+    }
+    layer_name2shape = {
+        'self_attn.k_proj.weight': [hidden_size, hidden_size],
+        'self_attn.k_proj.bias': [hidden_size],
+        'self_attn.v_proj.weight': [hidden_size, hidden_size],
+        'self_attn.v_proj.bias': [hidden_size],
+        'self_attn.q_proj.weight': [hidden_size, hidden_size],
+        'self_attn.q_proj.bias': [hidden_size],
+        'self_attn.out_proj.weight': [hidden_size, hidden_size],
+        'self_attn.out_proj.bias': [hidden_size],
+        'self_attn_layer_norm.weight': [hidden_size],
+        'self_attn_layer_norm.bias': [hidden_size],
+        'fc1.weight': [ffn_dim, hidden_size],
+        'fc1.bias': [ffn_dim],
+        'fc2.weight': [hidden_size, ffn_dim],
+        'fc2.bias': [hidden_size],
+        'final_layer_norm.weight': [hidden_size],
+        'final_layer_norm.bias': [hidden_size],
+    }
+    for idx in range(num_hidden_layers):
+        for name, shape in layer_name2shape.items():
+            name2shape[f'model.decoder.layers.{idx}.{name}'] = shape
+    name2shape['lm_head.weight'] = [vocab_size, hidden_size]
+    key_to_filename = {}
+    for idx, key in enumerate(name2shape.keys()):
+        key_to_filename[key] = f'p{idx}.{sanitize_file_name(key)}'
+        if empty:
+            key_to_filename[key] = f'{key_to_filename[key]}.empty_json'
+    split_param_dir = os.path.join(save, 'pytorch_model.bin')
+    os.makedirs(split_param_dir, exist_ok=True)
+    with open(os.path.join(split_param_dir, _KEY_TO_FILENAME_JSON), 'w') as fp:
+        json.dump(key_to_filename, fp, indent=2)
+    dtype = getattr(torch, torch_dtype)
+    for name, shape in name2shape.items():
+        save_path = os.path.join(split_param_dir, key_to_filename[name])
+        factor = 0.0 if 'layer_norm' in name or 'bias' in name else init_std
+        if empty:
+            empty_json = {
+                'torch_dtype': torch_dtype,
+                'shape': shape,
+                'init_std': factor,
+            }
+            with open(save_path, 'w') as fp:
+                json.dump(empty_json, fp, indent=2)
+            continue
+        init_param = factor * torch.randn(shape)
+        init_param = init_param.to(dtype)
+        torch.save(init_param, save_path)
+        print(f'done saving {save_path}')
+
+
+def opt_175b_config():
     vocab_size = 50272
     hidden_size = 12288
     max_position_embeddings = 2048
@@ -57,50 +135,4 @@ def main():
         vocab_size=vocab_size,
         word_embed_proj_dim=hidden_size,
     )
-    os.makedirs(args.save, exist_ok=True)
-    with open(os.path.join(args.save, 'config.json'), 'w') as fp:
-        json.dump(config, fp, indent=2)
-    name2shape = {
-        'model.decoder.embed_tokens.weight': [vocab_size, hidden_size],
-        'model.decoder.embed_positions.weight': [max_position_embeddings + 2, hidden_size],
-        'model.decoder.final_layer_norm.weight': [hidden_size],
-        'model.decoder.final_layer_norm.bias': [hidden_size],
-    }
-    layer_name2shape = {
-        'self_attn.k_proj.weight': [hidden_size, hidden_size],
-        'self_attn.k_proj.bias': [hidden_size],
-        'self_attn.v_proj.weight': [hidden_size, hidden_size],
-        'self_attn.v_proj.bias': [hidden_size],
-        'self_attn.q_proj.weight': [hidden_size, hidden_size],
-        'self_attn.q_proj.bias': [hidden_size],
-        'self_attn.out_proj.weight': [hidden_size, hidden_size],
-        'self_attn.out_proj.bias': [hidden_size],
-        'self_attn_layer_norm.weight': [hidden_size],
-        'self_attn_layer_norm.bias': [hidden_size],
-        'fc1.weight': [ffn_dim, hidden_size],
-        'fc1.bias': [ffn_dim],
-        'fc2.weight': [hidden_size, ffn_dim],
-        'fc2.bias': [hidden_size],
-        'final_layer_norm.weight': [hidden_size],
-        'final_layer_norm.bias': [hidden_size],
-    }
-    for idx in range(num_hidden_layers):
-        for name, shape in layer_name2shape.items():
-            name2shape[f'model.decoder.layers.{idx}.{name}'] = shape
-    name2shape['lm_head.weight'] = [vocab_size, hidden_size]
-    key_to_filename = {}
-    for idx, key in enumerate(name2shape.keys()):
-        key_to_filename[key] = f'p{idx}.{sanitize_file_name(key)}'
-    split_param_dir = os.path.join(args.save, 'pytorch_model.bin')
-    os.makedirs(split_param_dir, exist_ok=True)
-    with open(os.path.join(split_param_dir, _KEY_TO_FILENAME_JSON), 'w') as fp:
-        json.dump(key_to_filename, fp, indent=2)
-    for name, shape in name2shape.items():
-        if 'layer_norm' in name or 'bias' in name:
-            init_param = torch.zeros(shape)
-        else:
-            init_param = init_std * torch.randn(shape)
-        init_param = init_param.to(torch.float16)
-        save_path = os.path.join(split_param_dir, key_to_filename[name])
-        torch.save(init_param, save_path)
-        print(f'done saving {save_path}')
+    return config
