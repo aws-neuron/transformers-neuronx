@@ -33,26 +33,31 @@ class OPTForSampling(module.PretrainedModel):
         self.config = config
         if unroll is None:
             unroll = config.num_hidden_layers
+        self.unroll = unroll
         self.init_n_active_tokens = init_n_active_tokens
         dtype = dtypes.to_torch_dtype(config.amp)
         self.model = OPTModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.ln_lm_head = OPTLnLmHead(config, self.model.decoder.final_layer_norm, self.lm_head)
-        n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
-        self.n_positions_list = n_positions_list
-        self.program = build_opt_program(config, 1, n_positions_list, unroll)
+        self.n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+        self.program = None
         self.init_program = OPTProgramDoNothing()
-        if init_n_active_tokens is not None:
-            self.init_program = build_opt_program(config, init_n_active_tokens, n_positions_list, unroll)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
         self.to_neuron_hooks = []
 
     def to_neuron(self):
         ops.init()
+        config = self.config
+        n_positions_list = self.n_positions_list
+        unroll = self.unroll
+        self.program = build_opt_program(config, 1, n_positions_list, unroll)
+        init_n_active = self.init_n_active_tokens
+        if init_n_active is not None:
+            self.init_program = build_opt_program(config, init_n_active, n_positions_list, unroll)
         decoder = self.model.decoder
         decoder.embed_tokens.materialize()
         decoder.embed_positions.materialize()
-        parallel.layers_to_neuron(16, decoder.layers, self.n_positions_list, self.to_neuron_hooks)
+        parallel.layers_to_neuron(16, decoder.layers, n_positions_list, self.to_neuron_hooks)
         self.ln_lm_head.to_neuron()
         self.program.setup(self)
         self.init_program.setup(self)
