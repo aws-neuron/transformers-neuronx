@@ -132,13 +132,12 @@ class OPTForSampling(module.PretrainedModel):
                 next_token_scores[:, config.eos_token_id] = -float('inf')
 
             # Remove all tokens with a probability less than the last token of the top-k
-            topk_values, _ = torch.topk(next_token_scores, top_k)
-            indices_to_remove = next_token_scores < topk_values[:, -1, None]
-            next_token_scores = next_token_scores.masked_fill(indices_to_remove, filter_value)
+            topk_values, topk_indices = torch.topk(next_token_scores, top_k)
 
             # sample
-            probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-            inputs = torch.multinomial(probs, num_samples=1)
+            probs = torch.nn.functional.softmax(topk_values, dim=-1)
+            inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
+            inputs = torch.gather(topk_indices, 1, inputs_in_topk)
             tokens.append(inputs)
 
             # stop when eos_token is found
