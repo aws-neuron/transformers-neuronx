@@ -131,7 +131,6 @@ class GPT2ForSampling(module.PretrainedModel):
         tokens = [input_ids]
         # auto-regressive generation
         for cur_len in range(1, max_length):
-            print('cur_len=', cur_len)
             offset = cur_len - 1
             seq_len = cur_len
             mask = torch.zeros([1, config.n_positions])

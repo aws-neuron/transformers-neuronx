@@ -120,7 +120,6 @@ class OPTForSampling(module.PretrainedModel):
         # auto-regressive generation
         tokens = [input_ids]
         for cur_len in range(start, max_length):
-            print('cur_len=', cur_len)
             next_len = cur_len + 1
 
             # pre-process distribution
