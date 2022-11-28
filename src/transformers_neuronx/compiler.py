@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import os
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -44,6 +45,8 @@ def build_parallel_kernel(hlo_module, tp_degree):
 
 def compile_hlo_module(hlo_module):
     with tempfile.TemporaryDirectory() as tmpdir:
+        flags = os.environ.get('NEURON_CC_FLAGS', '')
+        flags = shlex.split(flags)
         dump_to = os.environ.get('NEURONX_DUMP_TO', None)
         if dump_to is not None:
             dump_to = os.path.join(dump_to, f'{hlo_module.name}.{GlobalCounter()()}')
@@ -55,7 +58,7 @@ def compile_hlo_module(hlo_module):
         neff_path = f'{hlo_module_path}.neff'
         neff_path = os.path.realpath(neff_path)
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        '--auto-cast=none', hlo_module_path, f'--output={neff_path}']
+                        hlo_module_path, f'--output={neff_path}', *flags]
         if dump_to is not None:
             command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
             command_line.append('--tensorizer-options=--dump-after-all=penguin')
