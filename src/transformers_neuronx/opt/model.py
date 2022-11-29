@@ -98,13 +98,14 @@ class OPTForSampling(module.PretrainedModel):
         position_embeds = self.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1).contiguous()
-        hidden = hidden.to(self.program.buffers.hidden_buffer.dtype)
+        input_buffers = program.buffers.get_input_buffers(bucket_id)
+        hidden_buffer, *_ = input_buffers
+        hidden = hidden.to(hidden_buffer.dtype)
         hidden = self.manipulator.duplicate_on_cpu(hidden)
         cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
         mask = self.manipulator.duplicate_on_cpu(mask)
-        ops.parallel_write(program.buffers.hidden_buffer, hidden)
-        ops.parallel_write(program.buffers.cache_offset_buffer, cache_offset)
-        ops.parallel_write(program.buffers.mask_buffers[bucket_id], mask)
+        for in_buffer, in_tensor in zip(input_buffers, [hidden, cache_offset, mask]):
+            ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
     @torch.no_grad()
@@ -157,19 +158,26 @@ class OPTForSampling(module.PretrainedModel):
 
 class OPTBuffers:
 
-    def __init__(self, opt_hlo_modules):
+    def __init__(self, opt_hlo_modules, tp_degree):
         first_hlo_module, *_ = opt_hlo_modules
-        self.hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
-        self.cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
-        self.mask_buffers = [compiler.gen_zero_input(hlo, 2) for hlo in opt_hlo_modules]
-        self.logits_buffer = compiler.gen_zero_output(first_hlo_module, 0)
+        hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
+        cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
+        mask_buffers = [compiler.gen_zero_input(hlo, 2) for hlo in opt_hlo_modules]
+        self.input_buffers = [hidden_buffer, cache_offset_buffer, mask_buffers]
+        self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
-    def to_neuron(self, manipulator):
-        duplicate = manipulator.duplicate
-        self.hidden_buffer = duplicate(self.hidden_buffer)
-        self.cache_offset_buffer = duplicate(self.cache_offset_buffer)
-        self.mask_buffers = [duplicate(mask_buffer) for mask_buffer in self.mask_buffers]
-        self.logits_buffer = duplicate(self.logits_buffer)
+    def to_neuron(self):
+        hidden_buffer, cache_offset_buffer, mask_buffers = self.input_buffers
+        hidden_buffer = self.manipulator.duplicate(hidden_buffer)
+        cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
+        mask_buffers = [self.manipulator.duplicate(mask_buffer) for mask_buffer in mask_buffers]
+        self.input_buffers = [hidden_buffer, cache_offset_buffer, mask_buffers]
+        self.output_buffer = self.manipulator.duplicate(self.output_buffer)
+
+    def get_input_buffers(self, bucket_id):
+        hidden_buffer, cache_offset_buffer, mask_buffers = self.input_buffers
+        return [hidden_buffer, cache_offset_buffer, mask_buffers[bucket_id]]
 
 
 def find_first_ge_index(values, target):
@@ -361,14 +369,13 @@ class OPTLnLmHead:
         self.vocab_pad = pad_vocab_size(vocab_size, tp_degree)
 
     def to_neuron(self):
-        manipulator = self.manipulator
         self.ln_f.materialize()
-        self.ln_f_weight = manipulator.duplicate(self.ln_f.weight.detach())
-        self.ln_f_bias = manipulator.duplicate(self.ln_f.bias.detach())
+        self.ln_f_weight = self.manipulator.duplicate(self.ln_f.weight.detach())
+        self.ln_f_bias = self.manipulator.duplicate(self.ln_f.bias.detach())
         self.lm_head.materialize()
         lm_head_weight = self.lm_head.weight.detach()
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
-        self.lm_head_weight = manipulator.shard_along(lm_head_weight.T, dim=1)
+        self.lm_head_weight = self.manipulator.shard_along(lm_head_weight.T, dim=1)
         self.lm_head.weight = UninitializedParameter()
 
     def get_parameters(self):
@@ -381,7 +388,7 @@ def pad_vocab_size(vocab_size, tp_degree):
 
 def build_opt_program(config, n_active, n_positions_list, n_layers):
     hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos) for npos in n_positions_list]
-    buffers = OPTBuffers(hlo_modules)
+    buffers = OPTBuffers(hlo_modules, config.tp_degree)
     if n_layers == config.num_hidden_layers:
         return OPTProgramFullyUnrolled(config, hlo_modules, buffers)
     else:
@@ -448,23 +455,24 @@ class OPTProgramPartiallyUnrolled(OPTProgramBase):
                 memory.init()
         self.head_memory.init()
         buffers = self.buffers
-        buffers.to_neuron(model.manipulator)
+        buffers.to_neuron()
+        hidden_buffer, *_ = buffers.get_input_buffers(0)
         multi_layer_starts = range(0, model.config.num_hidden_layers, self.n_layers)
         layers = model.model.decoder.layers
         multi_layers = [layers[start:start+self.n_layers] for start in multi_layer_starts]
         for memories, multi_layer in zip(self.multi_layers_memories, multi_layers):
             cache_slices, params = cache_slices_and_parameters(multi_layer)
-            setup_opt_memories(memories, buffers, cache_slices, params, buffers.hidden_buffer)
-        head_inputs = [buffers.hidden_buffer, *model.ln_lm_head.get_parameters()]
+            setup_opt_memories(memories, buffers, cache_slices, params, hidden_buffer)
+        head_inputs = [hidden_buffer, *model.ln_lm_head.get_parameters()]
         for index, input_buffer in enumerate(head_inputs):
             self.head_memory.inputs.add(index, input_buffer)
-        self.head_memory.outputs.add(0, buffers.logits_buffer)
+        self.head_memory.outputs.add(0, buffers.output_buffer)
 
     def run(self, bucket_id):
         for memories in self.multi_layers_memories:
             self.multi_layer_kernels[bucket_id](memories[bucket_id])
         self.head_kernel(self.head_memory)
-        return self.buffers.logits_buffer
+        return self.buffers.output_buffer
 
 
 class OPTProgramFullyUnrolled(OPTProgramBase):
@@ -482,12 +490,12 @@ class OPTProgramFullyUnrolled(OPTProgramBase):
         cache_slices, params = cache_slices_and_parameters(model.model.decoder.layers)
         params.extend(model.ln_lm_head.get_parameters())
         buffers = self.buffers
-        buffers.to_neuron(model.manipulator)
-        setup_opt_memories(self.memories, buffers, cache_slices, params, buffers.logits_buffer)
+        buffers.to_neuron()
+        setup_opt_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer)
 
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
-        return self.buffers.logits_buffer
+        return self.buffers.output_buffer
 
 
 def cache_slices_and_parameters(layers):
@@ -501,8 +509,7 @@ def cache_slices_and_parameters(layers):
 
 def setup_opt_memories(memories, buffers, cache_slices, params, output_buffer):
     for bucket_id, memory in enumerate(memories):
-        mask_buffer = buffers.mask_buffers[bucket_id]
-        input_buffers = [buffers.hidden_buffer, buffers.cache_offset_buffer, mask_buffer]
+        input_buffers = buffers.get_input_buffers(bucket_id)
         for index, input_buffer in enumerate(input_buffers):
             memory.inputs.add(index, input_buffer)
         cache_start_index = len(input_buffers)
