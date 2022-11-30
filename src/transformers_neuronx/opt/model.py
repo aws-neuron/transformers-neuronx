@@ -394,7 +394,8 @@ def build_opt_program(config, n_active, n_positions_list, n_layers):
     else:
         build_func = hlo.build_opt_multi_layer_hlo_module
         hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
-        return OPTProgramPartiallyUnrolled(config, hlo_modules, n_layers, buffers)
+        head_hlo_module = hlo.build_lm_head_hlo_module(config, n_active)
+        return OPTProgramPartiallyUnrolled(config, hlo_modules, head_hlo_module, n_layers, buffers)
 
 
 class OPTProgramDoNothing:
@@ -429,7 +430,7 @@ class OPTProgramBase:
 
 class OPTProgramPartiallyUnrolled(OPTProgramBase):
 
-    def __init__(self, config, multi_layer_hlo_modules, n_layers, buffers):
+    def __init__(self, config, multi_layer_hlo_modules, head_hlo_module, n_layers, buffers):
         num_hidden_layers = config.num_hidden_layers
         if num_hidden_layers % n_layers:
             raise ValueError(f'n_layers={n_layers} does not divide num_hidden_layers={num_hidden_layers}')
@@ -437,7 +438,6 @@ class OPTProgramPartiallyUnrolled(OPTProgramBase):
         tp_degree = config.tp_degree
         self.multi_layer_kernels = [compiler.build_parallel_kernel(hm, tp_degree)
                                     for hm in multi_layer_hlo_modules]
-        head_hlo_module = hlo.build_lm_head_hlo_module(config, 1)
         self.head_kernel = compiler.build_parallel_kernel(head_hlo_module, tp_degree)
         self.multi_layers_memories = []
         for _ in range(num_hidden_layers // n_layers):
