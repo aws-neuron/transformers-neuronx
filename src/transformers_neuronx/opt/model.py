@@ -59,8 +59,8 @@ class OPTForSampling(module.PretrainedModel):
         decoder.embed_positions.materialize()
         parallel.layers_to_neuron(16, decoder.layers, n_positions_list, self.to_neuron_hooks)
         self.ln_lm_head.to_neuron()
-        self.program.setup(self)
-        self.init_program.setup(self)
+        self.program.setup(self.model.decoder.layers, self.ln_lm_head)
+        self.init_program.setup(self.model.decoder.layers, self.ln_lm_head)
 
     def reset(self):
         for layer in self.model.decoder.layers:
@@ -400,7 +400,7 @@ def build_opt_program(config, n_active, n_positions_list, n_layers):
 
 class OPTProgramDoNothing:
 
-    def setup(self, model):
+    def setup(self, layers, ln_lm_head):
         pass
 
     def init_length(self, this_length, init_n_active_tokens):
@@ -415,7 +415,7 @@ class OPTProgramDoNothing:
 
 class OPTProgramBase:
 
-    def setup(self, model):
+    def setup(self, layers, ln_lm_head):
         raise NotImplementedError(OPTProgramBase)
 
     def init_length(self, this_length, init_n_active_tokens):
@@ -446,7 +446,7 @@ class OPTProgramPartiallyUnrolled(OPTProgramBase):
         self.head_memory = compiler.ParallelMemory(head_hlo_module, tp_degree)
         self.buffers = buffers
 
-    def setup(self, model):
+    def setup(self, layers, ln_lm_head):
         for kernel in self.multi_layer_kernels:
             kernel.load()
         self.head_kernel.load()
@@ -457,13 +457,12 @@ class OPTProgramPartiallyUnrolled(OPTProgramBase):
         buffers = self.buffers
         buffers.to_neuron()
         hidden_buffer, *_ = buffers.get_input_buffers(0)
-        multi_layer_starts = range(0, model.config.num_hidden_layers, self.n_layers)
-        layers = model.model.decoder.layers
+        multi_layer_starts = range(0, len(layers), self.n_layers)
         multi_layers = [layers[start:start+self.n_layers] for start in multi_layer_starts]
         for memories, multi_layer in zip(self.multi_layers_memories, multi_layers):
             cache_slices, params = cache_slices_and_parameters(multi_layer)
             setup_opt_memories(memories, buffers, cache_slices, params, hidden_buffer)
-        head_inputs = [hidden_buffer, *model.ln_lm_head.get_parameters()]
+        head_inputs = [hidden_buffer, *ln_lm_head.get_parameters()]
         for index, input_buffer in enumerate(head_inputs):
             self.head_memory.inputs.add(index, input_buffer)
         self.head_memory.outputs.add(0, buffers.output_buffer)
@@ -482,13 +481,13 @@ class OPTProgramFullyUnrolled(OPTProgramBase):
         self.memories = [compiler.ParallelMemory(hm, config.tp_degree) for hm in opt_hlo_modules]
         self.buffers = buffers
 
-    def setup(self, model):
+    def setup(self, layers, ln_lm_head):
         for kernel in self.kernels:
             kernel.load()
         for memory in self.memories:
             memory.init()
-        cache_slices, params = cache_slices_and_parameters(model.model.decoder.layers)
-        params.extend(model.ln_lm_head.get_parameters())
+        cache_slices, params = cache_slices_and_parameters(layers)
+        params.extend(ln_lm_head.get_parameters())
         buffers = self.buffers
         buffers.to_neuron()
         setup_opt_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer)
