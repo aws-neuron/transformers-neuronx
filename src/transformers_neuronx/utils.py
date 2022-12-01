@@ -29,3 +29,7 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
         bucket_size *= 2
     sizes.append(max_bucket_size)
     return sizes
+
+
+def pad_vocab_size(vocab_size, tp_degree):
+    return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
