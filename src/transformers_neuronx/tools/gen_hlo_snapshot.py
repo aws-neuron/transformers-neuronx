@@ -31,16 +31,16 @@ def main_randn():
         hlo_module.ParseFromString(fp.read())
     torch.manual_seed(15213)
     int_func = getattr(torch, args.int)
-    hlo_snapshot = gen_randn_hlo_snapshot(hlo_module, args.std, int_func, args.treat_as_int)
+    randn_inputs = compiler.gen_randn_inputs(hlo_module, args.std, int_func, args.treat_as_int)
+    hlo_snapshot = gen_hlo_snapshot(hlo_module, randn_inputs)
     with open(args.snapshot, 'wb') as fp:
         fp.write(hlo_snapshot.SerializeToString())
 
 
-def gen_randn_hlo_snapshot(hlo_module, std, int_func, treat_as_int):
-    randn_inputs = compiler.gen_randn_inputs(hlo_module, std, int_func, treat_as_int)
+def gen_hlo_snapshot(hlo_module, inputs):
     hlo_snapshot = hlo_pb2.HloSnapshot()
     hlo_snapshot.hlo.hlo_module.CopyFrom(hlo_module)
-    for tensor, param in zip(randn_inputs, hlo_module.host_program_shape.parameters):
+    for tensor, param in zip(inputs, hlo_module.host_program_shape.parameters):
         argument = hlo_snapshot.arguments.add()
         argument.shape.CopyFrom(param)
         name = xla_data_pb2.PrimitiveType.Name(param.element_type)
