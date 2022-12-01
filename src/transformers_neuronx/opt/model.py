@@ -367,7 +367,7 @@ class OPTLnLmHead:
         tp_degree = config.tp_degree
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
         vocab_size = config.vocab_size
-        self.vocab_pad = pad_vocab_size(vocab_size, tp_degree)
+        self.vocab_pad = utils.pad_vocab_size(vocab_size, tp_degree)
 
     def to_neuron(self):
         self.ln_f.materialize()
@@ -381,10 +381,6 @@ class OPTLnLmHead:
 
     def get_parameters(self):
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
-
-
-def pad_vocab_size(vocab_size, tp_degree):
-    return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
 
 
 def build_opt_program(config, n_active, n_positions_list, n_layers):
