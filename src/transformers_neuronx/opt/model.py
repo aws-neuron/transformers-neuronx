@@ -391,5 +391,5 @@ def build_opt_program(config, n_active, n_positions_list, n_layers):
     else:
         build_func = hlo.build_opt_multi_layer_hlo_module
         hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
-        head_hlo_module = hlo.build_lm_head_hlo_module(config, n_active)
+        head_hlo_module = hlo.build_ln_lm_head_hlo_module(config, n_active)
         return program.MultiLayerDecoder(config, hlo_modules, head_hlo_module, n_layers, buffers)
