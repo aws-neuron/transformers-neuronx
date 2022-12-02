@@ -16,24 +16,19 @@ from transformers_neuronx import compiler
 from transformers_neuronx import hlo
 
 
-def build_gpt2_block_kernel(config, n_active_tokens, n_positions):
-    block = gen_scribable_block(config, n_active_tokens, n_positions)
-    return compiler.build_kernel(block, config.tp_degree)
-
-
-def build_lm_head_kernel(config, n_active_tokens):
-    ln_lm_head = gen_scribable_ln_lm_head(config, n_active_tokens)
-    return compiler.build_kernel(ln_lm_head, config.tp_degree)
-
-
-def build_gpt2_kernel(config, n_active_tokens, n_positions):
-    gpt2 = gen_scribable_gpt2(config, n_active_tokens, n_positions)
-    return compiler.build_kernel(gpt2, config.tp_degree)
-
-
-def build_gpt2_multi_block_kernel(config, n_active_tokens, n_positions, n_blocks):
+def build_gpt2_multi_block_hlo_module(config, n_active_tokens, n_positions, n_blocks):
     multi_block = gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks)
-    return compiler.build_kernel(multi_block, config.tp_degree)
+    return compiler.compile_py_func(multi_block)
+
+
+def build_ln_lm_head_hlo_module(config, n_active_tokens):
+    ln_lm_head = gen_scribable_ln_lm_head(config, n_active_tokens)
+    return compiler.compile_py_func(ln_lm_head)
+
+
+def build_gpt2_hlo_module(config, n_active_tokens, n_positions):
+    gpt2 = gen_scribable_gpt2(config, n_active_tokens, n_positions)
+    return compiler.compile_py_func(gpt2)
 
 
 def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias,

@@ -17,9 +17,9 @@ from torch.nn.parameter import UninitializedParameter
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
-from transformers_neuronx import program
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
+from transformers_neuronx import program
 from transformers_neuronx import utils
 from transformers_neuronx.opt import hlo
 from transformers_neuronx.opt.config import OPTConfig
@@ -387,9 +387,10 @@ def build_opt_program(config, n_active, n_positions_list, n_layers):
     hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos) for npos in n_positions_list]
     buffers = OPTBuffers(hlo_modules, config.tp_degree)
     if n_layers == config.num_hidden_layers:
-        return program.FullyUnrolledDecoder(config, hlo_modules, buffers)
+        return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)
     else:
         build_func = hlo.build_opt_multi_layer_hlo_module
         hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
         head_hlo_module = hlo.build_ln_lm_head_hlo_module(config, n_active)
-        return program.MultiLayerDecoder(config, hlo_modules, head_hlo_module, n_layers, buffers)
+        return program.MultiLayerDecoder(config.num_hidden_layers, config.tp_degree, hlo_modules,
+                                         head_hlo_module, n_layers, buffers)
