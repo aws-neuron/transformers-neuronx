@@ -47,12 +47,11 @@ class DoNothingDecoder(DecoderProgram):
 
 class MultiLayerDecoder(DecoderProgram):
 
-    def __init__(self, config, multi_layer_hlo_modules, head_hlo_module, n_layers, buffers):
-        num_hidden_layers = config.num_hidden_layers
+    def __init__(self, num_hidden_layers, tp_degree, multi_layer_hlo_modules, head_hlo_module,
+                 n_layers, buffers):
         if num_hidden_layers % n_layers:
             raise ValueError(f'n_layers={n_layers} does not divide num_hidden_layers={num_hidden_layers}')
         self.n_layers = n_layers
-        tp_degree = config.tp_degree
         self.multi_layer_kernels = [compiler.build_parallel_kernel(hm, tp_degree)
                                     for hm in multi_layer_hlo_modules]
         self.head_kernel = compiler.build_parallel_kernel(head_hlo_module, tp_degree)
@@ -93,9 +92,9 @@ class MultiLayerDecoder(DecoderProgram):
 
 class FullyUnrolledDecoder(DecoderProgram):
 
-    def __init__(self, config, hlo_modules, buffers):
-        self.kernels = [compiler.build_parallel_kernel(hm, config.tp_degree) for hm in hlo_modules]
-        self.memories = [compiler.ParallelMemory(hm, config.tp_degree) for hm in hlo_modules]
+    def __init__(self, tp_degree, hlo_modules, buffers):
+        self.kernels = [compiler.build_parallel_kernel(hm, tp_degree) for hm in hlo_modules]
+        self.memories = [compiler.ParallelMemory(hm, tp_degree) for hm in hlo_modules]
         self.buffers = buffers
 
     def setup(self, layers, ln_lm_head):
