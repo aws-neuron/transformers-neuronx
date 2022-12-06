@@ -23,6 +23,7 @@ from transformers_neuronx import program
 from transformers_neuronx import utils
 from transformers_neuronx.opt import hlo
 from transformers_neuronx.opt.config import OPTConfig
+from transformers_neuronx.sampling import simple_sample
 
 
 class OPTForSampling(module.PretrainedModel):
@@ -109,49 +110,9 @@ class OPTForSampling(module.PretrainedModel):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
-    @torch.no_grad()
     def sample(self, input_ids, sequence_length):
-        config = self.config
-        filter_value = -float('inf')
-        min_length = max_length = sequence_length
-        top_k = 50
-        self.reset()
-        start = input_ids.shape[1]
-
-        # populate key/value caches according to the prompt text
-        cache_offset = torch.arange(start, dtype=torch.int32)
-        mask = torch.ones([start, config.n_positions])
-        mask = torch.tril(mask)
-        next_token_scores = self(input_ids, cache_offset, mask)
-
-        # auto-regressive generation
-        tokens = [input_ids]
-        for cur_len in range(start, max_length):
-            next_len = cur_len + 1
-
-            # pre-process distribution
-            if cur_len < min_length:
-                next_token_scores[:, config.eos_token_id] = -float('inf')
-
-            # Remove all tokens with a probability less than the last token of the top-k
-            topk_values, topk_indices = torch.topk(next_token_scores, top_k)
-
-            # sample
-            probs = torch.nn.functional.softmax(topk_values, dim=-1)
-            inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
-            inputs = torch.gather(topk_indices, 1, inputs_in_topk)
-            tokens.append(inputs)
-
-            # stop when eos_token is found
-            if (inputs == config.eos_token_id).all():
-                break
-
-            # forward pass to get next token
-            cache_offset = torch.as_tensor([cur_len], dtype=torch.int32)
-            mask = torch.zeros([1, config.n_positions])
-            mask[:, :next_len] = 1.0
-            next_token_scores = self(inputs, cache_offset, mask)
-        return torch.cat(tokens, dim=-1)
+        return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
+                             eos_token_id=self.config.eos_token_id, top_k=50)
 
     def register_to_neuron_hook(self, hook):
         self.to_neuron_hooks.append(hook)

@@ -23,6 +23,7 @@ from transformers_neuronx import program
 from transformers_neuronx import utils
 from transformers_neuronx.gpt2 import hlo
 from transformers_neuronx.gpt2.config import GPT2Config
+from transformers_neuronx.sampling import simple_sample
 
 
 class GPT2ForSampling(module.PretrainedModel):
@@ -109,47 +110,9 @@ class GPT2ForSampling(module.PretrainedModel):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
-    @torch.no_grad()
     def sample(self, input_ids, sequence_length):
-        config = self.config
-        filter_value = -float('inf')
-        min_length = max_length = top_k = sequence_length
-        self.reset()
-        start = input_ids.shape[1]
-        inputs = input_ids[:, 0:1]
-        tokens = [input_ids]
-        # auto-regressive generation
-        for cur_len in range(1, max_length):
-            offset = cur_len - 1
-            seq_len = cur_len
-            mask = torch.zeros([1, config.n_positions])
-            mask[:, :cur_len] = 1.0
-
-            # forward pass to get next token
-            cache_offset = torch.as_tensor([offset], dtype=torch.int32)
-            next_token_scores = self(inputs, cache_offset, mask)
-            if cur_len < start:
-                inputs = input_ids[:, cur_len:cur_len+1]
-                continue
-
-            # pre-process distribution
-            if cur_len < min_length:
-                next_token_scores[:, config.eos_token_id] = -float('inf')
-
-            # Remove all tokens with a probability less than the last token of the top-k
-            topk_values, _ = torch.topk(next_token_scores, top_k)
-            indices_to_remove = next_token_scores < topk_values[:, -1, None]
-            next_token_scores = next_token_scores.masked_fill(indices_to_remove, filter_value)
-
-            # sample
-            probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-            inputs = torch.multinomial(probs, num_samples=1)
-            tokens.append(inputs)
-
-            # stop when eos_token is found
-            if (inputs == config.eos_token_id).all():
-                break
-        return torch.cat(tokens, dim=-1)
+        return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
+                             eos_token_id=self.config.eos_token_id, top_k=50)
 
     def register_to_neuron_hook(self, hook):
         self.to_neuron_hooks.append(hook)
@@ -366,4 +329,3 @@ def build_gpt2_program(config, n_active, n_positions_list, n_layers):
         head_hlo_module = hlo.build_ln_lm_head_hlo_module(config, n_active)
         return program.MultiLayerDecoder(config.n_layer, config.tp_degree, hlo_modules,
                                          head_hlo_module, n_layers, buffers)
-
