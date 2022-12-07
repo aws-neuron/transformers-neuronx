@@ -19,6 +19,7 @@ from transformers_neuronx import module
 from transformers_neuronx import parallel
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
+from transformers_neuronx.sampling import simple_sample
 
 
 class GPTJForSampling(module.PretrainedModel):
@@ -47,11 +48,17 @@ class GPTJForSampling(module.PretrainedModel):
         for block in self.transformer.h:
             block.reset()
 
-    def forward(self, input_ids, pos_embd, cache_offset, mask):
+    def forward(self, input_ids, cache_offset, mask):
+        last_offset = cache_offset[-1].item()
         inputs_embeds = self.transformer.wte(input_ids)
         hidden = inputs_embeds.transpose(0, -1)
         dtype = dtypes.to_torch_dtype(self.config.amp)
         hidden = hidden.to(dtype)
+        config = self.config
+        rotary_dim = config.rotary_dim
+        s_head = config.n_embd // config.n_head
+        pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, offset=last_offset)
+        pos_embd = pos_embd.unsqueeze(0)
         pos_embd = pos_embd.to(dtype)
         duplicate = self.manipulator.duplicate
         hidden = duplicate(hidden)
@@ -67,53 +74,12 @@ class GPTJForSampling(module.PretrainedModel):
         logits = logits[:, -1, :]
         return logits
 
-    @torch.no_grad()
     def sample(self, input_ids, sequence_length):
-        config = self.config
-        filter_value = -float('inf')
-        min_length = max_length = top_k = sequence_length
-        rotary_dim = config.rotary_dim
-        s_head = config.n_embd // config.n_head
-        self.reset()
-        start = input_ids.shape[1]
-        inputs = input_ids[:, 0:1]
-        tokens = [input_ids]
-        # auto-regressive generation
-        for cur_len in range(1, max_length):
-            offset = cur_len - 1
-            seq_len = cur_len
-            pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, seq_len=seq_len, offset=offset)
-            pos_embd = pos_embd.unsqueeze(0)
-            mask = torch.zeros([1, config.n_positions])
-            mask[:, :cur_len] = 1.0
+        return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
+                             eos_token_id=self.config.eos_token_id, top_k=50)
 
-            # forward pass to get next token
-            cache_offset = torch.as_tensor([offset], dtype=torch.int32)
-            next_token_scores = self(inputs, pos_embd, cache_offset, mask)
-            if cur_len < start:
-                inputs = input_ids[:, cur_len:cur_len+1]
-                continue
-
-            # pre-process distribution
-            if cur_len < min_length:
-                next_token_scores[:, config.eos_token_id] = -float('inf')
-
-            # Remove all tokens with a probability less than the last token of the top-k
-            topk_values, _ = torch.topk(next_token_scores, top_k)
-            indices_to_remove = next_token_scores < topk_values[:, -1, None]
-            next_token_scores = next_token_scores.masked_fill(indices_to_remove, filter_value)
-
-            # sample
-            probs = torch.nn.functional.softmax(next_token_scores, dim=-1)
-            inputs = torch.multinomial(probs, num_samples=1)
-            tokens.append(inputs)
-
-            # stop when eos_token is found
-            if (inputs == config.eos_token_id).all():
-                break
-        return torch.cat(tokens, dim=-1)
-
-    def _fixed_pos_embedding(self, dim, head_dim, seq_len=None, offset=None):
+    def _fixed_pos_embedding(self, dim, head_dim, offset):
+        seq_len = offset + 1
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2) / dim))
         sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
         sin = torch.sin(sinusoid_inp)
