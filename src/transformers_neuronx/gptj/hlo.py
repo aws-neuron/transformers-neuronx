@@ -16,14 +16,19 @@ from transformers_neuronx import compiler
 from transformers_neuronx import hlo
 
 
-def build_gptj_block_kernel(config):
-    block = gen_scribable_block(config)
-    return compiler.build_kernel(block, config.tp_degree)
+def build_gptj_multi_block_hlo_module(config, n_active_tokens, n_positions, n_blocks):
+    multi_block = gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks)
+    return compiler.compile_py_func(multi_block)
 
 
-def build_lm_head_kernel(config):
-    ln_lm_head = gen_scribable_ln_lm_head(config)
-    return compiler.build_kernel(ln_lm_head, config.tp_degree)
+def build_ln_lm_head_hlo_module(config, n_active_tokens):
+    ln_lm_head = gen_scribable_ln_lm_head(config, n_active_tokens)
+    return compiler.compile_py_func(ln_lm_head)
+
+
+def build_gptj_hlo_module(config, n_active_tokens, n_positions):
+    gptj = gen_scribable_gptj(config, n_active_tokens, n_positions)
+    return compiler.compile_py_func(gptj)
 
 
 def attention(hidden, q_weight, k_weight, v_weight, out_weight, pos_embd,
@@ -165,52 +170,9 @@ def block(hidden, ln_1_weight, ln_1_bias,
     mlp_hidden = hlo.mlp(ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                          activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
-    out_hidden.set_alias_to(hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
     out_value_cache.set_alias_to(value_cache, must=True)
-    root_shape = scribe.tuple(dtype[hidden.sizes], dtype[key_cache.sizes], dtype[value_cache.sizes])
-    return root_shape.Tuple(out_hidden, out_key_cache, out_value_cache)
-
-
-def gen_scribable_block(config):
-    embed_dim = config.n_embd
-    n_heads = config.n_head
-    n_positions = config.n_positions
-    n_active_tokens = config.n_active_tokens
-    batch_size = config.batch_size
-    intermediate_dim = config.intermediate_dim
-    amp = config.amp
-    tp_degree = config.tp_degree
-    head_dim = embed_dim // n_heads
-    attn_dim_tp = embed_dim // tp_degree
-    n_heads_tp = n_heads // tp_degree
-    intermediate_dim_tp = intermediate_dim // tp_degree
-
-    def scribable(scribe):
-        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
-        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
-        ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
-        ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
-        attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
-        pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
-        cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
-        key_cache = pbuilder(cache_shape)
-        value_cache = pbuilder(cache_shape)
-        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
-        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
-        mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
-        mlp_in_bias = pbuilder([intermediate_dim_tp])
-        mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
-        mlp_out_bias = pbuilder([embed_dim])
-        return block(hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
-                     attn_out_weight, pos_embd, key_cache, value_cache, cache_offset, mask,
-                     mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                     config)
-
-    return scribable
+    return out_hidden, out_key_cache, out_value_cache
 
 
 def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
@@ -239,10 +201,9 @@ def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
     return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
 
-def gen_scribable_ln_lm_head(config):
+def gen_scribable_ln_lm_head(config, n_active_tokens):
     embed_dim = config.n_embd
     vocab_size = config.vocab_size
-    n_active_tokens = config.n_active_tokens
     batch_size = config.batch_size
     amp = config.amp
     tp_degree = config.tp_degree
@@ -258,5 +219,161 @@ def gen_scribable_ln_lm_head(config):
         lm_head_weight = pbuilder([embed_dim, vocab_size_tp])
         lm_head_bias = pbuilder([vocab_size_tp])
         return ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
+
+    return scribable
+
+
+def gptj(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config):
+    scribe = hidden.scribe
+    dtype = hidden.dtype
+    outputs = []
+    for (key_cache, value_cache), block_params in zip(blocks_caches, blocks_params):
+        (
+            ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight,
+            mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+        ) = block_params
+        hidden, out_key_cache, out_value_cache = block(
+            hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
+            attn_out_weight, pos_embd, key_cache, value_cache, cache_offset, mask,
+            mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias, config)
+        outputs.append(out_key_cache)
+        outputs.append(out_value_cache)
+    ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias = ln_lm_head_params
+    logits = ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
+    outputs.insert(0, logits)
+    root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+    return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+
+def gen_scribable_gptj(config, n_active_tokens, n_positions):
+    embed_dim = config.n_embd
+    n_heads = config.n_head
+    batch_size = config.batch_size
+    intermediate_dim = config.intermediate_dim
+    amp = config.amp
+    tp_degree = config.tp_degree
+    n_layer = config.n_layer
+    vocab_size = config.vocab_size
+    head_dim = embed_dim // n_heads
+    attn_dim_tp = embed_dim // tp_degree
+    n_heads_tp = n_heads // tp_degree
+    intermediate_dim_tp = intermediate_dim // tp_degree
+    if vocab_size % tp_degree:
+        vocab_size = (vocab_size // tp_degree + 1) * tp_degree
+    vocab_size_tp = vocab_size // tp_degree
+
+    def scribable(scribe):
+        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
+        pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
+        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
+        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
+
+        def gen_block_caches():
+            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+            key_cache = pbuilder(cache_shape)
+            value_cache = pbuilder(cache_shape)
+            return key_cache, value_cache
+
+        def gen_block_params():
+            ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
+            mlp_in_bias = pbuilder([intermediate_dim_tp])
+            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
+            mlp_out_bias = pbuilder([embed_dim])
+            return (
+                ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
+                attn_out_weight, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            )
+
+        def gen_ln_lm_head_params():
+            ln_f_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_f_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            lm_head_weight = pbuilder([embed_dim, vocab_size_tp])
+            lm_head_bias = pbuilder([vocab_size_tp])
+            return ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias
+
+        blocks_caches = [gen_block_caches() for _ in range(n_layer)]
+        blocks_params = [gen_block_params() for _ in range(n_layer)]
+        ln_lm_head_params = gen_ln_lm_head_params()
+        return gptj(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
+
+    return scribable
+
+
+def multi_block(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, config):
+    scribe = hidden.scribe
+    input_hidden = hidden
+    outputs = []
+    for (key_cache, value_cache), block_params in zip(blocks_caches, blocks_params):
+        (
+            ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
+            attn_out_weight, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+        ) = block_params
+        hidden, out_key_cache, out_value_cache = block(
+            hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
+            attn_out_weight, pos_embd, key_cache, value_cache, cache_offset, mask,
+            mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,  config)
+        outputs.append(out_key_cache)
+        outputs.append(out_value_cache)
+    hidden.set_alias_to(input_hidden)
+    outputs.insert(0, hidden)
+    root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+    return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+
+def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
+    embed_dim = config.n_embd
+    n_heads = config.n_head
+    batch_size = config.batch_size
+    intermediate_dim = config.intermediate_dim
+    amp = config.amp
+    tp_degree = config.tp_degree
+    vocab_size = config.vocab_size
+    head_dim = embed_dim // n_heads
+    attn_dim_tp = embed_dim // tp_degree
+    n_heads_tp = n_heads // tp_degree
+    intermediate_dim_tp = intermediate_dim // tp_degree
+    if vocab_size % tp_degree:
+        vocab_size = (vocab_size // tp_degree + 1) * tp_degree
+    vocab_size_tp = vocab_size // tp_degree
+
+    def scribable(scribe):
+        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
+        pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
+        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
+        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
+
+        def gen_block_caches():
+            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+            key_cache = pbuilder(cache_shape)
+            value_cache = pbuilder(cache_shape)
+            return key_cache, value_cache
+
+        def gen_block_params():
+            ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
+            mlp_in_bias = pbuilder([intermediate_dim_tp])
+            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
+            mlp_out_bias = pbuilder([embed_dim])
+            return (
+                ln_1_weight, ln_1_bias, attn_q_weight, attn_k_weight, attn_v_weight,
+                attn_out_weight, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            )
+
+        blocks_caches = [gen_block_caches() for _ in range(n_blocks)]
+        blocks_params = [gen_block_params() for _ in range(n_blocks)]
+        return multi_block(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, config)
 
     return scribable
