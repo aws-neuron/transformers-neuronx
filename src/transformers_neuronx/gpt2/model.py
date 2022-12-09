@@ -188,27 +188,29 @@ class GPT2Block(module.LowMemoryModule):
         primary_only = manipulator.primary_only
         self.ln_1_weight = duplicate(self.ln_1.weight.detach())
         self.ln_1_bias = duplicate(self.ln_1.bias.detach())
-        c_attn = self.attn.c_attn
-        c_proj = self.attn.c_proj
-        c_attn_weight = c_attn.weight.detach()
-        c_attn_bias = c_attn.bias.detach()
+        c_attn_weight = self.attn.c_attn.weight.detach()
+        c_attn_bias = self.attn.c_attn.bias.detach()
         n_embd = self.config.n_embd
-        self.attn_q_weight = shard_along(c_attn_weight[:, :n_embd], dim=1)
+        attn_q_weight = c_attn_weight[:, :n_embd]
+        attn_k_weight = c_attn_weight[:, n_embd:n_embd*2]
+        attn_v_weight = c_attn_weight[:, n_embd*2:n_embd*3]
+        attn_out_weight = self.attn.c_proj.weight.detach()
+        mlp_in_weight = self.mlp.c_fc.weight.detach()
+        mlp_out_weight = self.mlp.c_proj.weight.detach()
+        self.attn_q_weight = shard_along(attn_q_weight, dim=1)
         self.attn_q_bias = shard_along(c_attn_bias[:n_embd], dim=0)
-        self.attn_k_weight = shard_along(c_attn_weight[:, n_embd:n_embd*2], dim=1)
+        self.attn_k_weight = shard_along(attn_k_weight, dim=1)
         self.attn_k_bias = shard_along(c_attn_bias[n_embd:n_embd*2], dim=0)
-        self.attn_v_weight = shard_along(c_attn_weight[:, n_embd*2:n_embd*3], dim=1)
+        self.attn_v_weight = shard_along(attn_v_weight, dim=1)
         self.attn_v_bias = shard_along(c_attn_bias[n_embd*2:n_embd*3], dim=0)
-        self.attn_out_weight = shard_along(c_proj.weight.detach(), dim=0)
-        self.attn_out_bias = primary_only(c_proj.bias.detach())
+        self.attn_out_weight = shard_along(attn_out_weight, dim=0)
+        self.attn_out_bias = primary_only(self.attn.c_proj.bias.detach())
         self.ln_2_weight = duplicate(self.ln_2.weight.detach())
         self.ln_2_bias = duplicate(self.ln_2.bias.detach())
-        c_fc = self.mlp.c_fc
-        c_proj = self.mlp.c_proj
-        self.mlp_in_weight = shard_along(c_fc.weight.detach(), dim=1)
-        self.mlp_in_bias = shard_along(c_fc.bias.detach(), dim=0)
-        self.mlp_out_weight = shard_along(c_proj.weight.detach(), dim=0)
-        self.mlp_out_bias = primary_only(c_proj.bias.detach())
+        self.mlp_in_weight = shard_along(mlp_in_weight, dim=1)
+        self.mlp_in_bias = shard_along(self.mlp.c_fc.bias.detach(), dim=0)
+        self.mlp_out_weight = shard_along(mlp_out_weight, dim=0)
+        self.mlp_out_bias = primary_only(self.mlp.c_proj.bias.detach())
         self.nullify()
 
         slice_on_nc = manipulator.slice_on_nc
