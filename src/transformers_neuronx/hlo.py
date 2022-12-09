@@ -152,6 +152,19 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
+def decoder_attention_mask(cache_offset, dtype, sizes):
+    int_dtype = cache_offset.dtype
+    pred = cache_offset.scribe.pred
+    iota0 = int_dtype[sizes].Iota(dimensions=[0])
+    iota1 = int_dtype[sizes].Iota(dimensions=[1])
+    triu = pred[sizes].Compare(iota0, iota1, comparison_direction='GE')
+    triu = dtype[sizes].Convert(triu)
+    cache_offset = int_dtype[sizes].Broadcast(cache_offset, dimensions=[0])
+    mask = pred[sizes].Compare(iota1, cache_offset, comparison_direction='LE')
+    mask = dtype[sizes].Convert(mask)
+    return dtype[sizes].Multiply(mask, triu)
+
+
 class ParameterBuilder:
 
     def __init__(self, dtype):

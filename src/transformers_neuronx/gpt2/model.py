@@ -67,7 +67,7 @@ class GPT2ForSampling(module.PretrainedModel):
         for block in self.transformer.h:
             block.reset()
 
-    def forward(self, input_ids, cache_offset, mask):
+    def forward(self, input_ids, cache_offset):
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -75,11 +75,11 @@ class GPT2ForSampling(module.PretrainedModel):
         init_step = self.init_program.init_step(self.init_n_active_tokens)
         for cur_len in range(0, init_length, init_step):
             slicing = slice(cur_len, cur_len + init_step)
-            inputs = input_ids[:, slicing], cache_offset[slicing], mask[slicing]
+            inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.init_program, bucket_id, *inputs)
         for cur_len in range(init_length, this_length):
             slicing = slice(cur_len, cur_len + 1)
-            inputs = input_ids[:, slicing], cache_offset[slicing], mask[slicing]
+            inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
@@ -88,9 +88,8 @@ class GPT2ForSampling(module.PretrainedModel):
         logits = logits[:, -1, :]
         return logits
 
-    def _run_program(self, program, bucket_id, input_ids, cache_offset, mask):
+    def _run_program(self, program, bucket_id, input_ids, cache_offset):
         active_n_positions = self.n_positions_list[bucket_id]
-        mask = mask[:, :active_n_positions].contiguous()
         inputs_embeds = self.transformer.wte(input_ids)
         past_length = cache_offset[0].item()
         this_length = input_ids.shape[-1]
@@ -104,8 +103,7 @@ class GPT2ForSampling(module.PretrainedModel):
         hidden = hidden.to(hidden_buffer.dtype)
         hidden = self.manipulator.duplicate_on_cpu(hidden)
         cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        mask = self.manipulator.duplicate_on_cpu(mask)
-        for in_buffer, in_tensor in zip(input_buffers, [hidden, cache_offset, mask]):
+        for in_buffer, in_tensor in zip(input_buffers, [hidden, cache_offset]):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
@@ -123,22 +121,20 @@ class GPT2Buffers:
         first_hlo_module, *_ = opt_hlo_modules
         hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
         cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
-        mask_buffers = [compiler.gen_zero_input(hlo, 2) for hlo in opt_hlo_modules]
-        self.input_buffers = [hidden_buffer, cache_offset_buffer, mask_buffers]
+        self.input_buffers = [hidden_buffer, cache_offset_buffer]
         self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
     def to_neuron(self):
-        hidden_buffer, cache_offset_buffer, mask_buffers = self.input_buffers
+        hidden_buffer, cache_offset_buffer = self.input_buffers
         hidden_buffer = self.manipulator.duplicate(hidden_buffer)
         cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
-        mask_buffers = [self.manipulator.duplicate(mask_buffer) for mask_buffer in mask_buffers]
-        self.input_buffers = [hidden_buffer, cache_offset_buffer, mask_buffers]
+        self.input_buffers = [hidden_buffer, cache_offset_buffer]
         self.output_buffer = self.manipulator.duplicate(self.output_buffer)
 
     def get_input_buffers(self, bucket_id):
-        hidden_buffer, cache_offset_buffer, mask_buffers = self.input_buffers
-        return [hidden_buffer, cache_offset_buffer, mask_buffers[bucket_id]]
+        hidden_buffer, cache_offset_buffer = self.input_buffers
+        return [hidden_buffer, cache_offset_buffer]
 
 
 def find_first_ge_index(values, target):
