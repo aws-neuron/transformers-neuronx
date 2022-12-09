@@ -22,9 +22,7 @@ def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_to
 
     # populate key/value caches according to the prompt text
     cache_offset = torch.arange(start, dtype=torch.int32)
-    mask = torch.ones([start, max_sequence_length])
-    mask = torch.tril(mask)
-    next_token_scores = model(input_ids, cache_offset, mask)
+    next_token_scores = model(input_ids, cache_offset)
 
     # auto-regressive generation
     tokens = [input_ids]
@@ -45,7 +43,5 @@ def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_to
 
         # forward pass to get next token
         cache_offset = torch.as_tensor([cur_len], dtype=torch.int32)
-        mask = torch.zeros([1, max_sequence_length])
-        mask[:, :next_len] = 1.0
-        next_token_scores = model(inputs, cache_offset, mask)
+        next_token_scores = model(inputs, cache_offset)
     return torch.cat(tokens, dim=-1)

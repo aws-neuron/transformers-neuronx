@@ -171,59 +171,6 @@ def block(hidden, ln_1_weight, ln_1_bias,
     return out_hidden, out_key_cache, out_value_cache
 
 
-def gen_scribable_block(config, n_active_tokens, n_positions):
-    embed_dim = config.n_embd
-    n_heads = config.n_head
-    batch_size = config.batch_size
-    intermediate_dim = config.intermediate_dim
-    amp = config.amp
-    tp_degree = config.tp_degree
-
-    head_dim = embed_dim // n_heads
-    attn_dim_tp = embed_dim // tp_degree
-    n_heads_tp = n_heads // tp_degree
-    intermediate_dim_tp = intermediate_dim // tp_degree
-
-    def scribable(scribe):
-        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
-        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
-        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
-        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
-        cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
-        key_cache = pbuilder(cache_shape)
-        value_cache = pbuilder(cache_shape)
-        ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
-        ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
-        attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_q_bias = pbuilder([attn_dim_tp])
-        attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_k_bias = pbuilder([attn_dim_tp])
-        attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
-        attn_v_bias = pbuilder([attn_dim_tp])
-        attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
-        attn_out_bias = pbuilder([embed_dim])
-        ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
-        ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
-        mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
-        mlp_in_bias = pbuilder([intermediate_dim_tp])
-        mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
-        mlp_out_bias = pbuilder([embed_dim])
-        out_hidden, key_cache, value_cache = block(
-            hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
-            attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
-            attn_out_weight, attn_out_bias, key_cache, value_cache, cache_offset, mask,
-            ln_2_weight, ln_2_bias, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-            config)
-        out_hidden.set_alias_to(hidden)
-        out_hidden_shape = out_hidden.dtype[out_hidden.sizes]
-        key_shape = key_cache.dtype[key_cache.sizes]
-        value_shape = value_cache.dtype[value_cache.sizes]
-        root_shape = scribe.tuple(out_hidden_shape, key_shape, value_shape)
-        return root_shape.Tuple(out_hidden, key_cache, value_cache)
-
-    return scribable
-
-
 def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight):
     # single:
     #   hidden: [h, a, b]
@@ -315,7 +262,6 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
         hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
-        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
 
         def gen_block_caches():
             cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
@@ -356,6 +302,7 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         blocks_caches = [gen_block_caches() for _ in range(n_layer)]
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
+        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, [n_active_tokens, n_positions])
         return gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
 
     return scribable
@@ -406,7 +353,6 @@ def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
         pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
         hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
-        mask = pbuilder([n_active_tokens, n_positions], dtype=scribe.f32)
 
         def gen_block_caches():
             cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
@@ -440,6 +386,7 @@ def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
 
         blocks_caches = [gen_block_caches() for _ in range(n_blocks)]
         blocks_params = [gen_block_params() for _ in range(n_blocks)]
+        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, [n_active_tokens, n_positions])
         return multi_block(hidden, cache_offset, mask, blocks_caches, blocks_params, config)
 
     return scribable
