@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-from torch.nn.parameter import UninitializedParameter
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
@@ -203,36 +202,25 @@ class GPTJBlock(module.LowMemoryModule):
         self.value_cache_slices = None
 
     def to_neuron(self, n_positions_list):
+        self.materialize()
         config = self.config
         manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
-        self.ln_1.materialize()
         self.ln_1_weight = duplicate(self.ln_1.weight.detach())
         self.ln_1_bias = duplicate(self.ln_1.bias.detach())
         attn = self.attn
-        attn.q_proj.materialize()
-        attn.k_proj.materialize()
-        attn.v_proj.materialize()
-        attn.out_proj.materialize()
         self.attn_q_weight = shard_along(attn.q_proj.weight.detach().T, dim=1)
         self.attn_k_weight = shard_along(attn.k_proj.weight.detach().T, dim=1)
         self.attn_v_weight = shard_along(attn.v_proj.weight.detach().T, dim=1)
         self.attn_out_weight = shard_along(attn.out_proj.weight.detach().T, dim=0)
-        attn.q_proj.weight = UninitializedParameter()
-        attn.k_proj.weight = UninitializedParameter()
-        attn.v_proj.weight = UninitializedParameter()
-        attn.out_proj.weight = UninitializedParameter()
         mlp = self.mlp
-        mlp.fc_in.materialize()
-        mlp.fc_out.materialize()
         self.mlp_in_weight = shard_along(mlp.fc_in.weight.detach().T, dim=1)
         self.mlp_in_bias = shard_along(mlp.fc_in.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(mlp.fc_out.weight.detach().T, dim=0)
         self.mlp_out_bias = primary_only(mlp.fc_out.bias.detach())
-        mlp.fc_in.weight = UninitializedParameter()
-        mlp.fc_out.weight = UninitializedParameter()
+        self.nullify()
 
         slice_on_nc = manipulator.slice_on_nc
         n_positions = config.n_positions
@@ -317,7 +305,7 @@ class GPTJLnLmHead:
         self.lm_head.materialize()
         self.lm_head_weight = shard_along(self.lm_head.weight.detach().T, dim=1)
         self.lm_head_bias = shard_along(self.lm_head.bias.detach(), dim=0)
-        self.lm_head.weight = UninitializedParameter()
+        self.lm_head.nullify()
 
     def get_parameters(self):
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight, self.lm_head_bias]

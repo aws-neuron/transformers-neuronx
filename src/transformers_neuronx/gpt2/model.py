@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-from torch.nn.parameter import UninitializedParameter
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
@@ -185,18 +184,16 @@ class GPT2Block(module.LowMemoryModule):
         self.value_cache_slices = None
 
     def to_neuron(self, n_positions_list):
+        self.materialize()
         config = self.config
         manipulator = parallel.ParallelTensorManipulator(self.config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
-        self.ln_1.materialize()
         self.ln_1_weight = duplicate(self.ln_1.weight.detach())
         self.ln_1_bias = duplicate(self.ln_1.bias.detach())
         c_attn = self.attn.c_attn
-        c_attn.materialize()
         c_proj = self.attn.c_proj
-        c_proj.materialize()
         c_attn_weight = c_attn.weight.detach()
         c_attn_bias = c_attn.bias.detach()
         n_embd = self.config.n_embd
@@ -208,21 +205,15 @@ class GPT2Block(module.LowMemoryModule):
         self.attn_v_bias = shard_along(c_attn_bias[n_embd*2:n_embd*3], dim=0)
         self.attn_out_weight = shard_along(c_proj.weight.detach(), dim=0)
         self.attn_out_bias = primary_only(c_proj.bias.detach())
-        c_attn.weight = UninitializedParameter()
-        c_proj.weight = UninitializedParameter()
-        self.ln_2.materialize()
         self.ln_2_weight = duplicate(self.ln_2.weight.detach())
         self.ln_2_bias = duplicate(self.ln_2.bias.detach())
         c_fc = self.mlp.c_fc
-        c_fc.materialize()
         c_proj = self.mlp.c_proj
-        c_proj.materialize()
         self.mlp_in_weight = shard_along(c_fc.weight.detach(), dim=1)
         self.mlp_in_bias = shard_along(c_fc.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(c_proj.weight.detach(), dim=0)
         self.mlp_out_bias = primary_only(c_proj.bias.detach())
-        c_fc.weight = UninitializedParameter()
-        c_proj.weight = UninitializedParameter()
+        self.nullify()
 
         slice_on_nc = manipulator.slice_on_nc
         n_positions = config.n_positions
@@ -312,7 +303,7 @@ class GPT2LnLmHead:
         lm_head_weight = self.lm_head.weight.detach()
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
         self.lm_head_weight = self.manipulator.shard_along(lm_head_weight.T, dim=1)
-        self.lm_head.weight = UninitializedParameter()
+        self.lm_head.nullify()
 
     def get_parameters(self):
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]

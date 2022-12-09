@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-from torch.nn.parameter import UninitializedParameter
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
@@ -211,22 +210,18 @@ class OPTDecoderLayer(module.LowMemoryModule):
         self.value_cache_slices = None
 
     def to_neuron(self, n_positions_list):
+        self.materialize()
         config = self.config
         manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         duplicate = manipulator.duplicate
         shard_along = manipulator.shard_along
         primary_only = manipulator.primary_only
-        self.self_attn_layer_norm.materialize()
         self.ln_1_weight = duplicate(self.self_attn_layer_norm.weight.detach())
         self.ln_1_bias = duplicate(self.self_attn_layer_norm.bias.detach())
         q_proj = self.self_attn.q_proj
         k_proj = self.self_attn.k_proj
         v_proj = self.self_attn.v_proj
         out_proj = self.self_attn.out_proj
-        q_proj.materialize()
-        k_proj.materialize()
-        v_proj.materialize()
-        out_proj.materialize()
         self.attn_q_weight = shard_along(q_proj.weight.detach().T, dim=1)
         self.attn_q_bias = shard_along(q_proj.bias.detach(), dim=0)
         self.attn_k_weight = shard_along(k_proj.weight.detach().T, dim=1)
@@ -235,27 +230,15 @@ class OPTDecoderLayer(module.LowMemoryModule):
         self.attn_v_bias = shard_along(v_proj.bias.detach(), dim=0)
         self.attn_out_weight = shard_along(out_proj.weight.detach().T, dim=0)
         self.attn_out_bias = primary_only(out_proj.bias.detach())
-        q_proj.weight = UninitializedParameter()
-        q_proj.bias = UninitializedParameter()
-        k_proj.weight = UninitializedParameter()
-        k_proj.bias = UninitializedParameter()
-        v_proj.weight = UninitializedParameter()
-        v_proj.bias = UninitializedParameter()
-        out_proj.weight = UninitializedParameter()
-        out_proj.bias = UninitializedParameter()
-        self.final_layer_norm.materialize()
         self.ln_2_weight = duplicate(self.final_layer_norm.weight.detach())
         self.ln_2_bias = duplicate(self.final_layer_norm.bias.detach())
         fc1 = self.fc1
         fc2 = self.fc2
-        fc1.materialize()
-        fc2.materialize()
         self.mlp_in_weight = shard_along(fc1.weight.detach().T, dim=1)
         self.mlp_in_bias = shard_along(fc1.bias.detach(), dim=0)
         self.mlp_out_weight = shard_along(fc2.weight.detach().T, dim=0)
         self.mlp_out_bias = primary_only(fc2.bias.detach())
-        fc1.weight = UninitializedParameter()
-        fc2.weight = UninitializedParameter()
+        self.nullify()
 
         slice_on_nc = manipulator.slice_on_nc
         n_positions = config.n_positions
@@ -338,7 +321,7 @@ class OPTLnLmHead:
         lm_head_weight = self.lm_head.weight.detach()
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
         self.lm_head_weight = self.manipulator.shard_along(lm_head_weight.T, dim=1)
-        self.lm_head.weight = UninitializedParameter()
+        self.lm_head.nullify()
 
     def get_parameters(self):
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
