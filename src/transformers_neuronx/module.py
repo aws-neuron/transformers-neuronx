@@ -16,6 +16,7 @@ import json
 import os
 import re
 import torch
+from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
 
 
@@ -63,6 +64,20 @@ class LowMemoryModule(torch.nn.Module):
                 if torch.nn.parameter.is_lazy(param):
                     param.materialize(input_param.shape)
                 param.copy_(input_param)
+
+    def nullify(self):
+
+        def _nullify(module):
+            for name, param in module.named_parameters():
+                if '.' not in name and hasattr(module, name):
+                    setattr(module, name, UninitializedParameter())
+            for child in module.modules():
+                if child is module:
+                    continue
+                if child is not None:
+                    _nullify(child)
+
+        _nullify(self)
 
     def load_state_dict_low_memory(self, state_dict):
 
