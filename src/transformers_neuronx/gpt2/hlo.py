@@ -14,6 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import compiler
 from transformers_neuronx import hlo
+from transformers_neuronx import utils
 
 
 def build_gpt2_multi_block_hlo_module(config, n_active_tokens, n_positions, n_blocks):
@@ -26,14 +27,14 @@ def build_ln_lm_head_hlo_module(config, n_active_tokens):
     return compiler.compile_py_func(ln_lm_head)
 
 
-def build_gpt2_hlo_module(config, n_active_tokens, n_positions):
-    gpt2 = gen_scribable_gpt2(config, n_active_tokens, n_positions)
+def build_gpt2_hlo_module(config, n_active_tokens, n_positions, blocks_u8_bounds):
+    gpt2 = gen_scribable_gpt2(config, n_active_tokens, n_positions, blocks_u8_bounds)
     return compiler.compile_py_func(gpt2)
 
 
 def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias,
               cached_keys, cached_values, cache_offset, mask,
-              n_heads, tp_degree):
+              n_heads, tp_degree, dequant_dtype, u8_bounds):
     # hidden: [768, a, b]
     # cached_keys: [1024, b, 12, 64]
     # cached_values: [1024, b, 12, 64]
@@ -50,6 +51,12 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
     n_heads_tp = n_heads // tp_degree
     d_head = hidden_size // n_heads
     active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+    if u8_bounds is not None:
+        q_min, q_max, k_min, k_max, v_min, v_max, out_min, out_max, *_ = u8_bounds
+        q_weight = hlo.u8_decode(dtype, dequant_dtype, q_weight, q_min, q_max)
+        k_weight = hlo.u8_decode(dtype, dequant_dtype, k_weight, k_min, k_max)
+        v_weight = hlo.u8_decode(dtype, dequant_dtype, v_weight, v_min, v_max)
+        out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
 
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)        # [768, a, b] -> [768, a*b]
     active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias)   # [768, a*b] mm [768, 768] -> [a*b, 768]
@@ -133,7 +140,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
           attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
           key_cache, value_cache, cache_offset, mask, ln_2_weight, ln_2_bias,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-          config):
+          config, dequant_dtype=None, u8_bounds=None):
     dtype = hidden.dtype
     scribe = hidden.scribe
     ln_1_weight = hlo.transfer_with_static_ring(ln_1_weight)
@@ -154,6 +161,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
         attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
         in_key_cache, in_value_cache, cache_offset, mask,
         n_heads=config.n_head, tp_degree=config.tp_degree,
+        dequant_dtype=dequant_dtype, u8_bounds=u8_bounds,
     )
     out_hidden = dtype[hidden.sizes].Add(attn_output, hidden)
     ln_2_weight = hlo.transfer_with_static_ring(ln_2_weight)
@@ -164,7 +172,8 @@ def block(hidden, ln_1_weight, ln_1_bias,
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
     out_ln_hidden = hlo.layer_norm(out_hidden, ln_2_weight, ln_2_bias)
     mlp_hidden = hlo.mlp(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                         activation_function=config.activation_function, tp_degree=config.tp_degree)
+                         activation_function=config.activation_function, tp_degree=config.tp_degree,
+                         dequant_dtype=dequant_dtype, u8_bounds=u8_bounds)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
     out_value_cache.set_alias_to(value_cache, must=True)
@@ -215,23 +224,27 @@ def gen_scribable_ln_lm_head(config, n_active_tokens):
     return scribable
 
 
-def gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config):
+def gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params,
+         dequant_dtype, blocks_u8_bounds, config):
+    if blocks_u8_bounds is None:
+        blocks_u8_bounds = [None for _ in blocks_params]
     scribe = hidden.scribe
     dtype = hidden.dtype
     outputs = []
-    for (key_cache, value_cache), block_params in zip(blocks_caches, blocks_params):
+    for caches, params, u8_bounds in zip(blocks_caches, blocks_params, blocks_u8_bounds):
+        key_cache, value_cache = caches
         (
             ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
             attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
             attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-        ) = block_params
+        ) = params
         hidden, out_key_cache, out_value_cache = block(
             hidden, ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
             attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
             attn_out_weight, attn_out_bias, key_cache, value_cache, cache_offset, mask,
             ln_2_weight, ln_2_bias, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-            config)
+            config, dequant_dtype, u8_bounds)
         outputs.append(out_key_cache)
         outputs.append(out_value_cache)
     ln_f_weight, ln_f_bias, lm_head_weight = ln_lm_head_params
@@ -241,15 +254,15 @@ def gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_pa
     return scribe.tuple(*root_shapes).Tuple(*outputs)
 
 
-def gen_scribable_gpt2(config, n_active_tokens, n_positions):
+def gen_scribable_gpt2(config, n_active_tokens, n_positions, blocks_u8_bounds=None):
     embed_dim = config.n_embd
     n_heads = config.n_head
     batch_size = config.batch_size
     intermediate_dim = config.intermediate_dim
-    amp = config.amp
     tp_degree = config.tp_degree
     n_layer = config.n_layer
     vocab_size = config.vocab_size
+    amp, quantized, dequantized = utils.parse_amp(config.amp)
     head_dim = embed_dim // n_heads
     attn_dim_tp = embed_dim // tp_degree
     n_heads_tp = n_heads // tp_degree
@@ -259,7 +272,10 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
     vocab_size_tp = vocab_size // tp_degree
 
     def scribable(scribe):
-        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
+        dtype = getattr(scribe, amp)
+        weight_dtype = dtype if quantized is None else getattr(scribe, quantized)
+        dequant_dtype = None if dequantized is None else getattr(scribe, dequantized)
+        pbuilder = hlo.ParameterBuilder(dtype)
         hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
 
@@ -272,19 +288,19 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         def gen_block_params():
             ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
             ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
-            attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_q_weight = pbuilder([embed_dim, attn_dim_tp], dtype=weight_dtype)
             attn_q_bias = pbuilder([attn_dim_tp])
-            attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_k_weight = pbuilder([embed_dim, attn_dim_tp], dtype=weight_dtype)
             attn_k_bias = pbuilder([attn_dim_tp])
-            attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_v_weight = pbuilder([embed_dim, attn_dim_tp], dtype=weight_dtype)
             attn_v_bias = pbuilder([attn_dim_tp])
-            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            attn_out_weight = pbuilder([attn_dim_tp, embed_dim], dtype=weight_dtype)
             attn_out_bias = pbuilder([embed_dim])
             ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
             ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
-            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
+            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp], dtype=weight_dtype)
             mlp_in_bias = pbuilder([intermediate_dim_tp])
-            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
+            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim], dtype=weight_dtype)
             mlp_out_bias = pbuilder([embed_dim])
             return (
                 ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
@@ -303,7 +319,8 @@ def gen_scribable_gpt2(config, n_active_tokens, n_positions):
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
         mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, [n_active_tokens, n_positions])
-        return gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
+        return gpt2(hidden, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params,
+                    dequant_dtype, blocks_u8_bounds, config)
 
     return scribable
 
