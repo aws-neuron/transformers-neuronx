@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import torch
+
 
 def maybe_override_attributes(self, kwargs):
     for key, value in kwargs.items():
@@ -33,3 +35,23 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
 
 def pad_vocab_size(vocab_size, tp_degree):
     return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
+
+
+def amp_is_u8(amp):
+    return '-u8-' in amp
+
+
+def parse_amp(amp):
+    if amp_is_u8(amp):
+        return amp.split('-')
+    return amp, None, None
+
+
+def u8_encode(tensor):
+    tensor = tensor.to(torch.float32)
+    tensor_min = tensor.min().item()
+    tensor_max = tensor.max().item()
+    tensor = tensor - tensor_min
+    tensor *= 255.0 / (tensor_max - tensor_min)
+    tensor = tensor.round().to(torch.uint8)
+    return tensor, tensor_min, tensor_max

@@ -34,9 +34,12 @@ class GPT2ForSampling(module.PretrainedModel):
         self.config = config
         if unroll is None:
             unroll = config.n_layer
+        if utils.amp_is_u8(amp) and unroll != config.n_layer:
+            raise NotImplementedError(f'amp={amp} only works with unroll={config.n_layer}')
         self.unroll = unroll
         self.init_n_active_tokens = init_n_active_tokens
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.transformer = GPT2Transformer(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.ln_lm_head = GPT2LnLmHead(config, self.transformer.ln_f, self.lm_head)
@@ -51,15 +54,19 @@ class GPT2ForSampling(module.PretrainedModel):
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
-        self.program = build_gpt2_program(config, 1, n_positions_list, unroll)
-        init_n_active = self.init_n_active_tokens
-        if init_n_active is not None:
-            self.init_program = build_gpt2_program(config, init_n_active, n_positions_list, unroll)
         self.transformer.wte.materialize()
         self.transformer.wpe.materialize()
         for idx, block in enumerate(self.transformer.h):
             block.to_neuron(n_positions_list)
         self.ln_lm_head.to_neuron()
+        blocks_u8_bounds = None
+        if utils.amp_is_u8(config.amp):
+            blocks_u8_bounds = [block.get_u8_bounds() for block in self.transformer.h]
+        self.program = build_gpt2_program(config, 1, n_positions_list, unroll, blocks_u8_bounds)
+        init_n_active = self.init_n_active_tokens
+        if init_n_active is not None:
+            self.init_program = build_gpt2_program(config, init_n_active, n_positions_list, unroll,
+                                                   blocks_u8_bounds)
         self.program.setup(self.transformer.h, self.ln_lm_head)
         self.init_program.setup(self.transformer.h, self.ln_lm_head)
 
@@ -178,6 +185,18 @@ class GPT2Block(module.LowMemoryModule):
         self.key_cache_slices = None
         self.value_cache = None
         self.value_cache_slices = None
+        self.attn_q_min = None
+        self.attn_q_max = None
+        self.attn_k_min = None
+        self.attn_k_max = None
+        self.attn_v_min = None
+        self.attn_v_max = None
+        self.attn_out_min = None
+        self.attn_out_max = None
+        self.mlp_in_min = None
+        self.mlp_in_max = None
+        self.mlp_out_min = None
+        self.mlp_out_max = None
 
     def to_neuron(self, n_positions_list):
         self.materialize()
@@ -197,6 +216,13 @@ class GPT2Block(module.LowMemoryModule):
         attn_out_weight = self.attn.c_proj.weight.detach()
         mlp_in_weight = self.mlp.c_fc.weight.detach()
         mlp_out_weight = self.mlp.c_proj.weight.detach()
+        if utils.amp_is_u8(self.config.amp):
+            attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(attn_q_weight)
+            attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(attn_k_weight)
+            attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(attn_v_weight)
+            attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(attn_out_weight)
+            mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(mlp_in_weight)
+            mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(mlp_out_weight)
         self.attn_q_weight = shard_along(attn_q_weight, dim=1)
         self.attn_q_bias = shard_along(c_attn_bias[:n_embd], dim=0)
         self.attn_k_weight = shard_along(attn_k_weight, dim=1)
@@ -219,7 +245,8 @@ class GPT2Block(module.LowMemoryModule):
         n_head = config.n_head
         s_head = config.n_embd // n_head
         cache_shape = [n_positions, batch_size, n_head, s_head]
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         key_cache = torch.zeros(cache_shape, dtype=dtype)
         key_cache = manipulator.shard_along(key_cache, dim=2)
         self.key_cache = key_cache
@@ -251,6 +278,13 @@ class GPT2Block(module.LowMemoryModule):
             self.mlp_out_bias,
         ]
 
+    def get_u8_bounds(self):
+        return (
+            self.attn_q_min, self.attn_q_max, self.attn_k_min, self.attn_k_max,
+            self.attn_v_min, self.attn_v_max, self.attn_out_min, self.attn_out_max,
+            self.mlp_in_min, self.mlp_in_max, self.mlp_out_min, self.mlp_out_max,
+        )
+
     def get_cache_slices(self):
         return [self.key_cache_slices, self.value_cache_slices]
 
@@ -266,7 +300,8 @@ class GPT2Attention(module.LowMemoryModule):
     def __init__(self, config):
         super().__init__()
         n_embd = config.n_embd
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.c_attn = module.LowMemoryLazyLinear(n_embd, dtype=dtype)
         self.c_proj = module.LowMemoryLazyLinear(n_embd, dtype=dtype)
 
@@ -275,7 +310,8 @@ class GPT2MLP(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.c_fc = module.LowMemoryLazyLinear(config.n_embd, dtype=dtype)
         self.c_proj = module.LowMemoryLazyLinear(config.intermediate_dim, dtype=dtype)
 
@@ -307,8 +343,9 @@ class GPT2LnLmHead:
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
 
 
-def build_gpt2_program(config, n_active, n_positions_list, n_layers):
-    hlo_modules = [hlo.build_gpt2_hlo_module(config, n_active, npos) for npos in n_positions_list]
+def build_gpt2_program(config, n_active, n_positions_list, n_layers, blocks_u8_bounds):
+    hlo_modules = [hlo.build_gpt2_hlo_module(config, n_active, npos, blocks_u8_bounds)
+                   for npos in n_positions_list]
     buffers = GPT2Buffers(hlo_modules, config.tp_degree)
     if n_layers == config.n_layer:
         return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)
