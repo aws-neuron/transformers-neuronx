@@ -98,7 +98,8 @@ def gen_max_func(dtype):
     return max_func
 
 
-def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree):
+def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
+        dequant_dtype=None, u8_bounds=None):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
@@ -112,6 +113,11 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     #   out_weight: [4h/t, h]
     #   out_bias: [h]
     dtype = hidden.dtype
+    if u8_bounds is not None:
+        f32 = hidden.scribe.f32
+        *_, in_min, in_max, out_min, out_max = u8_bounds
+        in_weight = u8_decode(dtype, dequant_dtype, in_weight, in_min, in_max)
+        out_weight = u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
     hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
@@ -125,6 +131,19 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     add_func = gen_add_func(dtype)
     hidden = dtype[hidden_sizes].AllReduce(hidden, replica_groups=replica_groups, to_apply=add_func)
     return hidden
+
+
+def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
+    sizes = weight.sizes
+    weight = dequant_dtype[sizes].Convert(weight)
+    factor = (max_value - min_value) / 255.0
+    factor = dequant_dtype.Constant(constant_value=factor)
+    factor = dequant_dtype[sizes].Broadcast(factor, dimensions=[])
+    min_value = dequant_dtype.Constant(constant_value=min_value)
+    min_value = dequant_dtype[sizes].Broadcast(min_value, dimensions=[])
+    weight = dequant_dtype[sizes].Multiply(weight, factor)
+    weight = dequant_dtype[sizes].Add(weight, min_value)
+    return dtype[sizes].Convert(weight)
 
 
 def softmax(logits, dim=None):
