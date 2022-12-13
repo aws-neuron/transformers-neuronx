@@ -29,7 +29,7 @@ def build_ln_lm_head_hlo_module(config, n_active_tokens):
     return compiler.compile_py_func(ln_lm_head)
 
 
-def build_opt_hlo_module(config, n_active_tokens, n_positions):
+def build_opt_hlo_module(config, n_active_tokens, n_positions, blocks_u8_bounds):
     config = opt_config_to_gpt2_config(config)
-    gpt2 = gpt2_hlo.gen_scribable_gpt2(config, n_active_tokens, n_positions)
+    gpt2 = gpt2_hlo.gen_scribable_gpt2(config, n_active_tokens, n_positions, blocks_u8_bounds)
     return compiler.compile_py_func(gpt2)
