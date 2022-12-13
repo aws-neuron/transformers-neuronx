@@ -34,9 +34,12 @@ class OPTForSampling(module.PretrainedModel):
         self.config = config
         if unroll is None:
             unroll = config.num_hidden_layers
+        if utils.amp_is_u8(amp) and unroll != config.num_hidden_layers:
+            raise NotImplementedError(f'amp={amp} only works with unroll={config.num_hidden_layers}')
         self.unroll = unroll
         self.init_n_active_tokens = init_n_active_tokens
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.model = OPTModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
         self.ln_lm_head = OPTLnLmHead(config, self.model.decoder.final_layer_norm, self.lm_head)
@@ -51,15 +54,19 @@ class OPTForSampling(module.PretrainedModel):
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
-        self.program = build_opt_program(config, 1, n_positions_list, unroll)
-        init_n_active = self.init_n_active_tokens
-        if init_n_active is not None:
-            self.init_program = build_opt_program(config, init_n_active, n_positions_list, unroll)
         decoder = self.model.decoder
         decoder.embed_tokens.materialize()
         decoder.embed_positions.materialize()
         parallel.layers_to_neuron(16, decoder.layers, n_positions_list, self.to_neuron_hooks)
         self.ln_lm_head.to_neuron()
+        layers_u8_bounds = None
+        if utils.amp_is_u8(config.amp):
+            layers_u8_bounds = [layer.get_u8_bounds() for layer in decoder.layers]
+        self.program = build_opt_program(config, 1, n_positions_list, unroll, layers_u8_bounds)
+        init_n_active = self.init_n_active_tokens
+        if init_n_active is not None:
+            self.init_program = build_opt_program(config, init_n_active, n_positions_list, unroll,
+                                                  layers_u8_bounds)
         self.program.setup(self.model.decoder.layers, self.ln_lm_head)
         self.init_program.setup(self.model.decoder.layers, self.ln_lm_head)
 
@@ -183,7 +190,8 @@ class OPTDecoderLayer(module.LowMemoryModule):
         super().__init__()
         self.self_attn_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
         self.self_attn = OPTAttention(config)
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.fc1 = module.LowMemoryLazyLinear(config.hidden_size, dtype=dtype)
         self.fc2 = module.LowMemoryLazyLinear(config.ffn_dim, dtype=dtype)
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
@@ -204,6 +212,18 @@ class OPTDecoderLayer(module.LowMemoryModule):
         self.key_cache_slices = None
         self.value_cache = None
         self.value_cache_slices = None
+        self.attn_q_min = None
+        self.attn_q_max = None
+        self.attn_k_min = None
+        self.attn_k_max = None
+        self.attn_v_min = None
+        self.attn_v_max = None
+        self.attn_out_min = None
+        self.attn_out_max = None
+        self.mlp_in_min = None
+        self.mlp_in_max = None
+        self.mlp_out_min = None
+        self.mlp_out_max = None
 
     def to_neuron(self, n_positions_list):
         self.materialize()
@@ -214,26 +234,33 @@ class OPTDecoderLayer(module.LowMemoryModule):
         primary_only = manipulator.primary_only
         self.ln_1_weight = duplicate(self.self_attn_layer_norm.weight.detach())
         self.ln_1_bias = duplicate(self.self_attn_layer_norm.bias.detach())
-        q_proj = self.self_attn.q_proj
-        k_proj = self.self_attn.k_proj
-        v_proj = self.self_attn.v_proj
-        out_proj = self.self_attn.out_proj
-        self.attn_q_weight = shard_along(q_proj.weight.detach().T, dim=1)
-        self.attn_q_bias = shard_along(q_proj.bias.detach(), dim=0)
-        self.attn_k_weight = shard_along(k_proj.weight.detach().T, dim=1)
-        self.attn_k_bias = shard_along(k_proj.bias.detach(), dim=0)
-        self.attn_v_weight = shard_along(v_proj.weight.detach().T, dim=1)
-        self.attn_v_bias = shard_along(v_proj.bias.detach(), dim=0)
-        self.attn_out_weight = shard_along(out_proj.weight.detach().T, dim=0)
-        self.attn_out_bias = primary_only(out_proj.bias.detach())
+        attn_q_weight = self.self_attn.q_proj.weight.detach().T
+        attn_k_weight = self.self_attn.k_proj.weight.detach().T
+        attn_v_weight = self.self_attn.v_proj.weight.detach().T
+        attn_out_weight = self.self_attn.out_proj.weight.detach().T
+        mlp_in_weight = self.fc1.weight.detach().T
+        mlp_out_weight = self.fc2.weight.detach().T
+        if utils.amp_is_u8(self.config.amp):
+            attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(attn_q_weight)
+            attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(attn_k_weight)
+            attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(attn_v_weight)
+            attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(attn_out_weight)
+            mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(mlp_in_weight)
+            mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(mlp_out_weight)
+        self.attn_q_weight = shard_along(attn_q_weight, dim=1)
+        self.attn_q_bias = shard_along(self.self_attn.q_proj.bias.detach(), dim=0)
+        self.attn_k_weight = shard_along(attn_k_weight, dim=1)
+        self.attn_k_bias = shard_along(self.self_attn.k_proj.bias.detach(), dim=0)
+        self.attn_v_weight = shard_along(attn_v_weight, dim=1)
+        self.attn_v_bias = shard_along(self.self_attn.v_proj.bias.detach(), dim=0)
+        self.attn_out_weight = shard_along(attn_out_weight, dim=0)
+        self.attn_out_bias = primary_only(self.self_attn.out_proj.bias.detach())
         self.ln_2_weight = duplicate(self.final_layer_norm.weight.detach())
         self.ln_2_bias = duplicate(self.final_layer_norm.bias.detach())
-        fc1 = self.fc1
-        fc2 = self.fc2
-        self.mlp_in_weight = shard_along(fc1.weight.detach().T, dim=1)
-        self.mlp_in_bias = shard_along(fc1.bias.detach(), dim=0)
-        self.mlp_out_weight = shard_along(fc2.weight.detach().T, dim=0)
-        self.mlp_out_bias = primary_only(fc2.bias.detach())
+        self.mlp_in_weight = shard_along(mlp_in_weight, dim=1)
+        self.mlp_in_bias = shard_along(self.fc1.bias.detach(), dim=0)
+        self.mlp_out_weight = shard_along(mlp_out_weight, dim=0)
+        self.mlp_out_bias = primary_only(self.fc2.bias.detach())
         self.nullify()
 
         slice_on_nc = manipulator.slice_on_nc
@@ -242,7 +269,8 @@ class OPTDecoderLayer(module.LowMemoryModule):
         n_head = config.num_attention_heads
         s_head = config.hidden_size // n_head
         cache_shape = [n_positions, batch_size, n_head, s_head]
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         key_cache = torch.zeros(cache_shape, dtype=dtype)
         key_cache = manipulator.shard_along(key_cache, dim=2)
         self.key_cache = key_cache
@@ -274,6 +302,13 @@ class OPTDecoderLayer(module.LowMemoryModule):
             self.mlp_out_bias,
         ]
 
+    def get_u8_bounds(self):
+        return (
+            self.attn_q_min, self.attn_q_max, self.attn_k_min, self.attn_k_max,
+            self.attn_v_min, self.attn_v_max, self.attn_out_min, self.attn_out_max,
+            self.mlp_in_min, self.mlp_in_max, self.mlp_out_min, self.mlp_out_max,
+        )
+
     def get_cache_slices(self):
         return [self.key_cache_slices, self.value_cache_slices]
 
@@ -289,7 +324,8 @@ class OPTAttention(module.LowMemoryModule):
     def __init__(self, config):
         super().__init__()
         hidden_size = config.hidden_size
-        dtype = dtypes.to_torch_dtype(config.amp)
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
         self.q_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
         self.k_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
         self.v_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
@@ -323,8 +359,9 @@ class OPTLnLmHead:
         return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
 
 
-def build_opt_program(config, n_active, n_positions_list, n_layers):
-    hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos) for npos in n_positions_list]
+def build_opt_program(config, n_active, n_positions_list, n_layers, blocks_u8_bounds):
+    hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos, blocks_u8_bounds)
+                   for npos in n_positions_list]
     buffers = OPTBuffers(hlo_modules, config.tp_degree)
     if n_layers == config.num_hidden_layers:
         return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import argparse
+import itertools
 import math
 import time
 import torch
@@ -24,7 +25,11 @@ from transformers_neuronx.module import save_pretrained_split
 
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--amp', default='f32', choices=['f32', 'f16', 'bf16'])
+    amp_choices = ['f32', 'f16', 'bf16']
+    floatx_floaty_combinations = list(itertools.product(amp_choices, amp_choices))
+    for floatx, floaty in floatx_floaty_combinations:
+        amp_choices.append(f'{floatx}-u8-{floaty}')
+    parser.add_argument('--amp', default='f32', choices=amp_choices)
     parser.add_argument('--model_name', default=None)
     subparsers = parser.add_subparsers()
     save_name = 'save'
