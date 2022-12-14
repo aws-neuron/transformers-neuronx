@@ -293,7 +293,7 @@ def gen_scribable_gptj(config, n_active_tokens, n_positions):
         blocks_caches = [gen_block_caches() for _ in range(n_layer)]
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
-        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, [n_active_tokens, n_positions])
+        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, n_positions)
         return gptj(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
 
     return scribable
@@ -366,7 +366,7 @@ def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
 
         blocks_caches = [gen_block_caches() for _ in range(n_blocks)]
         blocks_params = [gen_block_params() for _ in range(n_blocks)]
-        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, [n_active_tokens, n_positions])
+        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, n_positions)
         return multi_block(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, config)
 
     return scribable
