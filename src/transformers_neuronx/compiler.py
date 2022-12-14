@@ -39,8 +39,9 @@ def build_kernel(py_func, tp_degree):
 
 
 def build_parallel_kernel(hlo_module, tp_degree):
-    neff_bytes = compile_hlo_module(hlo_module)
-    return ParallelKernel(hlo_module, neff_bytes, tp_degree)
+    kernel = ParallelKernel(hlo_module, tp_degree)
+    kernel.build()
+    return kernel
 
 
 def compile_hlo_module(hlo_module):
@@ -205,21 +206,40 @@ class ParallelMemory:
         output_names = find_output_names(hlo_module)
         self.inputs = torch.classes.neuron.ParallelTensorSet(input_names, tp_degree)
         self.outputs = torch.classes.neuron.ParallelTensorSet(output_names, tp_degree)
+        self.input_tensors = None
+        self.output_tensors = None
 
     def init(self):
         self.inputs.init()
         self.outputs.init()
 
+    def setup(self, input_tensors, output_tensors):
+        self.inputs.init()
+        self.outputs.init()
+        for idx, tensor in enumerate(input_tensors):
+            self.inputs.add(idx, tensor)
+        for idx, tensor in enumerate(output_tensors):
+            self.outputs.add(idx, tensor)
+        self.input_tensors = input_tensors
+        self.output_tensors = output_tensors
+
 
 class ParallelKernel:
 
-    def __init__(self, hlo_module, neff_bytes, tp_degree):
+    def __init__(self, hlo_module, tp_degree):
         self.hlo_module = hlo_module
-        self.neff_bytes = neff_bytes
-        self.model = torch.classes.neuron.ParallelModel(neff_bytes, tp_degree)
+        self.tp_degree = tp_degree
+        self.neff_bytes = None
+        self.model = None
+
+    def build_memory(self):
+        return ParallelMemory(self.hlo_module, self.tp_degree)
+
+    def build(self):
+        self.neff_bytes = compile_hlo_module(self.hlo_module)
 
     def load(self):
-        ops.init()
+        self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree)
         self.model.load()
 
     def __call__(self, memory):
@@ -233,8 +253,10 @@ def gen_zero_input(hlo_module, index):
     return torch.zeros(shape, dtype=dtype)
 
 
-def gen_zero_output(hlo_module, index):
-    shape_proto = hlo_module.host_program_shape.result.tuple_shapes[index]
+def gen_zero_output(hlo_module, index=None):
+    shape_proto = hlo_module.host_program_shape.result
+    if index is not None:
+        shape_proto = shape_proto.tuple_shapes[index]
     shape = [dim for dim in shape_proto.dimensions]
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
     return torch.zeros(shape, dtype=dtype)
