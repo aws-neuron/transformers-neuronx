@@ -32,8 +32,7 @@ def build_gptj_hlo_module(config, n_active_tokens, n_positions):
 
 
 def attention(hidden, q_weight, k_weight, v_weight, out_weight, pos_embd,
-              cached_keys, cached_values, cache_offset, mask,
-              n_heads, tp_degree):
+              cached_keys, cached_values, cache_offset, mask, tp_degree):
     # hidden: [4096, a, b]
     # pos_embd: [a, 256, 256]
     # cached_keys: [2048, b, 16, 256]
@@ -42,14 +41,10 @@ def attention(hidden, q_weight, k_weight, v_weight, out_weight, pos_embd,
     dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
-    s32 = scribe.s32
-    pred = scribe.pred
     hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
-    max_ctx_plus_n_active_tokens, *_ = cached_keys.sizes
+    max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
     attn_size = hidden_size // tp_degree
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-    n_heads_tp = n_heads // tp_degree
-    d_head = hidden_size // n_heads
     active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
     active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
 
@@ -147,7 +142,6 @@ def block(hidden, ln_1_weight, ln_1_bias,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
           config):
     dtype = hidden.dtype
-    scribe = hidden.scribe
     ln_1_weight = hlo.transfer_with_static_ring(ln_1_weight)
     ln_1_bias = hlo.transfer_with_static_ring(ln_1_bias)
     attn_q_weight = hlo.transfer_with_static_ring(attn_q_weight)
@@ -159,8 +153,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
     ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)
     attn_output, out_key_cache, out_value_cache = attention(
         ln_hidden, attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight,
-        pos_embd, in_key_cache, in_value_cache, cache_offset, mask,
-        n_heads=config.n_head, tp_degree=config.tp_degree,
+        pos_embd, in_key_cache, in_value_cache, cache_offset, mask, tp_degree=config.tp_degree,
     )
     out_hidden = dtype[hidden.sizes].Add(attn_output, hidden)
     mlp_in_weight = hlo.transfer_with_static_ring(mlp_in_weight)

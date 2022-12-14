@@ -34,7 +34,7 @@ def build_gpt2_hlo_module(config, n_active_tokens, n_positions, blocks_u8_bounds
 
 def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias,
               cached_keys, cached_values, cache_offset, mask,
-              n_heads, tp_degree, dequant_dtype, u8_bounds):
+              tp_degree, dequant_dtype, u8_bounds):
     # hidden: [768, a, b]
     # cached_keys: [1024, b, 12, 64]
     # cached_values: [1024, b, 12, 64]
@@ -42,14 +42,10 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_
     dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
-    s32 = scribe.s32
-    pred = scribe.pred
     hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
-    max_ctx_plus_n_active_tokens, *_ = cached_keys.sizes
+    max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
     attn_size = hidden_size // tp_degree
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-    n_heads_tp = n_heads // tp_degree
-    d_head = hidden_size // n_heads
     active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
     if u8_bounds is not None:
         q_min, q_max, k_min, k_max, v_min, v_max, out_min, out_max, *_ = u8_bounds
@@ -142,7 +138,6 @@ def block(hidden, ln_1_weight, ln_1_bias,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
           config, dequant_dtype=None, u8_bounds=None):
     dtype = hidden.dtype
-    scribe = hidden.scribe
     ln_1_weight = hlo.transfer_with_static_ring(ln_1_weight)
     ln_1_bias = hlo.transfer_with_static_ring(ln_1_bias)
     attn_q_weight = hlo.transfer_with_static_ring(attn_q_weight)
@@ -160,8 +155,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
         ln_hidden, attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
         attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
         in_key_cache, in_value_cache, cache_offset, mask,
-        n_heads=config.n_head, tp_degree=config.tp_degree,
-        dequant_dtype=dequant_dtype, u8_bounds=u8_bounds,
+        tp_degree=config.tp_degree, dequant_dtype=dequant_dtype, u8_bounds=u8_bounds,
     )
     out_hidden = dtype[hidden.sizes].Add(attn_output, hidden)
     ln_2_weight = hlo.transfer_with_static_ring(ln_2_weight)
