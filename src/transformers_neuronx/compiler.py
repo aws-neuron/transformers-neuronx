@@ -145,6 +145,7 @@ class DataTypeConverter:
         name_mapping = name_mapping.lstrip().strip()
         self.hlo2metaneff_mapping = {}
         self.hlo2torch_mapping = {}
+        self.torch2name_mapping = {}
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
             pname, dname, tname = line.split()
@@ -153,12 +154,16 @@ class DataTypeConverter:
             torch_dtype = getattr(torch, tname)
             self.hlo2metaneff_mapping[primitive_type] = metaneff_dtype
             self.hlo2torch_mapping[primitive_type] = torch_dtype
+            self.torch2name_mapping[torch_dtype] = pname.lower()
 
     def hlo2metaneff(self, primitive_type):
         return self.hlo2metaneff_mapping[primitive_type]
 
     def hlo2torch(self, primitive_type):
         return self.hlo2torch_mapping[primitive_type]
+
+    def torch2name(self, torch_dtype):
+        return self.torch2name_mapping[torch_dtype]
 
 
 class Kernel:
