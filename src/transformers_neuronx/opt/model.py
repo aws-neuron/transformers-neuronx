@@ -13,14 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
+from transformers_neuronx import hlo
 from transformers_neuronx import module
 from transformers_neuronx import ops
-from transformers_neuronx import parallel
-from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx.opt import hlo
+from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.sampling import simple_sample
 
@@ -31,121 +29,85 @@ class OPTForSampling(module.PretrainedModel):
                  unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
+        self.chkpt_model = OPTCheckpointCompatible(config)
         self.config = config
         if unroll is None:
             unroll = config.num_hidden_layers
-        if utils.amp_is_u8(amp) and unroll != config.num_hidden_layers:
-            raise NotImplementedError(f'amp={amp} only works with unroll={config.num_hidden_layers}')
-        self.unroll = unroll
-        self.init_n_active_tokens = init_n_active_tokens
-        dtype, _, _ = utils.parse_amp(config.amp)
-        dtype = dtypes.to_torch_dtype(dtype)
-        self.model = OPTModel(config)
-        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
-        self.ln_lm_head = OPTLnLmHead(config, self.model.decoder.final_layer_norm, self.lm_head)
-        self.n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
-        self.program = None
-        self.init_program = program.DoNothingDecoder()
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        self.to_neuron_hooks = []
+        n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+        attention_head_size = config.hidden_size // config.num_attention_heads
+        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, n_positions_list, batch_size, attention_head_size, amp,
+            config.num_hidden_layers, unroll, init_n_active_tokens,
+        )
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(
+            tp_degree, batch_size, config.hidden_size, config.activation_function)
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+    def load_state_dict_dir(self, state_dict_dir):
+        self.chkpt_model.load_state_dict_dir(state_dict_dir)
+
+    def load_state_dict_low_memory(self, state_dict):
+        self.chkpt_model.load_state_dict_low_memory(state_dict)
 
     def to_neuron(self):
         ops.init()
-        config = self.config
-        n_positions_list = self.n_positions_list
-        unroll = self.unroll
-        decoder = self.model.decoder
-        decoder.embed_tokens.materialize()
-        decoder.embed_positions.materialize()
-        parallel.layers_to_neuron(16, decoder.layers, n_positions_list, self.to_neuron_hooks)
-        self.ln_lm_head.to_neuron()
-        layers_u8_bounds = None
-        if utils.amp_is_u8(config.amp):
-            layers_u8_bounds = [layer.get_u8_bounds() for layer in decoder.layers]
-        self.program = build_opt_program(config, 1, n_positions_list, unroll, layers_u8_bounds)
-        init_n_active = self.init_n_active_tokens
-        if init_n_active is not None:
-            self.init_program = build_opt_program(config, init_n_active, n_positions_list, unroll,
-                                                  layers_u8_bounds)
-        self.program.setup(self.model.decoder.layers, self.ln_lm_head)
-        self.init_program.setup(self.model.decoder.layers, self.ln_lm_head)
+        self.chkpt_model.model.decoder.embed_tokens.materialize()
+        self.chkpt_model.model.decoder.embed_positions.materialize()
+        for layer in self.chkpt_model.model.decoder.layers:
+            layer.materialize()
+            attn = layer.self_attn
+            new_layer = self.decoder_lm_head.new_layer()
+            new_layer.add_pre_attention_layer_norm(layer.self_attn_layer_norm.weight.detach(),
+                                                   layer.self_attn_layer_norm.bias.detach())
+            new_layer.add_attention_query(attn.q_proj.weight.detach().T, attn.q_proj.bias.detach())
+            new_layer.add_attention_key(attn.k_proj.weight.detach().T, attn.k_proj.bias.detach())
+            new_layer.add_attention_value(attn.v_proj.weight.detach().T, attn.v_proj.bias.detach())
+            new_layer.add_attention_output(attn.out_proj.weight.detach().T, attn.out_proj.bias.detach())
+            new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
+                                             layer.final_layer_norm.bias.detach())
+            new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
+            new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
+            new_layer.to_neuron()
+            layer.nullify()
+        ln_f = self.chkpt_model.model.decoder.final_layer_norm
+        ln_f.materialize()
+        self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        lm_head = self.chkpt_model.lm_head
+        lm_head.materialize()
+        self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        lm_head.nullify()
+        self.decoder_lm_head.to_neuron()
 
     def reset(self):
-        for layer in self.model.decoder.layers:
-            layer.reset()
+        self.decoder_lm_head.reset()
 
-    def forward(self, input_ids, cache_offset):
-        last_offset = cache_offset[-1].item()
-        bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
-        this_length = input_ids.shape[-1]
-        init_length = self.init_program.init_length(this_length, self.init_n_active_tokens)
-        init_step = self.init_program.init_step(self.init_n_active_tokens)
-        for cur_len in range(0, init_length, init_step):
-            slicing = slice(cur_len, cur_len + init_step)
-            inputs = input_ids[:, slicing], cache_offset[slicing]
-            logits = self._run_program(self.init_program, bucket_id, *inputs)
-        for cur_len in range(init_length, this_length):
-            slicing = slice(cur_len, cur_len + 1)
-            inputs = input_ids[:, slicing], cache_offset[slicing]
-            logits = self._run_program(self.program, bucket_id, *inputs)
-        logits = self.manipulator.unshard_along(logits, dim=0)
+    def forward(self, input_ids, position_ids):
+        inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
+        position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
+        hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, -1)
+        logits = self.decoder_lm_head(hidden, position_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
         return logits
 
-    def _run_program(self, program, bucket_id, input_ids, cache_offset):
-        active_n_positions = self.n_positions_list[bucket_id]
-        inputs_embeds = self.model.decoder.embed_tokens(input_ids)
-        past_length = cache_offset[0].item()
-        this_length = input_ids.shape[-1]
-        position_ids = torch.arange(past_length, past_length + this_length)
-        position_ids = position_ids.unsqueeze(0).view(-1, this_length)
-        position_embeds = self.model.decoder.embed_positions(position_ids)
-        hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1).contiguous()
-        input_buffers = program.buffers.get_input_buffers(bucket_id)
-        hidden_buffer, *_ = input_buffers
-        hidden = hidden.to(hidden_buffer.dtype)
-        hidden = self.manipulator.duplicate_on_cpu(hidden)
-        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        for in_buffer, in_tensor in zip(input_buffers, [hidden, cache_offset]):
-            ops.parallel_write(in_buffer, in_tensor)
-        return program.run(bucket_id)
-
     def sample(self, input_ids, sequence_length):
         return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
                              eos_token_id=self.config.eos_token_id, top_k=50)
 
-    def register_to_neuron_hook(self, hook):
-        self.to_neuron_hooks.append(hook)
 
+class OPTCheckpointCompatible(module.PretrainedModel):
 
-class OPTBuffers:
-
-    def __init__(self, opt_hlo_modules, tp_degree):
-        first_hlo_module, *_ = opt_hlo_modules
-        hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
-        cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
-        self.input_buffers = [hidden_buffer, cache_offset_buffer]
-        self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-
-    def to_neuron(self):
-        hidden_buffer, cache_offset_buffer = self.input_buffers
-        hidden_buffer = self.manipulator.duplicate(hidden_buffer)
-        cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
-        self.input_buffers = [hidden_buffer, cache_offset_buffer]
-        self.output_buffer = self.manipulator.duplicate(self.output_buffer)
-
-    def get_input_buffers(self, bucket_id):
-        hidden_buffer, cache_offset_buffer = self.input_buffers
-        return [hidden_buffer, cache_offset_buffer]
-
-
-def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    def __init__(self, config):
+        super().__init__()
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
+        self.model = OPTModel(config)
+        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
 
 class OPTModel(module.LowMemoryModule):
@@ -195,128 +157,6 @@ class OPTDecoderLayer(module.LowMemoryModule):
         self.fc1 = module.LowMemoryLazyLinear(config.hidden_size, dtype=dtype)
         self.fc2 = module.LowMemoryLazyLinear(config.ffn_dim, dtype=dtype)
         self.final_layer_norm = module.LowMemoryLayerNorm(config.hidden_size)
-        self.config = config
-        self.ln_1_weight = None
-        self.ln_1_bias = None
-        self.attn_q_weight = None
-        self.attn_k_weight = None
-        self.attn_v_weight = None
-        self.attn_out_weight = None
-        self.ln_2_weight = None
-        self.ln_2_bias = None
-        self.mlp_in_weight = None
-        self.mlp_in_bias = None
-        self.mlp_out_weight = None
-        self.mlp_out_bias = None
-        self.key_cache = None
-        self.key_cache_slices = None
-        self.value_cache = None
-        self.value_cache_slices = None
-        self.attn_q_min = None
-        self.attn_q_max = None
-        self.attn_k_min = None
-        self.attn_k_max = None
-        self.attn_v_min = None
-        self.attn_v_max = None
-        self.attn_out_min = None
-        self.attn_out_max = None
-        self.mlp_in_min = None
-        self.mlp_in_max = None
-        self.mlp_out_min = None
-        self.mlp_out_max = None
-
-    def to_neuron(self, n_positions_list):
-        self.materialize()
-        config = self.config
-        manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
-        duplicate = manipulator.duplicate
-        shard_along = manipulator.shard_along
-        primary_only = manipulator.primary_only
-        self.ln_1_weight = duplicate(self.self_attn_layer_norm.weight.detach())
-        self.ln_1_bias = duplicate(self.self_attn_layer_norm.bias.detach())
-        attn_q_weight = self.self_attn.q_proj.weight.detach().T
-        attn_k_weight = self.self_attn.k_proj.weight.detach().T
-        attn_v_weight = self.self_attn.v_proj.weight.detach().T
-        attn_out_weight = self.self_attn.out_proj.weight.detach().T
-        mlp_in_weight = self.fc1.weight.detach().T
-        mlp_out_weight = self.fc2.weight.detach().T
-        if utils.amp_is_u8(self.config.amp):
-            attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(attn_q_weight)
-            attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(attn_k_weight)
-            attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(attn_v_weight)
-            attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(attn_out_weight)
-            mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(mlp_in_weight)
-            mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(mlp_out_weight)
-        self.attn_q_weight = shard_along(attn_q_weight, dim=1)
-        self.attn_q_bias = shard_along(self.self_attn.q_proj.bias.detach(), dim=0)
-        self.attn_k_weight = shard_along(attn_k_weight, dim=1)
-        self.attn_k_bias = shard_along(self.self_attn.k_proj.bias.detach(), dim=0)
-        self.attn_v_weight = shard_along(attn_v_weight, dim=1)
-        self.attn_v_bias = shard_along(self.self_attn.v_proj.bias.detach(), dim=0)
-        self.attn_out_weight = shard_along(attn_out_weight, dim=0)
-        self.attn_out_bias = primary_only(self.self_attn.out_proj.bias.detach())
-        self.ln_2_weight = duplicate(self.final_layer_norm.weight.detach())
-        self.ln_2_bias = duplicate(self.final_layer_norm.bias.detach())
-        self.mlp_in_weight = shard_along(mlp_in_weight, dim=1)
-        self.mlp_in_bias = shard_along(self.fc1.bias.detach(), dim=0)
-        self.mlp_out_weight = shard_along(mlp_out_weight, dim=0)
-        self.mlp_out_bias = primary_only(self.fc2.bias.detach())
-        self.nullify()
-
-        slice_on_nc = manipulator.slice_on_nc
-        n_positions = config.n_positions
-        batch_size = config.batch_size
-        n_head = config.num_attention_heads
-        s_head = config.hidden_size // n_head
-        cache_shape = [n_positions, batch_size, n_head, s_head]
-        dtype, _, _ = utils.parse_amp(config.amp)
-        dtype = dtypes.to_torch_dtype(dtype)
-        key_cache = torch.zeros(cache_shape, dtype=dtype)
-        key_cache = manipulator.shard_along(key_cache, dim=2)
-        self.key_cache = key_cache
-        self.key_cache_slices = [slice_on_nc(key_cache, 0, start=0, end=npos, step=1)
-                                 for npos in n_positions_list]
-        value_cache = torch.zeros(cache_shape, dtype=dtype)
-        value_cache = manipulator.shard_along(value_cache, dim=2)
-        self.value_cache = value_cache
-        self.value_cache_slices = [slice_on_nc(value_cache, 0, start=0, end=npos, step=1)
-                                   for npos in n_positions_list]
-
-    def get_parameters(self):
-        return [
-            self.ln_1_weight,
-            self.ln_1_bias,
-            self.attn_q_weight,
-            self.attn_q_bias,
-            self.attn_k_weight,
-            self.attn_k_bias,
-            self.attn_v_weight,
-            self.attn_v_bias,
-            self.attn_out_weight,
-            self.attn_out_bias,
-            self.ln_2_weight,
-            self.ln_2_bias,
-            self.mlp_in_weight,
-            self.mlp_in_bias,
-            self.mlp_out_weight,
-            self.mlp_out_bias,
-        ]
-
-    def get_u8_bounds(self):
-        return (
-            self.attn_q_min, self.attn_q_max, self.attn_k_min, self.attn_k_max,
-            self.attn_v_min, self.attn_v_max, self.attn_out_min, self.attn_out_max,
-            self.mlp_in_min, self.mlp_in_max, self.mlp_out_min, self.mlp_out_max,
-        )
-
-    def get_cache_slices(self):
-        return [self.key_cache_slices, self.value_cache_slices]
-
-    def reset(self):
-        zero_cache = torch.zeros(self.key_cache.shape, dtype=self.key_cache.dtype)
-        zero_cache = [zero_cache for _ in range(self.config.tp_degree)]
-        ops.parallel_write(self.key_cache, zero_cache)
-        ops.parallel_write(self.value_cache, zero_cache)
 
 
 class OPTAttention(module.LowMemoryModule):
@@ -332,42 +172,132 @@ class OPTAttention(module.LowMemoryModule):
         self.out_proj = module.LowMemoryLazyLinear(hidden_size, dtype=dtype)
 
 
-class OPTLnLmHead:
+class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, config, ln_f, lm_head):
-        self.ln_f = ln_f
-        self.lm_head = lm_head
-        self.ln_f_weight = None
-        self.ln_f_bias = None
-        self.lm_head_weight = None
-        tp_degree = config.tp_degree
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        vocab_size = config.vocab_size
-        self.vocab_pad = utils.pad_vocab_size(vocab_size, tp_degree)
+    def __init__(self, tp_degree, batch_size, hidden_size, activation_function):
+        self.tp_degree = tp_degree
+        self.batch_size = batch_size
+        self.hidden_size = hidden_size
+        self.activation_function = activation_function
 
-    def to_neuron(self):
-        self.ln_f.materialize()
-        self.ln_f_weight = self.manipulator.duplicate(self.ln_f.weight.detach())
-        self.ln_f_bias = self.manipulator.duplicate(self.ln_f.bias.detach())
-        self.lm_head.materialize()
-        lm_head_weight = self.lm_head.weight.detach()
-        lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
-        self.lm_head_weight = self.manipulator.shard_along(lm_head_weight.T, dim=1)
-        self.lm_head.nullify()
+    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens):
+        hidden_sizes = self.hidden_size, n_active_tokens, self.batch_size
+        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
+        position_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
+        mask = hlo.decoder_attention_mask(position_ids, scribe.f32, n_positions)
+        return (hidden, position_ids, mask), (1, 0)
 
-    def get_parameters(self):
-        return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
+    def layer(self, hidden, position_ids, mask, attn_k_cache, attn_v_cache,
+              pre_attn_ln_weight, pre_attn_ln_bias, attn_q_weight, attn_q_bias,
+              attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
+              attn_out_weight, attn_out_bias, post_attn_ln_weight, post_attn_ln_bias,
+              pre_mlp_ln_weight, pre_mlp_ln_bias, mlp_in_weight, mlp_in_bias,
+              mlp_out_weight, mlp_out_bias, post_mlp_ln_weight, post_mlp_ln_bias):
+        dtype = hidden.dtype
+        ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
+            ln_hidden, position_ids, mask, attn_k_cache, attn_v_cache,
+            attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
+            attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
+        )
+        hidden = dtype[hidden.sizes].Add(attn_output, hidden)
+        ln_hidden = hlo.layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp_hidden = hlo.mlp(ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+                             activation_function=self.activation_function, tp_degree=self.tp_degree)
+        hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        return hidden, out_attn_k_cache, out_attn_v_cache
 
+    def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
+        dtype = hidden.dtype
+        ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+        ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
+        logits = hlo.dot00(lm_head_weight, ln_hidden)
+        if lm_head_bias is not None:
+            lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
+            logits = dtype[logits.sizes].Add(logits, lm_head_bias)
+        vocab_size, _ = logits.sizes
+        return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-def build_opt_program(config, n_active, n_positions_list, n_layers, blocks_u8_bounds):
-    hlo_modules = [hlo.build_opt_hlo_module(config, n_active, npos, blocks_u8_bounds)
-                   for npos in n_positions_list]
-    buffers = OPTBuffers(hlo_modules, config.tp_degree)
-    if n_layers == config.num_hidden_layers:
-        return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)
-    else:
-        build_func = hlo.build_opt_multi_layer_hlo_module
-        hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
-        head_hlo_module = hlo.build_ln_lm_head_hlo_module(config, n_active)
-        return program.MultiLayerDecoder(config.num_hidden_layers, config.tp_degree, hlo_modules,
-                                         head_hlo_module, n_layers, buffers)
+    def attention(self, hidden, cache_offset, mask, cached_keys, cached_values,
+                  q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias):
+        dtype = hidden.dtype
+        scribe = hidden.scribe
+        f32 = scribe.f32
+        hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
+        max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
+        attn_size = hidden_size // self.tp_degree
+        hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
+        active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+
+        hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
+        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias)
+        active_q = dtype[active_sizes].Reshape(active_q)
+
+        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias)
+        active_k = dtype[active_sizes].Reshape(active_k)
+
+        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias)
+        active_v = dtype[active_sizes].Reshape(active_v)
+
+        scatter_dims = dict(update_window_dims=[1,2,3],
+                            inserted_window_dims=[0],
+                            scatter_dims_to_operand_dims=[0],
+                            index_vector_dim=1)
+        func = hlo.gen_assign_func(dtype)
+        cached_keys = dtype[cached_keys.sizes].Scatter(
+            cached_keys, cache_offset, active_k, scatter_dimension_numbers=scatter_dims, to_apply=func)
+        cached_values = dtype[cached_values.sizes].Scatter(
+            cached_values, cache_offset, active_v, scatter_dimension_numbers=scatter_dims, to_apply=func)
+
+        # compute self-attention: V x Softmax(QK^T)
+        # Keep the attention weights computation in fp32 to avoid overflow issues
+        scale_attn = d_head ** 0.5
+        scale = dtype.Constant(constant_value=scale_attn)
+        scale_attn_br = dtype[active_sizes].Broadcast(scale, dimensions=[])
+        active_q = dtype[active_sizes].Divide(active_q, scale_attn_br)
+        dot_dims = dict(lhs_contracting_dimensions=[3],
+                        lhs_batch_dimensions=[1, 2],
+                        rhs_contracting_dimensions=[3],
+                        rhs_batch_dimensions=[1, 2])
+        score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
+        score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+        score = f32[score_sizes].Convert(score)
+
+        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
+        score = f32[score_sizes].Multiply(score, mask_br)
+        one = f32.Constant(constant_value=1.0)
+        ones_br = f32[mask.sizes].Broadcast(one, dimensions=[])
+        add_mask = f32[mask.sizes].Subtract(ones_br, mask)
+        large_neg = f32.Constant(constant_value=-65536)
+        large_neg_br = f32[add_mask.sizes].Broadcast(large_neg, dimensions=[])
+        add_mask = f32[add_mask.sizes].Multiply(add_mask, large_neg_br)
+        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[2, 3])
+        score = f32[score_sizes].Add(score, add_mask_br)
+
+        probs = hlo.softmax(score)
+        probs = dtype[score_sizes].Convert(probs)
+
+        dot_dims = dict(lhs_contracting_dimensions=[3],
+                        lhs_batch_dimensions=[0, 1],
+                        rhs_contracting_dimensions=[0],
+                        rhs_batch_dimensions=[1, 2])
+        sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+        output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
+        sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+        output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+
+        output_sizes_2d = n_active_tokens*n_seqs, attn_size
+        output = dtype[output_sizes_2d].Reshape(output)
+        dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
+        output = dtype[hidden_r_sizes].Dot(out_weight, output, dot_dimension_numbers=dot_dims)
+        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
+        output = dtype[hidden_r_sizes].Add(output, out_bias)
+        output = dtype[hidden_sizes].Reshape(output)
+        if self.tp_degree == 1:
+            return output, cached_keys, cached_values
+        replica_groups = [list(range(self.tp_degree))]
+        add_func = hlo.gen_add_func(dtype)
+        output = dtype[hidden_sizes].AllReduce(output, replica_groups=replica_groups, to_apply=add_func)
+
+        return output, cached_keys, cached_values
