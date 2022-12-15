@@ -1,0 +1,623 @@
+# Copyright Amazon Web Services and its Affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+import torch
+from transformers_neuronx import compiler
+from transformers_neuronx import hlo
+from transformers_neuronx import ops
+from transformers_neuronx import parallel
+from transformers_neuronx import utils
+
+
+class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
+
+    def __init__(self, tp_degree, n_positions_list, batch_size, attention_head_size, amp,
+                 num_layers, unroll=None, init_n_active_tokens=None):
+        super().__init__()
+        if unroll is None:
+            unroll = num_layers
+        self.tp_degree = tp_degree
+        self.n_positions_list = n_positions_list
+        self.batch_size = batch_size
+        self.attention_head_size = attention_head_size
+        self.amp = amp
+        self.num_layers = num_layers
+        self.unroll = unroll
+        self.init_n_active_tokens = init_n_active_tokens
+        self.layers = torch.nn.ModuleList()
+        self.ln_f_weight = None
+        self.ln_f_bias = None
+        self.lm_head_weight = None
+        self.lm_head_bias = None
+        self.inputs_sdim = None
+        self.inputs_builder = None
+        self.layer_builder = None
+        self.ln_lm_head_builder = None
+        self.program = None
+        self.init_program = DecoderProgramDoNothing()
+
+    def add_inputs_builder(self, inputs_builder):
+        self.inputs_builder = inputs_builder
+
+    def add_layer_builder(self, layer_builder):
+        self.layer_builder = layer_builder
+
+    def add_ln_lm_head_builder(self, ln_lm_head_builder):
+        self.ln_lm_head_builder = ln_lm_head_builder
+
+    def new_layer(self):
+        *_, n_positions = self.n_positions_list
+        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size, self.amp)
+        self.layers.append(layer)
+        return layer
+
+    def add_final_layer_norm(self, weight, bias):
+        self.ln_f_weight = weight
+        self.ln_f_bias = bias
+
+    def add_lm_head(self, weight, bias=None):
+        self.lm_head_weight = weight
+        self.lm_head_bias = bias
+
+    def to_neuron(self):
+        manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
+        self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
+        _, vocab_size = self.lm_head_weight.shape
+        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
+        self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
+        ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
+        if self.lm_head_bias is not None:
+            self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
+            ln_lm_head_params.append(self.lm_head_bias)
+        self.program = self._build_program(1)
+        self.program.setup(self.layers, ln_lm_head_params)
+        if self.init_n_active_tokens is not None:
+            self.program = self._build_program(self.init_n_active_tokens)
+            self.init_program.setup(self.layers, ln_lm_head_params)
+
+    def reset(self):
+        for layer in self.layers:
+            layer.reset()
+
+    def forward(self, *inputs):
+        hidden, *_ = inputs
+        _, sequence_length, _ = hidden.shape
+        init_length = self.init_program.init_length(sequence_length)
+        init_step = self.init_program.n_active_tokens
+        for start in range(0, init_length, init_step):
+            slicing = slice(start, start + init_step)
+            self._run_program(self.init_program, inputs, slicing)
+        for start in range(init_length, sequence_length):
+            slicing = slice(start, start + 1)
+            self._run_program(self.program, inputs, slicing)
+        return self.program.logits_device_to_host()
+
+    def _build_program(self, n_active_tokens):
+        if self.unroll == self.num_layers:
+            hlo_modules = [self._hlo_fully_unrolled(npos, n_active_tokens)
+                           for npos in self.n_positions_list]
+            num_inputs = len(self.inputs_sdim)
+            program = DecoderProgramFullyUnrolled(hlo_modules, num_inputs, self.tp_degree)
+        else:
+            if utils.amp_is_u8(self.amp):
+                raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
+            hlo_modules = [self._hlo_multi_layer(npos, n_active_tokens)
+                           for npos in self.n_positions_list]
+            ln_lm_head_hlo_module = self._hlo_ln_lm_head(n_active_tokens)
+            num_inputs = len(self.inputs_sdim)
+            program = DecoderProgramMultiLayer(hlo_modules, ln_lm_head_hlo_module, num_inputs,
+                                               self.num_layers, self.unroll, self.tp_degree)
+        return program
+
+    def _hlo_fully_unrolled(self, n_positions, n_active_tokens):
+
+        def fully_unrolled(scribe):
+            amp, quantized, dequantized = utils.parse_amp(self.amp)
+            dtype = getattr(scribe, amp)
+            (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                scribe, dtype, n_positions, n_active_tokens)
+            param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
+            hidden, out_caches = self._hlo_layers(
+                scribe, self.layers, param_builder, n_positions, hidden, tensors)
+            ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
+            ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
+            head_weight = param_builder.from_tensor(self.lm_head_weight)
+            head_bias = param_builder.from_tensor(self.lm_head_bias)
+            logits = self.ln_lm_head_builder(hidden, ln_f_weight, ln_f_bias, head_weight, head_bias)
+            outputs = [logits, *out_caches]
+            root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+            return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+        return compiler.compile_py_func(fully_unrolled)
+
+    def _hlo_multi_layer(self, n_positions, n_active_tokens):
+
+        def multi_layer(scribe):
+            dtype = getattr(scribe, self.amp)
+            (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                scribe, dtype, n_positions, n_active_tokens)
+            param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
+            out_hidden, out_caches = self._hlo_layers(
+                scribe, self.layers[:self.unroll], param_builder, n_positions, hidden, tensors)
+            out_hidden.set_alias_to(hidden)
+            outputs = [out_hidden, *out_caches]
+            root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+            return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+        return compiler.compile_py_func(multi_layer)
+
+    def _hlo_layers(self, scribe, layers, param_builder, n_positions, hidden, tensors):
+        amp, quantized, dequantized = utils.parse_amp(self.amp)
+        dtype = getattr(scribe, amp)
+        dequant_dtype = None if dequantized is None else getattr(scribe, dequantized)
+
+        def attn_u8_decode(q_weight, k_weight, v_weight, out_weight, u8_bounds):
+            q_min, q_max, k_min, k_max, v_min, v_max, out_min, out_max, *_ = u8_bounds
+            q_weight = hlo.u8_decode(dtype, dequant_dtype, q_weight, q_min, q_max)
+            k_weight = hlo.u8_decode(dtype, dequant_dtype, k_weight, k_min, k_max)
+            v_weight = hlo.u8_decode(dtype, dequant_dtype, v_weight, v_min, v_max)
+            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
+            return q_weight, k_weight, v_weight, out_weight
+
+        def mlp_u8_decode(in_weight, out_weight, u8_bounds):
+            *_, in_min, in_max, out_min, out_max = u8_bounds
+            in_weight = hlo.u8_decode(dtype, dequant_dtype, in_weight, in_min, in_max)
+            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
+            return in_weight, out_weight
+
+        layers_caches = []
+        for layer in layers:
+            layer_caches = []
+            for cache in layer.attn_k_cache, layer.attn_v_cache:
+                par = param_builder.from_tensor(cache, dim_size={0: n_positions}, static=False)
+                layer_caches.append(par)
+            layers_caches.append(layer_caches)
+        layers_u8_bounds = [layer.u8_bounds() for layer in layers]
+        layers_weights = []
+        for layer, u8_bounds in zip(layers, layers_u8_bounds):
+            pre_attn_ln_weight = param_builder.from_tensor(layer.pre_attn_ln_weight)
+            pre_attn_ln_bias = param_builder.from_tensor(layer.pre_attn_ln_bias)
+            attn_q_weight = param_builder.from_tensor(layer.attn_q_weight)
+            attn_q_bias = param_builder.from_tensor(layer.attn_q_bias)
+            attn_k_weight = param_builder.from_tensor(layer.attn_k_weight)
+            attn_k_bias = param_builder.from_tensor(layer.attn_k_bias)
+            attn_v_weight = param_builder.from_tensor(layer.attn_v_weight)
+            attn_v_bias = param_builder.from_tensor(layer.attn_v_bias)
+            attn_out_weight = param_builder.from_tensor(layer.attn_out_weight)
+            attn_out_bias = param_builder.from_tensor(layer.attn_out_bias)
+            post_attn_ln_weight = param_builder.from_tensor(layer.post_attn_ln_weight)
+            post_attn_ln_bias = param_builder.from_tensor(layer.post_attn_ln_bias)
+            pre_mlp_ln_weight = param_builder.from_tensor(layer.pre_mlp_ln_weight)
+            pre_mlp_ln_bias = param_builder.from_tensor(layer.pre_mlp_ln_bias)
+            mlp_in_weight = param_builder.from_tensor(layer.mlp_in_weight)
+            mlp_in_bias = param_builder.from_tensor(layer.mlp_in_bias)
+            mlp_out_weight = param_builder.from_tensor(layer.mlp_out_weight)
+            mlp_out_bias = param_builder.from_tensor(layer.mlp_out_bias)
+            post_mlp_ln_weight = param_builder.from_tensor(layer.post_mlp_ln_weight)
+            post_mlp_ln_bias = param_builder.from_tensor(layer.post_mlp_ln_bias)
+            if u8_bounds is not None:
+                attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight = attn_u8_decode(
+                    attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight, u8_bounds)
+                mlp_in_weight, mlp_out_weight = mlp_u8_decode(mlp_in_weight, mlp_out_weight, u8_bounds)
+            layer_weights = [
+                pre_attn_ln_weight,
+                pre_attn_ln_bias,
+                attn_q_weight,
+                attn_q_bias,
+                attn_k_weight,
+                attn_k_bias,
+                attn_v_weight,
+                attn_v_bias,
+                attn_out_weight,
+                attn_out_bias,
+                post_attn_ln_weight,
+                post_attn_ln_bias,
+                pre_mlp_ln_weight,
+                pre_mlp_ln_bias,
+                mlp_in_weight,
+                mlp_in_bias,
+                mlp_out_weight,
+                mlp_out_bias,
+                post_mlp_ln_weight,
+                post_mlp_ln_bias,
+            ]
+            layers_weights.append(layer_weights)
+        output_caches = []
+        for caches, weights in zip(layers_caches, layers_weights):
+            in_caches = [hlo.transfer_with_static_ring(cache) for cache in caches]
+            hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
+            for out_cache, cache in zip(out_caches, caches):
+                out_cache.set_alias_to(cache, must=True)
+            output_caches.extend(out_caches)
+        return hidden, output_caches
+
+    def _hlo_ln_lm_head(self, n_active_tokens):
+        hidden_sizes = []
+
+        def capture_hidden_sizes(scribe):
+            dtype = getattr(scribe, self.amp)
+            *_, n_positions = self.n_positions_list
+            (hidden, *_), _ = self.inputs_builder(scribe, dtype, n_positions, n_active_tokens)
+            hidden_sizes.clear()
+            hidden_sizes.extend(hidden.sizes)
+            return hidden
+
+        compiler.compile_py_func(capture_hidden_sizes)
+
+        def ln_lm_head(scribe):
+            dtype = getattr(scribe, self.amp)
+            hidden = dtype[tuple(hidden_sizes)].Parameter(parameter_number=0)
+            param_builder = DecoderParameterBuilder(scribe, 1)
+            ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
+            ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
+            head_weight = param_builder.from_tensor(self.lm_head_weight)
+            head_bias = param_builder.from_tensor(self.lm_head_bias)
+            return self.ln_lm_head_builder(hidden, ln_f_weight, ln_f_bias, head_weight, head_bias)
+
+        return compiler.compile_py_func(ln_lm_head)
+
+    def _run_program(self, program, inputs, slicing):
+        input_tensors = []
+        for sdim, tensor in zip(self.inputs_sdim, inputs):
+            if sdim is not None:
+                slices = [slice(None) for _ in tensor.shape]
+                slices[sdim] = slicing
+                tensor = tensor[tuple(slices)].contiguous()
+            input_tensors.append(tensor)
+        *_, position_ids = input_tensors
+        last_id = position_ids[-1].item()
+        bucket_id = find_first_ge_index(program.n_positions_list, last_id)
+        program.inputs_host_to_device(input_tensors)
+        program.run(bucket_id)
+
+
+def read_n_position(hlo_module, num_inputs):
+    return hlo_module.host_program_shape.parameters[num_inputs].dimensions[0]
+
+
+def read_n_active_tokens(hlo_module):
+    return hlo_module.host_program_shape.parameters[0].dimensions[1]
+
+
+def find_first_ge_index(values, target):
+    return next(idx for idx, val in enumerate(values) if val >= target)
+
+
+class DecoderLayer(torch.nn.Module):
+
+    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp):
+        super().__init__()
+        self.pre_attn_ln_weight = None
+        self.pre_attn_ln_bias = None
+        self.attn_q_weight = None
+        self.attn_q_bias = None
+        self.attn_k_weight = None
+        self.attn_k_bias = None
+        self.attn_v_weight = None
+        self.attn_v_bias = None
+        self.attn_out_weight = None
+        self.attn_out_bias = None
+        self.post_attn_ln_weight = None
+        self.post_attn_ln_bias = None
+        self.pre_mlp_ln_weight = None
+        self.pre_mlp_ln_bias = None
+        self.mlp_in_weight = None
+        self.mlp_in_bias = None
+        self.mlp_out_weight = None
+        self.mlp_out_bias = None
+        self.post_mlp_ln_weight = None
+        self.post_mlp_ln_bias = None
+        self.attn_q_min = None
+        self.attn_q_max = None
+        self.attn_k_min = None
+        self.attn_k_max = None
+        self.attn_v_min = None
+        self.attn_v_max = None
+        self.attn_out_min = None
+        self.attn_out_max = None
+        self.mlp_in_min = None
+        self.mlp_in_max = None
+        self.mlp_out_min = None
+        self.mlp_out_max = None
+        self.attn_k_cache = None
+        self.attn_v_cache = None
+        self.tp_degree = tp_degree
+        self.n_positions = n_positions
+        self.batch_size = batch_size
+        self.attention_head_size = attention_head_size
+        self.amp = amp
+
+    def add_pre_attention_layer_norm(self, weight, bias):
+        self.pre_attn_ln_weight = weight
+        self.pre_attn_ln_bias = bias
+
+    def add_attention_query(self, weight, bias):
+        self.attn_q_weight = weight
+        self.attn_q_bias = bias
+
+    def add_attention_key(self, weight, bias):
+        self.attn_k_weight = weight
+        self.attn_k_bias = bias
+
+    def add_attention_value(self, weight, bias):
+        self.attn_v_weight = weight
+        self.attn_v_bias = bias
+
+    def add_attention_output(self, weight, bias):
+        self.attn_out_weight = weight
+        self.attn_out_bias = bias
+
+    def add_post_attention_layer_norm(self, weight, bias):
+        self.post_attn_ln_weight = weight
+        self.post_attn_ln_bias = bias
+
+    def add_pre_mlp_layer_norm(self, weight, bias):
+        self.pre_mlp_ln_weight = weight
+        self.pre_mlp_ln_bias = bias
+
+    def add_mlp_input(self, weight, bias):
+        self.mlp_in_weight = weight
+        self.mlp_in_bias = bias
+
+    def add_mlp_output(self, weight, bias):
+        self.mlp_out_weight = weight
+        self.mlp_out_bias = bias
+
+    def add_post_mlp_layer_norm(self, weight, bias):
+        self.post_mlp_ln_weight = weight
+        self.post_mlp_ln_bias = bias
+
+    def to_neuron(self):
+        cache_dtype = self.attn_q_weight.dtype
+        if utils.amp_is_u8(self.amp):
+            self.attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(self.attn_q_weight)
+            self.attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(self.attn_k_weight)
+            self.attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(self.attn_v_weight)
+            self.attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(self.attn_out_weight)
+            self.mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(self.mlp_in_weight)
+            self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
+        hidden_size, _ = self.attn_q_weight.shape
+        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
+        maybe_duplicate = maybe_manipulator.duplicate
+        maybe_shard_along = maybe_manipulator.shard_along
+        maybe_primary_only = maybe_manipulator.primary_only
+        self.pre_attn_ln_weight = maybe_duplicate(self.pre_attn_ln_weight)
+        self.pre_attn_ln_bias = maybe_duplicate(self.pre_attn_ln_bias)
+        self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
+        self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
+        self.attn_k_weight = maybe_shard_along(self.attn_k_weight, dim=1)
+        self.attn_k_bias = maybe_shard_along(self.attn_k_bias, dim=0)
+        self.attn_v_weight = maybe_shard_along(self.attn_v_weight, dim=1)
+        self.attn_v_bias = maybe_shard_along(self.attn_v_bias, dim=0)
+        self.attn_out_weight = maybe_shard_along(self.attn_out_weight, dim=0)
+        self.attn_out_bias = maybe_primary_only(self.attn_out_bias)
+        self.post_attn_ln_weight = maybe_duplicate(self.post_attn_ln_weight)
+        self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
+        self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
+        self.pre_mlp_ln_bias = maybe_duplicate(self.pre_mlp_ln_bias)
+        self.mlp_in_weight = maybe_shard_along(self.mlp_in_weight, dim=1)
+        self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
+        self.mlp_out_weight = maybe_shard_along(self.mlp_out_weight, dim=0)
+        self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
+        self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
+        self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
+        n_heads = hidden_size // self.attention_head_size
+        cache_shape = [self.n_positions, self.batch_size, n_heads, self.attention_head_size]
+        attn_k_cache = torch.zeros(cache_shape, dtype=cache_dtype)
+        attn_k_cache = maybe_shard_along(attn_k_cache, dim=2)
+        self.attn_k_cache = attn_k_cache
+        attn_v_cache = torch.zeros(cache_shape, dtype=cache_dtype)
+        attn_v_cache = maybe_shard_along(attn_v_cache, dim=2)
+        self.attn_v_cache = attn_v_cache
+
+    def valid_parameters(self):
+        params = [
+            self.pre_attn_ln_weight,
+            self.pre_attn_ln_bias,
+            self.attn_q_weight,
+            self.attn_q_bias,
+            self.attn_k_weight,
+            self.attn_k_bias,
+            self.attn_v_weight,
+            self.attn_v_bias,
+            self.attn_out_weight,
+            self.attn_out_bias,
+            self.post_attn_ln_weight,
+            self.post_attn_ln_bias,
+            self.pre_mlp_ln_weight,
+            self.pre_mlp_ln_bias,
+            self.mlp_in_weight,
+            self.mlp_in_bias,
+            self.mlp_out_weight,
+            self.mlp_out_bias,
+            self.post_mlp_ln_weight,
+            self.post_mlp_ln_bias,
+        ]
+        return [par for par in params if par is not None]
+
+    def u8_bounds(self):
+        bounds = (
+            self.attn_q_min, self.attn_q_max, self.attn_k_min, self.attn_k_max,
+            self.attn_v_min, self.attn_v_max, self.attn_out_min, self.attn_out_max,
+            self.mlp_in_min, self.mlp_in_max, self.mlp_out_min, self.mlp_out_max,
+        )
+        if any(bd is None for bd in bounds):
+            return None
+        return bounds
+
+    def reset(self):
+        zero_cache = torch.zeros(self.attn_k_cache.shape, dtype=self.attn_k_cache.dtype)
+        zero_cache = [zero_cache for _ in range(self.tp_degree)]
+        ops.parallel_write(self.attn_k_cache, zero_cache)
+        ops.parallel_write(self.attn_v_cache, zero_cache)
+
+
+class MaybeParallelTensorManipulator:
+
+    def __init__(self, tp_degree):
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+
+    def duplicate(self, tensor):
+        if tensor is None:
+            return None
+        return self.manipulator.duplicate(tensor)
+
+    def shard_along(self, tensor, dim):
+        if tensor is None:
+            return None
+        return self.manipulator.shard_along(tensor, dim)
+
+    def primary_only(self, tensor):
+        if tensor is None:
+            return None
+        return self.manipulator.primary_only(tensor)
+
+
+class DecoderParameterBuilder:
+
+    def __init__(self, scribe, parameter_number):
+        self.scribe = scribe
+        self.parameter_number = parameter_number
+        self.dtype_converter = compiler.DataTypeConverter()
+
+    def from_tensor(self, tensor, dim_size=None, static=True):
+        if tensor is None:
+            return None
+        name = self.dtype_converter.torch2name(tensor.dtype)
+        dtype = getattr(self.scribe, name)
+        sizes = list(tensor.shape)
+        if dim_size is not None:
+            for dim, size in dim_size.items():
+                sizes[dim] = size
+        param = dtype[sizes].Parameter(parameter_number=self.parameter_number)
+        self.parameter_number += 1
+        if static:
+            param = hlo.transfer_with_static_ring(param)
+        return param
+
+
+class DecoderProgram:
+
+    def __init__(self, hlo_modules, num_inputs, tp_degree):
+        first_hlo, *_ = hlo_modules
+        self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(num_inputs)]
+        self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
+        self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
+        self.n_active_tokens = read_n_active_tokens(first_hlo)
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+
+    def init_length(self, sequence_length):
+        return sequence_length // self.n_active_tokens * self.n_active_tokens
+
+    def setup(self, layers, ln_lm_head_params):
+        self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
+        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
+        for kernel in self.kernels:
+            kernel.build()
+            kernel.load()
+
+    def inputs_host_to_device(self, input_tensors):
+        for buf, tensor in zip(self.input_buffers, input_tensors):
+            tensor = tensor.to(buf.dtype)
+            tensor = self.manipulator.duplicate_on_cpu(tensor)
+            ops.parallel_write(buf, tensor)
+
+    def run(self, bucket_id):
+        raise NotImplementedError(DecoderProgram)
+
+    def logits_device_to_host(self):
+        return self.manipulator.unshard_along(self.logits_buffer, dim=0)
+
+    def _fill_io_tensors(self, input_tensors, output_tensors, layers, npos):
+        for layer in layers:
+            for cache in layer.attn_k_cache, layer.attn_v_cache:
+                cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=npos, step=1)
+                input_tensors.append(cache_slice)
+                output_tensors.append(cache_slice)
+        for layer in layers:
+            input_tensors.extend(layer.valid_parameters())
+
+
+class DecoderProgramDoNothing(DecoderProgram):
+
+    def __init__(self):
+        self.n_active_tokens = 1
+
+    def init_length(self, sequence_length):
+        return 0
+
+    def setup(self, layers, ln_lm_head_params):
+        pass
+
+    def run(self, bucket_id):
+        pass
+
+
+class DecoderProgramFullyUnrolled(DecoderProgram):
+
+    def __init__(self, hlo_modules, num_inputs, tp_degree):
+        super().__init__(hlo_modules, num_inputs, tp_degree)
+        first_hlo, *_ = hlo_modules
+        self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
+        self.memories = [kernel.build_memory() for kernel in self.kernels]
+
+    def setup(self, layers, ln_lm_head_params):
+        super().setup(layers, ln_lm_head_params)
+        for npos, memory in zip(self.n_positions_list, self.memories):
+            input_tensors = [*self.input_buffers]
+            output_tensors = [self.logits_buffer]
+            self._fill_io_tensors(input_tensors, output_tensors, layers, npos)
+            input_tensors.extend(ln_lm_head_params)
+            memory.setup(input_tensors, output_tensors)
+
+    def run(self, bucket_id):
+        self.kernels[bucket_id](self.memories[bucket_id])
+
+
+class DecoderProgramMultiLayer(DecoderProgram):
+
+    def __init__(self, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree):
+        super().__init__(hlo_modules, num_inputs, tp_degree)
+        if num_layers % unroll:
+            raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
+        self.logits_buffer = compiler.gen_zero_output(ln_lm_head_hlo_module)
+        self.unroll = unroll
+        self.multi_layers_memories = []
+        for _ in range(num_layers // unroll):
+            memories = [kernel.build_memory() for kernel in self.kernels]
+            self.multi_layers_memories.append(memories)
+        self.ln_lm_head_kernel = compiler.ParallelKernel(ln_lm_head_hlo_module, tp_degree)
+        self.ln_lm_head_memory = self.ln_lm_head_kernel.build_memory()
+
+    def setup(self, layers, ln_lm_head_params):
+        super().setup(layers, ln_lm_head_params)
+        hidden_buffer, *_ = self.input_buffers
+        multi_layer_starts = range(0, len(layers), self.unroll)
+        multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
+        for memories, multi_layer in zip(self.multi_layers_memories, multi_layers):
+            for npos, memory in zip(self.n_positions_list, memories):
+                input_tensors = [*self.input_buffers]
+                output_tensors = [hidden_buffer]
+                self._fill_io_tensors(input_tensors, output_tensors, multi_layer, npos)
+                memory.setup(input_tensors, output_tensors)
+        self.ln_lm_head_memory.setup([hidden_buffer, *ln_lm_head_params], [self.logits_buffer])
+        self.ln_lm_head_kernel.build()
+        self.ln_lm_head_kernel.load()
+
+    def run(self, bucket_id):
+        for memories in self.multi_layers_memories:
+            self.kernels[bucket_id](memories[bucket_id])
+        self.ln_lm_head_kernel(self.ln_lm_head_memory)
