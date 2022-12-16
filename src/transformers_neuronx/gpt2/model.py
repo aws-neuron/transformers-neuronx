@@ -13,139 +13,106 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
+from transformers_neuronx import hlo
 from transformers_neuronx import module
 from transformers_neuronx import ops
-from transformers_neuronx import parallel
-from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx.gpt2 import hlo
+from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.gpt2.config import GPT2Config
+from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.sampling import simple_sample
 
 
 class GPT2ForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=False, init_n_active_tokens=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
+        self.chkpt_model = GPT2CheckpointCompatible(config)
         self.config = config
         if unroll is None:
             unroll = config.n_layer
-        if utils.amp_is_u8(amp) and unroll != config.n_layer:
-            raise NotImplementedError(f'amp={amp} only works with unroll={config.n_layer}')
-        self.unroll = unroll
-        self.init_n_active_tokens = init_n_active_tokens
-        dtype, _, _ = utils.parse_amp(config.amp)
-        dtype = dtypes.to_torch_dtype(dtype)
-        self.transformer = GPT2Transformer(config)
-        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
-        self.ln_lm_head = GPT2LnLmHead(config, self.transformer.ln_f, self.lm_head)
-        self.n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
-        self.program = None
-        self.init_program = program.DoNothingDecoder()
-        self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
-        self.to_neuron_hooks = []
+        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
+        attention_head_size = config.n_embd // config.n_head
+        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, n_positions_list, batch_size, attention_head_size, amp,
+            config.n_layer, unroll, init_n_active_tokens,
+        )
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, batch_size, config.n_embd, 'gelu_new')
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+    def load_state_dict_dir(self, state_dict_dir):
+        self.chkpt_model.load_state_dict_dir(state_dict_dir)
+
+    def load_state_dict_low_memory(self, state_dict):
+        self.chkpt_model.load_state_dict_low_memory(state_dict)
 
     def to_neuron(self):
         ops.init()
-        config = self.config
-        n_positions_list = self.n_positions_list
-        unroll = self.unroll
-        self.transformer.wte.materialize()
-        self.transformer.wpe.materialize()
-        for idx, block in enumerate(self.transformer.h):
-            block.to_neuron(n_positions_list)
-        self.ln_lm_head.to_neuron()
-        blocks_u8_bounds = None
-        if utils.amp_is_u8(config.amp):
-            blocks_u8_bounds = [block.get_u8_bounds() for block in self.transformer.h]
-        self.program = build_gpt2_program(config, 1, n_positions_list, unroll, blocks_u8_bounds)
-        init_n_active = self.init_n_active_tokens
-        if init_n_active is not None:
-            self.init_program = build_gpt2_program(config, init_n_active, n_positions_list, unroll,
-                                                   blocks_u8_bounds)
-        self.program.setup(self.transformer.h, self.ln_lm_head)
-        self.init_program.setup(self.transformer.h, self.ln_lm_head)
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+        n_embd = self.config.n_embd
+        for layer in self.chkpt_model.transformer.h:
+            layer.materialize()
+            attn = layer.attn
+            mlp = layer.mlp
+            c_attn_weight = attn.c_attn.weight.detach()
+            c_attn_bias = attn.c_attn.bias.detach()
+            new_layer = self.decoder_lm_head.new_layer()
+            new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
+                                                   layer.ln_1.bias.detach())
+            new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
+            new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
+                                        c_attn_bias[n_embd:n_embd*2])
+            new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
+                                          c_attn_bias[n_embd*2:n_embd*3])
+            new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
+            new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
+            new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
+            new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            new_layer.to_neuron()
+            layer.nullify()
+        ln_f = self.chkpt_model.transformer.ln_f
+        ln_f.materialize()
+        self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        lm_head = self.chkpt_model.lm_head
+        lm_head.materialize()
+        self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        lm_head.nullify()
+        self.decoder_lm_head.to_neuron()
 
     def reset(self):
-        for block in self.transformer.h:
-            block.reset()
+        self.decoder_lm_head.reset()
 
-    def forward(self, input_ids, cache_offset):
-        last_offset = cache_offset[-1].item()
-        bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
-        this_length = input_ids.shape[-1]
-        init_length = self.init_program.init_length(this_length, self.init_n_active_tokens)
-        init_step = self.init_program.init_step(self.init_n_active_tokens)
-        for cur_len in range(0, init_length, init_step):
-            slicing = slice(cur_len, cur_len + init_step)
-            inputs = input_ids[:, slicing], cache_offset[slicing]
-            logits = self._run_program(self.init_program, bucket_id, *inputs)
-        for cur_len in range(init_length, this_length):
-            slicing = slice(cur_len, cur_len + 1)
-            inputs = input_ids[:, slicing], cache_offset[slicing]
-            logits = self._run_program(self.program, bucket_id, *inputs)
-        logits = self.manipulator.unshard_along(logits, dim=0)
+    def forward(self, input_ids, position_ids):
+        inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
+        position_embeds = self.chkpt_model.transformer.wpe(position_ids)
+        hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, -1)
+        logits = self.decoder_lm_head(hidden, position_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
         return logits
 
-    def _run_program(self, program, bucket_id, input_ids, cache_offset):
-        active_n_positions = self.n_positions_list[bucket_id]
-        inputs_embeds = self.transformer.wte(input_ids)
-        past_length = cache_offset[0].item()
-        this_length = input_ids.shape[-1]
-        position_ids = torch.arange(past_length, past_length + this_length)
-        position_ids = position_ids.unsqueeze(0).view(-1, this_length)
-        position_embeds = self.transformer.wpe(position_ids)
-        hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1).contiguous()
-        input_buffers = program.buffers.get_input_buffers(bucket_id)
-        hidden_buffer, *_ = input_buffers
-        hidden = hidden.to(hidden_buffer.dtype)
-        hidden = self.manipulator.duplicate_on_cpu(hidden)
-        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        for in_buffer, in_tensor in zip(input_buffers, [hidden, cache_offset]):
-            ops.parallel_write(in_buffer, in_tensor)
-        return program.run(bucket_id)
-
     def sample(self, input_ids, sequence_length):
         return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
                              eos_token_id=self.config.eos_token_id, top_k=50)
 
-    def register_to_neuron_hook(self, hook):
-        self.to_neuron_hooks.append(hook)
 
+class GPT2CheckpointCompatible(module.PretrainedModel):
 
-class GPT2Buffers:
-
-    def __init__(self, opt_hlo_modules, tp_degree):
-        first_hlo_module, *_ = opt_hlo_modules
-        hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
-        cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 1)
-        self.input_buffers = [hidden_buffer, cache_offset_buffer]
-        self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-
-    def to_neuron(self):
-        hidden_buffer, cache_offset_buffer = self.input_buffers
-        hidden_buffer = self.manipulator.duplicate(hidden_buffer)
-        cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
-        self.input_buffers = [hidden_buffer, cache_offset_buffer]
-        self.output_buffer = self.manipulator.duplicate(self.output_buffer)
-
-    def get_input_buffers(self, bucket_id):
-        hidden_buffer, cache_offset_buffer = self.input_buffers
-        return [hidden_buffer, cache_offset_buffer]
-
-
-def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    def __init__(self, config):
+        super().__init__()
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
+        self.transformer = GPT2Transformer(config)
+        self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
 
 class GPT2Transformer(module.LowMemoryModule):
@@ -168,131 +135,6 @@ class GPT2Block(module.LowMemoryModule):
         self.attn = GPT2Attention(config)
         self.ln_2 = module.LowMemoryLayerNorm(config.n_embd)
         self.mlp = GPT2MLP(config)
-        self.config = config
-        self.ln_1_weight = None
-        self.ln_1_bias = None
-        self.attn_q_weight = None
-        self.attn_k_weight = None
-        self.attn_v_weight = None
-        self.attn_out_weight = None
-        self.ln_2_weight = None
-        self.ln_2_bias = None
-        self.mlp_in_weight = None
-        self.mlp_in_bias = None
-        self.mlp_out_weight = None
-        self.mlp_out_bias = None
-        self.key_cache = None
-        self.key_cache_slices = None
-        self.value_cache = None
-        self.value_cache_slices = None
-        self.attn_q_min = None
-        self.attn_q_max = None
-        self.attn_k_min = None
-        self.attn_k_max = None
-        self.attn_v_min = None
-        self.attn_v_max = None
-        self.attn_out_min = None
-        self.attn_out_max = None
-        self.mlp_in_min = None
-        self.mlp_in_max = None
-        self.mlp_out_min = None
-        self.mlp_out_max = None
-
-    def to_neuron(self, n_positions_list):
-        self.materialize()
-        config = self.config
-        manipulator = parallel.ParallelTensorManipulator(self.config.tp_degree)
-        duplicate = manipulator.duplicate
-        shard_along = manipulator.shard_along
-        primary_only = manipulator.primary_only
-        self.ln_1_weight = duplicate(self.ln_1.weight.detach())
-        self.ln_1_bias = duplicate(self.ln_1.bias.detach())
-        c_attn_weight = self.attn.c_attn.weight.detach()
-        c_attn_bias = self.attn.c_attn.bias.detach()
-        n_embd = self.config.n_embd
-        attn_q_weight = c_attn_weight[:, :n_embd]
-        attn_k_weight = c_attn_weight[:, n_embd:n_embd*2]
-        attn_v_weight = c_attn_weight[:, n_embd*2:n_embd*3]
-        attn_out_weight = self.attn.c_proj.weight.detach()
-        mlp_in_weight = self.mlp.c_fc.weight.detach()
-        mlp_out_weight = self.mlp.c_proj.weight.detach()
-        if utils.amp_is_u8(self.config.amp):
-            attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(attn_q_weight)
-            attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(attn_k_weight)
-            attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(attn_v_weight)
-            attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(attn_out_weight)
-            mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(mlp_in_weight)
-            mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(mlp_out_weight)
-        self.attn_q_weight = shard_along(attn_q_weight, dim=1)
-        self.attn_q_bias = shard_along(c_attn_bias[:n_embd], dim=0)
-        self.attn_k_weight = shard_along(attn_k_weight, dim=1)
-        self.attn_k_bias = shard_along(c_attn_bias[n_embd:n_embd*2], dim=0)
-        self.attn_v_weight = shard_along(attn_v_weight, dim=1)
-        self.attn_v_bias = shard_along(c_attn_bias[n_embd*2:n_embd*3], dim=0)
-        self.attn_out_weight = shard_along(attn_out_weight, dim=0)
-        self.attn_out_bias = primary_only(self.attn.c_proj.bias.detach())
-        self.ln_2_weight = duplicate(self.ln_2.weight.detach())
-        self.ln_2_bias = duplicate(self.ln_2.bias.detach())
-        self.mlp_in_weight = shard_along(mlp_in_weight, dim=1)
-        self.mlp_in_bias = shard_along(self.mlp.c_fc.bias.detach(), dim=0)
-        self.mlp_out_weight = shard_along(mlp_out_weight, dim=0)
-        self.mlp_out_bias = primary_only(self.mlp.c_proj.bias.detach())
-        self.nullify()
-
-        slice_on_nc = manipulator.slice_on_nc
-        n_positions = config.n_positions
-        batch_size = config.batch_size
-        n_head = config.n_head
-        s_head = config.n_embd // n_head
-        cache_shape = [n_positions, batch_size, n_head, s_head]
-        dtype, _, _ = utils.parse_amp(config.amp)
-        dtype = dtypes.to_torch_dtype(dtype)
-        key_cache = torch.zeros(cache_shape, dtype=dtype)
-        key_cache = manipulator.shard_along(key_cache, dim=2)
-        self.key_cache = key_cache
-        self.key_cache_slices = [slice_on_nc(key_cache, 0, start=0, end=npos, step=1)
-                                 for npos in n_positions_list]
-        value_cache = torch.zeros(cache_shape, dtype=dtype)
-        value_cache = manipulator.shard_along(value_cache, dim=2)
-        self.value_cache = value_cache
-        self.value_cache_slices = [slice_on_nc(value_cache, 0, start=0, end=npos, step=1)
-                                   for npos in n_positions_list]
-
-    def get_parameters(self):
-        return [
-            self.ln_1_weight,
-            self.ln_1_bias,
-            self.attn_q_weight,
-            self.attn_q_bias,
-            self.attn_k_weight,
-            self.attn_k_bias,
-            self.attn_v_weight,
-            self.attn_v_bias,
-            self.attn_out_weight,
-            self.attn_out_bias,
-            self.ln_2_weight,
-            self.ln_2_bias,
-            self.mlp_in_weight,
-            self.mlp_in_bias,
-            self.mlp_out_weight,
-            self.mlp_out_bias,
-        ]
-
-    def get_u8_bounds(self):
-        return (
-            self.attn_q_min, self.attn_q_max, self.attn_k_min, self.attn_k_max,
-            self.attn_v_min, self.attn_v_max, self.attn_out_min, self.attn_out_max,
-            self.mlp_in_min, self.mlp_in_max, self.mlp_out_min, self.mlp_out_max,
-        )
-
-    def get_cache_slices(self):
-        return [self.key_cache_slices, self.value_cache_slices]
-
-    def reset(self):
-        zero_cache = torch.zeros(self.key_cache.shape, dtype=self.key_cache.dtype)
-        zero_cache = [zero_cache for _ in range(self.config.tp_degree)]
-        ops.parallel_write(self.key_cache, zero_cache)
-        ops.parallel_write(self.value_cache, zero_cache)
 
 
 class GPT2Attention(module.LowMemoryModule):
@@ -314,44 +156,3 @@ class GPT2MLP(module.LowMemoryModule):
         dtype = dtypes.to_torch_dtype(dtype)
         self.c_fc = module.LowMemoryLazyLinear(config.n_embd, dtype=dtype)
         self.c_proj = module.LowMemoryLazyLinear(config.intermediate_dim, dtype=dtype)
-
-
-class GPT2LnLmHead:
-
-    def __init__(self, config, ln_f, lm_head):
-        self.ln_f = ln_f
-        self.lm_head = lm_head
-        self.ln_f_weight = None
-        self.ln_f_bias = None
-        self.lm_head_weight = None
-        tp_degree = config.tp_degree
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        vocab_size = config.vocab_size
-        self.vocab_pad = utils.pad_vocab_size(vocab_size, tp_degree)
-
-    def to_neuron(self):
-        self.ln_f.materialize()
-        self.ln_f_weight = self.manipulator.duplicate(self.ln_f.weight.detach())
-        self.ln_f_bias = self.manipulator.duplicate(self.ln_f.bias.detach())
-        self.lm_head.materialize()
-        lm_head_weight = self.lm_head.weight.detach()
-        lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, 0, 0, self.vocab_pad))
-        self.lm_head_weight = self.manipulator.shard_along(lm_head_weight.T, dim=1)
-        self.lm_head.nullify()
-
-    def get_parameters(self):
-        return [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
-
-
-def build_gpt2_program(config, n_active, n_positions_list, n_layers, blocks_u8_bounds):
-    hlo_modules = [hlo.build_gpt2_hlo_module(config, n_active, npos, blocks_u8_bounds)
-                   for npos in n_positions_list]
-    buffers = GPT2Buffers(hlo_modules, config.tp_degree)
-    if n_layers == config.n_layer:
-        return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)
-    else:
-        build_func = hlo.build_gpt2_multi_block_hlo_module
-        hlo_modules = [build_func(config, n_active, npos, n_layers) for npos in n_positions_list]
-        head_hlo_module = hlo.build_ln_lm_head_hlo_module(config, n_active)
-        return program.MultiLayerDecoder(config.n_layer, config.tp_degree, hlo_modules,
-                                         head_hlo_module, n_layers, buffers)
