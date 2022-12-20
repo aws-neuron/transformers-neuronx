@@ -130,12 +130,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, n_positions, n_active_tokens)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
-            hidden, out_caches = self._hlo_layers(
-                scribe, self.layers, param_builder, n_positions, hidden, tensors)
+            layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
+            hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights)
+            ln_f_weight = maybe_transfer_with_static_ring(ln_f_weight)
+            ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
+            head_weight = maybe_transfer_with_static_ring(head_weight)
+            head_bias = maybe_transfer_with_static_ring(head_bias)
             logits = self.ln_lm_head_builder(hidden, ln_f_weight, ln_f_bias, head_weight, head_bias)
             outputs = [logits, *out_caches]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
@@ -150,8 +154,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, n_positions, n_active_tokens)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
-            out_hidden, out_caches = self._hlo_layers(
-                scribe, self.layers[:self.unroll], param_builder, n_positions, hidden, tensors)
+            # use the first `unroll` layers to build the HLO -- assuming all layers are same
+            layers = self.layers[:self.unroll]
+            layers_caches, layers_weights = self._hlo_layers_params(param_builder, layers, n_positions)
+            out_hidden, out_caches = self._hlo_layers(hidden, tensors, layers, layers_caches, layers_weights)
             out_hidden.set_alias_to(hidden)
             outputs = [out_hidden, *out_caches]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
@@ -159,85 +165,26 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
         return compiler.compile_py_func(multi_layer)
 
-    def _hlo_layers(self, scribe, layers, param_builder, n_positions, hidden, tensors):
-        amp, quantized, dequantized = utils.parse_amp(self.amp)
-        dtype = getattr(scribe, amp)
-        dequant_dtype = None if dequantized is None else getattr(scribe, dequantized)
-
-        def attn_u8_decode(q_weight, k_weight, v_weight, out_weight, u8_bounds):
-            q_min, q_max, k_min, k_max, v_min, v_max, out_min, out_max, *_ = u8_bounds
-            q_weight = hlo.u8_decode(dtype, dequant_dtype, q_weight, q_min, q_max)
-            k_weight = hlo.u8_decode(dtype, dequant_dtype, k_weight, k_min, k_max)
-            v_weight = hlo.u8_decode(dtype, dequant_dtype, v_weight, v_min, v_max)
-            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
-            return q_weight, k_weight, v_weight, out_weight
-
-        def mlp_u8_decode(in_weight, out_weight, u8_bounds):
-            *_, in_min, in_max, out_min, out_max = u8_bounds
-            in_weight = hlo.u8_decode(dtype, dequant_dtype, in_weight, in_min, in_max)
-            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
-            return in_weight, out_weight
-
+    def _hlo_layers_params(self, param_builder, layers, n_positions):
         layers_caches = []
         for layer in layers:
             layer_caches = []
             for cache in layer.attn_k_cache, layer.attn_v_cache:
-                par = param_builder.from_tensor(cache, dim_size={0: n_positions}, static=False)
+                par = param_builder.from_tensor(cache, dim_size={0: n_positions})
                 layer_caches.append(par)
             layers_caches.append(layer_caches)
-        layers_u8_bounds = [layer.u8_bounds() for layer in layers]
         layers_weights = []
-        for layer, u8_bounds in zip(layers, layers_u8_bounds):
-            pre_attn_ln_weight = param_builder.from_tensor(layer.pre_attn_ln_weight)
-            pre_attn_ln_bias = param_builder.from_tensor(layer.pre_attn_ln_bias)
-            attn_q_weight = param_builder.from_tensor(layer.attn_q_weight)
-            attn_q_bias = param_builder.from_tensor(layer.attn_q_bias)
-            attn_k_weight = param_builder.from_tensor(layer.attn_k_weight)
-            attn_k_bias = param_builder.from_tensor(layer.attn_k_bias)
-            attn_v_weight = param_builder.from_tensor(layer.attn_v_weight)
-            attn_v_bias = param_builder.from_tensor(layer.attn_v_bias)
-            attn_out_weight = param_builder.from_tensor(layer.attn_out_weight)
-            attn_out_bias = param_builder.from_tensor(layer.attn_out_bias)
-            post_attn_ln_weight = param_builder.from_tensor(layer.post_attn_ln_weight)
-            post_attn_ln_bias = param_builder.from_tensor(layer.post_attn_ln_bias)
-            pre_mlp_ln_weight = param_builder.from_tensor(layer.pre_mlp_ln_weight)
-            pre_mlp_ln_bias = param_builder.from_tensor(layer.pre_mlp_ln_bias)
-            mlp_in_weight = param_builder.from_tensor(layer.mlp_in_weight)
-            mlp_in_bias = param_builder.from_tensor(layer.mlp_in_bias)
-            mlp_out_weight = param_builder.from_tensor(layer.mlp_out_weight)
-            mlp_out_bias = param_builder.from_tensor(layer.mlp_out_bias)
-            post_mlp_ln_weight = param_builder.from_tensor(layer.post_mlp_ln_weight)
-            post_mlp_ln_bias = param_builder.from_tensor(layer.post_mlp_ln_bias)
-            if u8_bounds is not None:
-                attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight = attn_u8_decode(
-                    attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight, u8_bounds)
-                mlp_in_weight, mlp_out_weight = mlp_u8_decode(mlp_in_weight, mlp_out_weight, u8_bounds)
-            layer_weights = [
-                pre_attn_ln_weight,
-                pre_attn_ln_bias,
-                attn_q_weight,
-                attn_q_bias,
-                attn_k_weight,
-                attn_k_bias,
-                attn_v_weight,
-                attn_v_bias,
-                attn_out_weight,
-                attn_out_bias,
-                post_attn_ln_weight,
-                post_attn_ln_bias,
-                pre_mlp_ln_weight,
-                pre_mlp_ln_bias,
-                mlp_in_weight,
-                mlp_in_bias,
-                mlp_out_weight,
-                mlp_out_bias,
-                post_mlp_ln_weight,
-                post_mlp_ln_bias,
-            ]
+        for layer in layers:
+            layer_weights = [param_builder.from_tensor(weight) for weight in layer.all_parameters()]
             layers_weights.append(layer_weights)
+        return layers_caches, layers_weights
+
+    def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights):
         output_caches = []
-        for caches, weights in zip(layers_caches, layers_weights):
+        for layer, caches, weights in zip(layers, layers_caches, layers_weights):
             in_caches = [hlo.transfer_with_static_ring(cache) for cache in caches]
+            weights = [maybe_transfer_with_static_ring(weight) for weight in weights]
+            weights = layer.hlo_maybe_dequantize_weights(weights)
             hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
             for out_cache, cache in zip(out_caches, caches):
                 out_cache.set_alias_to(cache, must=True)
@@ -294,6 +241,12 @@ def read_n_active_tokens(hlo_module):
 
 def find_first_ge_index(values, target):
     return next(idx for idx, val in enumerate(values) if val >= target)
+
+
+def maybe_transfer_with_static_ring(shape):
+    if shape is None:
+        return None
+    return hlo.transfer_with_static_ring(shape)
 
 
 class DecoderLayer(torch.nn.Module):
@@ -423,8 +376,8 @@ class DecoderLayer(torch.nn.Module):
         attn_v_cache = maybe_shard_along(attn_v_cache, dim=2)
         self.attn_v_cache = attn_v_cache
 
-    def valid_parameters(self):
-        params = [
+    def all_parameters(self):
+        return [
             self.pre_attn_ln_weight,
             self.pre_attn_ln_bias,
             self.attn_q_weight,
@@ -446,7 +399,9 @@ class DecoderLayer(torch.nn.Module):
             self.post_mlp_ln_weight,
             self.post_mlp_ln_bias,
         ]
-        return [par for par in params if par is not None]
+
+    def valid_parameters(self):
+        return [par for par in self.all_parameters() if par is not None]
 
     def u8_bounds(self):
         bounds = (
@@ -457,6 +412,78 @@ class DecoderLayer(torch.nn.Module):
         if any(bd is None for bd in bounds):
             return None
         return bounds
+
+    def hlo_maybe_dequantize_weights(self, hlo_weights):
+        u8_bounds = self.u8_bounds()
+        if u8_bounds is None:
+            return hlo_weights
+        first_valid_weight, *_ = [weight for weight in hlo_weights if weight is not None]
+        scribe = first_valid_weight.scribe
+        amp, quantized, dequantized = utils.parse_amp(self.amp)
+        dtype = getattr(scribe, amp)
+        dequant_dtype = None if dequantized is None else getattr(scribe, dequantized)
+
+        def attn_u8_decode(q_weight, k_weight, v_weight, out_weight, u8_bounds):
+            q_min, q_max, k_min, k_max, v_min, v_max, out_min, out_max, *_ = u8_bounds
+            q_weight = hlo.u8_decode(dtype, dequant_dtype, q_weight, q_min, q_max)
+            k_weight = hlo.u8_decode(dtype, dequant_dtype, k_weight, k_min, k_max)
+            v_weight = hlo.u8_decode(dtype, dequant_dtype, v_weight, v_min, v_max)
+            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
+            return q_weight, k_weight, v_weight, out_weight
+
+        def mlp_u8_decode(in_weight, out_weight, u8_bounds):
+            *_, in_min, in_max, out_min, out_max = u8_bounds
+            in_weight = hlo.u8_decode(dtype, dequant_dtype, in_weight, in_min, in_max)
+            out_weight = hlo.u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
+            return in_weight, out_weight
+
+        (
+            pre_attn_ln_weight,
+            pre_attn_ln_bias,
+            attn_q_weight,
+            attn_q_bias,
+            attn_k_weight,
+            attn_k_bias,
+            attn_v_weight,
+            attn_v_bias,
+            attn_out_weight,
+            attn_out_bias,
+            post_attn_ln_weight,
+            post_attn_ln_bias,
+            pre_mlp_ln_weight,
+            pre_mlp_ln_bias,
+            mlp_in_weight,
+            mlp_in_bias,
+            mlp_out_weight,
+            mlp_out_bias,
+            post_mlp_ln_weight,
+            post_mlp_ln_bias,
+        ) = hlo_weights
+        attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight = attn_u8_decode(
+            attn_q_weight, attn_k_weight, attn_v_weight, attn_out_weight, u8_bounds)
+        mlp_in_weight, mlp_out_weight = mlp_u8_decode(mlp_in_weight, mlp_out_weight, u8_bounds)
+        return [
+            pre_attn_ln_weight,
+            pre_attn_ln_bias,
+            attn_q_weight,
+            attn_q_bias,
+            attn_k_weight,
+            attn_k_bias,
+            attn_v_weight,
+            attn_v_bias,
+            attn_out_weight,
+            attn_out_bias,
+            post_attn_ln_weight,
+            post_attn_ln_bias,
+            pre_mlp_ln_weight,
+            pre_mlp_ln_bias,
+            mlp_in_weight,
+            mlp_in_bias,
+            mlp_out_weight,
+            mlp_out_bias,
+            post_mlp_ln_weight,
+            post_mlp_ln_bias,
+        ]
 
     def reset(self):
         zero_cache = torch.zeros(self.attn_k_cache.shape, dtype=self.attn_k_cache.dtype)
@@ -493,7 +520,7 @@ class DecoderParameterBuilder:
         self.parameter_number = parameter_number
         self.dtype_converter = compiler.DataTypeConverter()
 
-    def from_tensor(self, tensor, dim_size=None, static=True):
+    def from_tensor(self, tensor, dim_size=None):
         if tensor is None:
             return None
         name = self.dtype_converter.torch2name(tensor.dtype)
@@ -504,8 +531,6 @@ class DecoderParameterBuilder:
                 sizes[dim] = size
         param = dtype[sizes].Parameter(parameter_number=self.parameter_number)
         self.parameter_number += 1
-        if static:
-            param = hlo.transfer_with_static_ring(param)
         return param
 
 
