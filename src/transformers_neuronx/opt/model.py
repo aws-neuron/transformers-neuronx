@@ -36,8 +36,8 @@ class OPTForSampling(module.PretrainedModel):
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
         attention_head_size = config.hidden_size // config.num_attention_heads
         self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, batch_size, attention_head_size, amp,
-            config.num_hidden_layers, unroll, init_n_active_tokens,
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
+            config.num_hidden_layers, unroll,
         )
         hlo_builder = OPTForSamplingNoEmbeddingHlo(
             tp_degree, batch_size, config.hidden_size, config.activation_function)
