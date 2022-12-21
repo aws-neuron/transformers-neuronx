@@ -22,19 +22,19 @@ from transformers_neuronx import utils
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
-    def __init__(self, tp_degree, n_positions_list, batch_size, attention_head_size, amp,
-                 num_layers, unroll=None, init_n_active_tokens=None):
+    def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
+                 attention_head_size, amp, num_layers, unroll=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
         self.tp_degree = tp_degree
         self.n_positions_list = n_positions_list
+        self.n_active_tokens = n_active_tokens
         self.batch_size = batch_size
         self.attention_head_size = attention_head_size
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
-        self.init_n_active_tokens = init_n_active_tokens
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
         self.ln_f_bias = None
@@ -45,7 +45,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.layer_builder = None
         self.ln_lm_head_builder = None
         self.program = None
-        self.init_program = DecoderProgramDoNothing()
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
@@ -82,11 +81,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
-        self.program = self._build_program(1)
+        self.program = self._build_program()
         self.program.setup(self.layers, ln_lm_head_params)
-        if self.init_n_active_tokens is not None:
-            self.program = self._build_program(self.init_n_active_tokens)
-            self.init_program.setup(self.layers, ln_lm_head_params)
 
     def reset(self):
         for layer in self.layers:
@@ -95,40 +91,51 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
     def forward(self, *inputs):
         hidden, *_ = inputs
         _, sequence_length, _ = hidden.shape
-        init_length = self.init_program.init_length(sequence_length)
-        init_step = self.init_program.n_active_tokens
-        for start in range(0, init_length, init_step):
-            slicing = slice(start, start + init_step)
-            self._run_program(self.init_program, inputs, slicing)
-        for start in range(init_length, sequence_length):
-            slicing = slice(start, start + 1)
-            self._run_program(self.program, inputs, slicing)
+        if sequence_length % self.n_active_tokens:
+            raise ValueError(f'sequence_length={sequence_length} cannot be divided by '
+                             f'n_active_tokens={self.n_active_tokens}')
+        for start in range(0, sequence_length, self.n_active_tokens):
+            slicing = slice(start, start + self.n_active_tokens)
+            input_tensors = []
+            for sdim, tensor in zip(self.inputs_sdim, inputs):
+                if sdim is not None:
+                    slices = [slice(None) for _ in tensor.shape]
+                    slices[sdim] = slicing
+                    tensor = tensor[tuple(slices)].contiguous()
+                input_tensors.append(tensor)
+            *_, position_ids = input_tensors
+            min_id = position_ids.max().item()
+            max_id = position_ids.min().item()
+            bucket_id = self.program.find_bucket_id(max_id)
+            if self.program.find_bucket_id(min_id) != bucket_id:
+                raise ValueError(f'given buckets {self.n_positions_list}, ids ranging from '
+                                 f'{min_id} to {max_id} do not fall into the same bucket')
+            self.program.inputs_host_to_device(input_tensors)
+            self.program.run(bucket_id)
         return self.program.logits_device_to_host()
 
-    def _build_program(self, n_active_tokens):
+    def _build_program(self):
         if self.unroll == self.num_layers:
-            hlo_modules = [self._hlo_fully_unrolled(npos, n_active_tokens)
-                           for npos in self.n_positions_list]
+            hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramFullyUnrolled(hlo_modules, num_inputs, self.tp_degree)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
-            hlo_modules = [self._hlo_multi_layer(npos, n_active_tokens)
-                           for npos in self.n_positions_list]
-            ln_lm_head_hlo_module = self._hlo_ln_lm_head(n_active_tokens)
+            hlo_modules = [self._hlo_multi_layer(npos) for npos in self.n_positions_list]
+            ln_lm_head_hlo_module = self._hlo_ln_lm_head(self.n_active_tokens)
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(hlo_modules, ln_lm_head_hlo_module, num_inputs,
                                                self.num_layers, self.unroll, self.tp_degree)
         return program
 
-    def _hlo_fully_unrolled(self, n_positions, n_active_tokens):
+    def _hlo_fully_unrolled(self, n_positions):
 
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, n_active_tokens)
+                scribe, dtype, n_positions, self.n_active_tokens)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
@@ -147,12 +154,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
         return compiler.compile_py_func(fully_unrolled)
 
-    def _hlo_multi_layer(self, n_positions, n_active_tokens):
+    def _hlo_multi_layer(self, n_positions):
 
         def multi_layer(scribe):
             dtype = getattr(scribe, self.amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, n_active_tokens)
+                scribe, dtype, n_positions, self.n_active_tokens)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             # use the first `unroll` layers to build the HLO -- assuming all layers are same
             layers = self.layers[:self.unroll]
@@ -191,13 +198,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             output_caches.extend(out_caches)
         return hidden, output_caches
 
-    def _hlo_ln_lm_head(self, n_active_tokens):
+    def _hlo_ln_lm_head(self):
         hidden_sizes = []
 
         def capture_hidden_sizes(scribe):
             dtype = getattr(scribe, self.amp)
             *_, n_positions = self.n_positions_list
-            (hidden, *_), _ = self.inputs_builder(scribe, dtype, n_positions, n_active_tokens)
+            (hidden, *_), _ = self.inputs_builder(scribe, dtype, n_positions, self.n_active_tokens)
             hidden_sizes.clear()
             hidden_sizes.extend(hidden.sizes)
             return hidden
@@ -216,20 +223,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
         return compiler.compile_py_func(ln_lm_head)
 
-    def _run_program(self, program, inputs, slicing):
-        input_tensors = []
-        for sdim, tensor in zip(self.inputs_sdim, inputs):
-            if sdim is not None:
-                slices = [slice(None) for _ in tensor.shape]
-                slices[sdim] = slicing
-                tensor = tensor[tuple(slices)].contiguous()
-            input_tensors.append(tensor)
-        *_, position_ids = input_tensors
-        last_id = position_ids[-1].item()
-        bucket_id = find_first_ge_index(program.n_positions_list, last_id)
-        program.inputs_host_to_device(input_tensors)
-        program.run(bucket_id)
-
 
 def read_n_position(hlo_module, num_inputs):
     return hlo_module.host_program_shape.parameters[num_inputs].dimensions[0]
@@ -237,10 +230,6 @@ def read_n_position(hlo_module, num_inputs):
 
 def read_n_active_tokens(hlo_module):
     return hlo_module.host_program_shape.parameters[0].dimensions[1]
-
-
-def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
 
 
 def maybe_transfer_with_static_ring(shape):
@@ -544,15 +533,15 @@ class DecoderProgram:
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
-    def init_length(self, sequence_length):
-        return sequence_length // self.n_active_tokens * self.n_active_tokens
-
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
         for kernel in self.kernels:
             kernel.build()
             kernel.load()
+
+    def find_bucket_id(self, length):
+        return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
 
     def inputs_host_to_device(self, input_tensors):
         for buf, tensor in zip(self.input_buffers, input_tensors):
@@ -574,21 +563,6 @@ class DecoderProgram:
                 output_tensors.append(cache_slice)
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
-
-
-class DecoderProgramDoNothing(DecoderProgram):
-
-    def __init__(self):
-        self.n_active_tokens = 1
-
-    def init_length(self, sequence_length):
-        return 0
-
-    def setup(self, layers, ln_lm_head_params):
-        pass
-
-    def run(self, bucket_id):
-        pass
 
 
 class DecoderProgramFullyUnrolled(DecoderProgram):

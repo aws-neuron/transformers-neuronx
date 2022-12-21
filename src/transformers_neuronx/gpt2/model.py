@@ -37,8 +37,8 @@ class GPT2ForSampling(module.PretrainedModel):
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, batch_size, attention_head_size, amp,
-            config.n_layer, unroll, init_n_active_tokens,
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
+            config.n_layer, unroll,
         )
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, batch_size, config.n_embd, 'gelu_new')
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
