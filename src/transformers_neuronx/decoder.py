@@ -14,6 +14,7 @@
 # ==============================================================================
 import torch
 from transformers_neuronx import compiler
+from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
@@ -83,6 +84,39 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             ln_lm_head_params.append(self.lm_head_bias)
         self.program = self._build_program()
         self.program.setup(self.layers, ln_lm_head_params)
+
+    def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
+                            unroll=None, share_caches=False):
+        if n_positions_list is None:
+            n_positions_list = self.n_positions_list
+        if n_active_tokens is None:
+            n_active_tokens = self.n_active_tokens
+        if batch_size is None:
+            batch_size = self.batch_size
+        if unroll is None:
+            unroll = self.unroll
+        new = DecoderLmHeadForSamplingNoEmbedding(
+            self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
+            self.amp, self.num_layers, unroll,
+        )
+        new.add_inputs_builder(self.inputs_builder)
+        new.add_layer_builder(self.layer_builder)
+        new.add_ln_lm_head_builder(self.ln_lm_head_builder)
+        for layer in self.layers:
+            new_layer = new.new_layer()
+            new_layer.assign_parameters(layer)
+            if share_caches:
+                new_layer.assign_caches(layer)
+            else:
+                new_layer.init_caches()
+        new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
+        new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
+        ln_lm_head_params = [new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
+        if new.lm_head_bias is not None:
+            ln_lm_head_params.append(new.lm_head_bias)
+        new.program = new._build_program()
+        new.program.setup(new.layers, ln_lm_head_params)
+        return new
 
     def reset(self):
         for layer in self.layers:
@@ -281,6 +315,8 @@ class DecoderLayer(torch.nn.Module):
         self.batch_size = batch_size
         self.attention_head_size = attention_head_size
         self.amp = amp
+        dtype, _, _ = utils.parse_amp(amp)
+        self.cache_dtype = dtypes.to_torch_dtype(dtype)
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -323,7 +359,6 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = bias
 
     def to_neuron(self):
-        cache_dtype = self.attn_q_weight.dtype
         if utils.amp_is_u8(self.amp):
             self.attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(self.attn_q_weight)
             self.attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(self.attn_k_weight)
@@ -331,7 +366,6 @@ class DecoderLayer(torch.nn.Module):
             self.attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(self.attn_out_weight)
             self.mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(self.mlp_in_weight)
             self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
-        hidden_size, _ = self.attn_q_weight.shape
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
@@ -356,14 +390,16 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
+        self.init_caches()
+
+    def init_caches(self):
+        hidden_size, _ = self.attn_q_weight.shape
         n_heads = hidden_size // self.attention_head_size
         cache_shape = [self.n_positions, self.batch_size, n_heads, self.attention_head_size]
-        attn_k_cache = torch.zeros(cache_shape, dtype=cache_dtype)
-        attn_k_cache = maybe_shard_along(attn_k_cache, dim=2)
-        self.attn_k_cache = attn_k_cache
-        attn_v_cache = torch.zeros(cache_shape, dtype=cache_dtype)
-        attn_v_cache = maybe_shard_along(attn_v_cache, dim=2)
-        self.attn_v_cache = attn_v_cache
+        cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+        manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=2)
+        self.attn_v_cache = manipulator.shard_along(cpu_cache, dim=2)
 
     def all_parameters(self):
         return [
@@ -479,6 +515,44 @@ class DecoderLayer(torch.nn.Module):
         zero_cache = [zero_cache for _ in range(self.tp_degree)]
         ops.parallel_write(self.attn_k_cache, zero_cache)
         ops.parallel_write(self.attn_v_cache, zero_cache)
+
+    def assign_parameters(self, layer):
+        self.pre_attn_ln_weight = layer.pre_attn_ln_weight
+        self.pre_attn_ln_bias = layer.pre_attn_ln_bias
+        self.attn_q_weight = layer.attn_q_weight
+        self.attn_q_bias = layer.attn_q_bias
+        self.attn_k_weight = layer.attn_k_weight
+        self.attn_k_bias = layer.attn_k_bias
+        self.attn_v_weight = layer.attn_v_weight
+        self.attn_v_bias = layer.attn_v_bias
+        self.attn_out_weight = layer.attn_out_weight
+        self.attn_out_bias = layer.attn_out_bias
+        self.post_attn_ln_weight = layer.post_attn_ln_weight
+        self.post_attn_ln_bias = layer.post_attn_ln_bias
+        self.pre_mlp_ln_weight = layer.pre_mlp_ln_weight
+        self.pre_mlp_ln_bias = layer.pre_mlp_ln_bias
+        self.mlp_in_weight = layer.mlp_in_weight
+        self.mlp_in_bias = layer.mlp_in_bias
+        self.mlp_out_weight = layer.mlp_out_weight
+        self.mlp_out_bias = layer.mlp_out_bias
+        self.post_mlp_ln_weight = layer.post_mlp_ln_weight
+        self.post_mlp_ln_bias = layer.post_mlp_ln_bias
+        self.attn_q_min = layer.attn_q_min
+        self.attn_q_max = layer.attn_q_max
+        self.attn_k_min = layer.attn_k_min
+        self.attn_k_max = layer.attn_k_max
+        self.attn_v_min = layer.attn_v_min
+        self.attn_v_max = layer.attn_v_max
+        self.attn_out_min = layer.attn_out_min
+        self.attn_out_max = layer.attn_out_max
+        self.mlp_in_min = layer.mlp_in_min
+        self.mlp_in_max = layer.mlp_in_max
+        self.mlp_out_min = layer.mlp_out_min
+        self.mlp_out_max = layer.mlp_out_max
+
+    def assign_caches(self, layer):
+        self.attn_k_cache = layer.attn_k_cache
+        self.attn_v_cache = layer.attn_v_cache
 
 
 class MaybeParallelTensorManipulator:
