@@ -94,7 +94,7 @@ class ParallelTensorManipulator:
     def duplicate(self, tensor):
         return ops.parallel_to_nc([tensor for ordinal in range(self.tp_degree)])
 
-    def shard_along(self, tensor, dim):
+    def shard_along_on_cpu(self, tensor, dim):
         size = tensor.shape[dim]
         shard_size = size // self.tp_degree
         slices = [slice(None) for _ in tensor.shape]
@@ -103,7 +103,10 @@ class ParallelTensorManipulator:
             slices[dim] = slice(start, start+shard_size, 1)
             shard = tensor[tuple(slices)].contiguous()
             tensors.append(shard)
-        return ops.parallel_to_nc(tensors)
+        return tensors
+
+    def shard_along(self, tensor, dim):
+        return ops.parallel_to_nc(self.shard_along_on_cpu(tensor, dim))
 
     def primary_only(self, tensor):
         tensors = [tensor]
