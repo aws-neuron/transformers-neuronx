@@ -39,8 +39,7 @@ class OPTForSampling(module.PretrainedModel):
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.num_hidden_layers, unroll,
         )
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(
-            tp_degree, batch_size, config.hidden_size, config.activation_function)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size, config.activation_function)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -174,14 +173,13 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, batch_size, hidden_size, activation_function):
+    def __init__(self, tp_degree, hidden_size, activation_function):
         self.tp_degree = tp_degree
-        self.batch_size = batch_size
         self.hidden_size = hidden_size
         self.activation_function = activation_function
 
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens):
-        hidden_sizes = self.hidden_size, n_active_tokens, self.batch_size
+    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
+        hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         position_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         mask = hlo.decoder_attention_mask(position_ids, scribe.f32, n_positions)
