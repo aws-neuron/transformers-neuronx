@@ -123,7 +123,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
             hlo_modules = [self._hlo_multi_layer(npos) for npos in self.n_positions_list]
-            ln_lm_head_hlo_module = self._hlo_ln_lm_head(self.n_active_tokens)
+            ln_lm_head_hlo_module = self._hlo_ln_lm_head()
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(hlo_modules, ln_lm_head_hlo_module, num_inputs,
                                                self.num_layers, self.unroll, self.tp_degree)
