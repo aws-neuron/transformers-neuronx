@@ -18,14 +18,17 @@ import torch
 @torch.no_grad()
 def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_token_id=2, top_k=50):
     model.reset()
-    start = input_ids.shape[1]
 
     # populate key/value caches according to the prompt text
+    _, start = input_ids.shape
     position_ids = torch.arange(start, dtype=torch.int32)
     next_token_scores = model(input_ids, position_ids)
+    return sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_id, top_k)
 
-    # auto-regressive generation
+
+def sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_id=2, top_k=50):
     tokens = [input_ids]
+    _, start = input_ids.shape
     for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 

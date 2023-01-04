@@ -169,7 +169,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, self.n_active_tokens)
+                scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
@@ -193,7 +193,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         def multi_layer(scribe):
             dtype = getattr(scribe, self.amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, self.n_active_tokens)
+                scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             # use the first `unroll` layers to build the HLO -- assuming all layers are same
             layers = self.layers[:self.unroll]
@@ -238,7 +238,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         def capture_hidden_sizes(scribe):
             dtype = getattr(scribe, self.amp)
             *_, n_positions = self.n_positions_list
-            (hidden, *_), _ = self.inputs_builder(scribe, dtype, n_positions, self.n_active_tokens)
+            (hidden, *_), _ = self.inputs_builder(
+                scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             hidden_sizes.clear()
             hidden_sizes.extend(hidden.sizes)
             return hidden
