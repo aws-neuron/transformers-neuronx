@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import warnings
 import torch
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -25,9 +26,13 @@ from transformers_neuronx.sampling import simple_sample
 
 class OPTForSampling(module.PretrainedModel):
 
-    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2, n_positions=2048,
+    def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
                  unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
+        if amp is None:
+            amp = dtypes.to_amp(config.torch_dtype)
+        else:
+            warnings.warn(f'torch_dtype={config.torch_dtype} ignored in favor of amp={amp}')
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         self.chkpt_model = OPTCheckpointCompatible(config)
         self.config = config
