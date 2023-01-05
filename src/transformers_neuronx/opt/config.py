@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import warnings
 from transformers.configuration_utils import PretrainedConfig
 from transformers_neuronx import utils
 from transformers_neuronx.gpt2.config import GPT2Config
@@ -23,7 +22,6 @@ class OPTConfig:
     def __init__(self, config, n_positions, batch_size, amp, tp_degree, **kwargs):
         if not config.do_layer_norm_before:
             raise NotImplementedError('do_layer_norm_before=False not implemented')
-        warnings.warn(f'torch_dtype={config.torch_dtype} ignored in favor of amp={amp}')
         self.activation_function = config.activation_function
         self.eos_token_id = config.eos_token_id
         self.pad_token_id = config.pad_token_id

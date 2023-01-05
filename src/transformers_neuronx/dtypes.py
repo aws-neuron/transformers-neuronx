@@ -22,3 +22,12 @@ def to_torch_dtype(dtype):
         'bf16': torch.bfloat16,
     }
     return mapping[dtype]
+
+
+def to_amp(dtype):
+    mapping = {
+        torch.float32: 'f32',
+        torch.float16: 'f16',
+        torch.bfloat16: 'bf16',
+    }
+    return mapping[dtype]
