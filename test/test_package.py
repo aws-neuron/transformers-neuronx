@@ -12,4 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from transformers_neuronx.version import __version__
+import os
+import unittest
+import transformers_neuronx
+
+
+class TestVersion(unittest.TestCase):
+
+    def test_version(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Config')) as fp:
+            for line in fp:
+                if line.strip().startswith('interfaces = '):
+                    brazil_interface_version = line[line.find('(')+1:line.find(')')]
+                    break
+        self.assertTrue(transformers_neuronx.__version__.startswith(brazil_interface_version))
+
+
+if __name__ == '__main__':
+    unittest.main()

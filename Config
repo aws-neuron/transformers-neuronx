@@ -1,4 +1,5 @@
 package.KaenaTransformers = {
+    # please make sure the major.minor version matches the __version__ string in version.py
     interfaces = (1.0);
 
     build-system = custom-build;

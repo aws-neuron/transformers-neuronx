@@ -39,3 +39,8 @@ cp -r ${BUILD_TN_SRC_TN} ${BUILD_PATH}/${SITE_PACKAGES_SUFFIX}/
 cd ${BUILD_PATH_TN}
 export PYTHONPATH=${RUNTIMEFARM_PATH}/${SITE_PACKAGES_SUFFIX}
 python setup.py bdist_wheel --dist-dir ${BUILD_PATH}/pip/public/transformers-neuronx
+
+# Run some tests
+if [ "$1" == "release" ]; then
+    env PYTHONPATH=${BUILD_PATH}/${SITE_PACKAGES_SUFFIX} python ${SRC_PATH}/test/test_package.py
+fi
