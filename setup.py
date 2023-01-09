@@ -17,8 +17,16 @@ from datetime import datetime
 from setuptools import setup, PEP420PackageFinder
 
 
+def version_py_path():
+    return os.path.join(os.path.dirname(__file__), 'src', 'transformers_neuronx', 'version.py')
+
+
+exec(open(version_py_path()).read())
+
+
 def get_version():
-    version = os.environ['TRANSFORMERS_NEURONX_VERSION']
+    # please make sure the major.minor version matches the interface version in Config
+    version = os.environ.get('TRANSFORMERS_NEURONX_VERSION', __version__)
     today = datetime.today().strftime('%Y%m%d')
     return version.replace('.x', f'.{today}')
 

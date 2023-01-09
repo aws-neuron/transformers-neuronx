@@ -12,4 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from transformers_neuronx.version import __version__
+
+# please make sure the major.minor version matches the interface version in Config
+__version__ = '1.0.x'
