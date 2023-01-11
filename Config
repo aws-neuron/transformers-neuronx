@@ -1,10 +1,10 @@
 package.KaenaTransformers = {
     # please make sure the major.minor version matches the __version__ string in version.py
-    interfaces = (1.0);
+    interfaces = (0.1);
 
     build-system = custom-build;
     build-tools = {
-        1.0 = {
+        0.1 = {
             Python3PBuildTool = 2.0;
             Python-wheel = 0.x;
         };
