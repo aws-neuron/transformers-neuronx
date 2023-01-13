@@ -25,13 +25,12 @@ from transformers_neuronx.gpt2.config import GPT2Config
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
 
-class GPT2ForSampling(module.PretrainedModel):
+class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):
-        super().__init__()
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
-        self.chkpt_model = GPT2CheckpointCompatible(config)
+        super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         if unroll is None:
             unroll = config.n_layer
@@ -45,12 +44,6 @@ class GPT2ForSampling(module.PretrainedModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-
-    def load_state_dict_dir(self, state_dict_dir):
-        self.chkpt_model.load_state_dict_dir(state_dict_dir)
-
-    def load_state_dict_low_memory(self, state_dict):
-        self.chkpt_model.load_state_dict_low_memory(state_dict)
 
     def to_neuron(self):
         ops.init()
@@ -106,12 +99,11 @@ class GPT2ForSampling(module.PretrainedModel):
                                       eos_token_id=self.config.eos_token_id, top_k=50)
 
 
-class GPT2ForSamplingWithContextBroadcasting(module.PretrainedModel):
+class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, num_seqs=1, amp='f32', tp_degree=2, context_length_estimate=None, **kwargs):
-        super().__init__()
         config = GPT2Config(config, num_seqs, amp, tp_degree, **kwargs)
-        self.chkpt_model = GPT2CheckpointCompatible(config)
+        super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         attention_head_size = config.n_embd // config.n_head
         if context_length_estimate is None:
@@ -129,12 +121,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.PretrainedModel):
         self.decoder_lm_head_for_context = None
         self.context_pre_hook = None
         self.context_hook = None
-
-    def load_state_dict_dir(self, state_dict_dir):
-        self.chkpt_model.load_state_dict_dir(state_dict_dir)
-
-    def load_state_dict_low_memory(self, state_dict):
-        self.chkpt_model.load_state_dict_low_memory(state_dict)
 
     def to_neuron(self):
         ops.init()

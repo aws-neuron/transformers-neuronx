@@ -144,3 +144,16 @@ class PretrainedModel(LowMemoryModule):
             state_dict = torch.load(state_dict_path)
             model.load_state_dict_low_memory(state_dict)
         return model
+
+
+class WrappingCheckpointCompatibleModel(PretrainedModel):
+
+    def __init__(self, chkpt_model_cls, *args, **kwargs):
+        super().__init__()
+        self.chkpt_model = chkpt_model_cls(*args, **kwargs)
+
+    def load_state_dict_dir(self, state_dict_dir):
+        self.chkpt_model.load_state_dict_dir(state_dict_dir)
+
+    def load_state_dict_low_memory(self, state_dict):
+        self.chkpt_model.load_state_dict_low_memory(state_dict)
