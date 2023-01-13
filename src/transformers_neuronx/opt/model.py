@@ -24,17 +24,16 @@ from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class OPTForSampling(module.PretrainedModel):
+class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
                  unroll=None, init_n_active_tokens=None, **kwargs):
-        super().__init__()
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
             warnings.warn(f'torch_dtype={config.torch_dtype} ignored in favor of amp={amp}')
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
-        self.chkpt_model = OPTCheckpointCompatible(config)
+        super().__init__(OPTCheckpointCompatible, config)
         self.config = config
         if unroll is None:
             unroll = config.num_hidden_layers
@@ -48,12 +47,6 @@ class OPTForSampling(module.PretrainedModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-
-    def load_state_dict_dir(self, state_dict_dir):
-        self.chkpt_model.load_state_dict_dir(state_dict_dir)
-
-    def load_state_dict_low_memory(self, state_dict):
-        self.chkpt_model.load_state_dict_low_memory(state_dict)
 
     def to_neuron(self):
         ops.init()
