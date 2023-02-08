@@ -22,6 +22,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import GPT2Config as GPT2ConfigTransformer
+from transformers import GPTJConfig as GPTJConfigTransformer
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
 
@@ -53,7 +54,7 @@ def demo(model_name, model_cls, amp_callback):
     if args.model_name is not None:
         model_name = args.model_name
     if args.which == save_name:
-        save(args, model_name, amp_callback)
+        save(args, model_name, amp_callback, model_cls)
     elif args.which == run_name:
         run(args, model_name, model_cls)
 
@@ -64,10 +65,13 @@ def load_config(args):
     config = json.load(open(config_filename))
     return config
 
-def save(args, model_name, amp_callback):
+def save(args, model_name, amp_callback, model_cls):
     if args.random:
         config = load_config(args)
-        config = GPT2ConfigTransformer(**config)
+        if "GPTJ" in str(model_cls):
+            config = GPTJConfigTransformer(**config)
+        else:
+            config = GPT2ConfigTransformer(**config)
         model = AutoModelForCausalLM.from_config(config=config)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
