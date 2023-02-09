@@ -17,12 +17,26 @@ multiple files, as opposed to one monolithic file given by `torch.save`. This "s
 the Neuron model loader can "load parameters to Neuron device high-bandwidth memory (HBM) directly"
 by keeping at most one layer of model parameters in the CPU main memory.
 
+To reduce the memory usage, we cast the attention and mlp layers to `float16` precision before
+saving them. We keep the layernorms in `float32`. To do this, we implement a callback function
+that casts each layer in the model.
+
 ```
 # split_checkpoint.py
+import torch
 from transformers.models.opt import OPTForCausalLM
 from transformers_neuronx.module import save_pretrained_split
 
+def amp_callback(model, dtype):
+    # cast attention and mlp to low precision only; layernorms stay as f32
+    for block in model.model.decoder.layers:
+        block.self_attn.to(dtype)
+        block.fc1.to(dtype)
+        block.fc2.to(dtype)
+    model.lm_head.to(dtype)
+
 hf_model = OPTForCausalLM.from_pretrained('./opt-13b-local', low_cpu_mem_usage=True)
+amp_callback(hf_model, torch.float16)
 save_pretrained_split(hf_model, './opt-13b-split')
 ```
 
@@ -39,9 +53,9 @@ import torch
 from transformers import AutoTokenizer
 from transformers_neuronx.opt.model import OPTForSampling
 
-
 # load facebook/opt-13b to NeuronCores with 2-way tensor parallel
-neuron_model = OPTForSampling.from_pretrained('./opt-13b-split', batch_size=2, tp_degree=2)
+# enable float16 casting
+neuron_model = OPTForSampling.from_pretrained('./opt-13b-split', batch_size=2, tp_degree=2, amp='f16')
 neuron_model.to_neuron()
 
 # construct a tokenizer and encode prompt text
