@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx.gpt_demo import demo
 from transformers_neuronx.gptj.model import GPTJForSampling
-from transformers_neuronx.gptj.demo import amp_callback
+from transformers_neuronx.gpt2.demo import amp_callback
 
 
 def main():
