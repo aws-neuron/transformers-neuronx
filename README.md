@@ -11,6 +11,33 @@ repository, we recommend treating the Neuron optimized module implementations as
 the version of the main library package `torch-neuronx` to avoid breaking interface changes as new
 features are developed.
 
+# Installation
+
+If `git` is installed:
+
+```
+pip install git+https://github.com/aws-neuron/transformers-neuronx.git
+```
+<details>
+<summary>Installation Alternatives</summary>
+<br>
+
+Without `git`, save the package contents locally and use:
+```
+pip install transformers-neuronx/ # This directory contains `setup.py`
+```
+
+Similarly, a standalone wheel can be created using the `wheel` package
+with the local repository contents:
+```
+pip install wheel
+cd transformers-neuronx/  # This directory contains `setup.py`
+python setup.py bdist_wheel
+pip install dist/transformers_neuronx*.whl
+```
+This generates an installable `.whl` package under the `dist/` folder.
+</details>
+
 # Checkpoint compatibility with HuggingFace Transformers
 
 `transformers-neuronx` is checkpoint-compatible with HuggingFace Transformers. While the Neuron
@@ -86,12 +113,6 @@ device memory.
 3. `gpt2-xl` has 25 attention heads and requires ~4 GB memory at bfloat16 precision. It runs without
 tensor-parallelism only.
 
-# Installation
-
-The repository installs through standard `python setup.py install`. Additionally, if the `wheel`
-package is installed, then `python setup.py bdist_wheel` can generate an installable `whl` package
-under the `dist` folder.
-
 # Examples
 
 The `examples` folder contains tutorials for running autoregressive sampling using HuggingFace
@@ -111,3 +132,28 @@ for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xl
 - [gpt2-medium](https://huggingface.co/gpt2-medium)
 - [gpt2-large](https://huggingface.co/gpt2-large)
 - [gpt2-xl](https://huggingface.co/gpt2-xl)
+
+
+# Troubleshooting
+
+## ImportError: WRONG PACKAGE
+
+An error is generated upon importing the package.
+
+### Action:
+```
+import transformers_neuronx
+```
+
+### Error:
+```
+ImportError: WRONG PACKAGE. Please install the package from Neuron Repository - https://github.com/aws-neuron/transformers-neuronx#installation
+```
+
+### Resolution:
+This error occurs when the `transformers_neuronx` package is installed from
+PyPI rather than from GitHub. The package that is available on
+https://pypi.org/ is a stub that ensures that malicious packages are not
+uploaded. The `transformers_neuronx` package is intended to be installed
+directly from this git repository using the [Installation](#installation)
+instructions above.
