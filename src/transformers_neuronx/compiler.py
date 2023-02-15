@@ -57,7 +57,7 @@ def compile_hlo_module(hlo_module):
         neff_path = f'{hlo_module_path}.neff'
         neff_path = os.path.realpath(neff_path)
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        hlo_module_path, f'--output={neff_path}']
+                        hlo_module_path, f'--output={neff_path}', '--verbose=35']
         if dump_to is not None:
             command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
             command_line.append('--tensorizer-options=--dump-after-all=penguin')
