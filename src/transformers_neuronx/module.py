@@ -15,10 +15,14 @@
 import json
 import os
 import re
+import warnings
+
 import torch
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
 
+# Disable lazy module warning since torch-neuronx version is pinned
+warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
 
 def save_pretrained_split(model, save_directory):
     model.save_pretrained(save_directory, save_function=save_split, max_shard_size='10000GB')
