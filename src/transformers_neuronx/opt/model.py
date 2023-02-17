@@ -35,6 +35,13 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(OPTCheckpointCompatible, config)
         self.config = config
+
+        # Check if input sequence length is allowed given position embedding dimensions
+        sequence_length = n_positions
+        max_allowed_sequence_length = config.max_position_embeddings
+        if sequence_length > max_allowed_sequence_length:
+            raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
+
         if unroll is None:
             unroll = config.num_hidden_layers
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
