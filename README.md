@@ -13,6 +13,31 @@ repository, we recommend treating the Neuron optimized module implementations as
 the version of the main library package `torch-neuronx` to avoid breaking interface changes as new
 features are developed.
 
+## Installation
+
+```
+pip install git+https://github.com/aws-neuron/transformers-neuronx.git
+```
+<details>
+<summary>Installation Alternatives</summary>
+<br>
+
+Without `git`, save the package contents locally and use:
+```
+pip install transformers-neuronx/ # This directory contains `setup.py`
+```
+
+Similarly, a standalone wheel can be created using the `wheel` package
+with the local repository contents:
+```
+pip install wheel
+cd transformers-neuronx/  # This directory contains `setup.py`
+python setup.py bdist_wheel
+pip install dist/transformers_neuronx*.whl
+```
+This generates an installable `.whl` package under the `dist/` folder.
+</details>
+
 ## Checkpoint compatibility with HuggingFace Transformers
 
 `transformers-neuronx` is checkpoint-compatible with HuggingFace Transformers. While the Neuron
@@ -20,7 +45,7 @@ team reimplemented some HuggingFace Transformers models from scratch for the pur
 the execution efficiency of transformer decoders on Neuron, the implementations are done with
 maximizing compatibility in mind, meaning one can train transformer decoder models, say GPT2, using
 the standard HuggingFace Transformers library, and then construct an inference-optimized decoder
-model using transformers-neuronx's GPT2ForSampling class. If training was done with other libraries
+model using transformers-neuronx's `GPT2ForSampling` class. If training was done with other libraries
 such as MegatronLM, then it is still possible to convert the obtained checkpoint to the standard
 HuggingFace Transformers checkpoint format, and then move on to transformers-neuronx's optimized
 decoder implementations.
@@ -28,13 +53,13 @@ decoder implementations.
 ## Neuron optimized transformer decoders implemented in XLA High Level Operations (HLO)
 
 Due to the stateful nature of the autoregressive sampling computation, an efficient implementation
-of autoregressive sampling using Neuron SDK requires rewriting the model forward function into
+of autoregressive sampling using the Neuron SDK requires rewriting the model forward function into
 a pure-function computation running on fixed-shape tensors. Furthermore, we want the pure-function
 computation be implemented in a compiled language so that the Neuron compiler can perform extensive
 code analysis and optimization. We chose XLA High Level Operations (HLO) as the compiled language
 for implementing Neuron optimized transformer decoder classes. The source code of these classes
 contains Python functions written in a syntax called "PyHLO", name of a Neuron internal tool for
-writing/compiling the HLO language in Python. As a example, a "language model head" implemented in
+writing/compiling the HLO language in Python. As an example, a "language model head" implemented in
 PyHLO may look like the following.
 
 ```
@@ -76,7 +101,8 @@ in sharded matrix multiply operations) for Neuron-optimized transformer decoder 
 1. The number of attention heads needs to be divisible by the tensor-parallelism degree.
 2. The total data size of model weights and key-value caches needs to be smaller than 16 GB times
 the tensor-parallelism degree.
-3. Currently, the Neuron runtime supports tensor-parallelism degrees 1, 2, 8, and 32.
+3. Currently, the Neuron runtime supports tensor-parallelism degrees 1, 2, 8,
+and 32 on Trn1 and supports tensor-parallelism degrees 1, 2, 4, 8, and 24 on Inf2.
 
 Some examples:
 
@@ -88,17 +114,10 @@ device memory.
 3. `gpt2-xl` has 25 attention heads and requires ~4 GB memory at bfloat16 precision. It runs without
 tensor-parallelism only.
 
-## Installation
-
-The repository installs through standard `python setup.py install`. Additionally, if the `wheel`
-package is installed, then `python setup.py bdist_wheel` can generate an installable `whl` package
-under the `dist` folder.
-
 ## Examples
 
-The `examples` folder contains tutorials for running autoregressive sampling using HuggingFace
-transformers checkpoints. For example, `examples/facebook-opt-13b-sampling.md` contains instructions
-for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xlarge instance.
+The [AWS Neuron Samples GitHub Repository](https://github.com/aws-neuron/aws-neuron-samples/tree/master/torch-neuronx/transformers-neuronx) contains examples of running autoregressive sampling using HuggingFace
+transformers checkpoints on Inf2 & Trn1.
 
 ## Currently supported models
 
@@ -109,10 +128,58 @@ for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xl
 - [facebook/opt-6.7b](https://huggingface.co/facebook/opt-6.7b)
 - [facebook/opt-13b](https://huggingface.co/facebook/opt-13b)
 - [facebook/opt-30b](https://huggingface.co/facebook/opt-30b)
+- [facebook/opt-66b](https://huggingface.co/facebook/opt-66b)
 - [gpt2](https://huggingface.co/gpt2)
 - [gpt2-medium](https://huggingface.co/gpt2-medium)
 - [gpt2-large](https://huggingface.co/gpt2-large)
 - [gpt2-xl](https://huggingface.co/gpt2-xl)
+
+
+## Upcoming features
+### Serialization
+We are working on adding the ability to serialize and load `transformers-neuronx` models. 
+
+### Additional sampling methods
+`transformers-neuronx` currently supports basic multinomial sampling. We are
+working on adding support for additional sampling methods.
+
+### Performance metrics
+The `transformers-neuronx` samples currently provide limited performance data.
+We are looking into adding additional metrics, such as `tokens / second` and
+latency measurements. 
+
+## Troubleshooting
+
+### ImportError: WRONG PACKAGE
+
+An error is generated upon importing the package.
+
+#### Action:
+```
+import transformers_neuronx
+```
+
+### Error:
+```
+ImportError: WRONG PACKAGE. Please install the package from Neuron Repository - https://github.com/aws-neuron/transformers-neuronx#installation
+```
+
+#### Resolution:
+This error occurs when the `transformers_neuronx` package is installed from
+PyPI rather than from GitHub. The package that is available on
+https://pypi.org/ is a stub that ensures that malicious packages are not
+uploaded. The `transformers_neuronx` package is intended to be installed
+directly from this git repository using the [Installation](#installation)
+instructions above.
+
+### Other errors
+For all other errors, please refer to our [Contact Us](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/contact.html)
+page for additional information and support resources. If you intend to file a
+ticket and you can share your model artifacts, please re-run your failing
+script with `NEURONX_DUMP_TO=./some_dir`. This will dump compiler artifacts
+and logs to `./some_dir`. You can then include this directory in your
+correspondance with us. The artifacts and logs are useful for debugging
+the specific failure.
 
 # Security
 
