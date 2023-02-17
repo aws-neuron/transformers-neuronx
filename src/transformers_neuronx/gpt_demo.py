@@ -89,18 +89,6 @@ def run(args, model_name, model_cls):
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
                                       unroll=args.unroll)
-    
-    # Check if input sequence length is allowed given position embedding dimensions
-    sequence_length = args.n_positions
-    max_allowed_sequence_length = float('inf')
-    if hasattr(model.config, "max_position_embeddings"):
-        max_allowed_sequence_length = model.config.max_position_embeddings
-    elif hasattr(model.config, "n_ctx"):
-        max_allowed_sequence_length = model.config.n_ctx
-    elif hasattr(model.config, "n_positions"):
-        max_allowed_sequence_length = model.config.n_positions
-    assert sequence_length <= max_allowed_sequence_length, f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({model.config.n_positions})!"
-                                         
     if args.print_latency:
         latency_printer = LatencyPrinter()
         model.register_forward_pre_hook(latency_printer.pre_hook)

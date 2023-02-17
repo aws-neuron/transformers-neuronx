@@ -23,6 +23,7 @@ class GPTJConfig:
         self.n_head = config.n_head
         self.n_layer = config.n_layer
         self.n_positions = config.n_positions
+        self.n_ctx = config.n_positions # needed since self.n_positions will be overriden by input n_positions
         self.rotary_dim = config.rotary_dim
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
