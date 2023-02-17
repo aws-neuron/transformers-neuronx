@@ -16,12 +16,15 @@ import argparse
 import itertools
 import math
 import time
+import json
+import os
 import torch
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
+from transformers import GPT2Config as GPT2ConfigTransformer
+from transformers import GPTJConfig as GPTJConfigTransformer
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-
 
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
@@ -30,32 +33,48 @@ def demo(model_name, model_cls, amp_callback):
     for floatx, floaty in floatx_floaty_combinations:
         amp_choices.append(f'{floatx}-u8-{floaty}')
     parser.add_argument('--amp', default='f32', choices=amp_choices)
-    parser.add_argument('--model_name', default=None)
+    parser.add_argument('--model_name', default=None, help="Model name for loading a pretrained model")
     subparsers = parser.add_subparsers()
     save_name = 'save'
     save_parser = subparsers.add_parser(save_name)
     save_parser.set_defaults(which=save_name)
-    save_parser.add_argument('save')
+    save_parser.add_argument('save', help="Directory to save the model")
+    save_parser.add_argument('--random', action='store_true', help="Random weights flag. If true, config.json would be used to generate a model with random weight")
+    save_parser.add_argument('--config', type=str, default='', help="Path to config.json file (example: path/to/config.json)")
     run_name = 'run'
     run_parser = subparsers.add_parser(run_name)
     run_parser.set_defaults(which=run_name)
     run_parser.add_argument('load')
-    run_parser.add_argument('--batch_size', type=int, default=4)
-    run_parser.add_argument('--n_positions', type=int, default=128)
-    run_parser.add_argument('--tp_degree', type=int, default=2)
+    run_parser.add_argument('--batch_size', type=int, default=4, help="Input batch size")
+    run_parser.add_argument('--n_positions', type=int, default=128, help="Input sequence length")
+    run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
-    run_parser.add_argument('--print_latency', action='store_true')
+    run_parser.add_argument('--print_latency', action='store_true', help="Print latency for generation of each output token")
     args = parser.parse_args()
     if args.model_name is not None:
         model_name = args.model_name
     if args.which == save_name:
-        save(args, model_name, amp_callback)
+        save(args, model_name, amp_callback, model_cls)
     elif args.which == run_name:
         run(args, model_name, model_cls)
 
+def load_config(args):
+    config_filename = args.config
+    assert config_filename, "Please provide the config.json like: --config=./config.json"
+    assert os.path.exists(config_filename), f"File {config_filename} does not exist."
+    config = json.load(open(config_filename))
+    return config
 
-def save(args, model_name, amp_callback):
-    model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
+def save(args, model_name, amp_callback, model_cls):
+    if args.random:
+        config = load_config(args)
+        if "GPTJ" in str(model_cls):
+            config = GPTJConfigTransformer(**config)
+        else:
+            config = GPT2ConfigTransformer(**config)
+        model = AutoModelForCausalLM.from_config(config=config)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True)
     if args.amp != 'f32':
         dtype = dtypes.to_torch_dtype(args.amp)
         amp_callback(model, dtype)
@@ -95,8 +114,9 @@ class LatencyPrinter:
         self.start = None
 
     def pre_hook(self, module, input):
-        _, cache_offset, _ = input
-        print(f'cache_offset: {cache_offset}')
+        if len(input) == 3:
+            _, cache_offset, _ = input
+            print(f'cache_offset: {cache_offset}')
         self.start = time.time()
 
     def hook(self, *args):
