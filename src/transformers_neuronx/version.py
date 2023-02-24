@@ -14,4 +14,4 @@
 # ==============================================================================
 
 # please make sure the major.minor version matches the interface version in Config
-__version__ = '0.1.x'
+__version__ = '0.2.x'
