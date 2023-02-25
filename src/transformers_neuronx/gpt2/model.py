@@ -25,7 +25,7 @@ from transformers_neuronx.gpt2.config import GPT2Config
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
 
-class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
+class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, module.SamplingModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):

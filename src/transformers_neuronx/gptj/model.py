@@ -25,7 +25,7 @@ from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class GPTJForSampling(module.PretrainedModel):
+class GPTJForSampling(module.PretrainedModel, module.SamplingModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):

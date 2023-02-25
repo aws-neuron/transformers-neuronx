@@ -24,7 +24,7 @@ from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class OPTForSampling(module.WrappingCheckpointCompatibleModel):
+class OPTForSampling(module.WrappingCheckpointCompatibleModel, module.SamplingModel):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
                  unroll=None, init_n_active_tokens=None, **kwargs):
