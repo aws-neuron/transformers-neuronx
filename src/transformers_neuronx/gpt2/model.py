@@ -102,9 +102,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         logits = logits[:, -1, :]
         return logits
 
-    def sample(self, input_ids, sequence_length):
+    def sample(self, input_ids, sequence_length, top_k=50):
         return sampling.simple_sample(self, input_ids, sequence_length, self.config.n_positions,
-                                      eos_token_id=self.config.eos_token_id, top_k=50)
+                                      eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
@@ -193,7 +193,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         return logits
 
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length):
+    def sample(self, input_ids, sequence_length, top_k=50):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         broadcaster = CacheBroadcaster(self.decoder_lm_head.tp_degree, shard_dim=2, batch_dim=1,
@@ -220,7 +220,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             self.context_hook()
         next_token_scores = next_token_scores.repeat([self.decoder_lm_head.batch_size, 1])
         return sampling.sample_loop(self, input_ids, next_token_scores, sequence_length,
-                                    eos_token_id=self.config.eos_token_id, top_k=50)
+                                    eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class CacheBroadcaster:

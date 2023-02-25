@@ -99,9 +99,9 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         logits = logits[:, -1, :]
         return logits
 
-    def sample(self, input_ids, sequence_length):
+    def sample(self, input_ids, sequence_length, top_k=50):
         return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
-                             eos_token_id=self.config.eos_token_id, top_k=50)
+                             eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):
