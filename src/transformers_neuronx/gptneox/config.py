@@ -23,7 +23,7 @@ class GPTNeoXConfig:
         self.n_head = config.num_attention_heads
         self.n_layer = config.num_hidden_layers
         self.n_positions = config.max_position_embeddings
-        self.n_ctx = config.n_positions # TODO - Needed for now because self.n_positions will be overriden by the kwargs n_positions
+        self.n_ctx = self.n_positions # TODO - Needed for now because self.n_positions will be overridden by the kwargs n_positions
         """
         rotary_dim calculation
         Reference: transformers/models/gpt_neox/modeling_gpt_neox.py, class "GPTNeoXAttention"
