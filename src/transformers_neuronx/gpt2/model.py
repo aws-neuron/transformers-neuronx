@@ -106,8 +106,6 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         return sampling.simple_sample(self, input_ids, sequence_length, self.config.n_positions,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
-	def beam_search(self, input_ids, beam_scorer, sequence_length, logits_processor, config):
-        return beam_search_func.beam_search_func(self, input_ids, beam_scorer, max_length=sequence_length, logits_processor=logits_processor, config=config)
 
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
