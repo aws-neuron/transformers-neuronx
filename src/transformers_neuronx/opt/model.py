@@ -14,6 +14,7 @@
 # ==============================================================================
 import warnings
 import torch
+from transformers.utils import ModelOutput
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
@@ -32,6 +33,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
             amp = dtypes.to_amp(config.torch_dtype)
         else:
             warnings.warn(f'torch_dtype={config.torch_dtype} ignored in favor of amp={amp}')
+
         config = OPTConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(OPTCheckpointCompatible, config)
         self.config = config
@@ -54,6 +56,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.done_prompt = False
 
     def to_neuron(self):
         ops.init()
@@ -86,8 +89,19 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 
     def reset(self):
         self.decoder_lm_head.reset()
+        self.done_prompt = False
 
-    def forward(self, input_ids, position_ids):
+    # attention_mask is not used, but huggingFace will detect it
+    def forward(self, input_ids, position_ids, output_hidden_states=False, output_attentions=False,
+            attention_mask=None, return_dict=True):
+        logits = self._forward(input_ids, position_ids)
+        if return_dict:
+            return ModelOutput(
+                [("logits", logits)]
+            )
+        return (logits,)
+
+    def _forward(self, input_ids, position_ids):
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
@@ -96,8 +110,29 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        # logits = logits[:, -1, :]
         return logits
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+        # hf will create attention_mask including batch_size (batch_size, seq_length)
+        if attention_mask is not None and position_ids is None:
+            attention_mask = attention_mask[0, :]
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if self.done_prompt:
+                input_ids = input_ids[:, -1:]
+                position_ids = position_ids[-1:]
+        else:
+            position_ids = None
+        self.done_prompt = True
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+        return model_inputs
 
     def sample(self, input_ids, sequence_length, top_k=50):
         return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
@@ -107,7 +142,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 class OPTCheckpointCompatible(module.PretrainedModel):
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
         self.model = OPTModel(config)
