@@ -17,7 +17,6 @@ import torch
 
 @torch.no_grad()
 def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_token_id=2, top_k=50):
-    model.reset()
 
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
