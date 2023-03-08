@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+import warnings
+from transformers.utils import ModelOutput
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
@@ -52,6 +54,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.cur_len = 0
 
     def to_neuron(self):
         ops.init()
@@ -89,8 +92,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
 
     def reset(self):
         self.decoder_lm_head.reset()
+        self.cur_len = 0
 
-    def forward(self, input_ids, position_ids):
+    def _forward(self, input_ids, position_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
@@ -99,10 +103,50 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
         return logits
 
-    def sample(self, input_ids, sequence_length, top_k=50):
+    def forward(self, input_ids, position_ids, output_hidden_states=False, output_attentions=False,
+            attention_mask=None, return_dict=False):
+        if  output_hidden_states or output_attentions or attention_mask is not None:
+            warnings.warn("Warning: These arguments are not used by forward(): \
+                (output_hidden_states, output_attentions, attention_mask)")
+        batch_dim = input_ids.shape[0]
+        batch_size = self.config.batch_size
+        if batch_dim != batch_size:
+            if batch_dim < batch_size or batch_dim % batch_size != 0:
+                raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
+            input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
+            out_logits = []
+            # iterate per beam
+            for split in input_ids_splits:
+                out = self._forward(split.squeeze(0), position_ids)
+                out_logits.append(out)
+            out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
+        else:
+            out_logits = self._forward(input_ids, position_ids)
+        if return_dict:
+            return ModelOutput(
+                [("logits", out_logits)]
+            )
+        return (out_logits,)
+
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        if self.cur_len > 0:
+            input_ids = input_ids[:, -1:]
+            position_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
+        else:
+            position_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
+
+        self.cur_len += input_ids.shape[-1]
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+
+        return model_inputs
+
+    def topk_sample(self, input_ids, sequence_length, top_k=50):
         return sampling.simple_sample(self, input_ids, sequence_length, self.config.n_positions,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
@@ -180,6 +224,8 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
     def forward_for_context(self, input_ids, position_ids):
         return self._forward(self.decoder_lm_head_for_context, input_ids, position_ids)
 
+        
+
     def _forward(self, decoder_lm_head, input_ids, position_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
@@ -244,7 +290,7 @@ class CacheBroadcaster:
 class GPT2CheckpointCompatible(module.PretrainedModel):
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
         self.transformer = GPT2Transformer(config)

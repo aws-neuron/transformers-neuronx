@@ -12,21 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import transformers
 from transformers_neuronx import utils
 
-
-class GPT2Config:
+class GPT2Config(transformers.GPT2Config):
 
     def __init__(self, config, batch_size, amp, tp_degree, **kwargs):
-        self.activation_function = config.activation_function
-        self.n_ctx = config.n_ctx
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-        self.n_layer = config.n_layer
-        self.n_positions = config.n_positions
-        self.vocab_size = config.vocab_size
-        self.eos_token_id = config.eos_token_id
+        kwargs.update(config.to_dict())
+        super().__init__(**kwargs)
         utils.maybe_override_attributes(self, kwargs)
+        self.n_ctx = config.n_ctx
         self.intermediate_dim = self.n_embd * 4
         self.batch_size = batch_size
         self.amp = amp
