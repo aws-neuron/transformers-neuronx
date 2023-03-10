@@ -107,7 +107,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 class OPTCheckpointCompatible(module.PretrainedModel):
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
         self.model = OPTModel(config)
