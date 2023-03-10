@@ -19,8 +19,8 @@ import warnings
 
 import torch
 from torch.nn.parameter import UninitializedParameter
-from transformers import AutoConfig, PreTrainedModel
-from transformers.generation import GenerationConfig, GenerationMixin
+from transformers import AutoConfig
+from transformers_neuronx.generation_utils import GenerationMixin
 
 # Disable lazy module warning since torch-neuronx version is pinned
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
@@ -136,7 +136,7 @@ class LowMemoryLayerNorm(torch.nn.LayerNorm, LowMemoryModule): ...
 class LowMemoryLazyLinear(torch.nn.LazyLinear, LowMemoryModule): ...
 
 
-class PretrainedModel(PreTrainedModel, LowMemoryModule):
+class PretrainedModel(LowMemoryModule, GenerationMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
@@ -153,9 +153,9 @@ class PretrainedModel(PreTrainedModel, LowMemoryModule):
 
 class WrappingCheckpointCompatibleModel(PretrainedModel):
 
-    def __init__(self, chkpt_model_cls, config, *args, **kwargs):
-        super().__init__(config)
-        self.chkpt_model = chkpt_model_cls(config, *args, **kwargs)
+    def __init__(self, chkpt_model_cls, *args, **kwargs):
+        super().__init__()
+        self.chkpt_model = chkpt_model_cls(*args, **kwargs)
 
     def load_state_dict_dir(self, state_dict_dir):
         self.chkpt_model.load_state_dict_dir(state_dict_dir)
