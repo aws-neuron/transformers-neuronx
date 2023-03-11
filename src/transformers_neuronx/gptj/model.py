@@ -29,7 +29,7 @@ class GPTJForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):
-        super().__init__(config)
+        super().__init__()
         config = GPTJConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.config = config
         
