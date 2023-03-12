@@ -15,15 +15,6 @@
 import torch
 
 
-# make sample_loop implementation compatible with the 
-# changes of model ouput for HuggingFace generation API
-def post_process(next_token_scores):
-    if isinstance(next_token_scores, tuple):
-        next_token_scores = next_token_scores[0]
-    if len(next_token_scores.shape) == 3:
-        next_token_scores = next_token_scores[:, -1, :]
-    return next_token_scores
-
 @torch.no_grad()
 def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_token_id=2, top_k=50):
 
@@ -37,9 +28,9 @@ def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_to
 def sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_id=2, top_k=50):
     tokens = [input_ids]
     _, start = input_ids.shape
-    next_token_scores = post_process(next_token_scores)
     for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
+
         # don't sample EOS
         next_token_scores[:, eos_token_id] = -float('inf')
 
@@ -55,5 +46,4 @@ def sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_
         # forward pass to get next token
         position_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, position_ids)
-        next_token_scores = post_process(next_token_scores)
     return torch.cat(tokens, dim=-1)
