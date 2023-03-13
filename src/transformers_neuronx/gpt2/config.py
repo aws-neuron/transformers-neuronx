@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import transformers
 from transformers_neuronx import utils
 
-
-class GPT2Config:
+# (bowenc): inherit from transformer.GPT2Config as we need to inherit from
+# transformers.PreTrainedModel to call transformers generation API
+class GPT2Config(transformers.GPT2Config):
 
     def __init__(self, config, batch_size, amp, tp_degree, **kwargs):
+        kwargs.update(config.to_dict())
+        super().__init__(**kwargs)
         self.activation_function = config.activation_function
         self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
