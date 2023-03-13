@@ -13,6 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+import warnings
+from transformers import PreTrainedModel
+from transformers.utils import ModelOutput
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
@@ -32,14 +35,12 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
-        
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
             max_allowed_sequence_length = config.n_ctx
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
-        
         if unroll is None:
             unroll = config.n_layer
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
@@ -106,6 +107,130 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         return sampling.simple_sample(self, input_ids, sequence_length, self.config.n_positions,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
+# (bowencc): Need to keep PreTrainedModel after module.PretrainedModel as the later
+# overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly 
+# since it doesn't pass config in suer().__init__
+class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
+    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
+                 unroll=None, init_n_active_tokens=None, **kwargs):
+        config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
+        super().__init__(config) # will call transformers.PreTrainedModel(confg)
+        self.chkpt_model = GPT2CheckpointCompatible(config)
+        self.config = config
+
+        # Check if input sequence length is allowed given position embedding dimensions
+        sequence_length = kwargs.get("n_positions", None)
+        if sequence_length:
+            max_allowed_sequence_length = config.n_ctx
+            if sequence_length > max_allowed_sequence_length:
+                raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
+
+        if unroll is None:
+            unroll = config.n_layer
+        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
+        attention_head_size = config.n_embd // config.n_head
+        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
+            config.n_layer, unroll,
+        )
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new')
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+    def load_state_dict_dir(self, state_dict_dir):
+        self.chkpt_model.load_state_dict_dir(state_dict_dir)
+
+    def load_state_dict_low_memory(self, state_dict):
+        self.chkpt_model.load_state_dict_low_memory(state_dict)
+
+    def to_neuron(self):
+        ops.init()
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+        n_embd = self.config.n_embd
+        for layer in self.chkpt_model.transformer.h:
+            layer.materialize()
+            attn = layer.attn
+            mlp = layer.mlp
+            c_attn_weight = attn.c_attn.weight.detach()
+            c_attn_bias = attn.c_attn.bias.detach()
+            new_layer = self.decoder_lm_head.new_layer()
+            new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
+                                                   layer.ln_1.bias.detach())
+            new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
+            new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
+                                        c_attn_bias[n_embd:n_embd*2])
+            new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
+                                          c_attn_bias[n_embd*2:n_embd*3])
+            new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
+            new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
+            new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
+            new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            new_layer.to_neuron()
+            layer.nullify()
+        ln_f = self.chkpt_model.transformer.ln_f
+        ln_f.materialize()
+        self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        lm_head = self.chkpt_model.lm_head
+        lm_head.materialize()
+        self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        lm_head.nullify()
+        self.decoder_lm_head.to_neuron()
+
+    def reset(self):
+        self.decoder_lm_head.reset()
+
+    def _forward(self, input_ids, position_ids):
+        inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
+        position_embeds = self.chkpt_model.transformer.wpe(position_ids)
+        hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, -1)
+        logits = self.decoder_lm_head(hidden, position_ids)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size]
+        logits = logits.transpose(0, -1)
+        return logits
+
+    def forward(self, input_ids, position_ids, output_hidden_states=False, output_attentions=False,
+            attention_mask=None, return_dict=False):
+        if  output_hidden_states or output_attentions or attention_mask is not None:
+            warnings.warn("Warning: These arguments are not used by forward(): \
+                (output_hidden_states, output_attentions, attention_mask)")
+        batch_dim = input_ids.shape[0]
+        batch_size = self.config.batch_size
+        if batch_dim != batch_size:
+            if batch_dim < batch_size or batch_dim % batch_size != 0:
+                raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
+            input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
+            out_logits = []
+            # iterate per beam
+            for split in input_ids_splits:
+                out = self._forward(split.squeeze(0), position_ids)
+                out_logits.append(out)
+            out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
+        else:
+            out_logits = self._forward(input_ids, position_ids)
+        if return_dict:
+            return ModelOutput(
+                [("logits", out_logits)]
+            )
+        return (out_logits,)
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        if self.cur_len > 0:
+            input_ids = input_ids[:, -1:]
+            position_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
+        else:
+            position_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
+
+        self.cur_len += input_ids.shape[-1]
+        model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+
+        return model_inputs
 
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 

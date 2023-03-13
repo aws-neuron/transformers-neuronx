@@ -20,7 +20,6 @@ import warnings
 import torch
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
-from transformers_neuronx.generation_utils import GenerationMixin
 
 # Disable lazy module warning since torch-neuronx version is pinned
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
@@ -136,7 +135,7 @@ class LowMemoryLayerNorm(torch.nn.LayerNorm, LowMemoryModule): ...
 class LowMemoryLazyLinear(torch.nn.LazyLinear, LowMemoryModule): ...
 
 
-class PretrainedModel(LowMemoryModule, GenerationMixin):
+class PretrainedModel(LowMemoryModule):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
