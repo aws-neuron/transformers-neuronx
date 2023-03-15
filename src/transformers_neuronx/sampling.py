@@ -16,16 +16,17 @@ import torch
 
 
 @torch.no_grad()
-def simple_sample(model, input_ids, sequence_length, max_sequence_length, eos_token_id=2, top_k=50):
-
+def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50):
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
-    position_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, position_ids)
-    return sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_id, top_k)
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
+    return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
+                       eos_token_id, top_k)
 
 
-def sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_id=2, top_k=50):
+def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
+                top_k=50):
     tokens = [input_ids]
     _, start = input_ids.shape
     for cur_len in range(start, sequence_length):
@@ -44,6 +45,6 @@ def sample_loop(model, input_ids, next_token_scores, sequence_length, eos_token_
         tokens.append(inputs)
 
         # forward pass to get next token
-        position_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-        next_token_scores = model(inputs, position_ids)
+        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        next_token_scores = model(inputs, cache_ids, start_ids)
     return torch.cat(tokens, dim=-1)
