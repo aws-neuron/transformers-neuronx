@@ -137,6 +137,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.cur_len = 0
 
     def load_state_dict_dir(self, state_dict_dir):
         self.chkpt_model.load_state_dict_dir(state_dict_dir)
@@ -180,6 +181,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 
     def reset(self):
         self.decoder_lm_head.reset()
+        self.cur_len = 0
 
     def _forward(self, input_ids, position_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
