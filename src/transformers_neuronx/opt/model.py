@@ -87,20 +87,21 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def forward(self, input_ids, position_ids):
+    def forward(self, input_ids, cache_ids, start_ids=None):
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
-        logits = self.decoder_lm_head(hidden, position_ids)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
         return logits
 
-    def sample(self, input_ids, sequence_length, top_k=50):
-        return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+        return simple_sample(self, input_ids, start_ids, sequence_length,
                              eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
@@ -186,11 +187,12 @@ class OPTForSamplingNoEmbeddingHlo:
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        position_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
-        mask = hlo.decoder_attention_mask(position_ids, scribe.f32, n_positions)
-        return (hidden, position_ids, mask), (1, 0)
+        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
+        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+        mask = hlo.decoder_attention_mask(start_ids, cache_ids, scribe.f32, n_positions)
+        return (hidden, cache_ids, mask), (1, 0, None)
 
-    def layer(self, hidden, position_ids, mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias, attn_q_weight, attn_q_bias,
               attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
               attn_out_weight, attn_out_bias, post_attn_ln_weight, post_attn_ln_bias,
@@ -199,7 +201,7 @@ class OPTForSamplingNoEmbeddingHlo:
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, position_ids, mask, attn_k_cache, attn_v_cache,
+            ln_hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
             attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
         )
@@ -222,7 +224,7 @@ class OPTForSamplingNoEmbeddingHlo:
         vocab_size, _ = logits.sizes
         return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-    def attention(self, hidden, cache_offset, mask, cached_keys, cached_values,
+    def attention(self, hidden, cache_ids, mask, cached_keys, cached_values,
                   q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias):
         dtype = hidden.dtype
         scribe = hidden.scribe
@@ -249,9 +251,9 @@ class OPTForSamplingNoEmbeddingHlo:
                             index_vector_dim=1)
         func = hlo.gen_assign_func(dtype)
         cached_keys = dtype[cached_keys.sizes].Scatter(
-            cached_keys, cache_offset, active_k, scatter_dimension_numbers=scatter_dims, to_apply=func)
+            cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=func)
         cached_values = dtype[cached_values.sizes].Scatter(
-            cached_values, cache_offset, active_v, scatter_dimension_numbers=scatter_dims, to_apply=func)
+            cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=func)
 
         # compute self-attention: V x Softmax(QK^T)
         # Keep the attention weights computation in fp32 to avoid overflow issues
@@ -267,7 +269,7 @@ class OPTForSamplingNoEmbeddingHlo:
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
         score = f32[score_sizes].Convert(score)
 
-        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
+        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
         score = f32[score_sizes].Multiply(score, mask_br)
         one = f32.Constant(constant_value=1.0)
         ones_br = f32[mask.sizes].Broadcast(one, dimensions=[])
@@ -275,7 +277,7 @@ class OPTForSamplingNoEmbeddingHlo:
         large_neg = f32.Constant(constant_value=-65536)
         large_neg_br = f32[add_mask.sizes].Broadcast(large_neg, dimensions=[])
         add_mask = f32[add_mask.sizes].Multiply(add_mask, large_neg_br)
-        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[2, 3])
+        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[0, 2, 3])
         score = f32[score_sizes].Add(score, add_mask_br)
 
         probs = hlo.softmax(score)
