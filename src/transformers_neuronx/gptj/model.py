@@ -76,7 +76,7 @@ class GPTJForSampling(module.PretrainedModel):
         for block in self.transformer.h:
             block.reset()
 
-    def forward(self, input_ids, cache_offset):
+    def forward(self, input_ids, cache_offset, start_ids=None):
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -119,7 +119,7 @@ class GPTJForSampling(module.PretrainedModel):
         return program.run(bucket_id)
 
     def sample(self, input_ids, sequence_length, top_k=50):
-        return simple_sample(self, input_ids, sequence_length, self.config.n_positions,
+        return simple_sample(self, input_ids, sequence_length,
                              eos_token_id=self.config.eos_token_id, top_k=top_k)
 
     def _fixed_pos_embedding(self, dim, head_dim, offset):

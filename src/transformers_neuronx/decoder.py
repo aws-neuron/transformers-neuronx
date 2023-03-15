@@ -137,9 +137,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
                     slices[sdim] = slicing
                     tensor = tensor[tuple(slices)].contiguous()
                 input_tensors.append(tensor)
-            *_, position_ids = input_tensors
-            min_id = position_ids.max().item()
-            max_id = position_ids.min().item()
+            _, cache_ids, *_ = input_tensors
+            min_id = cache_ids.max().item()
+            max_id = cache_ids.min().item()
             bucket_id = self.program.find_bucket_id(max_id)
             if self.program.find_bucket_id(min_id) != bucket_id:
                 raise ValueError(f'given buckets {self.n_positions_list}, ids ranging from '
@@ -147,6 +147,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             self.program.inputs_host_to_device(input_tensors)
             self.program.run(bucket_id)
         return self.program.logits_device_to_host()
+
+    def embed_positions_ids(self, position_ids, start_ids=None):
+        if start_ids is None:
+            return position_ids, torch.zeros([self.batch_size], dtype=torch.int32)
+        position_ids = position_ids.unsqueeze(0).repeat(self.batch_size, 1)
+        position_ids -= start_ids.unsqueeze(1)
+        position_ids.masked_fill_(position_ids < 0, 0)
+        return position_ids, start_ids
 
     def _build_program(self):
         if self.unroll == self.num_layers:
