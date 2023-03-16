@@ -206,3 +206,18 @@ class ParameterBuilder:
         param = dtype[tuple(shape)].Parameter(parameter_number=self.parameter_number)
         self.parameter_number += 1
         return param
+
+
+def decoder_attention_mask_legacy(position_ids, dtype, n_positions):
+    n_active_tokens, = position_ids.sizes
+    sizes = n_active_tokens, n_positions
+    int_dtype = position_ids.dtype
+    pred = position_ids.scribe.pred
+    iota0 = int_dtype[sizes].Iota(dimensions=[0])
+    iota1 = int_dtype[sizes].Iota(dimensions=[1])
+    triu = pred[sizes].Compare(iota0, iota1, comparison_direction='GE')
+    triu = dtype[sizes].Convert(triu)
+    position_ids = int_dtype[sizes].Broadcast(position_ids, dimensions=[0])
+    mask = pred[sizes].Compare(iota1, position_ids, comparison_direction='LE')
+    mask = dtype[sizes].Convert(mask)
+    return dtype[sizes].Multiply(mask, triu)
