@@ -397,7 +397,7 @@ def gen_scribable_multi_block(config, n_active_tokens, n_positions, n_blocks):
 
         blocks_caches = [gen_block_caches() for _ in range(n_blocks)]
         blocks_params = [gen_block_params() for _ in range(n_blocks)]
-        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, n_positions)
+        mask = hlo.decoder_attention_mask_legacy(cache_offset, scribe.f32, n_positions)
         return multi_block(hidden, cache_offset, mask, blocks_caches, blocks_params, config)
 
     return scribable
