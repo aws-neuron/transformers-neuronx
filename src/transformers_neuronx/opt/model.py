@@ -189,7 +189,7 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        mask = hlo.decoder_attention_mask(start_ids, cache_ids, scribe.f32, n_positions)
+        mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions)
         return (hidden, cache_ids, mask), (1, 0, None)
 
     def layer(self, hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
@@ -229,6 +229,7 @@ class OPTForSamplingNoEmbeddingHlo:
         dtype = hidden.dtype
         scribe = hidden.scribe
         f32 = scribe.f32
+        pred = scribe.pred
         hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
         max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
         attn_size = hidden_size // self.tp_degree
@@ -267,19 +268,13 @@ class OPTForSamplingNoEmbeddingHlo:
                         rhs_batch_dimensions=[1, 2])
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+
+        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
+        large_neg = dtype.Constant(constant_value=-30000)
+        large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
+        score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
+
         score = f32[score_sizes].Convert(score)
-
-        mask_br = f32[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
-        score = f32[score_sizes].Multiply(score, mask_br)
-        one = f32.Constant(constant_value=1.0)
-        ones_br = f32[mask.sizes].Broadcast(one, dimensions=[])
-        add_mask = f32[mask.sizes].Subtract(ones_br, mask)
-        large_neg = f32.Constant(constant_value=-65536)
-        large_neg_br = f32[add_mask.sizes].Broadcast(large_neg, dimensions=[])
-        add_mask = f32[add_mask.sizes].Multiply(add_mask, large_neg_br)
-        add_mask_br = f32[score_sizes].Broadcast(add_mask, dimensions=[0, 2, 3])
-        score = f32[score_sizes].Add(score, add_mask_br)
-
         probs = hlo.softmax(score)
         probs = dtype[score_sizes].Convert(probs)
 
