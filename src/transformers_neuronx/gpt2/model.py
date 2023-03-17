@@ -181,39 +181,42 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.to_neuron()
 
     def reset(self):
-        self.decoder_lm_head.reset()
+        # self.decoder_lm_head.reset()
         self.cur_len = 0
 
-    def _forward(self, input_ids, position_ids):
+    def _forward(self, input_ids, cache_ids, start_ids=None):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
-        logits = self.decoder_lm_head(hidden, position_ids)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         return logits
 
-    def forward(self, input_ids, position_ids, output_hidden_states=False, output_attentions=False,
+    def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
             attention_mask=None, return_dict=False):
+        
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
-        batch_dim = input_ids.shape[0]
-        batch_size = self.config.batch_size
-        if batch_dim != batch_size:
-            if batch_dim < batch_size or batch_dim % batch_size != 0:
-                raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
-            input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
-            out_logits = []
-            # iterate per beam
-            for split in input_ids_splits:
-                out = self._forward(split.squeeze(0), position_ids)
-                out_logits.append(out)
-            out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
-        else:
-            out_logits = self._forward(input_ids, position_ids)
+        # TODO (bowencc): Need to further verify the behavior of attention_mask and position_ids under beam search, comment out for now
+        # batch_dim = input_ids.shape[0]
+        # batch_size = self.config.batch_size
+        # if batch_dim != batch_size:
+        #     if batch_dim < batch_size or batch_dim % batch_size != 0:
+        #         raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
+        #     input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
+        #     out_logits = []
+        #     # iterate per beam
+        #     for split in input_ids_splits:
+        #         out = self._forward(split.squeeze(0), cache_ids, start_ids)
+        #         out_logits.append(out)
+        #     out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
+        # else:
+        out_logits = self._forward(input_ids, cache_ids, start_ids)
         if return_dict:
             return ModelOutput(
                 [("logits", out_logits)]
@@ -221,16 +224,25 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         return (out_logits,)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        # convert attention_mask to start_ids
+        attention_mask = None
+        start_ids = None
+        if "attention_mask" in kwargs:
+            attention_mask = kwargs["attention_mask"]
+        if attention_mask is not None:
+            _, start_ids = attention_mask.max(axis=1)
+
         if self.cur_len > 0:
             input_ids = input_ids[:, -1:]
-            position_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
+            cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
         else:
-            position_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
+            cache_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
 
         self.cur_len += input_ids.shape[-1]
         model_inputs = {
             "input_ids": input_ids,
-            "position_ids": position_ids,
+            "cache_ids": cache_ids,
+            "start_ids": start_ids,
         }
 
         return model_inputs
