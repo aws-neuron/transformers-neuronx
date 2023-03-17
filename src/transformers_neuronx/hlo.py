@@ -171,7 +171,7 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
-def decoder_attention_mask(start_ids, position_ids, dtype, n_positions):
+def decoder_attention_mask(start_ids, position_ids, n_positions):
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     sizes = n_active_tokens, n_positions
@@ -180,18 +180,16 @@ def decoder_attention_mask(start_ids, position_ids, dtype, n_positions):
     iota0 = int_dtype[sizes].Iota(dimensions=[0])
     iota1 = int_dtype[sizes].Iota(dimensions=[1])
     triu = pred[sizes].Compare(iota0, iota1, comparison_direction='GE')
-    triu = dtype[sizes].Convert(triu)
     position_ids = int_dtype[sizes].Broadcast(position_ids, dimensions=[0])
     mask = pred[sizes].Compare(iota1, position_ids, comparison_direction='LE')
-    mask = dtype[sizes].Convert(mask)
-    mask = dtype[sizes].Multiply(mask, triu)
+    mask = pred[sizes].Select(mask, mask, triu)  # FIXME: And doesn't work; consult compiler team
     mask_sizes = batch_size, n_active_tokens, n_positions
     iota1 = int_dtype[mask_sizes].Broadcast(iota1, dimensions=[1, 2])
     start_ids = int_dtype[mask_sizes].Broadcast(start_ids, dimensions=[0])
     mask_start = pred[mask_sizes].Compare(iota1, start_ids, comparison_direction='GE')
-    mask_start = dtype[mask_sizes].Convert(mask_start)
-    mask = dtype[mask_sizes].Broadcast(mask, dimensions=[0, 2])
-    return dtype[mask_sizes].Multiply(mask, mask_start)
+    mask = pred[mask_sizes].Broadcast(mask, dimensions=[1, 2])
+    return pred[mask_sizes].And(mask, mask_start)
+
 
 
 class ParameterBuilder:
