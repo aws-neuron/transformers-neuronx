@@ -145,8 +145,16 @@ def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
     weight = dequant_dtype[sizes].Add(weight, min_value)
     return dtype[sizes].Convert(weight)
 
-
 def softmax(logits, dim=None):
+    rank = len(logits.sizes)
+    if dim is None:
+        dim = rank - 1    
+    shape = logits.sizes  
+    dtype = logits.dtype                
+    backend_config = str(dim).encode()        
+    return dtype[shape].CustomCall(logits, custom_call_target="AwsNeuronSoftmax", backend_config=backend_config,)
+
+def softmax_slow(logits, dim=None):
     rank = len(logits.sizes)
     if dim is None:
         dim = rank - 1
