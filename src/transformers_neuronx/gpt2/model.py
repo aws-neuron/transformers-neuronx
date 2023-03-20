@@ -124,8 +124,8 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         logits = logits[:, -1, :]
         return logits
 
-    def sample(self, input_ids, sequence_length, top_k=50):
-        return sampling.simple_sample(self, input_ids, sequence_length,
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+        return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 # (bowencc): Need to keep PreTrainedModel after module.PretrainedModel as the later
@@ -285,6 +285,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 
         return model_inputs
 
+
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, num_seqs=1, amp='f32', tp_degree=2, context_length_estimate=None, **kwargs):
@@ -352,18 +353,19 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context.reset()
 
-    def forward(self, input_ids, position_ids):
-        return self._forward(self.decoder_lm_head, input_ids, position_ids)
+    def forward(self, input_ids, cache_ids, start_ids=None):
+        return self._forward(self.decoder_lm_head, input_ids, position_ids, start_ids)
 
-    def forward_for_context(self, input_ids, position_ids):
+    def forward_for_context(self, input_ids, cache_ids, start_ids=None):
         return self._forward(self.decoder_lm_head_for_context, input_ids, position_ids)
 
-    def _forward(self, decoder_lm_head, input_ids, position_ids):
+    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids, start_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
-        logits = decoder_lm_head(hidden, position_ids)
+        logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
@@ -381,19 +383,19 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
 
         # populate key/value caches according to the prompt text
         context_length = self.context_length_estimate
-        position_ids = torch.arange(context_length, dtype=torch.int32)
+        cache_ids = torch.arange(context_length, dtype=torch.int32)
         input_context = input_ids[:, :context_length]
         if start < context_length:
             input_pad = context_length - start
             input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
-        next_token_scores = self.forward_for_context(input_context, position_ids)
+        next_token_scores = self.forward_for_context(input_context, cache_ids)
         for source, target in zip(self.decoder_lm_head_for_context.layers, self.decoder_lm_head.layers):
             broadcaster.broadcast(source.attn_k_cache, target.attn_k_cache, context_length)
             broadcaster.broadcast(source.attn_v_cache, target.attn_v_cache, context_length)
         input_ids = input_ids.repeat([self.decoder_lm_head.batch_size, 1])
         for cur_len in range(context_length, start):
-            position_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-            next_token_scores = self(input_ids[:, cur_len:cur_len+1], position_ids)
+            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+            next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids)
         if self.context_hook is not None:
             self.context_hook()
         next_token_scores = next_token_scores.repeat([self.decoder_lm_head.batch_size, 1])
