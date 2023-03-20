@@ -118,8 +118,8 @@ class GPTJForSampling(module.PretrainedModel):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
-    def sample(self, input_ids, sequence_length, top_k=50):
-        return simple_sample(self, input_ids, sequence_length,
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+        return simple_sample(self, input_ids, start_ids, sequence_length,
                              eos_token_id=self.config.eos_token_id, top_k=top_k)
 
     def _fixed_pos_embedding(self, dim, head_dim, offset):
