@@ -22,15 +22,17 @@ from transformers_neuronx.module import sanitize_file_name, _KEY_TO_FILENAME_JSO
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('name')
-    parser.add_argument('save')
+    parser.add_argument('name', help="OPT model name or path to config.json")
+    parser.add_argument('save', help="target folder to save the model")
     parser.add_argument('--empty', action='store_true')
     args = parser.parse_args()
     gen_random_pretrained(args.name, args.save, args.empty)
 
 
 def gen_random_pretrained(model_name, save, empty=False):
-    if model_name == 'facebook/opt-175b':
+    if 'json' in model_name:
+        config = json.load(open(model_name))
+    elif model_name == 'facebook/opt-175b':
         config = opt_175b_config()
     else:
         config = OPTConfig.from_pretrained(model_name).to_dict()
