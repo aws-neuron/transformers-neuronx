@@ -359,7 +359,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
         return self._forward(self.decoder_lm_head_for_context, input_ids, position_ids)
 
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids, start_ids):
+    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
