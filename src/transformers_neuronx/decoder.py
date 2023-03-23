@@ -82,9 +82,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
-        if self.program is None:
-            self.program = self._build_program()
-            self.program.inputs_sdim = self.inputs_sdim # TODO: See if this can be moved program constructor
+        self.program = self._build_program()
         self.program.setup(self.layers, ln_lm_head_params)
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
@@ -133,7 +131,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         for start in range(0, sequence_length, self.n_active_tokens):
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
-            for sdim, tensor in zip(self.program.inputs_sdim, inputs):
+            for sdim, tensor in zip(self.inputs_sdim, inputs):
                 if sdim is not None:
                     slices = [slice(None) for _ in tensor.shape]
                     slices[sdim] = slicing
@@ -612,17 +610,15 @@ class DecoderProgram:
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
         first_hlo, *_ = hlo_modules
-        self.input_tensor_info = [compiler.get_hlo_input_info(first_hlo, idx) for idx in range(num_inputs)]
+        self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(num_inputs)]
         self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
         self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        self.input_buffers = None
-        self.inputs_sdim = None
 
     def setup(self, layers, ln_lm_head_params):
-        self.input_buffers = [torch.zeros(shape, dtype=dtype) for shape, dtype in self.input_tensor_info]
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
+        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
         for kernel in self.kernels:
             kernel.build()
             kernel.load()
@@ -651,27 +647,17 @@ class DecoderProgram:
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state['input_buffers']
-        return state
-
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
         super().__init__(hlo_modules, num_inputs, tp_degree)
         first_hlo, *_ = hlo_modules
-        self.shape, self.dtype = compiler.get_hlo_output_info(first_hlo, 0)
-        self.memories = None
-        self.logits_buffer = None
+        self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
+        self.memories = [kernel.build_memory() for kernel in self.kernels]
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params)
-        self.memories = [kernel.build_memory() for kernel in self.kernels]
-        self.logits_buffer = torch.zeros(self.shape, dtype=self.dtype)
-        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
-
         for npos, memory in zip(self.n_positions_list, self.memories):
             input_tensors = [*self.input_buffers]
             output_tensors = [self.logits_buffer]
@@ -681,12 +667,6 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
-
-    def __getstate__(self):
-        state = super().__getstate__()
-        del state["memories"]
-        del state["logits_buffer"]
-        return state
 
 
 class DecoderProgramMultiLayer(DecoderProgram):
