@@ -246,9 +246,6 @@ class ParallelKernel:
         return ParallelMemory(self.hlo_module, self.tp_degree)
 
     def build(self):
-        # Avoid rebuilding NEFF. This path occurs during deserialization
-        if self.neff_bytes is not None:
-            return
         self.neff_bytes = compile_hlo_module(self.hlo_module)
 
     def load(self):
@@ -258,35 +255,20 @@ class ParallelKernel:
     def __call__(self, memory):
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["model"] # Do not pickle "model". Will be reloaded from "neff_bytes"
-        return state
 
-
-def get_hlo_input_info(hlo_module, index=0):
+def gen_zero_input(hlo_module, index):
     shape_proto = hlo_module.host_program_shape.parameters[index]
     shape = [dim for dim in shape_proto.dimensions]
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
-    return shape, dtype
-
-
-def gen_zero_input(hlo_module, index):
-    shape, dtype = get_hlo_input_info(hlo_module, index)
     return torch.zeros(shape, dtype=dtype)
 
 
-def get_hlo_output_info(hlo_module, index=None):
+def gen_zero_output(hlo_module, index=None):
     shape_proto = hlo_module.host_program_shape.result
     if index is not None:
         shape_proto = shape_proto.tuple_shapes[index]
     shape = [dim for dim in shape_proto.dimensions]
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
-    return shape, dtype
-
-
-def gen_zero_output(hlo_module, index=None):
-    shape, dtype = get_hlo_output_info(hlo_module, index)
     return torch.zeros(shape, dtype=dtype)
 
 
