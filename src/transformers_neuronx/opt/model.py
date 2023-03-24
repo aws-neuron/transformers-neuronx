@@ -189,10 +189,10 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions)
-        return (hidden, cache_ids, mask), (1, 0, None)
+        mask_triu, mask_start = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions)
+        return (hidden, cache_ids, mask_triu, mask_start), (1, 0, None)
 
-    def layer(self, hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, cache_ids, mask_triu, mask_start, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias, attn_q_weight, attn_q_bias,
               attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
               attn_out_weight, attn_out_bias, post_attn_ln_weight, post_attn_ln_bias,
@@ -201,7 +201,7 @@ class OPTForSamplingNoEmbeddingHlo:
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
+            ln_hidden, cache_ids, mask_triu, mask_start, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
             attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
         )
@@ -224,7 +224,7 @@ class OPTForSamplingNoEmbeddingHlo:
         vocab_size, _ = logits.sizes
         return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-    def attention(self, hidden, cache_ids, mask, cached_keys, cached_values,
+    def attention(self, hidden, cache_ids, mask_triu, mask_start, cached_keys, cached_values,
                   q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias):
         dtype = hidden.dtype
         scribe = hidden.scribe
@@ -269,10 +269,12 @@ class OPTForSamplingNoEmbeddingHlo:
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
 
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
+        mask_triu_br = pred[score_sizes].Broadcast(mask_triu, dimensions=[2, 3])
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
-        score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
+        score = dtype[score_sizes].Select(mask_triu_br, score, large_neg_br)
+        mask_start_br = pred[score_sizes].Broadcast(mask_start, dimensions=[0, 3])
+        score = dtype[score_sizes].Select(mask_start_br, score, large_neg_br)
 
         score = f32[score_sizes].Convert(score)
         probs = hlo.softmax(score)
