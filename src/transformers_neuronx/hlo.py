@@ -154,6 +154,7 @@ def softmax_new(logits, dim=None):
     backend_config = str(dim).encode()        
     return dtype[shape].CustomCall(logits, custom_call_target="AwsNeuronSoftmax", backend_config=backend_config,)
 
+
 def softmax(logits, dim=None):
     rank = len(logits.sizes)
     if dim is None:
@@ -182,22 +183,23 @@ def transfer_with_static_ring(shape):
 def decoder_attention_mask(start_ids, position_ids, n_positions):
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
-    sizes = n_active_tokens, n_positions
+    triu_sizes = n_active_tokens, n_positions
     int_dtype = position_ids.dtype
     pred = position_ids.scribe.pred
-    iota0 = int_dtype[sizes].Iota(dimensions=[0])
-    iota1 = int_dtype[sizes].Iota(dimensions=[1])
-    triu = pred[sizes].Compare(iota0, iota1, comparison_direction='GE')
-    position_ids = int_dtype[sizes].Broadcast(position_ids, dimensions=[0])
-    mask = pred[sizes].Compare(iota1, position_ids, comparison_direction='LE')
-    mask = pred[sizes].Select(mask, mask, triu)  # FIXME: And doesn't work; consult compiler team
+    iota0 = int_dtype[n_active_tokens].Iota(dimensions=[0])
+    iota0 = int_dtype[triu_sizes].Broadcast(iota0, dimensions=[0])
+    iota1 = int_dtype[n_positions].Iota(dimensions=[0])
+    iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
+    triu = pred[triu_sizes].Compare(iota0, iota1t, comparison_direction='GE')
+    position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
+    mask = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction='LE')
+    mask_triu = pred[triu_sizes].Select(mask, mask, triu)  # FIXME: And doesn't work; consult compiler team
+    start_sizes = batch_size, n_positions
+    iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
+    start_ids = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
+    mask_start = pred[start_sizes].Compare(iota1s, start_ids, comparison_direction='GE')
     mask_sizes = batch_size, n_active_tokens, n_positions
-    iota1 = int_dtype[mask_sizes].Broadcast(iota1, dimensions=[1, 2])
-    start_ids = int_dtype[mask_sizes].Broadcast(start_ids, dimensions=[0])
-    mask_start = pred[mask_sizes].Compare(iota1, start_ids, comparison_direction='GE')
-    mask = pred[mask_sizes].Broadcast(mask, dimensions=[1, 2])
-    return pred[mask_sizes].And(mask, mask_start)
-
+    return mask_triu, mask_start
 
 
 class ParameterBuilder:
