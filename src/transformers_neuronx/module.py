@@ -60,7 +60,7 @@ class LowMemoryModule(torch.nn.Module):
                 if param._file_path.endswith('.empty_json'):
                     with open(param._file_path) as fp:
                         empty_json = json.load(fp)
-                    input_param = empty_json['init_std'] * torch.randn(empty_json['shape'])
+                    input_param = empty_json.get('init_std', 1.0) * torch.randn(empty_json['shape'])
                     dtype = getattr(torch, empty_json['torch_dtype'])
                     input_param = input_param.to(dtype)
                 else:
