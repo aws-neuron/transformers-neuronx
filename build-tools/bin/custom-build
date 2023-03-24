@@ -38,7 +38,7 @@ cp -r ${BUILD_TN_SRC_TN} ${BUILD_PATH}/${SITE_PACKAGES_SUFFIX}/
 # Build wheel
 cd ${BUILD_PATH_TN}
 export PYTHONPATH=${RUNTIMEFARM_PATH}/${SITE_PACKAGES_SUFFIX}
-python setup.py bdist_wheel --dist-dir ${BUILD_PATH}/pip/public/transformers-neuronx
+python setup.py bdist_wheel --dist-dir ${BUILD_PATH}/pip/private/transformers-neuronx
 
 # Run some tests
 if [ "$1" == "release" ]; then
