@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
 import warnings
 import torch
 from transformers_neuronx import dtypes
@@ -183,13 +184,16 @@ class OPTForSamplingNoEmbeddingHlo:
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
+        self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        mask_triu, mask_start = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions)
+        triu_comparison = 'LT' if self.allow_kv_dot_prefetch else 'LE'
+        mask_triu, mask_start = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
+                                                           triu_comparison=triu_comparison)
         return (hidden, cache_ids, mask_triu, mask_start), (1, 0, None)
 
     def layer(self, hidden, cache_ids, mask_triu, mask_start, attn_k_cache, attn_v_cache,
@@ -246,16 +250,6 @@ class OPTForSamplingNoEmbeddingHlo:
         active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias)
         active_v = dtype[active_sizes].Reshape(active_v)
 
-        scatter_dims = dict(update_window_dims=[1,2,3],
-                            inserted_window_dims=[0],
-                            scatter_dims_to_operand_dims=[0],
-                            index_vector_dim=1)
-        func = hlo.gen_assign_func(dtype)
-        cached_keys = dtype[cached_keys.sizes].Scatter(
-            cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=func)
-        cached_values = dtype[cached_values.sizes].Scatter(
-            cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=func)
-
         # compute self-attention: V x Softmax(QK^T)
         # Keep the attention weights computation in fp32 to avoid overflow issues
         scale_attn = d_head ** 0.5
@@ -266,26 +260,84 @@ class OPTForSamplingNoEmbeddingHlo:
                         lhs_batch_dimensions=[1, 2],
                         rhs_contracting_dimensions=[3],
                         rhs_batch_dimensions=[1, 2])
+
+        scatter_dims = dict(update_window_dims=[1,2,3],
+                            inserted_window_dims=[0],
+                            scatter_dims_to_operand_dims=[0],
+                            index_vector_dim=1)
+        assign_func = hlo.gen_assign_func(dtype)
+        if self.allow_kv_dot_prefetch:
+            active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
+            active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_score = f32[active_score_sizes].Convert(active_score)
+        else:
+            cached_keys = dtype[cached_keys.sizes].Scatter(
+                cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
-
         mask_triu_br = pred[score_sizes].Broadcast(mask_triu, dimensions=[2, 3])
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
         score = dtype[score_sizes].Select(mask_triu_br, score, large_neg_br)
         mask_start_br = pred[score_sizes].Broadcast(mask_start, dimensions=[0, 3])
         score = dtype[score_sizes].Select(mask_start_br, score, large_neg_br)
-
         score = f32[score_sizes].Convert(score)
-        probs = hlo.softmax(score)
-        probs = dtype[score_sizes].Convert(probs)
 
         dot_dims = dict(lhs_contracting_dimensions=[3],
                         lhs_batch_dimensions=[0, 1],
                         rhs_contracting_dimensions=[0],
                         rhs_batch_dimensions=[1, 2])
         sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-        output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
+
+        if self.allow_kv_dot_prefetch:
+            # Main logic:
+            # 1. Split softmax into exp / sum(exp) where exp is independent along axis 3
+            #   probs_post_scatter = softmax(score_post_scatter)
+            #   output = probs_post_scatter @ cached_values_post_scatter
+            #          = exps_post_scatter / sum(exps_post_scatter) @ cached_values_post_scatter
+            #          = exps_post_scatter @ cached_values_post_scatter / sum(exps_post_scatter)
+            # 2. Split exps @ cached_values dot into a sum of dots
+            #   dot = exps_post_scatter @ cached_values_post_scatter
+            #       = exps_pre_scatter @ cached_values_pre_scatter + exp_active @ cached_values_active
+            #   Note that exps_pre_scatter @ cached_values_active and exp_active @ cached_values_pre_scatter
+            #   are assumed to be 0 due to the use of attention mask.
+            reduce_sizes = n_seqs, n_heads_tp, n_active_tokens
+            minus_inf = f32.Constant(constant_value=float('-inf'))
+            max_func = hlo.gen_max_func(f32)
+            reduce_max = f32[reduce_sizes].Reduce(score, minus_inf, dimensions=[3], to_apply=max_func)
+            active_reduce_max = f32[reduce_sizes].Reduce(active_score, minus_inf, dimensions=[3], to_apply=max_func)
+            reduce_max = f32[reduce_sizes].Maximum(reduce_max, active_reduce_max)
+            reduce_max_br = f32[score.sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
+            score_shifted = f32[score.sizes].Subtract(score, reduce_max_br)
+            exp = f32[score.sizes].Exp(score_shifted)
+            zero = f32.Constant(constant_value=0)
+            add_func = hlo.gen_add_func(f32)
+            denom = f32[reduce_sizes].Reduce(exp, zero, dimensions=[3], to_apply=add_func)
+            exp = dtype[exp.sizes].Convert(exp)
+            reduce_max_bra = f32[active_score_sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
+            active_score_shifted = f32[active_score_sizes].Subtract(active_score, reduce_max_bra)
+            active_exp = f32[active_score_sizes].Exp(active_score_shifted)
+            active_denom = f32[reduce_sizes].Reduce(active_exp, zero, dimensions=[3], to_apply=add_func)
+            denom = f32[reduce_sizes].Add(denom, active_denom)
+            active_exp = dtype[active_exp.sizes].Convert(active_exp)
+            denom = dtype[denom.sizes].Convert(denom)
+            output = dtype[sizes].Dot(exp, cached_values, dot_dimension_numbers=dot_dims)
+            active_output = dtype[sizes].Dot(active_exp, active_v, dot_dimension_numbers=dot_dims)
+            output = dtype[sizes].Add(output, active_output)
+            denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
+            output = dtype[sizes].Divide(output, denom_br)
+            cached_keys = dtype[cached_keys.sizes].Scatter(
+                cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+            cached_values = dtype[cached_values.sizes].Scatter(
+                cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+        else:
+            cached_values = dtype[cached_values.sizes].Scatter(
+                cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+            probs = hlo.softmax(score)
+            probs = dtype[probs.sizes].Convert(probs)
+            output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
+
         sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
 
