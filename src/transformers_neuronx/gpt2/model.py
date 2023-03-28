@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import torch
+import pickle
+import os
 import warnings
+import torch
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 from transformers_neuronx import dtypes
@@ -53,6 +55,24 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+    def _save_compiled_artifacts(self, directory):
+        if os.path.isfile(directory):
+            raise FileExistsError(
+                f'Artifacts should be saved to a directory. '
+                f'Found existing file: {directory}'
+            )
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, 'neuron-program.pkl'), 'wb') as f:
+            pickle.dump(self.decoder_lm_head.program, f)
+
+    def _load_compiled_artifacts(self, directory):
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f'Did not find directory: {directory}')
+        program_filename = os.path.join(directory, 'neuron-program.pkl')
+        if os.path.exists(program_filename):
+            with open(program_filename, 'rb') as f:
+                self.decoder_lm_head.program = pickle.load(f)
 
     def to_neuron(self):
         ops.init()
@@ -139,6 +159,24 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.cur_len = 0
+
+    def _save_compiled_artifacts(self, directory):
+        if os.path.isfile(directory):
+            raise FileExistsError(
+                f'Artifacts should be saved to a directory. '
+                f'Found existing file: {directory}'
+            )
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, 'neuron-program.pkl'), 'wb') as f:
+            pickle.dump(self.decoder_lm_head.program, f)
+
+    def _load_compiled_artifacts(self, directory):
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f'Did not find directory: {directory}')
+        program_filename = os.path.join(directory, 'neuron-program.pkl')
+        if os.path.exists(program_filename):
+            with open(program_filename, 'rb') as f:
+                self.decoder_lm_head.program = pickle.load(f)
 
     def load_state_dict_dir(self, state_dict_dir):
         self.chkpt_model.load_state_dict_dir(state_dict_dir)
