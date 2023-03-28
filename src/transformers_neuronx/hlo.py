@@ -180,7 +180,7 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
-def decoder_attention_mask(start_ids, position_ids, n_positions):
+def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE'):
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     triu_sizes = n_active_tokens, n_positions
@@ -192,7 +192,7 @@ def decoder_attention_mask(start_ids, position_ids, n_positions):
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
     triu = pred[triu_sizes].Compare(iota0, iota1t, comparison_direction='GE')
     position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
-    mask = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction='LE')
+    mask = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
     mask_triu = pred[triu_sizes].Select(mask, mask, triu)  # FIXME: And doesn't work; consult compiler team
     start_sizes = batch_size, n_positions
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
