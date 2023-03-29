@@ -258,11 +258,6 @@ class ParallelKernel:
     def __call__(self, memory):
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        del state["model"] # Do not pickle "model". Will be reloaded from "neff_bytes"
-        return state
-
 
 def get_hlo_input_info(hlo_module, index=0):
     shape_proto = hlo_module.host_program_shape.parameters[index]
