@@ -149,4 +149,6 @@ def amp_callback(model, dtype):
         block.attn.to(dtype)
         block.mlp.to(dtype)
     model.lm_head.to(dtype)
-demo('gpt2', GPT2ForHuggingFaceSampling, amp_callback)
+
+def main():
+    demo('gpt2', GPT2ForHuggingFaceSampling, amp_callback)
