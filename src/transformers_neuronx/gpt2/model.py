@@ -363,10 +363,10 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head_for_context.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, position_ids, start_ids)
+        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, position_ids)
+        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
@@ -382,7 +382,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         return logits
 
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         broadcaster = CacheBroadcaster(self.decoder_lm_head.tp_degree, shard_dim=2, batch_dim=1,
@@ -397,7 +397,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if start < context_length:
             input_pad = context_length - start
             input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
-        next_token_scores = self.forward_for_context(input_context, cache_ids)
+        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
         for source, target in zip(self.decoder_lm_head_for_context.layers, self.decoder_lm_head.layers):
             broadcaster.broadcast(source.attn_k_cache, target.attn_k_cache, context_length)
             broadcaster.broadcast(source.attn_v_cache, target.attn_v_cache, context_length)
@@ -408,7 +408,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if self.context_hook is not None:
             self.context_hook()
         next_token_scores = next_token_scores.repeat([self.decoder_lm_head.batch_size, 1])
-        return sampling.sample_loop(self, input_ids, next_token_scores, sequence_length,
+        return sampling.sample_loop(self, input_ids, start_ids, next_token_scores, sequence_length,
                                     eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
