@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+from torch_neuronx.pyhlo import hlo_pb2
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -36,6 +37,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
+        self.fully_unrolled = self.unroll == self.num_layers
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
         self.ln_f_bias = None
@@ -159,7 +161,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         return position_ids, start_ids
 
     def _build_program(self):
-        if self.unroll == self.num_layers:
+        if self.fully_unrolled:
             hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramFullyUnrolled(hlo_modules, num_inputs, self.tp_degree)
@@ -611,21 +613,20 @@ class DecoderParameterBuilder:
 class DecoderProgram:
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
-        first_hlo, *_ = hlo_modules
-        self.input_tensor_info = [compiler.get_hlo_input_info(first_hlo, idx) for idx in range(num_inputs)]
-        self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
-        self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
-        self.n_active_tokens = read_n_active_tokens(first_hlo)
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        self.input_buffers = None
+        self.hlo_modules = hlo_modules
+        self.num_inputs = num_inputs
+        self.tp_degree = tp_degree
         self.inputs_sdim = None
+        first_hlo, *_ = self.hlo_modules
+        self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(self.num_inputs)]
+        self.kernels = [compiler.ParallelKernel(hm, self.tp_degree) for hm in self.hlo_modules]
+        self.n_positions_list = [read_n_position(hm, self.num_inputs) for hm in self.hlo_modules]
+        self.n_active_tokens = read_n_active_tokens(first_hlo)
+        self.manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
 
     def setup(self, layers, ln_lm_head_params):
-
-        # Create I/O tensor objects
-        self.input_buffers = [torch.zeros(shape, dtype=dtype) for shape, dtype in self.input_tensor_info]
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
-
+        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
         for kernel in self.kernels:
             kernel.build()
             kernel.load()
@@ -654,11 +655,15 @@ class DecoderProgram:
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # Remove I/O serialization
-        del state['input_buffers']
-        return state
+
+class SerializableDecoderProgramFullyUnrolled:
+
+    def __init__(self, hlo_modules, num_inputs, tp_degree, inputs_sdim, neffs) -> None:
+        self.hlo_modules = hlo_modules
+        self.num_inputs = num_inputs
+        self.tp_degree = tp_degree
+        self.inputs_sdim = inputs_sdim
+        self.neffs = neffs
 
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
@@ -666,18 +671,11 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
     def __init__(self, hlo_modules, num_inputs, tp_degree):
         super().__init__(hlo_modules, num_inputs, tp_degree)
         first_hlo, *_ = hlo_modules
-        self.shape, self.dtype = compiler.get_hlo_output_info(first_hlo, 0)
-        self.memories = None
-        self.logits_buffer = None
+        self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
+        self.memories = [kernel.build_memory() for kernel in self.kernels]
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params)
-
-        # Create I/O tensor objects
-        self.memories = [kernel.build_memory() for kernel in self.kernels]
-        self.logits_buffer = torch.zeros(self.shape, dtype=self.dtype)
-        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
-
         for npos, memory in zip(self.n_positions_list, self.memories):
             input_tensors = [*self.input_buffers]
             output_tensors = [self.logits_buffer]
@@ -688,12 +686,28 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
 
-    def __getstate__(self):
-        state = super().__getstate__()
-        # Remove I/O serialization
-        del state["memories"]
-        del state["logits_buffer"]
-        return state
+    def save(self):
+        hlo_modules = [kernel.hlo_module.SerializeToString() for kernel in self.kernels]
+        neffs = [kernel.neff_bytes for kernel in self.kernels]
+        return SerializableDecoderProgramFullyUnrolled(hlo_modules, self.num_inputs, self.tp_degree, self.inputs_sdim, neffs)
+
+    @classmethod
+    def load(cls, serialized_program):
+        num_inputs = serialized_program.num_inputs
+        tp_degree = serialized_program.tp_degree
+        inputs_sdim = serialized_program.inputs_sdim
+        hlo_modules = []
+        neffs = []
+        for hm, neff in zip(serialized_program.hlo_modules, serialized_program.neffs):
+            hlo_module = hlo_pb2.HloModuleProto()
+            hlo_module.ParseFromString(hm)
+            hlo_modules.append(hlo_module)
+            neffs.append(neff)
+        decoder = cls(hlo_modules, num_inputs, tp_degree)
+        for kernel, neff in zip(decoder.kernels, neffs):
+            kernel.neff_bytes = neff
+        decoder.inputs_sdim = inputs_sdim
+        return decoder
 
 
 class DecoderProgramMultiLayer(DecoderProgram):
@@ -702,26 +716,17 @@ class DecoderProgramMultiLayer(DecoderProgram):
         super().__init__(hlo_modules, num_inputs, tp_degree)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
-        self.shape, self.dtype = compiler.get_hlo_output_info(ln_lm_head_hlo_module)
-        self.num_layers = num_layers
+        self.logits_buffer = compiler.gen_zero_output(ln_lm_head_hlo_module)
         self.unroll = unroll
+        self.multi_layers_memories = []
+        for _ in range(num_layers // unroll):
+            memories = [kernel.build_memory() for kernel in self.kernels]
+            self.multi_layers_memories.append(memories)
         self.ln_lm_head_kernel = compiler.ParallelKernel(ln_lm_head_hlo_module, tp_degree)
-        self.multi_layers_memories = None
-        self.ln_lm_head_memory = None
-        self.logits_buffer = None
+        self.ln_lm_head_memory = self.ln_lm_head_kernel.build_memory()
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params)
-
-        # Create I/O tensor objects
-        self.multi_layers_memories = []
-        for _ in range(self.num_layers // self.unroll):
-            memories = [kernel.build_memory() for kernel in self.kernels]
-            self.multi_layers_memories.append(memories)
-        self.ln_lm_head_memory = self.ln_lm_head_kernel.build_memory()
-        self.logits_buffer = torch.zeros(self.shape, dtype=self.dtype)
-        self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
-
         hidden_buffer, *_ = self.input_buffers
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
@@ -740,10 +745,9 @@ class DecoderProgramMultiLayer(DecoderProgram):
             self.kernels[bucket_id](memories[bucket_id])
         self.ln_lm_head_kernel(self.ln_lm_head_memory)
 
-    def __getstate__(self):
-        state = super().__getstate__()
-        # Remove I/O serialization
-        del state["multi_layers_memories"]
-        del state["ln_lm_head_memory"]
-        del state["logits_buffer"]
-        return state
+    def save(self):
+        raise NotImplementedError('Only serialization of fully unrolled programs is currently supported')
+
+    @classmethod
+    def load(cls, serialized_program):
+        raise NotImplementedError('Only serialization of fully unrolled programs is currently supported')
