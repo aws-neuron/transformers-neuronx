@@ -57,6 +57,7 @@ setup(
     },
     entry_points = {
         'console_scripts': [
+            'gpt2_generation_demo=transformers_neuronx.gpt2.generation_demo:main',
             'gpt2_demo=transformers_neuronx.gpt2.demo:main',
             'gptj_demo=transformers_neuronx.gptj.demo:main',
             'opt_demo=transformers_neuronx.opt.demo:main',
