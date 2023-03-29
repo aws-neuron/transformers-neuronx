@@ -25,7 +25,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
-from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
+from transformers_neuronx.decoder import DecoderProgramFullyUnrolled, DecoderProgramMultiLayer, DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.gpt2.config import GPT2Config
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
@@ -64,7 +64,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
             )
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, 'neuron-program.pkl'), 'wb') as f:
-            pickle.dump(self.decoder_lm_head.program, f)
+            pickle.dump(self.decoder_lm_head.program.save(), f)
 
     def _load_compiled_artifacts(self, directory):
         if not os.path.isdir(directory):
@@ -72,7 +72,11 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         program_filename = os.path.join(directory, 'neuron-program.pkl')
         if os.path.exists(program_filename):
             with open(program_filename, 'rb') as f:
-                self.decoder_lm_head.program = pickle.load(f)
+                serialized_decoder = pickle.load(f)
+                if self.decoder_lm_head.fully_unrolled:
+                    self.decoder_lm_head.program = DecoderProgramFullyUnrolled.load(serialized_decoder)
+                else:
+                    self.decoder_lm_head.program = DecoderProgramMultiLayer.load(serialized_decoder)
 
     def to_neuron(self):
         ops.init()
@@ -168,7 +172,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
             )
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, 'neuron-program.pkl'), 'wb') as f:
-            pickle.dump(self.decoder_lm_head.program, f)
+            pickle.dump(self.decoder_lm_head.program.save(), f)
 
     def _load_compiled_artifacts(self, directory):
         if not os.path.isdir(directory):
@@ -176,7 +180,11 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         program_filename = os.path.join(directory, 'neuron-program.pkl')
         if os.path.exists(program_filename):
             with open(program_filename, 'rb') as f:
-                self.decoder_lm_head.program = pickle.load(f)
+                serialized_decoder = pickle.load(f)
+                if self.decoder_lm_head.fully_unrolled:
+                    self.decoder_lm_head.program = DecoderProgramFullyUnrolled.load(serialized_decoder)
+                else:
+                    self.decoder_lm_head.program = DecoderProgramMultiLayer.load(serialized_decoder)
 
     def load_state_dict_dir(self, state_dict_dir):
         self.chkpt_model.load_state_dict_dir(state_dict_dir)
