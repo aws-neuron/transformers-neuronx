@@ -25,7 +25,7 @@ from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
-from transformers_neuronx.gpt2.config import GPT2Config
+from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
 
@@ -131,7 +131,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
 class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):
-        config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
+        config = GPT2HuggingFaceConfig(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(config) # will call transformers.PreTrainedModel(confg)
         self.chkpt_model = GPT2CheckpointCompatible(config)
         self.config = config
@@ -283,10 +283,13 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
-    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2, context_length_estimate=None, **kwargs):
+    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2, context_length_estimate=None,
+                 unroll=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
+        if unroll is None:
+            unroll = config.n_layer
         attention_head_size = config.n_embd // config.n_head
         if context_length_estimate is None:
             context_length_estimate = config.n_positions // 2
@@ -294,7 +297,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         n_positions_list = [config.n_positions]
         self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, config.n_layer,
+            config.n_layer, unroll,
         )
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new')
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
@@ -352,7 +355,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids[[0]], cache_ids, start_ids[[0]])
+        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
         batch_size = input_ids.shape[0]

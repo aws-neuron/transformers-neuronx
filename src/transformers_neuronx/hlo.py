@@ -186,20 +186,20 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     triu_sizes = n_active_tokens, n_positions
     int_dtype = position_ids.dtype
     pred = position_ids.scribe.pred
-    iota0 = int_dtype[n_active_tokens].Iota(dimensions=[0])
-    iota0 = int_dtype[triu_sizes].Broadcast(iota0, dimensions=[0])
     iota1 = int_dtype[n_positions].Iota(dimensions=[0])
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
-    triu = pred[triu_sizes].Compare(iota0, iota1t, comparison_direction='GE')
     position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
-    mask = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
-    mask_triu = pred[triu_sizes].Select(mask, mask, triu)  # FIXME: And doesn't work; consult compiler team
+    mask_triu = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
     start_sizes = batch_size, n_positions
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
     start_ids = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
     mask_start = pred[start_sizes].Compare(iota1s, start_ids, comparison_direction='GE')
+    if n_active_tokens > 1:
+        return mask_triu, mask_start
     mask_sizes = batch_size, n_active_tokens, n_positions
-    return mask_triu, mask_start
+    mask_triu = pred[mask_sizes].Broadcast(mask_triu, dimensions=[1, 2])
+    mask_start = pred[mask_sizes].Broadcast(mask_start, dimensions=[0, 2])
+    return pred[mask_sizes].And(mask_triu, mask_start), None
 
 
 class ParameterBuilder:
