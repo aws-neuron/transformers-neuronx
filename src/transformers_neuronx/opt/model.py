@@ -276,12 +276,15 @@ class OPTForSamplingNoEmbeddingHlo:
 
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
-        mask_triu_br = pred[score_sizes].Broadcast(mask_triu, dimensions=[2, 3])
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
+        if mask_start is not None:  # two small masks for the context-encoding code path
+            mask_start_br = pred[score_sizes].Broadcast(mask_start, dimensions=[0, 3])
+            score = dtype[score_sizes].Select(mask_start_br, score, large_neg_br)
+            mask_triu_br = pred[score_sizes].Broadcast(mask_triu, dimensions=[2, 3])
+        else:  # one 3-D mask for the per-token decoding code path
+            mask_triu_br = pred[score_sizes].Broadcast(mask_triu, dimensions=[0, 2, 3])
         score = dtype[score_sizes].Select(mask_triu_br, score, large_neg_br)
-        mask_start_br = pred[score_sizes].Broadcast(mask_start, dimensions=[0, 3])
-        score = dtype[score_sizes].Select(mask_start_br, score, large_neg_br)
         score = f32[score_sizes].Convert(score)
 
         dot_dims = dict(lhs_contracting_dimensions=[3],
