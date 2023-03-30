@@ -150,10 +150,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             self.program.run(bucket_id)
         return self.program.logits_device_to_host()
 
-    def embed_positions_ids(self, position_ids, start_ids=None):
+    def embed_positions_ids(self, position_ids, start_ids=None, batch_size=None):
+        if batch_size is None:
+            batch_size = self.batch_size
         if start_ids is None:
-            return position_ids, torch.zeros([self.batch_size], dtype=torch.int32)
-        position_ids = position_ids.unsqueeze(0).repeat(self.batch_size, 1)
+            return position_ids, torch.zeros([batch_size], dtype=torch.int32)
+        position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
         position_ids -= start_ids.unsqueeze(1)
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
@@ -648,6 +650,7 @@ class DecoderProgram:
 
     def inputs_host_to_device(self, input_tensors):
         for buf, tensor in zip(self.input_buffers, input_tensors):
+            assert buf.shape == tensor.shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor.shape}) have different shapes!"
             tensor = tensor.to(buf.dtype)
             tensor = self.manipulator.duplicate_on_cpu(tensor)
             ops.parallel_write(buf, tensor)
