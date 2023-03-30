@@ -84,6 +84,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
+
         self.program = self._build_program()
         self.program.setup(self.layers, ln_lm_head_params)
 
