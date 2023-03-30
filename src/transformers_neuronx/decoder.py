@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import pickle
 import torch
-from torch_neuronx.pyhlo import hlo_pb2
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -37,7 +37,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
-        self.fully_unrolled = self.unroll == self.num_layers
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
         self.ln_f_bias = None
@@ -48,6 +47,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.layer_builder = None
         self.ln_lm_head_builder = None
         self.program = None
+        self.compiler_artifacts_path = None
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
@@ -84,9 +84,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
-        if self.program is None:
-            self.program = self._build_program()
-            self.program.inputs_sdim = self.inputs_sdim # TODO: See if this can be moved program constructor
+        self.program = self._build_program()
         self.program.setup(self.layers, ln_lm_head_params)
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
@@ -135,7 +133,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         for start in range(0, sequence_length, self.n_active_tokens):
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
-            for sdim, tensor in zip(self.program.inputs_sdim, inputs):
+            for sdim, tensor in zip(self.inputs_sdim, inputs):
                 if sdim is not None:
                     slices = [slice(None) for _ in tensor.shape]
                     slices[sdim] = slicing
@@ -160,8 +158,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
 
+    def save_compiler_artifacts(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump(self.program.get_neff_bytes(), f)
+
+    def load_compiler_artifacts_after_build(self, path):
+        self.compiler_artifacts_path = path
+
     def _build_program(self):
-        if self.fully_unrolled:
+        if self.unroll == self.num_layers:
             hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramFullyUnrolled(hlo_modules, num_inputs, self.tp_degree)
@@ -173,6 +178,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(hlo_modules, ln_lm_head_hlo_module, num_inputs,
                                                self.num_layers, self.unroll, self.tp_degree)
+        if self.compiler_artifacts_path is not None:
+            with open(self.compiler_artifacts_path, 'rb') as f:
+                kernels_neff_bytes = pickle.load(f)
+            program.set_neff_bytes(kernels_neff_bytes)
         return program
 
     def _hlo_fully_unrolled(self, n_positions):
@@ -613,16 +622,12 @@ class DecoderParameterBuilder:
 class DecoderProgram:
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
-        self.hlo_modules = hlo_modules
-        self.num_inputs = num_inputs
-        self.tp_degree = tp_degree
-        self.inputs_sdim = None
-        first_hlo, *_ = self.hlo_modules
-        self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(self.num_inputs)]
-        self.kernels = [compiler.ParallelKernel(hm, self.tp_degree) for hm in self.hlo_modules]
-        self.n_positions_list = [read_n_position(hm, self.num_inputs) for hm in self.hlo_modules]
+        first_hlo, *_ = hlo_modules
+        self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(num_inputs)]
+        self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
+        self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
-        self.manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
@@ -630,6 +635,13 @@ class DecoderProgram:
         for kernel in self.kernels:
             kernel.build()
             kernel.load()
+
+    def get_neff_bytes(self):
+        return [kernel.neff_bytes for kernel in self.kernels]
+
+    def set_neff_bytes(self, kernels_neff_bytes):
+        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes):
+            kernel.neff_bytes = neff_bytes
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -656,16 +668,6 @@ class DecoderProgram:
             input_tensors.extend(layer.valid_parameters())
 
 
-class SerializableDecoderProgramFullyUnrolled:
-
-    def __init__(self, hlo_modules, num_inputs, tp_degree, inputs_sdim, neffs) -> None:
-        self.hlo_modules = hlo_modules
-        self.num_inputs = num_inputs
-        self.tp_degree = tp_degree
-        self.inputs_sdim = inputs_sdim
-        self.neffs = neffs
-
-
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
@@ -685,29 +687,6 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
-
-    def save(self):
-        hlo_modules = [kernel.hlo_module.SerializeToString() for kernel in self.kernels]
-        neffs = [kernel.neff_bytes for kernel in self.kernels]
-        return SerializableDecoderProgramFullyUnrolled(hlo_modules, self.num_inputs, self.tp_degree, self.inputs_sdim, neffs)
-
-    @classmethod
-    def load(cls, serialized_program):
-        num_inputs = serialized_program.num_inputs
-        tp_degree = serialized_program.tp_degree
-        inputs_sdim = serialized_program.inputs_sdim
-        hlo_modules = []
-        neffs = []
-        for hm, neff in zip(serialized_program.hlo_modules, serialized_program.neffs):
-            hlo_module = hlo_pb2.HloModuleProto()
-            hlo_module.ParseFromString(hm)
-            hlo_modules.append(hlo_module)
-            neffs.append(neff)
-        decoder = cls(hlo_modules, num_inputs, tp_degree)
-        for kernel, neff in zip(decoder.kernels, neffs):
-            kernel.neff_bytes = neff
-        decoder.inputs_sdim = inputs_sdim
-        return decoder
 
 
 class DecoderProgramMultiLayer(DecoderProgram):
@@ -744,10 +723,3 @@ class DecoderProgramMultiLayer(DecoderProgram):
         for memories in self.multi_layers_memories:
             self.kernels[bucket_id](memories[bucket_id])
         self.ln_lm_head_kernel(self.ln_lm_head_memory)
-
-    def save(self):
-        raise NotImplementedError('Only serialization of fully unrolled programs is currently supported')
-
-    @classmethod
-    def load(cls, serialized_program):
-        raise NotImplementedError('Only serialization of fully unrolled programs is currently supported')
