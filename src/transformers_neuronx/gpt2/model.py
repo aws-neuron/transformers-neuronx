@@ -284,7 +284,6 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2, context_length_estimate=None, **kwargs):
-        self.batch_size = batch_size
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
