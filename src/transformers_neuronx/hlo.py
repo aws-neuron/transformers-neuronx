@@ -148,10 +148,10 @@ def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
 def softmax_new(logits, dim=None):
     rank = len(logits.sizes)
     if dim is None:
-        dim = rank - 1    
-    shape = logits.sizes  
-    dtype = logits.dtype                
-    backend_config = str(dim).encode()        
+        dim = rank - 1
+    shape = logits.sizes
+    dtype = logits.dtype
+    backend_config = str(dim).encode()
     return dtype[shape].CustomCall(logits, custom_call_target="AwsNeuronSoftmax", backend_config=backend_config,)
 
 
@@ -229,3 +229,184 @@ def decoder_attention_mask_legacy(position_ids, dtype, n_positions):
     mask = pred[sizes].Compare(iota1, position_ids, comparison_direction='LE')
     mask = dtype[sizes].Convert(mask)
     return dtype[sizes].Multiply(mask, triu)
+
+
+def reduce_max(tensor, dim, keepdim=False):
+
+    dtype = tensor.dtype
+    reduce_shape = list(tensor.sizes)
+    reduce_shape.pop(dim)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Maximum(p0, p1)
+
+    minimum = dtype.Constant(constant_value=float('-inf')) # XXX: Does not handle integer min value
+    value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=[dim], to_apply=reducer)
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        keepdim_shape[dim] = 1
+        value = dtype[keepdim_shape].Reshape(value)
+
+    return value
+
+
+def reduce_sum(tensor, dim, keepdim=False):
+
+    dtype = tensor.dtype
+    reduce_shape = list(tensor.sizes)
+    reduce_shape.pop(dim)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    minimum = dtype.Constant(constant_value=0)
+    value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=[dim], to_apply=reducer)
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        keepdim_shape[dim] = 1
+        value = dtype[keepdim_shape].Reshape(value)
+
+    return value
+
+
+def argmax(tensor, dim, keepdim=False):
+    backend_config = str(dim).encode()
+
+    scribe = tensor.scribe
+    u32 = scribe.u32
+    reduce_shape = list(tensor.sizes)
+    reduce_shape.pop(dim)
+
+    index = u32[reduce_shape].CustomCall(
+        tensor, custom_call_target='AwsNeuronArgMax', backend_config=backend_config,
+    )
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        keepdim_shape[dim] = 1
+        index = u32[keepdim_shape].Reshape(index)
+
+    return index
+
+
+def all_gather(tensor, dim, tp_degree):
+    shape = list(tensor.sizes)
+    shape[dim] *= tp_degree
+    dtype = tensor.dtype
+    return dtype[shape].AllGather(
+        tensor,
+        dimensions=[dim],
+        replica_groups=[list(range(tp_degree))],
+    )
+
+
+def unsqueeze(tensor, dim):
+    size = list(tensor.sizes)
+    dim %= len(size) + 1  # Handle negative sizes
+    size.insert(dim, 1)
+    dtype = tensor.dtype
+    return dtype[size].Reshape(tensor)
+
+
+def gather(tensor, dim, index):
+    """
+    Gather elements from a `tensor` along `dim` at the given `index`
+
+    Provides similar functionality to `torch.gather`. The `tensor` and `index`
+    tensors must have the same rank.
+    """
+    assert dim <= len(tensor.sizes)
+
+    # Must have the same rank
+    tensor_sizes = list(tensor.sizes)
+    index_sizes = list(index.sizes)
+    assert len(tensor_sizes) == len(index_sizes)
+
+    # Must have same dimensions in non-`dim` dimension
+    tensor_sizes.pop(dim)
+    index_sizes.pop(dim)
+    assert tensor_sizes == index_sizes
+
+    dims = len(tensor.sizes)
+    final_size = index.sizes
+
+    # Usqueeze the index to concatenate with linear indices
+    index = unsqueeze(index, -1)
+
+    index_size = index.sizes
+    dtype = tensor.dtype
+
+    # Build linear indexers for non-`dim` dimensions
+    indices = list()
+    for i in range(dims):
+        if i == dim:
+            indices.append(index)
+        else:
+            indices.append(index.dtype[index_size].Iota(dimensions=[i]))
+
+    # Concatenate indices into a single dense indexing tensor
+    concat_size = list(index_size)
+    concat_size[-1] = dims
+    index = index.dtype[concat_size].Concatenate(*indices, dimensions=[dims])
+
+    # Gather using dense index
+    result = dtype[final_size].Gather(
+        tensor,
+        index,
+        gather_dimension_numbers=dict(
+            collapsed_slice_dims=list(range(dims)),
+            start_index_map=list(range(dims)),
+            index_vector_dim=dims,
+        ),
+        gather_slice_sizes=[1] * dims,
+    )
+
+    return result
+
+
+def argmax_tensor_parallel(tensor, dim, tp_degree=2):
+
+    scribe = tensor.scribe
+
+    # Initially reduce on each replica for replica-local result
+    index = argmax(tensor, dim, keepdim=True)
+    value = reduce_max(tensor, dim, keepdim=True)
+
+    # Synchronize replica-local results across all replicas (Much smaller after argmax)
+    index = all_gather(index, dim, tp_degree)
+    value = all_gather(value, dim, tp_degree)
+
+    dtype = index.dtype
+    sizes = index.sizes
+
+    # Fix concatenated replica-local indices. Offset by (replica_id * replica_size)
+    replica_size = dtype.Constant(constant_value=tensor.sizes[dim])
+    replica_size = dtype[sizes].Broadcast(replica_size)
+    replica_ids = dtype[sizes].Iota(dimensions=[dim])
+    offset = dtype[sizes].Multiply(replica_ids, replica_size)
+    index = dtype[sizes].Add(index, offset)
+
+    # Find replica with globally maximum value
+    replica_index = argmax(value, dim, keepdim=True)
+
+    # Final masked reduction
+    dimensions = list(range(len(replica_index.sizes) + 1))
+    dimensions.pop(dim)
+
+    rs_size = list(replica_index.sizes)
+    rs_size[dim] *= tp_degree
+    br_size = list(replica_index.sizes)
+    br_size.insert(dim, tp_degree)
+    replica_index = dtype[br_size].Broadcast(replica_index, dimensions=dimensions)
+    replica_index = dtype[rs_size].Reshape(replica_index)
+
+    mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
+    mask = index.dtype[mask.sizes].Convert(mask)
+    masked = dtype[sizes].Multiply(mask, index)
+    return reduce_sum(masked, dim=0)
