@@ -125,6 +125,35 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
+    def beam_search(self, input_ids, num_beams, sequence_length, start_ids=None):
+        batch_size, start = input_ids.shape
+        bn = batch_size * num_beams
+        b_n_input_ids = input_ids.unsqueeze(1).repeat(1, num_beams, 1)
+        bn_input_ids = b_n_input_ids.reshape([bn, start])
+        if start_ids is not None:
+            start_ids = start_ids.unsqueeze(1).repeat(1, num_beams).reshape([bn])
+        cache_ids = torch.arange(start, dtype=torch.int32)
+        next_token_scores = self(bn_input_ids, cache_ids, start_ids)  # [bn, v]
+        next_token_scores = next_token_scores[::num_beams, ...]  # [b, v]
+        total_scores, topk_indices = torch.topk(next_token_scores, num_beams)  # [b, n]
+        total_scores = total_scores.reshape([batch_size, num_beams, 1])
+        inputs = topk_indices.reshape([batch_size, num_beams, 1])
+        tokens = [b_n_input_ids, inputs]
+        for cur_len in range(start, sequence_length):
+            next_len = cur_len + 1
+            inputs = inputs.reshape([bn, 1])
+            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+            next_token_scores = self(inputs, cache_ids, start_ids)
+            total_scores = total_scores + next_token_scores.reshape([batch_size, num_beams, -1])
+            scores = total_scores.reshape([batch_size, -1])  # [b, n*v]
+            topk_scores, topk_indices_in_nv = torch.topk(scores, num_beams)  # [b, n]
+            topk_indices_in_nv = topk_indices_in_nv.reshape([batch_size, num_beams, 1])
+            inputs = topk_indices_in_nv % self.config.vocab_size
+            total_scores = total_scores.gather(dim=2, index=inputs)
+            tokens.append(inputs)
+        return torch.cat(tokens, dim=-1)
+
+
 # (bowencc): Need to keep PreTrainedModel after module.PretrainedModel as the later
 # overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly 
 # since it doesn't pass config in suer().__init__
