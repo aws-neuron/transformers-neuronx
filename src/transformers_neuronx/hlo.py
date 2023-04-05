@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
 from transformers_neuronx import activations
 
 
@@ -194,7 +195,7 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
     start_ids = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
     mask_start = pred[start_sizes].Compare(iota1s, start_ids, comparison_direction='GE')
-    if n_active_tokens > 1:
+    if os.environ.get('NEURON_INTERNAL_SPLIT_ATTENTION_MASKS', None) == '1':
         return mask_triu, mask_start
     mask_sizes = batch_size, n_active_tokens, n_positions
     mask_triu = pred[mask_sizes].Broadcast(mask_triu, dimensions=[1, 2])
