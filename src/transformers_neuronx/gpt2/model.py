@@ -404,8 +404,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
-        broadcaster = CacheBroadcaster(self.decoder_lm_head.tp_degree, shard_dim=2, batch_dim=1,
-                                       batch_size=self.decoder_lm_head.batch_size)
+        broadcaster = parallel.CacheBroadcaster(
+            self.decoder_lm_head.tp_degree, shard_dim=2, batch_dim=1,
+            batch_size=self.decoder_lm_head.batch_size)
         self.reset()
         _, start = input_ids.shape
 
@@ -433,24 +434,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             next_token_scores = next_token_scores.repeat([self.decoder_lm_head.batch_size, 1])
         return sampling.sample_loop(self, input_ids, start_ids, next_token_scores, sequence_length,
                                     eos_token_id=self.config.eos_token_id, top_k=top_k)
-
-
-class CacheBroadcaster:
-
-    def __init__(self, tp_degree, shard_dim, batch_dim, batch_size):
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
-        self.shard_dim = shard_dim
-        self.batch_dim = batch_dim
-        self.batch_size = batch_size
-
-    def broadcast(self, source, target, context_length):
-        source = self.manipulator.unshard_along(source, dim=self.shard_dim)
-        source[context_length:] = 0.0
-        repeats = [1 for _ in source.shape]
-        repeats[self.batch_dim] = self.batch_size
-        source = source.repeat(repeats)
-        source = self.manipulator.shard_along_on_cpu(source, dim=self.shard_dim)
-        ops.parallel_write(target, source)
 
 
 class GPT2CheckpointCompatible(module.PretrainedModel):
