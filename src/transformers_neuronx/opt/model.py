@@ -19,16 +19,17 @@ from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
 from transformers_neuronx import ops
+from transformers_neuronx import parallel
+from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.sampling import simple_sample
 
 
 class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, init_n_active_tokens=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
@@ -55,6 +56,9 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.decoder_lm_head_for_context = None
+        self.context_length_estimate = context_length_estimate
+        self.context_unroll = context_unroll
 
     def to_neuron(self):
         ops.init()
@@ -84,17 +88,30 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        if self.context_length_estimate is not None:
+            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
+                n_positions_list=[self.context_length_estimate],
+                n_active_tokens=self.context_length_estimate,
+                unroll=self.context_unroll,
+                share_caches=True,
+            )
 
     def reset(self):
         self.decoder_lm_head.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
+        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+
+    def forward_for_context(self, input_ids, cache_ids, start_ids=None):
+        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
+
+    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+        logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
@@ -102,8 +119,23 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        return simple_sample(self, input_ids, start_ids, sequence_length,
-                             eos_token_id=self.config.eos_token_id, top_k=top_k)
+        if self.context_length_estimate is None:
+            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+        _, start = input_ids.shape
+        context_length = self.context_length_estimate
+        cache_ids = torch.arange(context_length, dtype=torch.int32)
+        input_context = input_ids[:, :context_length]
+        if start < context_length:
+            input_pad = context_length - start
+            input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
+        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
+        for cur_len in range(context_length, start):
+            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+            next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
+        return sampling.sample_loop(
+            self, input_ids, start_ids, next_token_scores, sequence_length,
+            eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):
