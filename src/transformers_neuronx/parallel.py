@@ -137,11 +137,11 @@ class CacheBroadcaster:
         self.batch_dim = batch_dim
         self.batch_size = batch_size
 
-    def broadcast(self, source, target, context_length):
+    def broadcast(self, source, target):
+        source_batch_size = source.shape[self.batch_dim]
         source = self.manipulator.unshard_along(source, dim=self.shard_dim)
-        source[context_length:] = 0.0
         repeats = [1 for _ in source.shape]
-        repeats[self.batch_dim] = self.batch_size
+        repeats[self.batch_dim] = self.batch_size // source_batch_size
         source = source.repeat(repeats)
         source = self.manipulator.shard_along_on_cpu(source, dim=self.shard_dim)
         ops.parallel_write(target, source)

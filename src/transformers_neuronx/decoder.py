@@ -151,9 +151,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             self.program.run(bucket_id)
         return self.program.logits_device_to_host()
 
-    def embed_positions_ids(self, position_ids, start_ids=None, batch_size=None):
-        if batch_size is None:
-            batch_size = self.batch_size
+    def embed_positions_ids(self, position_ids, start_ids=None):
+        batch_size = self.batch_size
         if start_ids is None:
             return position_ids, torch.zeros([batch_size], dtype=torch.int32)
         position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
