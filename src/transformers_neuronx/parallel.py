@@ -127,3 +127,21 @@ def layers_to_neuron(num_workers, layers, n_positions_list, to_neuron_hooks):
             future.result()
             for hook in to_neuron_hooks:
                 hook(idx)
+
+
+class CacheBroadcaster:
+
+    def __init__(self, tp_degree, shard_dim, batch_dim, batch_size):
+        self.manipulator = ParallelTensorManipulator(tp_degree)
+        self.shard_dim = shard_dim
+        self.batch_dim = batch_dim
+        self.batch_size = batch_size
+
+    def broadcast(self, source, target, context_length):
+        source = self.manipulator.unshard_along(source, dim=self.shard_dim)
+        source[context_length:] = 0.0
+        repeats = [1 for _ in source.shape]
+        repeats[self.batch_dim] = self.batch_size
+        source = source.repeat(repeats)
+        source = self.manipulator.shard_along_on_cpu(source, dim=self.shard_dim)
+        ops.parallel_write(target, source)
