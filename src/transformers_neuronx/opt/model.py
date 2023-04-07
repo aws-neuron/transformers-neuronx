@@ -224,11 +224,11 @@ class OPTForSamplingNoEmbeddingHlo:
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         triu_comparison = 'LT' if self.allow_kv_dot_prefetch else 'LE'
-        mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
-                                          triu_comparison=triu_comparison)
-        return (hidden, cache_ids, mask), (1, 0, None)
+        mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
+                                                       triu_comparison, self.allow_kv_dot_prefetch)
+        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
-    def layer(self, hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias, attn_q_weight, attn_q_bias,
               attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
               attn_out_weight, attn_out_bias, post_attn_ln_weight, post_attn_ln_bias,
@@ -237,7 +237,7 @@ class OPTForSamplingNoEmbeddingHlo:
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, mask, attn_k_cache, attn_v_cache,
+            ln_hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
             attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
         )
@@ -260,7 +260,7 @@ class OPTForSamplingNoEmbeddingHlo:
         vocab_size, _ = logits.sizes
         return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-    def attention(self, hidden, cache_ids, mask, cached_keys, cached_values,
+    def attention(self, hidden, cache_ids, mask, active_mask, cached_keys, cached_values,
                   q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias):
         dtype = hidden.dtype
         scribe = hidden.scribe
@@ -301,6 +301,10 @@ class OPTForSamplingNoEmbeddingHlo:
         if self.allow_kv_dot_prefetch:
             active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
             active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_mask_br = pred[active_score_sizes].Broadcast(active_mask, dimensions=[0, 3])
+            large_neg = dtype.Constant(constant_value=-30000)
+            large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
+            active_score = dtype[active_score_sizes].Select(active_mask_br, active_score, large_neg_br)
             active_score = f32[active_score_sizes].Convert(active_score)
         else:
             cached_keys = dtype[cached_keys.sizes].Scatter(

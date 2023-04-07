@@ -181,7 +181,8 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
-def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE'):
+def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
+                           allow_kv_dot_prefetch=False):
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     triu_sizes = n_active_tokens, n_positions
@@ -198,7 +199,14 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     mask_sizes = batch_size, n_active_tokens, n_positions
     mask_triu = pred[mask_sizes].Broadcast(mask_triu, dimensions=[1, 2])
     mask_start = pred[mask_sizes].Broadcast(mask_start, dimensions=[0, 2])
-    return pred[mask_sizes].And(mask_triu, mask_start)
+    mask = pred[mask_sizes].And(mask_triu, mask_start)
+    if not allow_kv_dot_prefetch:
+        return mask, None
+    sizes = batch_size, n_active_tokens
+    start_ids_br = int_dtype[sizes].Broadcast(start_ids, dimensions=[0])
+    position_ids_br = int_dtype[sizes].Broadcast(position_ids, dimensions=[1])
+    active_mask = pred[sizes].Compare(position_ids_br, start_ids_br, comparison_direction='GE')
+    return mask, active_mask
 
 
 class ParameterBuilder:
