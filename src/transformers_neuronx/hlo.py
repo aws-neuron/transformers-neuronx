@@ -192,6 +192,8 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
     position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
     mask_triu = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
+    if os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) == '1':
+        return mask_triu, None
     start_sizes = batch_size, n_positions
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
     start_ids = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
