@@ -25,6 +25,54 @@ def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, 
                        eos_token_id, top_k)
 
 
+def sample_tokens(model, input_ids, start_ids=None, sequence_length=128):
+    """
+    A sampling loop for a model that emits selected tokens.
+
+    This sampling loop should be used when the token selection is built into
+    the model itself.
+    """
+    _, start = input_ids.shape
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_tokens = model(input_ids, cache_ids, start_ids)
+
+    tokens = [input_ids]
+    for cur_len in range(start, sequence_length):
+
+        next_tokens = next_tokens[..., -1:]
+        tokens.append(next_tokens)
+
+        # forward pass to get next token
+        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        next_tokens = model(next_tokens, cache_ids, start_ids)
+
+    return torch.cat(tokens, dim=-1)
+
+
+def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
+    """
+    A sampling loop that selects tokens according to the most probable score.
+
+    This is useful as a reference implementation for on-device greedy sampling.
+    """
+    _, start = input_ids.shape
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
+
+    tokens = [input_ids]
+    for cur_len in range(start, sequence_length):
+
+        # greedy sample
+        inputs = torch.argmax(next_token_scores, dim=1, keepdim=True)
+        tokens.append(inputs)
+
+        # forward pass to get next token
+        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        next_token_scores = model(inputs, cache_ids, start_ids)
+
+    return torch.cat(tokens, dim=-1)
+
+
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
                 top_k=50):
     tokens = [input_ids]
