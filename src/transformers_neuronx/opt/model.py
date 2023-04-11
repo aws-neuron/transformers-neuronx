@@ -301,10 +301,11 @@ class OPTForSamplingNoEmbeddingHlo:
         if self.allow_kv_dot_prefetch:
             active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
             active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
-            active_mask_br = pred[active_score_sizes].Broadcast(active_mask, dimensions=[0, 3])
-            large_neg = dtype.Constant(constant_value=-30000)
-            large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
-            active_score = dtype[active_score_sizes].Select(active_mask_br, active_score, large_neg_br)
+            if active_mask is not None:
+                large_neg = dtype.Constant(constant_value=-30000)
+                large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
+                active_mask_br = pred[active_score_sizes].Broadcast(active_mask, dimensions=[0, 3])
+                active_score = dtype[active_score_sizes].Select(active_mask_br, active_score, large_neg_br)
             active_score = f32[active_score_sizes].Convert(active_score)
         else:
             cached_keys = dtype[cached_keys.sizes].Scatter(
