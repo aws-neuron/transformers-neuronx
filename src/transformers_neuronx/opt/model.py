@@ -314,7 +314,10 @@ class OPTForSamplingNoEmbeddingHlo:
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
+        if len(mask.sizes) == 2:
+            mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
+        else:
+            mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
         score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
         score = f32[score_sizes].Convert(score)
 
