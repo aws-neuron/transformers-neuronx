@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import os
 from transformers_neuronx import activations
 
 
@@ -182,7 +181,7 @@ def transfer_with_static_ring(shape):
 
 
 def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
-                           allow_kv_dot_prefetch=False):
+                           allow_kv_dot_prefetch=False, start_mask=True):
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     triu_sizes = n_active_tokens, n_positions
@@ -192,7 +191,7 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
     position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
     mask_triu = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
-    if os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) == '1':
+    if not start_mask:
         return mask_triu, None
     start_sizes = batch_size, n_positions
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
