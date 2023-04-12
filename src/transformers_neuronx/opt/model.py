@@ -52,7 +52,9 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.num_hidden_layers, unroll,
         )
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size, config.activation_function)
+        start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
+                                                   config.activation_function, start_mask)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -212,10 +214,11 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function):
+    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
+        self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
@@ -225,7 +228,8 @@ class OPTForSamplingNoEmbeddingHlo:
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         triu_comparison = 'LT' if self.allow_kv_dot_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
-                                                       triu_comparison, self.allow_kv_dot_prefetch)
+                                                       triu_comparison, self.allow_kv_dot_prefetch,
+                                                       self.start_mask)
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def layer(self, hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
