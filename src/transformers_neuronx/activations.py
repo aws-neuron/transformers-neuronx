@@ -14,8 +14,10 @@
 # ==============================================================================
 import math
 
-
 def gelu_new(hidden):
+    return hidden.dtype[hidden.sizes].CustomCall(hidden, custom_call_target="AwsNeuronGelu")
+
+def gelu_new_legacy(hidden):
     dtype = hidden.dtype
     sizes = hidden.sizes
     input_input = dtype[sizes].Multiply(hidden, hidden)
