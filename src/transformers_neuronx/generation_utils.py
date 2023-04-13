@@ -5,14 +5,14 @@ from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
 """
-An adaptor class for HuggingFace Generation API compatibility.
+An adapter class for HuggingFace Generation API compatibility.
 
 It requires model to have a forward interface as:
 
     forward(input_ids: Tensor(batch_size, seq_len), cache_ids: Tensor(seq_len), 
         start_ids: Optional[Tensor(batch_size)])) -> Tensor(batch_size, vocab_size)
 """
-class HuggingFaceGenerationModelAdaptor(PreTrainedModel):
+class HuggingFaceGenerationModelAdapter(PreTrainedModel):
     
     def __init__(self, config, model):
         super().__init__(config)
