@@ -397,3 +397,49 @@ class OPTForSamplingNoEmbeddingHlo:
         output = dtype[hidden_sizes].AllReduce(output, replica_groups=replica_groups, to_apply=add_func)
 
         return output, cached_keys, cached_values
+
+
+class OPTForGreedySearchNoEmbeddingHlo(OPTForSamplingNoEmbeddingHlo):
+
+    def ln_lm_head(self, *args, **kwargs):
+        logits = super().ln_lm_head(*args, **kwargs)
+        # FIXME: Update to tp_degree=self.tp_degree after AllGather fix
+        return hlo.argmax(logits, dim=0, keepdim=True, tp_degree=1)
+
+
+class OPTForGreedySearch(OPTForSampling):
+    """
+    An OPT model variant which performs greedy token selection on device.
+
+    This variant reduces the generation flexibility by compiling the token
+    selection into the model binary. This may improve performance for large
+    batch sizes when compared to CPU token selection since this avoids
+    large data copies from the Neuron device to CPU.
+
+    In contrast, when using CPU token selection, different generation
+    strategies can be used with the same model since the token selection
+    is not compiled into the model graph.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hlo_builder = OPTForGreedySearchNoEmbeddingHlo(
+            self.config.tp_degree,
+            self.config.hidden_size,
+            self.config.activation_function
+        )
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+    def forward(self, input_ids, cache_ids, start_ids=None):
+        inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
+        hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, -1)
+        tokens = self.decoder_lm_head(hidden, cache_ids, start_ids)
+        tokens = tokens.transpose(0, -1)
+        tokens = tokens[:, -1, :]
+        return tokens
+
+    def sample(self, input_ids, sequence_length, start_ids=None):
+        return sampling.sample_tokens(self, input_ids, start_ids, sequence_length)
