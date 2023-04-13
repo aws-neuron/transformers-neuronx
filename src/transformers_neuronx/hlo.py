@@ -283,26 +283,6 @@ def reduce_sum(tensor, dim, keepdim=False):
     return value
 
 
-def argmax(tensor, dim, keepdim=False):
-    backend_config = str(dim).encode()
-
-    scribe = tensor.scribe
-    u32 = scribe.u32
-    reduce_shape = list(tensor.sizes)
-    reduce_shape.pop(dim)
-
-    index = u32[reduce_shape].CustomCall(
-        tensor, custom_call_target='AwsNeuronArgMax', backend_config=backend_config,
-    )
-
-    if keepdim:
-        keepdim_shape = list(tensor.sizes)
-        keepdim_shape[dim] = 1
-        index = u32[keepdim_shape].Reshape(index)
-
-    return index
-
-
 def all_gather(tensor, dim, tp_degree):
     shape = list(tensor.sizes)
     shape[dim] *= tp_degree
@@ -378,12 +358,38 @@ def gather(tensor, dim, index):
     return result
 
 
-def argmax_tensor_parallel(tensor, dim, tp_degree=2):
+def _argmax(tensor, dim, keepdim=False):
+    """
+    Performs argmax on a single partition
+    """
+    backend_config = str(dim).encode()
+
+    scribe = tensor.scribe
+    u32 = scribe.u32
+    reduce_shape = list(tensor.sizes)
+    reduce_shape.pop(dim)
+
+    index = u32[reduce_shape].CustomCall(
+        tensor, custom_call_target='AwsNeuronArgMax', backend_config=backend_config,
+    )
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        keepdim_shape[dim] = 1
+        index = u32[keepdim_shape].Reshape(index)
+
+    return index
+
+
+def argmax(tensor, dim, keepdim=False, tp_degree=1):
+
+    if tp_degree == 1:
+        return _argmax(tensor, dim, keepdim)
 
     scribe = tensor.scribe
 
     # Initially reduce on each replica for replica-local result
-    index = argmax(tensor, dim, keepdim=True)
+    index = _argmax(tensor, dim, keepdim=True)
     value = reduce_max(tensor, dim, keepdim=True)
 
     # Synchronize replica-local results across all replicas (Much smaller after argmax)
@@ -401,7 +407,7 @@ def argmax_tensor_parallel(tensor, dim, tp_degree=2):
     index = dtype[sizes].Add(index, offset)
 
     # Find replica with globally maximum value
-    replica_index = argmax(value, dim, keepdim=True)
+    replica_index = _argmax(value, dim, keepdim=True)
 
     # Final masked reduction
     dimensions = list(range(len(replica_index.sizes) + 1))
@@ -417,4 +423,4 @@ def argmax_tensor_parallel(tensor, dim, tp_degree=2):
     mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
     mask = index.dtype[mask.sizes].Convert(mask)
     masked = dtype[sizes].Multiply(mask, index)
-    return reduce_sum(masked, dim=0)
+    return reduce_sum(masked, dim=dim, keepdim=keepdim)
