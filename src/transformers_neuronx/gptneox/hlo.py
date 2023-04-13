@@ -272,7 +272,7 @@ def gen_scribable_gptneox(config, n_active_tokens, n_positions):
         blocks_caches = [gen_block_caches() for _ in range(n_layer)]
         blocks_params = [gen_block_params() for _ in range(n_layer)]
         ln_lm_head_params = gen_ln_lm_head_params()
-        mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, n_positions)
+        mask = hlo.decoder_attention_mask_legacy(cache_offset, scribe.f32, n_positions)
         return gptneox(hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
 
     return scribable
