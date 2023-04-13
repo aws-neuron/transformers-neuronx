@@ -27,7 +27,7 @@ from transformers_neuronx.module import save_pretrained_split
 from transformers_neuronx.gpt2.model import GPT2ForSampling
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
-from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdaptor
+from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
 def amp_callback(model_type, model, dtype):
@@ -147,7 +147,7 @@ def run(args, hf_model_name, model_cls):
                                         tp_degree=args.tp_degree, n_positions=args.n_positions,
                                         unroll=args.unroll)
         neuron_model.to_neuron()
-        model = HuggingFaceGenerationModelAdaptor(config, neuron_model)
+        model = HuggingFaceGenerationModelAdapter(config, neuron_model)
         print('running model.to_neuron')
     else:
         print(f'running {model_cls.__name__}.from_pretrained')
