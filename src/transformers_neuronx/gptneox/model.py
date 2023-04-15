@@ -26,13 +26,13 @@ from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
-
 class GPTNeoXForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
         config = GPTNeoXConfig(config, batch_size, amp, tp_degree, **kwargs)
+        self.debug = kwargs.get('debug', False)
         self.config = config
         if self.config.activation_function not in ["gelu_new"]: # TODO see if we actually need to implement any other activation func variants
             warnings.warn(f'hidden_act="{self.config.activation_function}" ignored in favor of hidden_act="gelu_new"')
@@ -61,7 +61,7 @@ class GPTNeoXForSampling(module.PretrainedModel):
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
-        self.program = build_gptneox_program(config, 1, n_positions_list, unroll)
+        self.program = build_gptneox_program(config, 1, n_positions_list, unroll, self.debug)
         self.gpt_neox.embed_in.materialize()
         for idx, block in enumerate(self.gpt_neox.layers):
             block.to_neuron(n_positions_list)
@@ -87,6 +87,12 @@ class GPTNeoXForSampling(module.PretrainedModel):
             slicing = slice(cur_len, cur_len + 1)
             inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
+            if self.debug:
+                debug_tensors, debug_names = compiler.get_debug_outputs(self.program, bucket_id)
+                for tensor, name in zip(debug_tensors, debug_names):
+                    print("====================================")
+                    print(f"Var name: {name}\nTensor:\n{tensor}")
+                logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
@@ -152,7 +158,7 @@ class GPTNeoXForSampling(module.PretrainedModel):
 
         # Stack sin and cos
         sin = torch.cat((sin[None, offset:seq_len, None, :], sin[None, offset:seq_len, None, :]), dim=-1)
-        sin[..., : sin.shape[-1] // 2] *= -1 # multiply second half by -1
+        sin[..., sin.shape[-1] // 2 :] *= -1 # multiply first half by -1
         cos = torch.cat((cos[None, offset:seq_len, None, :], cos[None, offset:seq_len, None, :]), dim=-1)
 
         sin_diag = torch.diagflat(sin)
@@ -170,13 +176,14 @@ class GPTNeoXForSampling(module.PretrainedModel):
 
 class GPTNeoXBuffers:
 
-    def __init__(self, hlo_modules, tp_degree):
+    def __init__(self, hlo_modules, dbg_outputs, tp_degree):
         first_hlo_module, *_ = hlo_modules
         hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
         pos_embd_buffer = compiler.gen_zero_input(first_hlo_module, 1)
         cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 2)
         self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
         self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
+        self.debug_outputs = [compiler.gen_zero_output_from_shape(x) for x in dbg_outputs]
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
     def to_neuron(self):
@@ -186,6 +193,7 @@ class GPTNeoXBuffers:
         cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
         self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
         self.output_buffer = self.manipulator.duplicate(self.output_buffer)
+        self.debug_outputs = [self.manipulator.duplicate(x) for x in self.debug_outputs]
 
     def get_input_buffers(self, bucket_id):
         hidden_buffer, pos_embd_buffer, cache_offset_buffer = self.input_buffers
@@ -252,7 +260,8 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.ln_1_bias = duplicate(self.input_layernorm.bias.detach())
 
         attention = self.attention
-        query_key_value_weight = attention.query_key_value.weight.detach().T
+
+        query_key_value_weight = attention.query_key_value.weight.detach().T # TODO confirm we want the transpose
         query_key_value_bias = attention.query_key_value.bias.detach()
         self.attn_q_weight = shard_along(query_key_value_weight[:, :n_embd], dim=1)
         self.attn_q_bias = shard_along(query_key_value_bias[:n_embd], dim=0)
@@ -365,11 +374,12 @@ class GPTNeoXLnLmHead:
         return [self.ln_f_weight, self.ln_f_bias, self.embed_out_weight]
 
 
-def build_gptneox_program(config, n_active, n_positions_list, n_blocks):
-    hlo_modules = [hlo.build_gptneox_hlo_module(config, n_active, npos) for npos in n_positions_list]
-    buffers = GPTNeoXBuffers(hlo_modules, config.tp_degree)
+def build_gptneox_program(config, n_active, n_positions_list, n_blocks, debug):
+    debugger = program.Debugger(debug)
+    hlo_modules = [hlo.build_gptneox_hlo_module(config, n_active, npos, debugger=debugger) for npos in n_positions_list]
+    buffers = GPTNeoXBuffers(hlo_modules, debugger, config.tp_degree)
     if n_blocks == config.n_layer:
-        return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers)
+        return program.FullyUnrolledDecoder(config.tp_degree, hlo_modules, buffers, debugger)
     else:
         # We are here if unroll is specified and it's not equal to n_layer
         raise NotImplementedError('unroll != n_layer is not yet implemented') # TODO implement unroll
