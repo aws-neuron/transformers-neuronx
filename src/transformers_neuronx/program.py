@@ -125,7 +125,7 @@ def cache_slices_and_parameters(layers):
     return cache_slices, params
 
 
-def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug_outputs):
+def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug_outputs=[]):
     for bucket_id, memory in enumerate(memories):
         input_buffers = buffers.get_input_buffers(bucket_id)
         for index, input_buffer in enumerate(input_buffers):
