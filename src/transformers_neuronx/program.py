@@ -82,6 +82,9 @@ class MultiLayerDecoder(DecoderProgram):
         for index, input_buffer in enumerate(head_inputs):
             self.head_memory.inputs.add(index, input_buffer)
         self.head_memory.outputs.add(0, buffers.output_buffer)
+        if hasattr(self.buffers, "debug_outputs"):
+            for i, debug_tensor in enumerate(self.buffers.debug_outputs):
+                self.head_memory.outputs.add(1+2*self.n_layers+i, debug_tensor)
 
     def run(self, bucket_id):
         for memories in self.multi_layers_memories:
@@ -106,7 +109,7 @@ class FullyUnrolledDecoder(DecoderProgram):
         params.extend(ln_lm_head.get_parameters())
         buffers = self.buffers
         buffers.to_neuron()
-        setup_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer)
+        setup_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer, buffers.debug_outputs)
 
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
@@ -122,7 +125,7 @@ def cache_slices_and_parameters(layers):
     return cache_slices, params
 
 
-def setup_memories(memories, buffers, cache_slices, params, output_buffer):
+def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug_outputs):
     for bucket_id, memory in enumerate(memories):
         input_buffers = buffers.get_input_buffers(bucket_id)
         for index, input_buffer in enumerate(input_buffers):
@@ -136,3 +139,6 @@ def setup_memories(memories, buffers, cache_slices, params, output_buffer):
         memory.outputs.add(0, output_buffer)
         for index, bucketed_caches in enumerate(cache_slices, start=1):
             memory.outputs.add(index, bucketed_caches[bucket_id])
+        for index, debug_output in enumerate(debug_outputs):
+            memory.__dict__[f"debug_output{index}"] = debug_output
+

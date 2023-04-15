@@ -293,3 +293,10 @@ def gen_randn_inputs(hlo_module, std=0.01, int_func=torch.zeros, treat_as_int=No
             tensor = int_func(shape, dtype=dtype)
         inputs.append(tensor)
     return inputs
+
+def gen_zero_output_from_shape(input):
+    shape_proto = input.shape_proto
+    shape = tuple(shape_proto.dimensions)
+    dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
+    out = torch.zeros(shape, dtype=dtype)
+    return out
