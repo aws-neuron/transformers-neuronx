@@ -34,26 +34,27 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias,
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
     active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
     active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)    
 
     active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias)
-    active_q = dtype[active_r_sizes].Reshape(active_q)  
+    active_q = dtype[active_r_sizes].Reshape(active_q)
+
+    # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
                     rhs_batch_dimensions=[0],
                     rhs_contracting_dimensions=[1])
-
     active_q = dtype[active_r_sizes].Dot(active_q, pos_embd, dot_dimension_numbers=dot_dims)
     active_q = dtype[active_sizes].Reshape(active_q)
 
     active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias)
     active_k = dtype[active_r_sizes].Reshape(active_k)
+
+    # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
                     rhs_batch_dimensions=[0],
                     rhs_contracting_dimensions=[1])
-
     active_k = dtype[active_r_sizes].Dot(active_k, pos_embd, dot_dimension_numbers=dot_dims)
     active_k = dtype[active_sizes].Reshape(active_k)
 
@@ -115,6 +116,7 @@ def attention(hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias,
     output = dtype[output_sizes_2d].Reshape(output)
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
 
+    # dense Linear layer
     output = dtype[hidden_r_sizes].Dot(out_weight, output, dot_dimension_numbers=dot_dims)
     out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
     output = dtype[hidden_r_sizes].Add(output, out_bias)
@@ -146,7 +148,9 @@ def block(hidden, ln_1_weight, ln_1_bias,
     attn_out_bias = hlo.transfer_with_static_ring(attn_out_bias)
     in_key_cache = hlo.transfer_with_static_ring(key_cache)
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
-    ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)
+    # Parallel Attention + FF Layers pseudocode:
+    #   x = x + attn(ln1(x)) + mlp(ln2(x))
+    ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias) # input_layernorm
     attn_output, out_key_cache, out_value_cache = attention(
         hidden=ln_hidden, q_weight=attn_q_weight, q_bias=attn_q_bias, k_weight=attn_k_weight, k_bias=attn_k_bias,
         v_weight=attn_v_weight, v_bias=attn_v_bias, out_weight=attn_out_weight, out_bias=attn_out_bias, pos_embd=pos_embd,
@@ -160,9 +164,7 @@ def block(hidden, ln_1_weight, ln_1_bias,
     mlp_in_bias = hlo.transfer_with_static_ring(mlp_in_bias)
     mlp_out_weight = hlo.transfer_with_static_ring(mlp_out_weight)
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
-    # Parallel Attention + FF Layers pseudocode:
-    #   x = x + attn(ln1(x)) + mlp(ln2(x))
-    out_ln_hidden = hlo.layer_norm(hidden, ln_2_weight, ln_2_bias)
+    out_ln_hidden = hlo.layer_norm(hidden, ln_2_weight, ln_2_bias) # post_attention_layernorm
     mlp_hidden = hlo.mlp(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                          activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
