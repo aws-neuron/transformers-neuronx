@@ -152,7 +152,7 @@ class GPTNeoXForSampling(module.PretrainedModel):
 
         # Stack sin and cos
         sin = torch.cat((sin[None, offset:seq_len, None, :], sin[None, offset:seq_len, None, :]), dim=-1)
-        sin[..., sin.shape[-1] // 2 :] *= -1 # multiply first half by -1
+        sin[..., : sin.shape[-1] // 2] *= -1 # multiply second half by -1
         cos = torch.cat((cos[None, offset:seq_len, None, :], cos[None, offset:seq_len, None, :]), dim=-1)
 
         sin_diag = torch.diagflat(sin)
@@ -252,19 +252,19 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.ln_1_bias = duplicate(self.input_layernorm.bias.detach())
 
         attention = self.attention
-        query_key_value_weight = attention.query_key_value.weight.detach() # TODO confirm we want the transpose
+        query_key_value_weight = attention.query_key_value.weight.detach().T
         query_key_value_bias = attention.query_key_value.bias.detach()
-        self.attn_q_weight = shard_along(query_key_value_weight[:n_embd, :], dim=1)
+        self.attn_q_weight = shard_along(query_key_value_weight[:, :n_embd], dim=1)
         self.attn_q_bias = shard_along(query_key_value_bias[:n_embd], dim=0)
-        self.attn_k_weight = shard_along(query_key_value_weight[n_embd:n_embd*2, :], dim=1)
+        self.attn_k_weight = shard_along(query_key_value_weight[:, n_embd:n_embd*2], dim=1)
         self.attn_k_bias = shard_along(query_key_value_bias[n_embd:n_embd*2], dim=0)
-        self.attn_v_weight = shard_along(query_key_value_weight[n_embd*2:n_embd*3, :], dim=1)
+        self.attn_v_weight = shard_along(query_key_value_weight[:, n_embd*2:n_embd*3], dim=1)
         self.attn_v_bias = shard_along(query_key_value_bias[n_embd*2:n_embd*3], dim=0)
-        self.attn_out_weight = shard_along(attention.dense.weight.detach() , dim=0)
+        self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
         self.attn_out_bias = shard_along(attention.dense.bias.detach(), dim=0)
 
-        self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach().to(torch.bfloat16)) # TODO: move type conversion to amp (didn't work)
-        self.ln_2_bias = duplicate(self.post_attention_layernorm.bias.detach().to(torch.bfloat16))     # TODO: move type conversion to amp (didn't work)
+        self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())
+        self.ln_2_bias = duplicate(self.post_attention_layernorm.bias.detach())
 
         mlp = self.mlp
         self.mlp_in_weight = shard_along(mlp.dense_h_to_4h.weight.detach().T, dim=1)
