@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import functools
+import operator
+
 from transformers_neuronx import activations
 
 
@@ -424,3 +427,59 @@ def argmax(tensor, dim, keepdim=False, tp_degree=1):
     mask = index.dtype[mask.sizes].Convert(mask)
     masked = dtype[sizes].Multiply(mask, index)
     return reduce_sum(masked, dim=dim, keepdim=keepdim)
+
+
+def _embedding(weight, index):
+    """
+    Performs embedding on a single partition
+    """
+    assert len(weight.sizes) == 2, (
+        f'Expected rank 2 embedding weights but found shape: {weight.sizes}'
+    )
+
+    n_embedding, embedding_dim = weight.sizes
+    dtype = weight.dtype
+
+    # Linearize index tensor to gather from 0th dimension
+    n_index = functools.reduce(operator.mul, index.sizes, 1)
+    linear_index = index.dtype[n_index].Reshape(index)
+
+    # Gather
+    result = dtype[n_index, embedding_dim].Gather(
+        weight,
+        linear_index,
+        gather_dimension_numbers=dict(
+            offset_dims=[1],
+            collapsed_slice_dims=[0],
+            start_index_map=[0],
+            index_vector_dim=1,
+        ),
+        gather_slice_sizes=[1, embedding_dim],
+    )
+
+    # Reshape embedding tensor to look like the original index shape
+    return dtype[(*index.sizes, embedding_dim)].Reshape(result)
+
+
+def embedding(weight, index, tp_degree=1, dim=1):
+    """
+    An embedding operation analogous to torch.nn.Embedding
+
+    When `tp_degree` == 1, this assumes that each program has its own
+    embedding data that will be used exclusively within that partition. In a
+    program that uses multiple nodes, this can be useful if the embedding
+    data is replicated across all nodes.
+
+    When `tp_degree` > 1, this function assumes that the index is identical
+    across nodes and the embedding data is partitioned along the
+    `dim` dimension. This allows each partition to gather from their
+    embedding weight matrices idependently and the results can be combined
+    with an AllGather concatenation along `dim`.
+    """
+    result = _embedding(weight, index)
+
+    # Early exit if not combining results from multiple partitions
+    if tp_degree == 1:
+        return result
+
+    return all_gather(result, dim=dim, tp_degree=tp_degree)
