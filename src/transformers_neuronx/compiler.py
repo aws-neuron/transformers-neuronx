@@ -300,3 +300,11 @@ def gen_zero_output_from_shape(input):
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
     out = torch.zeros(shape, dtype=dtype)
     return out
+
+def get_debug_outputs(program):
+    all_vars = dir(program.memories[0])
+    debug_vars = [x for x in all_vars if 'debug_output' in x]
+    debug_tensors = [getattr(program.memories[0], var) for var in debug_vars]
+    debug_tensors = [ops.parallel_cpu(x) for x in debug_tensors]
+    debug_names = program.debugger.get_names() if hasattr(program, "debugger") else []
+    return debug_tensors, debug_names
