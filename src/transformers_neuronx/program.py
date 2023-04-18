@@ -29,7 +29,6 @@ class DecoderProgram:
     def run(self, bucket_id):
         raise NotImplementedError(DecoderProgram)
 
-
 class DoNothingDecoder(DecoderProgram):
 
     def setup(self, layers, ln_lm_head):
@@ -82,9 +81,6 @@ class MultiLayerDecoder(DecoderProgram):
         for index, input_buffer in enumerate(head_inputs):
             self.head_memory.inputs.add(index, input_buffer)
         self.head_memory.outputs.add(0, buffers.output_buffer)
-        if hasattr(self.buffers, "debug_outputs"):
-            for i, debug_tensor in enumerate(self.buffers.debug_outputs):
-                self.head_memory.outputs.add(1+2*self.n_layers+i, debug_tensor)
 
     def run(self, bucket_id):
         for memories in self.multi_layers_memories:
@@ -95,10 +91,11 @@ class MultiLayerDecoder(DecoderProgram):
 
 class FullyUnrolledDecoder(DecoderProgram):
 
-    def __init__(self, tp_degree, hlo_modules, buffers):
+    def __init__(self, tp_degree, hlo_modules, buffers, debugger=None):
         self.kernels = [compiler.build_parallel_kernel(hm, tp_degree) for hm in hlo_modules]
         self.memories = [compiler.ParallelMemory(hm, tp_degree) for hm in hlo_modules]
         self.buffers = buffers
+        self.debugger = debugger
 
     def setup(self, layers, ln_lm_head):
         for kernel in self.kernels:
@@ -115,6 +112,28 @@ class FullyUnrolledDecoder(DecoderProgram):
         self.kernels[bucket_id](self.memories[bucket_id])
         return self.buffers.output_buffer
 
+class Debugger:
+    counter = 0
+
+    def __init__(self):
+        self.debug_output_tensors = []
+        self.debug_output_names = []
+
+    def get_counter(self):
+        self.counter += 1
+        return self.counter
+
+    def add_var(self, var, name=None):
+        if name is None:
+            name = f"debug_var_{self.get_counter()}"
+        self.debug_output_tensors.append(var)
+        self.debug_output_names.append(name)
+
+    def get_tensors(self):
+        return self.debug_output_tensors
+
+    def get_names(self):
+        return self.debug_output_names
 
 def cache_slices_and_parameters(layers):
     cache_slices = []
@@ -139,6 +158,8 @@ def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug
         memory.outputs.add(0, output_buffer)
         for index, bucketed_caches in enumerate(cache_slices, start=1):
             memory.outputs.add(index, bucketed_caches[bucket_id])
+        start = len(cache_slices) + 1
+        for index, debug_output in enumerate(debug_outputs, start=start):
+            memory.outputs.add(index, debug_output)
         for index, debug_output in enumerate(debug_outputs):
             memory.__dict__[f"debug_output{index}"] = debug_output
-
