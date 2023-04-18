@@ -87,20 +87,12 @@ class GPTNeoXForSampling(module.PretrainedModel):
             slicing = slice(cur_len, cur_len + 1)
             inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
-<<<<<<< HEAD
             if self.debug:
                 debug_tensors, debug_names = compiler.get_debug_outputs(self.program, bucket_id)
                 for tensor, name in zip(debug_tensors, debug_names):
                     print("====================================")
                     print(f"Var name: {name}\nTensor:\n{tensor}")
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
-=======
-            debug_tensors, debug_names = compiler.get_debug_outputs(self.program)
-            for tensor, name in zip(debug_tensors, debug_names):
-                print("====================================")
-                print(f"Var name: {name}\nTensor:\n{tensor}")
-            logits_cpu = self.manipulator.unshard_along(logits, dim=0)
->>>>>>> e8bc81d (Adding debugging feature to transformers-neuronx. Added a debugger class)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
@@ -166,7 +158,7 @@ class GPTNeoXForSampling(module.PretrainedModel):
 
         # Stack sin and cos
         sin = torch.cat((sin[None, offset:seq_len, None, :], sin[None, offset:seq_len, None, :]), dim=-1)
-        sin[..., sin.shape[-1] // 2 :] *= -1 # multiply first half by -1
+        sin[..., : sin.shape[-1] // 2] *= -1 # multiply second half by -1
         cos = torch.cat((cos[None, offset:seq_len, None, :], cos[None, offset:seq_len, None, :]), dim=-1)
 
         sin_diag = torch.diagflat(sin)
