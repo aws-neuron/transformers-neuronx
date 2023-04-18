@@ -115,7 +115,8 @@ class FullyUnrolledDecoder(DecoderProgram):
 class Debugger:
     counter = 0
 
-    def __init__(self):
+    def __init__(self, debug=False):
+        self.debug = debug
         self.debug_output_tensors = []
         self.debug_output_names = []
 
@@ -124,6 +125,8 @@ class Debugger:
         return self.counter
 
     def add_var(self, var, name=None):
+        if not self.debug: 
+            return
         if name is None:
             name = f"debug_var_{self.get_counter()}"
         self.debug_output_tensors.append(var)
@@ -145,21 +148,10 @@ def cache_slices_and_parameters(layers):
 
 
 def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug_outputs=[]):
-    for bucket_id, memory in enumerate(memories):
+    if debug_outputs is None:
+        debug_outputs = []
+    for bucket_id, memory in enumerate(memories):        
         input_buffers = buffers.get_input_buffers(bucket_id)
-        for index, input_buffer in enumerate(input_buffers):
-            memory.inputs.add(index, input_buffer)
-        cache_start_index = len(input_buffers)
-        for index, bucketed_caches in enumerate(cache_slices, start=cache_start_index):
-            memory.inputs.add(index, bucketed_caches[bucket_id])
-        param_start_index = cache_start_index + len(cache_slices)
-        for index, param in enumerate(params, start=param_start_index):
-            memory.inputs.add(index, param)
-        memory.outputs.add(0, output_buffer)
-        for index, bucketed_caches in enumerate(cache_slices, start=1):
-            memory.outputs.add(index, bucketed_caches[bucket_id])
-        start = len(cache_slices) + 1
-        for index, debug_output in enumerate(debug_outputs, start=start):
-            memory.outputs.add(index, debug_output)
-        for index, debug_output in enumerate(debug_outputs):
-            memory.__dict__[f"debug_output{index}"] = debug_output
+        inputs = input_buffers + [cache_slices[i][bucket_id] for i in range(len(cache_slices))] + params
+        outputs = [output_buffer] + [cache_slices[i][bucket_id] for i in range(len(cache_slices))] + debug_outputs
+        memory.setup(inputs, outputs, len(debug_outputs))
