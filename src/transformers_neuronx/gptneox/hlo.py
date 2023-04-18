@@ -39,33 +39,26 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)    
 
     active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias)
-<<<<<<< HEAD
 
     # Debug feature: 
     #       1) If debugger is instatiated by debugger = Debugger(False), debugger.add_var does nothing 
     #       2) If debugger is instatiated by debugger = Debugger(False), this adds the variable to output vars
     #          and the tensor can be obtained in cpu side by compiler.get_debug_outputs(program)
     self.debugger.add_var(active_q, "active_q")
-=======
-    self.debugger.add_var(active_q, "active_q_before")
->>>>>>> e8bc81d (Adding debugging feature to transformers-neuronx. Added a debugger class)
     active_q = dtype[active_r_sizes].Reshape(active_q)  
     self.debugger.add_var(active_q, "active_q_after_reshape")
-
+    # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
                     rhs_batch_dimensions=[0],
                     rhs_contracting_dimensions=[1])
-<<<<<<< HEAD
-=======
-    self.debugger.add_var(active_q, "active_q_after")
->>>>>>> e8bc81d (Adding debugging feature to transformers-neuronx. Added a debugger class)
 
     active_q = dtype[active_r_sizes].Dot(active_q, pos_embd, dot_dimension_numbers=dot_dims)
     active_q = dtype[active_sizes].Reshape(active_q)
 
     active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias)
     active_k = dtype[active_r_sizes].Reshape(active_k)
+    # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
                     rhs_batch_dimensions=[0],

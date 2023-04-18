@@ -218,12 +218,14 @@ class ParallelMemory:
         self.outputs = torch.classes.neuron.ParallelTensorSet(output_names, tp_degree)
         self.input_tensors = None
         self.output_tensors = None
+        self.n_debug_tensors = 0 # How many of output tensors are for debugging
 
     def init(self):
         self.inputs.init()
         self.outputs.init()
 
-    def setup(self, input_tensors, output_tensors):
+    def setup(self, input_tensors, output_tensors, n_debug_tensors=0):
+        self.n_debug_tensors = n_debug_tensors
         self.inputs.init()
         self.outputs.init()
         for idx, tensor in enumerate(input_tensors):
@@ -232,6 +234,12 @@ class ParallelMemory:
             self.outputs.add(idx, tensor)
         self.input_tensors = input_tensors
         self.output_tensors = output_tensors
+
+    def get_debug_tensors(self):
+        if self.n_debug_tensors > 0:
+            return self.output_tensors[-self.n_debug_tensors:]
+        else:
+            return []
 
 
 class ParallelKernel:
