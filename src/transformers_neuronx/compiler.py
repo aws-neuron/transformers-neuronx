@@ -306,13 +306,10 @@ def gen_zero_output_from_shape(input):
     shape_proto = input.shape_proto
     shape = tuple(shape_proto.dimensions)
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
-    out = torch.zeros(shape, dtype=dtype)
-    return out
-
-def get_debug_outputs(program):
-    all_vars = dir(program.memories[0])
-    debug_vars = [x for x in all_vars if 'debug_output' in x]
-    debug_tensors = [getattr(program.memories[0], var) for var in debug_vars]
+    return torch.zeros(shape, dtype=dtype)
+    
+def get_debug_outputs(program, bucket_id=0):
+    debug_tensors = program.memories[bucket_id].get_debug_tensors()
     debug_tensors = [ops.parallel_cpu(x) for x in debug_tensors]
     debug_names = program.debugger.get_names() if hasattr(program, "debugger") else []
     return debug_tensors, debug_names
