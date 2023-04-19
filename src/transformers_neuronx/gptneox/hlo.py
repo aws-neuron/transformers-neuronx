@@ -42,11 +42,14 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
 
     # Debug feature: 
     #       1) If debugger is instatiated by debugger = Debugger(False), debugger.add_var does nothing 
-    #       2) If debugger is instatiated by debugger = Debugger(False), this adds the variable to output vars
+    #       2) If debugger is instatiated by debugger = Debugger(True), this adds the variable to output vars
     #          and the tensor can be obtained in cpu side by compiler.get_debug_outputs(program)
-    self.debugger.add_var(active_q, "active_q")
+    #
+    #       Example:
+    #           To add active_q as a debug variable by
+    #           >>>    self.debugger.add_var(active_q, "active_q")
     active_q = dtype[active_r_sizes].Reshape(active_q)  
-    self.debugger.add_var(active_q, "active_q_after_reshape")
+    
     # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
@@ -96,7 +99,6 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
     score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
 
     score = f32[score_sizes].Dot(active_q, cached_keys_f32, dot_dimension_numbers=dot_dims)
-    self.debugger.add_var(score, "score")
 
     mask_br = f32[score_sizes].Broadcast(mask, dimensions=[2, 3])
     score = f32[score_sizes].Multiply(score, mask_br)
@@ -127,6 +129,7 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
     output = dtype[output_sizes_2d].Reshape(output)
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
 
+    # dense Linear layer
     output = dtype[hidden_r_sizes].Dot(out_weight, output, dot_dimension_numbers=dot_dims)
     out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
     output = dtype[hidden_r_sizes].Add(output, out_bias)
@@ -158,7 +161,7 @@ def block(self, hidden, ln_1_weight, ln_1_bias,
     attn_out_bias = hlo.transfer_with_static_ring(attn_out_bias)
     in_key_cache = hlo.transfer_with_static_ring(key_cache)
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
-    ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)
+    ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)  # input_layernorm
     attn_output, out_key_cache, out_value_cache = attention(
         self,
         hidden=ln_hidden, q_weight=attn_q_weight, q_bias=attn_q_bias, k_weight=attn_k_weight, k_bias=attn_k_bias,
@@ -175,7 +178,7 @@ def block(self, hidden, ln_1_weight, ln_1_bias,
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
     # Parallel Attention + FF Layers pseudocode:
     #   x = x + attn(ln1(x)) + mlp(ln2(x))
-    out_ln_hidden = hlo.layer_norm(hidden, ln_2_weight, ln_2_bias)
+    out_ln_hidden = hlo.layer_norm(hidden, ln_2_weight, ln_2_bias) # post_attention_layernorm
     mlp_hidden = hlo.mlp(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                          activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
