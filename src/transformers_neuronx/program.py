@@ -106,7 +106,7 @@ class FullyUnrolledDecoder(DecoderProgram):
         params.extend(ln_lm_head.get_parameters())
         buffers = self.buffers
         buffers.to_neuron()
-        setup_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer, buffers.debug_outputs)
+        setup_memories(self.memories, buffers, cache_slices, params, buffers.output_buffer)
 
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
@@ -147,9 +147,10 @@ def cache_slices_and_parameters(layers):
     return cache_slices, params
 
 
-def setup_memories(memories, buffers, cache_slices, params, output_buffer, debug_outputs=[]):
-    if debug_outputs is None:
-        debug_outputs = []
+def setup_memories(memories, buffers, cache_slices, params, output_buffer):
+    # Since not all buffers have debug_outputs implemented, we need to check. 
+    # TODO: Remove hasattr when this is added to all models
+    debug_outputs = buffers.debug_outputs if hasattr(buffers, "debug_outputs") else []
     for bucket_id, memory in enumerate(memories):        
         input_buffers = buffers.get_input_buffers(bucket_id)
         inputs = input_buffers + [cache_slices[i][bucket_id] for i in range(len(cache_slices))] + params
