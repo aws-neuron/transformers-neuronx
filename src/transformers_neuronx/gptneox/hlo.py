@@ -15,14 +15,13 @@
 from transformers_neuronx import compiler
 from transformers_neuronx import hlo
 
-def build_gptneox_hlo_module(config, n_active_tokens, n_positions, debugger=None):
-    builder = Builder(debugger=debugger)
-    gptneox = builder.gen_scribable_gptneox(config, n_active_tokens, n_positions)
+def build_gptneox_hlo_module(config, n_active_tokens, n_positions, debugger=None):    
+    gptneox = gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions)
     hlo = compiler.compile_py_func(gptneox)
     return hlo
 
 
-def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias,
+def attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias,
               out_weight, out_bias, pos_embd, cached_keys, cached_values,
               cache_offset, mask, tp_degree): 
     # TODO ADD SHAPE ANNOTATIONS
@@ -47,7 +46,7 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
     #
     #       Example:
     #           To add active_q as a debug variable by
-    #           >>>    self.debugger.add_var(active_q, "active_q")
+    #           >>>    debugger.add_var(active_q, "active_q")
     active_q = dtype[active_r_sizes].Reshape(active_q)  
     
     # apply_rotary_pos_emb
@@ -142,7 +141,7 @@ def attention(self, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias
     return output, cached_keys, cached_values
 
 
-def block(self, hidden, ln_1_weight, ln_1_bias,
+def block(debugger, hidden, ln_1_weight, ln_1_bias,
           attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
           attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
           pos_embd, key_cache, value_cache, cache_offset, mask, ln_2_weight, ln_2_bias,
@@ -163,7 +162,7 @@ def block(self, hidden, ln_1_weight, ln_1_bias,
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
     ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)  # input_layernorm
     attn_output, out_key_cache, out_value_cache = attention(
-        self,
+        debugger,
         hidden=ln_hidden, q_weight=attn_q_weight, q_bias=attn_q_bias, k_weight=attn_k_weight, k_bias=attn_k_bias,
         v_weight=attn_v_weight, v_bias=attn_v_bias, out_weight=attn_out_weight, out_bias=attn_out_bias, pos_embd=pos_embd,
         cached_keys=in_key_cache, cached_values=in_value_cache, cache_offset=cache_offset, mask=mask,
@@ -187,7 +186,7 @@ def block(self, hidden, ln_1_weight, ln_1_bias,
     return out_hidden, out_key_cache, out_value_cache
 
 
-def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight):
+def ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight):
     feature_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
     ln_f_weight = hlo.transfer_with_static_ring(ln_f_weight)
@@ -200,7 +199,7 @@ def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight):
     return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
 
-def gptneox(self, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config):
+def gptneox(debugger, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config):
     scribe = hidden.scribe
     dtype = hidden.dtype
     outputs = []
@@ -211,7 +210,7 @@ def gptneox(self, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_pa
             attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
         ) = block_params
-        hidden, out_key_cache, out_value_cache = block(self, hidden, ln_1_weight,
+        hidden, out_key_cache, out_value_cache = block(debugger, hidden, ln_1_weight,
           ln_1_bias, attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
           attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
           pos_embd, key_cache, value_cache, cache_offset, mask, ln_2_weight, ln_2_bias,
@@ -219,83 +218,77 @@ def gptneox(self, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_pa
           config)
         outputs.append(out_key_cache)
         outputs.append(out_value_cache)
-    outputs.extend(self.debugger.get_tensors())
+    outputs.extend(debugger.get_tensors())
 
     ln_f_weight, ln_f_bias, lm_head_weight = ln_lm_head_params
-    logits = ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight)
+    logits = ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight)
     outputs.insert(0, logits)
     root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
     return scribe.tuple(*root_shapes).Tuple(*outputs)
 
-class Builder:
-    def __init__(self, debugger=None):
-        self.debugger = debugger
+def gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions):
+    embed_dim = config.n_embd
+    n_heads = config.n_head
+    batch_size = config.batch_size
+    intermediate_dim = config.intermediate_dim
+    amp = config.amp
+    tp_degree = config.tp_degree
+    n_layer = config.n_layer
+    vocab_size = config.vocab_size
+    head_dim = embed_dim // n_heads
+    attn_dim_tp = embed_dim // tp_degree
+    n_heads_tp = n_heads // tp_degree
+    intermediate_dim_tp = intermediate_dim // tp_degree
+    if vocab_size % tp_degree:
+        vocab_size = (vocab_size // tp_degree + 1) * tp_degree
+    vocab_size_tp = vocab_size // tp_degree
 
-    def gen_scribable_gptneox(self, config, n_active_tokens, n_positions):
-        embed_dim = config.n_embd
-        n_heads = config.n_head
-        batch_size = config.batch_size
-        intermediate_dim = config.intermediate_dim
-        amp = config.amp
-        tp_degree = config.tp_degree
-        n_layer = config.n_layer
-        vocab_size = config.vocab_size
-        head_dim = embed_dim // n_heads
-        attn_dim_tp = embed_dim // tp_degree
-        n_heads_tp = n_heads // tp_degree
-        intermediate_dim_tp = intermediate_dim // tp_degree
-        if vocab_size % tp_degree:
-            vocab_size = (vocab_size // tp_degree + 1) * tp_degree
-        vocab_size_tp = vocab_size // tp_degree
+    def scribable(scribe):
+        pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
+        pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
+        cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
 
-        def scribable(scribe):
-            pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
-            hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
-            pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
-            cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
+        def gen_block_caches():
+            cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
+            key_cache = pbuilder(cache_shape)
+            value_cache = pbuilder(cache_shape)
+            return key_cache, value_cache
 
-            def gen_block_caches():
-                cache_shape = [n_positions, batch_size, n_heads_tp, head_dim]
-                key_cache = pbuilder(cache_shape)
-                value_cache = pbuilder(cache_shape)
-                return key_cache, value_cache
+        def gen_block_params():
+            ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_q_bias = pbuilder([attn_dim_tp])
+            attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_k_bias = pbuilder([attn_dim_tp])
+            attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
+            attn_v_bias = pbuilder([attn_dim_tp])
+            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            attn_out_bias = pbuilder([embed_dim])
+            ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
+            mlp_in_bias = pbuilder([intermediate_dim_tp])
+            mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
+            mlp_out_bias = pbuilder([embed_dim])
+            return (
+                ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
+                attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
+                attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
+                mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
+            )
 
-            def gen_block_params():
-                ln_1_weight = pbuilder([embed_dim], dtype=scribe.f32)
-                ln_1_bias = pbuilder([embed_dim], dtype=scribe.f32)
-                attn_q_weight = pbuilder([embed_dim, attn_dim_tp])
-                attn_q_bias = pbuilder([attn_dim_tp])
-                attn_k_weight = pbuilder([embed_dim, attn_dim_tp])
-                attn_k_bias = pbuilder([attn_dim_tp])
-                # embed_dim = 6144, attn_dim_tp = 192
-                attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
-                attn_v_bias = pbuilder([attn_dim_tp])
-                attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
-                attn_out_bias = pbuilder([embed_dim])
-                ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
-                ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
-                # 6144, intermediate_dim_tp = 768
-                mlp_in_weight = pbuilder([embed_dim, intermediate_dim_tp])
-                mlp_in_bias = pbuilder([intermediate_dim_tp])
-                mlp_out_weight = pbuilder([intermediate_dim_tp, embed_dim])
-                mlp_out_bias = pbuilder([embed_dim])
-                return (
-                    ln_1_weight, ln_1_bias, attn_q_weight, attn_q_bias,
-                    attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
-                    attn_out_weight, attn_out_bias, ln_2_weight, ln_2_bias,
-                    mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                )
+        def gen_ln_lm_head_params():
+            ln_f_weight = pbuilder([embed_dim], dtype=scribe.f32)
+            ln_f_bias = pbuilder([embed_dim], dtype=scribe.f32)
+            lm_head_weight = pbuilder([embed_dim, vocab_size_tp])
+            return ln_f_weight, ln_f_bias, lm_head_weight
 
-            def gen_ln_lm_head_params():
-                ln_f_weight = pbuilder([embed_dim], dtype=scribe.f32)
-                ln_f_bias = pbuilder([embed_dim], dtype=scribe.f32)
-                lm_head_weight = pbuilder([embed_dim, vocab_size_tp])
-                return ln_f_weight, ln_f_bias, lm_head_weight
+        blocks_caches = [gen_block_caches() for _ in range(n_layer)]
+        blocks_params = [gen_block_params() for _ in range(n_layer)]
+        ln_lm_head_params = gen_ln_lm_head_params()
+        mask = hlo.decoder_attention_mask_legacy(cache_offset, scribe.f32, n_positions)
+        return gptneox(debugger, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
 
-            blocks_caches = [gen_block_caches() for _ in range(n_layer)]
-            blocks_params = [gen_block_params() for _ in range(n_layer)]
-            ln_lm_head_params = gen_ln_lm_head_params()
-            mask = hlo.decoder_attention_mask(cache_offset, scribe.f32, n_positions)
-            return gptneox(self, hidden, pos_embd, cache_offset, mask, blocks_caches, blocks_params, ln_lm_head_params, config)
-
-        return scribable
+    return scribable
