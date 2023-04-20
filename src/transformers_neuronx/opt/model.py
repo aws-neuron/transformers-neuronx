@@ -255,6 +255,16 @@ class OPTForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
         hidden_size, n_active_tokens, batch_size = hidden.sizes
         dtype = hidden.dtype
+        slice_threshold = 2  # 1 doesn't work for now; see P86509517
+        if n_active_tokens > slice_threshold:
+            slice_dimensions = [
+                dict(start=0, limit=hidden_size, stride=1),
+                dict(start=n_active_tokens-slice_threshold, limit=n_active_tokens, stride=1),
+                dict(start=0, limit=batch_size, stride=1),
+            ]
+            n_active_tokens = slice_threshold
+            sizes = hidden_size, n_active_tokens, batch_size
+            hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
         ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
         ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
         logits = hlo.dot00(lm_head_weight, ln_hidden)
