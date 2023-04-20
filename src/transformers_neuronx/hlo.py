@@ -483,3 +483,23 @@ def embedding(weight, index, tp_degree=1, dim=1):
         return result
 
     return all_gather(result, dim=dim, tp_degree=tp_degree)
+
+
+def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_head, amp, n_layer):
+    if to_batch_size % from_batch_size:
+        raise ValueError(f'to_batch_size={to_batch_size} is not multiples of from_batch_size={from_batch_size}')
+
+    def cache_broadcast_impl(scribe):
+        dtype = getattr(scribe, amp)
+        sizes = n_positions, from_batch_size, n_heads_tp, d_head
+        sources = [dtype[sizes].Parameter(parameter_number=pn) for pn in range(n_layer * 2)]
+        num_repeat = to_batch_size // from_batch_size
+        outputs = []
+        for source in sources:
+            operands = [source for _ in range(num_repeat)]
+            sizes = n_positions, to_batch_size, n_heads_tp, d_head
+            outputs.append(dtype[sizes].Concatenate(*operands, dimensions=[1]))
+        root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+        return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+    return cache_broadcast_impl

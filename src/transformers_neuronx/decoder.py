@@ -726,3 +726,22 @@ class DecoderProgramMultiLayer(DecoderProgram):
         for memories in self.multi_layers_memories:
             self.kernels[bucket_id](memories[bucket_id])
         self.ln_lm_head_kernel(self.ln_lm_head_memory)
+
+
+class FastCacheBroadcaster:
+
+    def __init__(self, n_positions, from_batch_size, to_batch_size, n_heads_tp, d_head, amp,
+                 tp_degree, n_layer):
+        cache_broadcast_impl = hlo.cache_broadcast(n_positions, from_batch_size, to_batch_size,
+                                                   n_heads_tp, d_head, amp, n_layer)
+        cache_broadcast_hlo_module = compiler.compile_py_func(cache_broadcast_impl)
+        self.cache_broadcast_kernel = compiler.ParallelKernel(cache_broadcast_hlo_module, tp_degree)
+        self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
+        self.cache_broadcast_kernel.build()
+        self.cache_broadcast_kernel.load()
+
+    def setup(self, source_caches, target_caches):
+        self.cache_broadcast_memory.setup(source_caches, target_caches)
+
+    def run_broadcast(self):
+        self.cache_broadcast_kernel(self.cache_broadcast_memory)

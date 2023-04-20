@@ -17,6 +17,7 @@ import warnings
 import torch
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
+from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
@@ -24,7 +25,6 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
-from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
@@ -46,7 +46,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
             unroll = config.n_layer
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
-        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll,
         )
@@ -177,7 +177,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
             unroll = config.n_layer
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
-        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll,
         )
@@ -315,7 +315,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 context_length_estimate=None, unroll=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -326,8 +326,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if context_length_estimate is None:
             context_length_estimate = config.n_positions // 2
         self.context_length_estimate = context_length_estimate
+        self.context_unroll = context_unroll
         n_positions_list = [config.n_positions]
-        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll,
         )
@@ -339,6 +340,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head_for_context = None
         self.context_pre_hook = None
         self.context_hook = None
+        self.broadcaster = None
 
     def to_neuron(self):
         ops.init()
@@ -377,8 +379,23 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             n_positions_list=[self.context_length_estimate],
             n_active_tokens=self.context_length_estimate,
             batch_size=self.prompt_batch_size,
-            unroll=1,
+            unroll=self.context_unroll,
         )
+        config = self.config
+        n_heads_tp = config.n_head // config.tp_degree
+        d_head = n_embd // config.n_head
+        self.broadcaster = decoder.FastCacheBroadcaster(
+            config.n_positions, self.prompt_batch_size, self.decoder_lm_head.batch_size,
+            n_heads_tp, d_head, config.amp, config.tp_degree, config.n_layer)
+        source_caches = []
+        for layer in self.decoder_lm_head_for_context.layers:
+            source_caches.append(layer.attn_k_cache)
+            source_caches.append(layer.attn_v_cache)
+        target_caches = []
+        for layer in self.decoder_lm_head.layers:
+            target_caches.append(layer.attn_k_cache)
+            target_caches.append(layer.attn_v_cache)
+        self.broadcaster.setup(source_caches, target_caches)
 
     def reset(self):
         self.decoder_lm_head.reset()
@@ -412,8 +429,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if batch_size % runtime_batch_size:
             raise ValueError(f'model batch_size must be multiples of runtime_batch_size; got '
                              'batch_size={batch_size} and {runtime_batch_size=runtime_batch_size}')
-        broadcaster = parallel.CacheBroadcaster(self.decoder_lm_head.tp_degree, shard_dim=2,
-                                                batch_dim=1, batch_size=batch_size)
 
         # populate key/value caches according to the prompt text
         context_length = self.context_length_estimate
@@ -423,9 +438,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             input_pad = context_length - start
             input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
         next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
-        for source, target in zip(self.decoder_lm_head_for_context.layers, self.decoder_lm_head.layers):
-            broadcaster.broadcast(source.attn_k_cache, target.attn_k_cache)
-            broadcaster.broadcast(source.attn_v_cache, target.attn_v_cache)
+        self.broadcaster.run_broadcast()
         repeat_factor = batch_size // runtime_batch_size
         input_ids = input_ids.repeat([repeat_factor, 1])
         next_token_scores = next_token_scores.repeat([repeat_factor, 1])
