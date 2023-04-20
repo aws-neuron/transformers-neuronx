@@ -286,6 +286,8 @@ class OPTForSamplingNoEmbeddingHlo:
         active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias)
         active_v = dtype[active_sizes].Reshape(active_v)
 
+        can_skip_scatter = n_active_tokens == max_ctx_plus_n_active_tokens
+
         # compute self-attention: V x Softmax(QK^T)
         # Keep the attention weights computation in fp32 to avoid overflow issues
         scale_attn = d_head ** 0.5
@@ -312,8 +314,11 @@ class OPTForSamplingNoEmbeddingHlo:
                 active_score = dtype[active_score_sizes].Select(active_mask_br, active_score, large_neg_br)
             active_score = f32[active_score_sizes].Convert(active_score)
         else:
-            cached_keys = dtype[cached_keys.sizes].Scatter(
-                cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+            if can_skip_scatter:
+                cached_keys = active_k
+            else:
+                cached_keys = dtype[cached_keys.sizes].Scatter(
+                    cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
 
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
         score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
@@ -374,8 +379,11 @@ class OPTForSamplingNoEmbeddingHlo:
             cached_values = dtype[cached_values.sizes].Scatter(
                 cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
         else:
-            cached_values = dtype[cached_values.sizes].Scatter(
-                cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+            if can_skip_scatter:
+                cached_values = active_v
+            else:
+                cached_values = dtype[cached_values.sizes].Scatter(
+                    cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
             probs = hlo.softmax(score)
             probs = dtype[probs.sizes].Convert(probs)
             output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
