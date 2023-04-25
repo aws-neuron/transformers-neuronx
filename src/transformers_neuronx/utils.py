@@ -17,8 +17,14 @@ import math
 
 
 def get_closest_pow2_bucket_size(size):
-    shift = 0.03
-    size = 2 ** math.ceil(math.log(size, 2) - shift)
+    # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)? 
+    # Elapsed time for these 2 cases:
+    #   2^k bucket:       parallel_time + (n - 2^k) * serial_time
+    #   2^(k+1) bucket:   2 * parallel_time
+    # Approximate: parallel_time ~ 40 x serial_time for 2048
+    # switching criteria: n - 2^k = 40
+    criteria = 1 - 40 / 2048
+    size = 2 ** math.ceil(math.log(criteria * size, 2))
     return size
 
 def maybe_override_attributes(self, kwargs):
