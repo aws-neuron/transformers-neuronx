@@ -421,8 +421,7 @@ class OPTForGreedySearchNoEmbeddingHlo(OPTForSamplingNoEmbeddingHlo):
 
     def ln_lm_head(self, *args, **kwargs):
         logits = super().ln_lm_head(*args, **kwargs)
-        # FIXME: Update to tp_degree=self.tp_degree after AllGather fix
-        return hlo.argmax(logits, dim=0, keepdim=True, tp_degree=1)
+        return hlo.argmax(logits, dim=0, keepdim=True, tp_degree=self.tp_degree)
 
 
 class OPTForGreedySearch(OPTForSampling):
