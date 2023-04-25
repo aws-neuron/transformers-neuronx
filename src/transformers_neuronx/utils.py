@@ -17,7 +17,8 @@ import math
 
 
 def get_closest_pow2_bucket_size(size):
-    size = 2 ** round(math.log(size, 2))
+    shift = 0.03
+    size = 2 ** math.ceil(math.log(size, 2) - shift)
     return size
 
 def maybe_override_attributes(self, kwargs):
