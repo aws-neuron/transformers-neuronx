@@ -325,6 +325,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         attention_head_size = config.n_embd // config.n_head
         if context_length_estimate is None:
             context_length_estimate = config.n_positions // 2
+        context_length_estimate = utils.get_closest_pow2_bucket_size(context_length_estimate)
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
         n_positions_list = [config.n_positions]

@@ -13,7 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+import math
 
+
+def get_closest_pow2_bucket_size(size):
+    size = 2 ** round(math.log(size, 2))
+    return size
 
 def maybe_override_attributes(self, kwargs):
     for key, value in kwargs.items():
