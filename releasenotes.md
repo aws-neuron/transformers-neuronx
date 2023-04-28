@@ -1,3 +1,28 @@
+# Transformers Neuron 0.3.0 Release Notes
+
+Date: 2023-04-28
+
+## What's New?
+
+- Added ``transformers-neuronx`` artifacts to PyPI repository.
+- Added support for the the Hugging Face [generate()](https://huggingface.co/docs/transformers/v4.28.1/en/main_classes/text_generation#transformers.GenerationMixin.generate)
+- Added support for model serialization, including model saving, loading, and
+  weight swapping.
+- Added support for caching compiled artifacts.
+- Improved performance by removing unnecessary KV-cache tensor resetting.
+- Improved prompt context encoding performance (`OPT`, `GPT2`).
+
+## Bug Fixes
+
+- Incorrect `GPT-J` ``amp_callback`` import: Fixed the `GPT-J` demo now imports the correct ``amp_callback`` function.
+
+## Known Issues and Limitations
+
+Incorrect output with HuggingFace `beam_search`: When the HuggingFace `generate` method is configured to use `beam_search`, this
+can produce incorrect results for certain configurations. It is recommended to
+use other generation methods such as `sample` or `greedy_search`.
+
+
 # Transformers Neuron 0.2.0 Release Notes
 
 Date: 2023-02-24
