@@ -297,6 +297,22 @@ def all_gather(tensor, dim, tp_degree):
     )
 
 
+def all_reduce_sum(tensor, tp_degree):
+    size = tensor.sizes
+    dtype = tensor.dtype
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    return dtype[size].AllReduce(
+        tensor,
+        replica_groups=[list(range(tp_degree))],
+        to_apply=reducer
+    )
+
+
 def unsqueeze(tensor, dim):
     size = list(tensor.sizes)
     dim %= len(size) + 1  # Handle negative sizes
@@ -471,18 +487,77 @@ def embedding(weight, index, tp_degree=1, dim=1):
     data is replicated across all nodes.
 
     When `tp_degree` > 1, this function assumes that the index is identical
-    across nodes and the embedding data is partitioned along the
-    `dim` dimension. This allows each partition to gather from their
-    embedding weight matrices idependently and the results can be combined
-    with an AllGather concatenation along `dim`.
+    across replicas and the embedding data is partitioned across them. This
+    allows each partition to gather from their embedding weight matrices
+    independently and the results can be combined with a collective compute
+    operation. The combination strategy is based on how the embedding was
+    partitioned:
+    - When `dim` == 0, this function assumes that the embedding has been
+      partitioned with distinct vocabulary tokens on each device. This uses
+      AllReduce to combine results with a masked summation.
+    - When `dim` == 1, this function assumes that each partition has the all
+      vocabulary tokens but only a portion of the embedding. This uses
+      AllGather to combine results with concatenation.
     """
-    result = _embedding(weight, index)
+    partition_size, embed_size = weight.sizes
 
-    # Early exit if not combining results from multiple partitions
+    # Use (index % partition_size) with partitioned vocabulary
+    offset = index
+    if tp_degree > 1 and dim == 0:
+        const = index.dtype.Constant(constant_value=partition_size)
+        const_br = index.dtype[index.sizes].Broadcast(const, dimensions=[])
+        offset = index.dtype[index.sizes].Remainder(index, const_br)
+
+    # Replica-local embedding
+    result = _embedding(weight, offset)
+
+    # Case 1: Early exit if not combining results from multiple replicas
     if tp_degree == 1:
         return result
 
-    return all_gather(result, dim=dim, tp_degree=tp_degree)
+    # Case 2: Partitioned vocabulary - Sum masked embeddings
+    if dim == 0:
+
+        raise NotImplementedError(
+            f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
+        )
+
+        pred = index.scribe.pred
+
+        # Compute embedding mask
+        replica_id = index.dtype.ReplicaId() # XXX: Unsupported
+        vocab_size = index.dtype.Constant(constant_value=partition_size)
+        one = index.dtype.Constant(constant_value=1)
+
+        minimum = index.dtype.Multiply(replica_id, vocab_size)
+        next_replica_id = index.dtype.Add(replica_id, one)
+        maximum = index.dtype.Multiply(next_replica_id, vocab_size)
+
+        minimum_br = index.dtype[index.sizes].Broadcast(minimum, dimensions=[])
+        maximum_br = index.dtype[index.sizes].Broadcast(maximum, dimensions=[])
+
+        mask_min = pred[index.sizes].Compare(index, minimum_br, comparison_direction='GE')
+        mask_max = pred[index.sizes].Compare(index, maximum_br, comparison_direction='LT')
+
+        mask = pred[index.sizes].And(mask_min, mask_max)
+        dims = range(len(result.sizes))[:-1] # All but the embedding dimension
+        mask_br = pred[result.sizes].Broadcast(mask, dimensions=dims)
+
+        # Zero out embeddings which are not contained in this partition
+        zero = result.dtype.Constant(constant_value=0)
+        zero_br = result.dtype[result.sizes].Broadcast(zero, dimensions=[])
+        masked_result = result.dtype[result.sizes].Select(mask_br, result, zero_br)
+
+        # Combine embeddings from all partitions
+        return all_reduce_sum(masked_result, tp_degree=tp_degree)
+
+    # Case 3: Partitioned embedding: Concatenate embedding pieces
+    if dim == 1:
+        return all_gather(result, dim, tp_degree=tp_degree)
+
+    raise NotImplementedError(
+        f'Embedding operation does not support dim={dim}'
+    )
 
 
 def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_head, amp, n_layer):
