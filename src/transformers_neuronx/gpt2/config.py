@@ -16,7 +16,7 @@ import transformers
 from transformers_neuronx import utils
 
 
-# inherit from transformer.GPT2Config as we need to inherit from
+# (bowenc): inherit from transformer.GPT2Config as we need to inherit from
 # transformers.PreTrainedModel to call transformers generation API
 class GPT2HuggingFaceConfig(transformers.GPT2Config):
 

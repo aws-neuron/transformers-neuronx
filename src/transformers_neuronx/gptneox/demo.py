@@ -14,14 +14,14 @@
 # ==============================================================================
 from transformers_neuronx.gpt_demo import demo
 from transformers_neuronx.gptneox.model import GPTNeoXForSampling
-
+from transformers_neuronx.gptj.demo import amp_callback
 
 def amp_callback(model, dtype):
     # cast attention and mlp to low precisions only; layernorms stay as f32
-    for layer in model.gpt_neox.layers:
-        layer.attention.to(dtype)
-        layer.mlp.to(dtype)
-    model.embed_out.to(dtype)
+    for block in model.gpt_neox.layers:
+        block.attention.to(dtype)
+        block.mlp.to(dtype)
+        block.post_attention_layernorm.to(dtype)
 
 
 def main():

@@ -46,27 +46,3 @@ def relu(hidden):
     zero = dtype.Constant(constant_value=0.0)
     zero_br = dtype[sizes].Broadcast(zero, dimensions=[])
     return dtype[sizes].Maximum(hidden, zero_br)
-
-def softmax(logits, dim=None):
-    rank = len(logits.sizes)
-    if dim is None:
-        dim = rank - 1
-    shape = logits.sizes
-    dtype = logits.dtype
-    backend_config = str(dim).encode()
-    return dtype[shape].CustomCall(logits, custom_call_target="AwsNeuronSoftmax", backend_config=backend_config,)
-
-def solu(hidden, dim=None):
-    dtype = hidden.dtype
-    sizes = hidden.sizes
-    softmax_hidden = softmax(hidden, dim)
-    output = dtype[sizes].Multiply(hidden,softmax_hidden)
-    return output
-
-def sigmoid(tensor):
-    return tensor.dtype[tensor.sizes].Logistic(tensor)
-
-
-def silu(tensor):
-    logistic = sigmoid(tensor)
-    return tensor.dtype[tensor.sizes].Multiply(tensor, logistic)

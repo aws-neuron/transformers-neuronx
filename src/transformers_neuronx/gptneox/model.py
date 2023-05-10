@@ -22,28 +22,23 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx import base
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
-
-class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
+class GPTNeoXForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, **kwargs):
         super().__init__()
         config = GPTNeoXConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.debug = kwargs.get('debug', False)
         self.config = config
-        self.neuron_config = neuron_config
         if self.config.activation_function not in ["gelu_new"]: # TODO see if we actually need to implement any other activation func variants
             warnings.warn(f'hidden_act="{self.config.activation_function}" ignored in favor of hidden_act="gelu_new"')
             self.config.activation_function = "gelu_new"
         if not self.config.use_parallel_residual: # TODO implement use_parallel_residual = False
             raise NotImplementedError(f'use_parallel_residual=False is not yet implemented')
-        if neuron_config and neuron_config.quant:
-            raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is not None: # TODO add support for unroll
             raise NotImplementedError(f'unroll={unroll} is not yet implemented')
         if unroll is None:
@@ -79,10 +74,6 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
-
-        if start_ids is None:
-            start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
-
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -90,11 +81,11 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
         init_step = self.init_program.init_step(self.init_n_active_tokens)
         for cur_len in range(0, init_length, init_step):
             slicing = slice(cur_len, cur_len + init_step)
-            inputs = input_ids[:, slicing], cache_offset[slicing], start_ids
+            inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.init_program, bucket_id, *inputs)
         for cur_len in range(init_length, this_length):
             slicing = slice(cur_len, cur_len + 1)
-            inputs = input_ids[:, slicing], cache_offset[slicing], start_ids
+            inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
             if self.debug:
                 debug_tensors, debug_names = compiler.get_debug_outputs(self.program, bucket_id)
@@ -104,11 +95,12 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
+        logits = logits[:self.config.vocab_size]
+        logits = logits.transpose(0, -1)
+        logits = logits[:, -1, :]
         return logits
 
-    def _run_program(self, program, bucket_id, input_ids, cache_offset, start_ids):
+    def _run_program(self, program, bucket_id, input_ids, cache_offset):
         active_n_positions = self.n_positions_list[bucket_id]
         hidden = self.gpt_neox.embed_in(input_ids)
         hidden = hidden.transpose(0, -1).contiguous()
@@ -125,8 +117,7 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
         hidden = self.manipulator.duplicate_on_cpu(hidden)
         pos_embd = self.manipulator.duplicate_on_cpu(pos_embd)
         cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        start_ids = self.manipulator.duplicate_on_cpu(start_ids)
-        for in_buffer, in_tensor in zip(input_buffers, [hidden, pos_embd, cache_offset, start_ids]):
+        for in_buffer, in_tensor in zip(input_buffers, [hidden, pos_embd, cache_offset]):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
@@ -139,9 +130,9 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
         GPT-NeoX Rotary Positional Embeddings Reference:
             rotary function defitions: https://github.com/huggingface/transformers/blob/v4.26-release/src/transformers/models/gpt_neox/modeling_gpt_neox.py#L242-L283
             rotary function usage: https://github.com/huggingface/transformers/blob/v4.26-release/src/transformers/models/gpt_neox/modeling_gpt_neox.py#L127-L142
-
+            
         Differences compared to GPT-J:
-            1. sin and cos:
+            1. sin and cos: 
                 GPT-J uses
                     [
                         A, A, B, B, C, C, D, D,
@@ -150,13 +141,13 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
                     ]
                 GPT-NeoX uses
                     [
-                        A, B, C, D, A, B, C, D,
+                        A, B, C, D, A, B, C, D, 
                         E, F, G, H, E, F, G, H,
                         ...
                     ]
             2. rotation:
                 GPT-J swaps every two elements
-                GPT-NeoX swaps halves
+                GPT-NeoX swaps halves 
         """
         rotary_emb_base = self.config.rotary_emb_base
         seq_len = offset + 1
@@ -190,25 +181,23 @@ class GPTNeoXBuffers:
         hidden_buffer = compiler.gen_zero_input(first_hlo_module, 0)
         pos_embd_buffer = compiler.gen_zero_input(first_hlo_module, 1)
         cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 2)
-        start_ids_buffer = compiler.gen_zero_input(first_hlo_module, 3)
-        self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer, start_ids_buffer]
+        self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
         self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
-        self.debug_outputs = [compiler.gen_zero_output_from_shape(x) for x in dbg_outputs.get_tensors()]
+        self.debug_outputs = [compiler.gen_zero_output_from_shape(x) for x in dbg_outputs]
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
     def to_neuron(self):
-        hidden_buffer, pos_embd_buffer, cache_offset_buffer, start_ids_buffer = self.input_buffers
+        hidden_buffer, pos_embd_buffer, cache_offset_buffer = self.input_buffers
         hidden_buffer = self.manipulator.duplicate(hidden_buffer)
         pos_embd_buffer = self.manipulator.duplicate(pos_embd_buffer)
         cache_offset_buffer = self.manipulator.duplicate(cache_offset_buffer)
-        start_ids_buffer = self.manipulator.duplicate(start_ids_buffer)
-        self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer, start_ids_buffer]
+        self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
         self.output_buffer = self.manipulator.duplicate(self.output_buffer)
         self.debug_outputs = [self.manipulator.duplicate(x) for x in self.debug_outputs]
 
     def get_input_buffers(self, bucket_id):
-        hidden_buffer, pos_embd_buffer, cache_offset_buffer, start_ids_buffer = self.input_buffers
-        return [hidden_buffer, pos_embd_buffer, cache_offset_buffer, start_ids_buffer]
+        hidden_buffer, pos_embd_buffer, cache_offset_buffer = self.input_buffers
+        return [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
 
 
 def find_first_ge_index(values, target):
@@ -260,6 +249,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
     def to_neuron(self, n_positions_list):
         self.materialize()
         config = self.config
+        n_embd = config.n_embd
 
         manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         duplicate = manipulator.duplicate
@@ -271,33 +261,16 @@ class GPTNeoXLayer(module.LowMemoryModule):
 
         attention = self.attention
 
-        n_head = self.config.n_head
-        hidden_size = self.config.n_embd
-
-        qkv = attention.query_key_value.weight
-        qkv = qkv.reshape(n_head, 3, hidden_size // n_head, hidden_size).transpose(1, 0)
-        qkv = qkv.reshape(3, hidden_size, hidden_size)
-
-        qkv_bias = attention.query_key_value.bias
-        qkv_bias = qkv_bias.reshape(n_head, 3, hidden_size // n_head).transpose(1, 0)
-        qkv_bias = qkv_bias.reshape(3, hidden_size)
-
-        q = qkv[0].T
-        k = qkv[1].T
-        v = qkv[2].T
-
-        q_bias = qkv_bias[0]
-        k_bias = qkv_bias[1]
-        v_bias = qkv_bias[2]
-
-        self.attn_q_weight = shard_along(q, dim=1)
-        self.attn_q_bias = shard_along(q_bias, dim=0)
-        self.attn_k_weight = shard_along(k, dim=1)
-        self.attn_k_bias = shard_along(k_bias, dim=0)
-        self.attn_v_weight = shard_along(v, dim=1)
-        self.attn_v_bias = shard_along(v_bias, dim=0)
+        query_key_value_weight = attention.query_key_value.weight.detach().T # TODO confirm we want the transpose
+        query_key_value_bias = attention.query_key_value.bias.detach()
+        self.attn_q_weight = shard_along(query_key_value_weight[:, :n_embd], dim=1)
+        self.attn_q_bias = shard_along(query_key_value_bias[:n_embd], dim=0)
+        self.attn_k_weight = shard_along(query_key_value_weight[:, n_embd:n_embd*2], dim=1)
+        self.attn_k_bias = shard_along(query_key_value_bias[n_embd:n_embd*2], dim=0)
+        self.attn_v_weight = shard_along(query_key_value_weight[:, n_embd*2:n_embd*3], dim=1)
+        self.attn_v_bias = shard_along(query_key_value_bias[n_embd*2:n_embd*3], dim=0)
         self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
-        self.attn_out_bias = primary_only(attention.dense.bias.detach())
+        self.attn_out_bias = shard_along(attention.dense.bias.detach(), dim=0)
 
         self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())
         self.ln_2_bias = duplicate(self.post_attention_layernorm.bias.detach())
@@ -380,13 +353,12 @@ class GPTNeoXMLP(module.LowMemoryModule):
 class GPTNeoXLnLmHead:
 
     def __init__(self, config, final_layer_norm, embed_out):
-        self.tp_degree = config.tp_degree
         self.final_layer_norm = final_layer_norm
         self.embed_out = embed_out # Linear layer without bias (analogous to lm_head in GPT-J)
         self.ln_f_weight = None
         self.ln_f_bias = None
         self.embed_out_weight = None
-        self.manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
 
     def to_neuron(self):
         duplicate = self.manipulator.duplicate
@@ -395,12 +367,7 @@ class GPTNeoXLnLmHead:
         self.ln_f_weight = duplicate(self.final_layer_norm.weight.detach())
         self.ln_f_bias = duplicate(self.final_layer_norm.bias.detach())
         self.embed_out.materialize()
-        # Pad the lm_head_weight if vocab_size % tp_degree != 0
-        embed_out_weight = self.embed_out.weight.detach().T
-        _, vocab_size = embed_out_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
-        embed_out_weight = torch.nn.functional.pad(embed_out_weight, (0, vocab_pad, 0, 0))
-        self.embed_out_weight = shard_along(embed_out_weight, dim=1)
+        self.embed_out_weight = shard_along(self.embed_out.weight.detach().T, dim=1) # Use transpose
         self.embed_out.nullify()
 
     def get_parameters(self):

@@ -19,13 +19,9 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         self.model = model
         self.config = config
         self.cur_len = 0
-        self.do_context_encode = False
-        self.start_ids_after_pad = None
 
     def reset_generation(self):
         self.cur_len = 0
-        self.do_context_encode = False
-        self.start_ids_after_pad = None
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
             attention_mask=None, return_dict=False):
@@ -33,26 +29,27 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
-
-        # TODO: remove this check after making forward api generalizez for serial/paralle context encoding
-        if  self.do_context_encode:
-            out_logits = self.model(input_ids, cache_ids, start_ids, is_context_encode=True)
-            self.do_context_encode = False
-        else:
-            out_logits = self.model(input_ids, cache_ids, start_ids)
-
+        # TODO (bowencc): Need to further verify the behavior of attention_mask and position_ids under beam search, comment out for now
+        # batch_dim = input_ids.shape[0]
+        # batch_size = self.config.batch_size
+        # if batch_dim != batch_size:
+        #     if batch_dim < batch_size or batch_dim % batch_size != 0:
+        #         raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
+        #     input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
+        #     out_logits = []
+        #     # iterate per beam
+        #     for split in input_ids_splits:
+        #         out = self._forward(split.squeeze(0), cache_ids, start_ids)
+        #         out_logits.append(out)
+        #     out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
+        # else:
+        out_logits = self.model.forward(input_ids, cache_ids, start_ids)
         out_logits = out_logits[:, None, :]
         if return_dict:
             return ModelOutput(
-                [("logits", out_logits), ("past_key_values", tuple())],
+                [("logits", out_logits)]
             )
         return (out_logits,)
-
-    # implemented for beam search
-    # we ignore past as we don't expose k/v_cache
-    def _reorder_cache(self, past, beam_idx):
-        assert hasattr(self.model, 'reorder_cache') and callable(self.model.reorder_cache), f"{self.model.__class__.__name__} doesn't have reorder_cache implemented for beam search"
-        self.model.reorder_cache(beam_idx)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         # convert attention_mask to start_ids
@@ -67,19 +64,10 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         if self.cur_len > 0:
             input_ids = input_ids[:, -1:]
             cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
-            if self.start_ids_after_pad is not None:
-                start_ids = self.start_ids_after_pad 
         else:
-            # TODO: remove this check after making forward api generalized for both serial/paralle context encoding
-            if hasattr(self.model, "context_buckets") and hasattr(self.model, "pad_context"):
-                # pad input_ids and start_ids
-                input_ids, start_ids, offset = self.model.pad_context(input_ids, start_ids=start_ids)
-                self.do_context_encode = True
-                self.start_ids_after_pad = start_ids
-                # update cache_ids
-                print(f"Warning: the padding offset is {offset}, make sure max_length is maller than offset+n_positions")
             cache_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
-        self.cur_len += input_ids.shape[-1] 
+
+        self.cur_len += input_ids.shape[-1]
         model_inputs = {
             "input_ids": input_ids,
             "cache_ids": cache_ids,
