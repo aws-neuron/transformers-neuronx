@@ -20,7 +20,6 @@ def to_torch_dtype(dtype):
         'f32': torch.float32,
         'f16': torch.float16,
         'bf16': torch.bfloat16,
-        's8': torch.int8,
     }
     return mapping[dtype]
 

@@ -32,7 +32,7 @@ def gen_random_pretrained(model_name, save, empty=False, print_shapes=False):
     vocab_size = config['vocab_size']
     hidden_size = config['n_embd']
     max_position_embeddings = config['n_ctx']
-    ffn_dim = hidden_size * 4
+    ffn_dim = hidden_size #TODO: Check this ffn_dim = hidden_size or ffn_dim = hidden_size * 4 (this fails)
     num_hidden_layers = config['n_layer']
     torch_dtype = config.get('torch_dtype', None)
     if torch_dtype is None:
@@ -53,9 +53,9 @@ def gen_random_pretrained(model_name, save, empty=False, print_shapes=False):
         'attn.c_proj.bias': [hidden_size],
         'ln_2.weight': [hidden_size],
         'ln_2.bias': [hidden_size],  
-        'mlp.c_fc.weight': [hidden_size, ffn_dim],
+        'mlp.c_fc.weight': [ffn_dim, hidden_size], 
         'mlp.c_fc.bias': [ffn_dim],
-        'mlp.c_proj.weight': [ffn_dim, hidden_size],
+        'mlp.c_proj.weight': [hidden_size, ffn_dim],
         'mlp.c_proj.bias': [hidden_size],
     }
     for idx in range(num_hidden_layers):

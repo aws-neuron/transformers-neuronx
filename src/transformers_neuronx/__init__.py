@@ -13,5 +13,3 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx.version import __version__
-
-from . import testing
