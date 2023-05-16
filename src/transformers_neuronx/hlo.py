@@ -625,3 +625,101 @@ def dequantize(tensor, scales, neuron_config: NeuronConfig, scales_dim):
     tensor = f32[tensor.sizes].Multiply(tensor, scales)
     tensor = dtype[tensor.sizes].Convert(tensor)
     return tensor
+
+
+def reduce_mean(tensor, dims, keepdim=False):
+
+    dtype = tensor.dtype
+
+    if dims is None:
+        dims = list(range(len(tensor.sizes)))
+
+    if isinstance(dims, int):
+        dims = [dims]
+
+    elements = 1
+    reduce_shape = list(tensor.sizes)
+    for dim in sorted(dims, reverse=True):
+        elements *= reduce_shape[dim]
+        reduce_shape.pop(dim)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    minimum = dtype.Constant(constant_value=0)
+    value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=dims, to_apply=reducer)
+    divisor = dtype.Constant(constant_value=1.0 / elements)
+    divisor_br = dtype[reduce_shape].Broadcast(divisor)
+    value = dtype[reduce_shape].Multiply(value, divisor_br)
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        for dim in dims:
+            keepdim_shape[dim] = 1
+        value = dtype[keepdim_shape].Reshape(value)
+
+    return value
+
+
+def rms_norm(tensor, normalized_shape, weight, eps):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
+
+    dtype = tensor.dtype
+    dims = tuple(range(len(tensor.sizes)))
+    reduce_dims = dims[len(normalized_shape) + 1:]
+    initial_dims = dims[:len(normalized_shape) + 1]
+
+    # PERF: Is it better to use BatchNormTraining operation here?
+    square = dtype[tensor.sizes].Multiply(tensor, tensor)
+    variance = reduce_mean(square, reduce_dims)
+
+    eps = dtype.Constant(constant_value=eps)
+    eps_br = dtype[variance.sizes].Broadcast(eps, dimensions=[])
+    mean_eps = dtype[variance.sizes].Add(variance, eps_br)
+    rsqrt = dtype[variance.sizes].Rsqrt(mean_eps)
+    rsqrt_br = dtype[tensor.sizes].Broadcast(rsqrt, dimensions=initial_dims)
+    scaled = dtype[tensor.sizes].Multiply(tensor, rsqrt_br)
+
+    if weight is None:
+        return scaled
+
+    weight_br = dtype[tensor.sizes].Broadcast(weight, dimensions=reduce_dims)
+    return dtype[tensor.sizes].Multiply(scaled, weight_br)
+
+
+def cumsum(tensor, dim):
+
+    dtype = tensor.dtype
+
+    init = dtype.Constant(constant_value=0)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    sizes = [1] * len(tensor.sizes)
+    strides = [1] * len(tensor.sizes)
+    pads = [0] * len(tensor.sizes)
+
+    sizes[dim] = tensor.sizes[dim]
+    pads[dim] = tensor.sizes[dim] - 1
+
+    return dtype[tensor.sizes].ReduceWindow(
+        tensor,
+        init,
+        to_apply=reducer,
+        window=dict(
+            dimensions=[
+                dict(
+                    size=size,
+                    stride=stride,
+                    padding_low=pad,
+                )
+                for (size, stride, pad) in zip(sizes, strides, pads)
+            ],
+        ),
+    )
+

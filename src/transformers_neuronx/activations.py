@@ -46,3 +46,12 @@ def relu(hidden):
     zero = dtype.Constant(constant_value=0.0)
     zero_br = dtype[sizes].Broadcast(zero, dimensions=[])
     return dtype[sizes].Maximum(hidden, zero_br)
+
+
+def sigmoid(tensor):
+    return tensor.dtype[tensor.sizes].Logistic(tensor)
+
+
+def silu(tensor):
+    logistic = sigmoid(tensor)
+    return tensor.dtype[tensor.sizes].Multiply(tensor, logistic)
