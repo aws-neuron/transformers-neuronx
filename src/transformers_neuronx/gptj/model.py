@@ -32,15 +32,12 @@ class GPTJForSampling(module.PretrainedModel):
         super().__init__()
         config = GPTJConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.config = config
-        
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
             max_allowed_sequence_length = config.n_ctx
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
-                  
-                          
         if unroll is None:
             unroll = config.n_layer
         self.unroll = unroll
@@ -293,6 +290,7 @@ class GPTJMLP(module.LowMemoryModule):
 class GPTJLnLmHead:
 
     def __init__(self, config, ln_f, lm_head):
+        self.tp_degree = config.tp_degree
         self.ln_f = ln_f
         self.lm_head = lm_head
         self.ln_f_weight = None
@@ -308,8 +306,15 @@ class GPTJLnLmHead:
         self.ln_f_weight = duplicate(self.ln_f.weight.detach())
         self.ln_f_bias = duplicate(self.ln_f.bias.detach())
         self.lm_head.materialize()
-        self.lm_head_weight = shard_along(self.lm_head.weight.detach().T, dim=1)
-        self.lm_head_bias = shard_along(self.lm_head.bias.detach(), dim=0)
+        # Pad the lm_head_weight and lm_head_bias if vocab_size % tp_degree != 0
+        lm_head_weight = self.lm_head.weight.detach().T
+        _, vocab_size = lm_head_weight.shape
+        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, vocab_pad, 0, 0))
+        self.lm_head_weight = shard_along(lm_head_weight, dim=1)
+        lm_head_bias = self.lm_head.bias.detach()
+        lm_head_bias = torch.nn.functional.pad(lm_head_bias, (0, vocab_pad))
+        self.lm_head_bias = shard_along(lm_head_bias, dim=0)
         self.lm_head.nullify()
 
     def get_parameters(self):
