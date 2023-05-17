@@ -316,7 +316,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -332,10 +332,11 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         n_positions_list = [config.n_positions]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll,
+            config.n_layer, unroll, neuron_config=neuron_config
         )
         start_mask = prompt_batch_size > 1
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
+                                                   neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)

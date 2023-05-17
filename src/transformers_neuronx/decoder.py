@@ -176,8 +176,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
-            if self.neuron_config and self.neuron_config.quant:
-                raise NotImplementedError(f'Quantization only supports fully unrolled decoder')
             hlo_modules = [self._hlo_multi_layer(npos) for npos in self.n_positions_list]
             ln_lm_head_hlo_module = self._hlo_ln_lm_head()
             num_inputs = len(self.inputs_sdim)
