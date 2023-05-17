@@ -60,6 +60,7 @@ def attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_
 
     active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias)
     active_k = dtype[active_r_sizes].Reshape(active_k)
+
     # apply_rotary_pos_emb
     dot_dims = dict(lhs_batch_dimensions=[0],
                     lhs_contracting_dimensions=[2],
@@ -160,6 +161,8 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     attn_out_bias = hlo.transfer_with_static_ring(attn_out_bias)
     in_key_cache = hlo.transfer_with_static_ring(key_cache)
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
+    # Parallel Attention + FF Layers pseudocode:
+    #   x = x + attn(ln1(x)) + mlp(ln2(x))
     ln_hidden = hlo.layer_norm(hidden, ln_1_weight, ln_1_bias)  # input_layernorm
     attn_output, out_key_cache, out_value_cache = attention(
         debugger,
@@ -175,8 +178,6 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     mlp_in_bias = hlo.transfer_with_static_ring(mlp_in_bias)
     mlp_out_weight = hlo.transfer_with_static_ring(mlp_out_weight)
     mlp_out_bias = hlo.transfer_with_static_ring(mlp_out_bias)
-    # Parallel Attention + FF Layers pseudocode:
-    #   x = x + attn(ln1(x)) + mlp(ln2(x))
     out_ln_hidden = hlo.layer_norm(hidden, ln_2_weight, ln_2_bias) # post_attention_layernorm
     mlp_hidden = hlo.mlp(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                          activation_function=config.activation_function, tp_degree=config.tp_degree)
