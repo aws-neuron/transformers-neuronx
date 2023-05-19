@@ -268,8 +268,13 @@ class ParallelKernel:
                 tensor_cpu = ops.parallel_cpu(tensor)
                 if isinstance(tensor_cpu, list):
                     tensor_cpu = tensor_cpu[0]
-                tensor_numpy = tensor_cpu.detach().numpy()
-                np.save(filename, tensor_numpy)
+                if tensor_cpu.dtype == torch.bfloat16:
+                    tensor_cpu = tensor_cpu.view(torch.int16)
+                    tensor_cpu = tensor_cpu.numpy()
+                    tensor_cpu = tensor_cpu.view('|V2')
+                else:
+                    tensor_cpu = tensor_cpu.detach().numpy()
+                np.save(filename, tensor_cpu)
             ParallelKernel.hlo_snapshot_iter += 1
 
 
