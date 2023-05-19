@@ -274,7 +274,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.attn_v_weight = shard_along(query_key_value_weight[:, n_embd*2:n_embd*3], dim=1)
         self.attn_v_bias = shard_along(query_key_value_bias[n_embd*2:n_embd*3], dim=0)
         self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
-        self.attn_out_bias = shard_along(attention.dense.bias.detach(), dim=0)
+        self.attn_out_bias = primary_only(attention.dense.bias.detach())
 
         self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())
         self.ln_2_bias = duplicate(self.post_attention_layernorm.bias.detach())
