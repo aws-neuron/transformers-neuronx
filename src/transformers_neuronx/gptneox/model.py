@@ -26,19 +26,23 @@ from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
+
 class GPTNeoXForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         super().__init__()
         config = GPTNeoXConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.debug = kwargs.get('debug', False)
         self.config = config
+        self.neuron_config = neuron_config
         if self.config.activation_function not in ["gelu_new"]: # TODO see if we actually need to implement any other activation func variants
             warnings.warn(f'hidden_act="{self.config.activation_function}" ignored in favor of hidden_act="gelu_new"')
             self.config.activation_function = "gelu_new"
         if not self.config.use_parallel_residual: # TODO implement use_parallel_residual = False
             raise NotImplementedError(f'use_parallel_residual=False is not yet implemented')
+        if neuron_config and neuron_config.quant:
+            raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is not None: # TODO add support for unroll
             raise NotImplementedError(f'unroll={unroll} is not yet implemented')
         if unroll is None:
@@ -183,7 +187,7 @@ class GPTNeoXBuffers:
         cache_offset_buffer = compiler.gen_zero_input(first_hlo_module, 2)
         self.input_buffers = [hidden_buffer, pos_embd_buffer, cache_offset_buffer]
         self.output_buffer = compiler.gen_zero_output(first_hlo_module, 0)
-        self.debug_outputs = [compiler.gen_zero_output_from_shape(x) for x in dbg_outputs]
+        self.debug_outputs = [compiler.gen_zero_output_from_shape(x) for x in dbg_outputs.get_tensors()]
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
 
     def to_neuron(self):
@@ -261,7 +265,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
 
         attention = self.attention
 
-        query_key_value_weight = attention.query_key_value.weight.detach().T # TODO confirm we want the transpose
+        query_key_value_weight = attention.query_key_value.weight.detach().T
         query_key_value_bias = attention.query_key_value.bias.detach()
         self.attn_q_weight = shard_along(query_key_value_weight[:, :n_embd], dim=1)
         self.attn_q_bias = shard_along(query_key_value_bias[:n_embd], dim=0)
@@ -270,7 +274,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.attn_v_weight = shard_along(query_key_value_weight[:, n_embd*2:n_embd*3], dim=1)
         self.attn_v_bias = shard_along(query_key_value_bias[n_embd*2:n_embd*3], dim=0)
         self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
-        self.attn_out_bias = shard_along(attention.dense.bias.detach(), dim=0)
+        self.attn_out_bias = primary_only(attention.dense.bias.detach())
 
         self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())
         self.ln_2_bias = duplicate(self.post_attention_layernorm.bias.detach())
@@ -353,12 +357,13 @@ class GPTNeoXMLP(module.LowMemoryModule):
 class GPTNeoXLnLmHead:
 
     def __init__(self, config, final_layer_norm, embed_out):
+        self.tp_degree = config.tp_degree
         self.final_layer_norm = final_layer_norm
         self.embed_out = embed_out # Linear layer without bias (analogous to lm_head in GPT-J)
         self.ln_f_weight = None
         self.ln_f_bias = None
         self.embed_out_weight = None
-        self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
+        self.manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
 
     def to_neuron(self):
         duplicate = self.manipulator.duplicate
@@ -367,7 +372,12 @@ class GPTNeoXLnLmHead:
         self.ln_f_weight = duplicate(self.final_layer_norm.weight.detach())
         self.ln_f_bias = duplicate(self.final_layer_norm.bias.detach())
         self.embed_out.materialize()
-        self.embed_out_weight = shard_along(self.embed_out.weight.detach().T, dim=1) # Use transpose
+        # Pad the lm_head_weight if vocab_size % tp_degree != 0
+        embed_out_weight = self.embed_out.weight.detach().T
+        _, vocab_size = embed_out_weight.shape
+        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        embed_out_weight = torch.nn.functional.pad(embed_out_weight, (0, vocab_pad, 0, 0))
+        self.embed_out_weight = shard_along(embed_out_weight, dim=1)
         self.embed_out.nullify()
 
     def get_parameters(self):
