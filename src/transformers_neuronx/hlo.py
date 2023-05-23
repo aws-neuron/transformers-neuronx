@@ -701,9 +701,7 @@ def cumsum(tensor, dim):
         return dtype.Add(p0, p1)
 
     sizes = [1] * len(tensor.sizes)
-    strides = [1] * len(tensor.sizes)
     pads = [0] * len(tensor.sizes)
-
     sizes[dim] = tensor.sizes[dim]
     pads[dim] = tensor.sizes[dim] - 1
 
@@ -715,10 +713,12 @@ def cumsum(tensor, dim):
             dimensions=[
                 dict(
                     size=size,
-                    stride=stride,
+                    stride=1,
                     padding_low=pad,
+                    window_dilation=1,
+                    base_dilation=1,
                 )
-                for (size, stride, pad) in zip(sizes, strides, pads)
+                for (size, pad) in zip(sizes, pads)
             ],
         ),
     )
