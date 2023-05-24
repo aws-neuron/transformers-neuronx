@@ -230,7 +230,9 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        triu_comparison = 'LT' if self.allow_kv_dot_prefetch else 'LE'
+        # For the best perf, we only use kv prefetch in the token generation stage
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        triu_comparison = 'LT' if allow_kv_dot_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
                                                        triu_comparison, self.allow_kv_dot_prefetch,
                                                        self.start_mask)
@@ -339,7 +341,9 @@ class OPTForSamplingNoEmbeddingHlo:
                             scatter_dims_to_operand_dims=[0],
                             index_vector_dim=1)
         assign_func = hlo.gen_assign_func(dtype)
-        if self.allow_kv_dot_prefetch:
+        # For the best perf, we only use kv prefetch in the token generation stage
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        if allow_kv_dot_prefetch:
             active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
             active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
             if active_mask is not None:
@@ -372,7 +376,7 @@ class OPTForSamplingNoEmbeddingHlo:
                         rhs_batch_dimensions=[1, 2])
         sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
 
-        if self.allow_kv_dot_prefetch:
+        if allow_kv_dot_prefetch:
             # Main logic:
             # 1. Split softmax into exp / sum(exp) where exp is independent along axis 3
             #   probs_post_scatter = softmax(score_post_scatter)
