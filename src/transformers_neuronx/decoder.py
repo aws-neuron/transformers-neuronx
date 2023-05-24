@@ -49,9 +49,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.ln_lm_head_builder = None
         self.program = None
         self.compiler_artifacts_path = None
+        self.pre_layer_parameters = []
+        self.pre_layer_builder = None
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
+
+    def add_pre_layer_parameter(self, param, sharding=None):
+        self.pre_layer_parameters.append((param, sharding))
+
+    def add_pre_layer_builder(self, builder):
+        self.pre_layer_builder = builder
 
     def add_layer_builder(self, layer_builder):
         self.layer_builder = layer_builder
@@ -75,13 +83,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def to_neuron(self):
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        self.pre_layer_parameters = [
+            manipulator.duplicate_or_shard_along(param, dim)
+            for param, dim in self.pre_layer_parameters
+        ]
         self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
         self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
         _, vocab_size = self.lm_head_weight.shape
         vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
         lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
-        ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
+        ln_lm_head_params = [*self.pre_layer_parameters, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
@@ -104,6 +116,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             self.amp, self.num_layers, unroll, neuron_config=self.neuron_config
         )
         new.add_inputs_builder(self.inputs_builder)
+        new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
         for layer in self.layers:
@@ -113,9 +126,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
                 new_layer.assign_caches(layer)
             else:
                 new_layer.init_caches()
+        new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
         new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
-        ln_lm_head_params = [new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
+        ln_lm_head_params = [*new.pre_layer_parameters, new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
         new.program = new._build_program()
@@ -195,6 +209,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
+            hidden, tensors = self._hlo_pre_layer(hidden, tensors, param_builder)
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
@@ -219,6 +234,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
+            hidden, tensors = self._hlo_pre_layer(hidden, tensors, param_builder)
             # use the first `unroll` layers to build the HLO -- assuming all layers are same
             layers = self.layers[:self.unroll]
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, layers, n_positions)
@@ -229,6 +245,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
         return compiler.compile_py_func(multi_layer)
+
+    def _hlo_pre_layer(self, hidden, tensors, param_builder):
+        params = []
+        if self.pre_layer_builder is not None:
+            for param in self.pre_layer_parameters:
+                param = param_builder.from_tensor(param)
+                param = hlo.transfer_with_static_ring(param)
+                params.append(param)
+            (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
+        return hidden, tensors
 
     def _hlo_layers_params(self, param_builder, layers, n_positions):
         layers_caches = []

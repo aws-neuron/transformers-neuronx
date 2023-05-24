@@ -18,13 +18,11 @@ import math
 from transformers_neuronx import decoder
 from transformers_neuronx import module
 from transformers_neuronx import ops
-from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
-import copy
 
 
 class BloomForSampling(module.WrappingCheckpointCompatibleModel):
@@ -51,9 +49,9 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         )
         hlo_builder = BloomForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size, 'gelu_new', config.n_head, True, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head.add_debug_builder(hlo_builder.debug)
 
     def build_alibi_slopes(self):
         # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/bloom/modeling_bloom.py#L86
@@ -142,14 +140,9 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
-        self.decoder_lm_head.to_neuron()
-
-        # TODO: Add more robust mapping between buffer/data
         slopes = self.build_alibi_slopes()
-        manipulator = parallel.ParallelTensorManipulator(self.config.tp_degree)
-        tensors = manipulator.shard_along_on_cpu(slopes, 0)
-        buf = self.decoder_lm_head.program.input_buffers[3]
-        ops.parallel_write(buf, tensors)
+        self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0)
+        self.decoder_lm_head.to_neuron()
 
     def reset(self):
         self.decoder_lm_head.reset()
