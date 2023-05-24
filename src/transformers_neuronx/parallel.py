@@ -108,6 +108,11 @@ class ParallelTensorManipulator:
     def shard_along(self, tensor, dim):
         return ops.parallel_to_nc(self.shard_along_on_cpu(tensor, dim))
 
+    def duplicate_or_shard_along(self, tensor, dim):
+        if dim is None:
+            return self.duplicate(tensor)
+        return self.shard_along(tensor, dim)
+
     def primary_only(self, tensor):
         tensors = [tensor]
         tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.tp_degree))

@@ -30,11 +30,9 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        slopes = scribe.f32[self.num_heads // self.tp_degree, 1].Parameter(parameter_number=3)
         mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
                                                        'LE', False, self.start_mask)
-        alibi = self.build_alibi_from_slopes(slopes, mask, self.num_heads, self.tp_degree)
-        return (hidden, cache_ids, mask, active_mask, alibi), (1, 0, None, None)
+        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def build_alibi_from_slopes(self, slopes, attention_mask, num_heads, tp_degree=1):
 
@@ -69,6 +67,9 @@ class BloomForSamplingNoEmbeddingHlo:
         product_sh = dtype[batch_size, num_heads_tp, 1, seq_length].Reshape(product)
         return dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Broadcast(product_sh, dimensions=[0, 1, 2, 3])
 
+    def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
+        alibi = self.build_alibi_from_slopes(slopes, mask, self.num_heads, self.tp_degree)
+        return hidden, cache_ids, mask, active_mask, alibi
 
     def layer(self, hidden, cache_ids, mask, active_mask, alibi, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
