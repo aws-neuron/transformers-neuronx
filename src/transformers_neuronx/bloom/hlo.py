@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import copy
 from transformers_neuronx import hlo
 
 
@@ -34,41 +35,8 @@ class BloomForSamplingNoEmbeddingHlo:
                                                        'LE', False, self.start_mask)
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
-    def build_alibi_from_slopes(self, slopes, attention_mask, num_heads, tp_degree=1):
-
-        assert num_heads % tp_degree == 0, (
-            f"Attention heads ({num_heads}) must be divisible by tensor parellism degree {tp_degree}"
-        )
-        num_heads_tp = num_heads // tp_degree
-
-        scribe = attention_mask.scribe
-        dtype = scribe.f32
-        size = attention_mask.sizes
-
-        batch_size, n_active_tokens, seq_length = attention_mask.sizes
-
-        slopes_br = dtype[batch_size, num_heads_tp, 1].Broadcast(slopes, dimensions=[1, 2])
-
-        mask_cast = dtype[size].Convert(attention_mask)
-        summation = hlo.cumsum(mask_cast, -1)
-        one = dtype.Constant(constant_value=1)
-        one_br = dtype[size].Broadcast(one, dimensions=[])
-        summation_sub = dtype[size].Subtract(summation, one_br)
-
-        sum_mul = dtype[size].Multiply(summation_sub, mask_cast)
-        sum_sh = dtype[batch_size, 1, seq_length].Reshape(sum_mul)
-
-        dot_dims = dict(lhs_contracting_dimensions=[2],
-                        lhs_batch_dimensions=[0],
-                        rhs_contracting_dimensions=[1],
-                        rhs_batch_dimensions=[0])
-
-        product = dtype[batch_size, num_heads_tp, seq_length].Dot(slopes_br, sum_sh, dot_dimension_numbers=dot_dims)
-        product_sh = dtype[batch_size, num_heads_tp, 1, seq_length].Reshape(product)
-        return dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Broadcast(product_sh, dimensions=[0, 1, 2, 3])
-
     def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
-        alibi = self.build_alibi_from_slopes(slopes, mask, self.num_heads, self.tp_degree)
+        alibi = build_alibi_from_slopes(slopes, mask, self.num_heads, self.tp_degree)
         return hidden, cache_ids, mask, active_mask, alibi
 
     def layer(self, hidden, cache_ids, mask, active_mask, alibi, attn_k_cache, attn_v_cache,
@@ -232,3 +200,36 @@ class BloomForSamplingNoEmbeddingHlo:
         output = dtype[hidden_sizes].AllReduce(output, replica_groups=replica_groups, to_apply=add_func)
 
         return output, cached_keys, cached_values
+
+
+def build_alibi_from_slopes(slopes, attention_mask, num_heads, tp_degree=1):
+
+    assert num_heads % tp_degree == 0, (
+        f"Attention heads ({num_heads}) must be divisible by tensor parellism degree {tp_degree}"
+    )
+    num_heads_tp = num_heads // tp_degree
+
+    scribe = attention_mask.scribe
+    dtype = scribe.f32
+    size = attention_mask.sizes
+
+    batch_size, n_active_tokens, seq_length = attention_mask.sizes
+
+    mask_cast = dtype[size].Convert(attention_mask)
+    summation = hlo.cumsum(mask_cast, -1)
+    one = dtype.Constant(constant_value=1)
+    one_br = dtype[size].Broadcast(one, dimensions=[])
+    summation_sub = dtype[size].Subtract(summation, one_br)
+    sum_mul = dtype[size].Multiply(summation_sub, mask_cast)
+
+    slopes_sh = dtype[batch_size, n_active_tokens, num_heads_tp, 1].Broadcast(slopes, dimensions=[2, 3])
+    sum_sh = dtype[batch_size, n_active_tokens, 1, seq_length].Reshape(sum_mul)
+    dot_dims = dict(
+        lhs_contracting_dimensions=[3],
+        lhs_batch_dimensions=[0, 1],
+        rhs_contracting_dimensions=[2],
+        rhs_batch_dimensions=[0, 1]
+    )
+    product = dtype[batch_size, n_active_tokens, num_heads_tp, seq_length].Dot(slopes_sh, sum_sh, dot_dimension_numbers=dot_dims)
+    result = dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Transpose(product, dimensions=[0, 2, 1, 3])
+    return result
