@@ -18,6 +18,7 @@ import torch
 import numpy as np
 from cpu_layernorm import LayerNormCPU
 from transformers_neuronx.gpt2.model import GPT2ForSampling
+from transformers_neuronx.opt.model import OPTForSampling
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers_neuronx.gpt2.demo import amp_callback as amp_callback_gpt2
 from transformers_neuronx.opt.demo import amp_callback as amp_callback_opt
@@ -43,10 +44,20 @@ Solution:
         The reason for this naming instead of save_dir/tp_degree_n is to avoid
         recreation of checkpoint when different tp_degree needs same extra head.
 Usage:
+    GPT2
+    ----
     >>> from transformers_neuronx.convert_checkpoint import save_pretrained_split_tp_degree
     >>> model = AutoModelForCausalLM.from_pretrained('gpt2')
     >>> save_pretrained_split_tp_degree(model, "./gpt2_split", tp_degree=8)
     >>> neuron_model = GPT2ForSampling.from_pretrained("./gpt2_split/extra_heads_4", tp_degree=8)
+    >>> neuron_model.to_neuron()
+
+    OPT
+    ----
+    >>> from transformers_neuronx.convert_checkpoint import save_pretrained_split_tp_degree
+    >>> model = AutoModelForCausalLM.from_pretrained('facebook/opt-125m')
+    >>> save_pretrained_split_tp_degree(model, "./opt_125m_split", tp_degree=8)
+    >>> neuron_model = OPTForSampling.from_pretrained("./opt_125m_split/extra_heads_4", tp_degree=8)
     >>> neuron_model.to_neuron()
 """
 
@@ -60,7 +71,7 @@ def rule_mlp(src_param, tgt_param):
     Returns:
         torch.tensor: modified target parameters
     """
-    slices = tuple(slice(0, x) for x in src_param.shape)            
+    slices = tuple(slice(0, x) for x in src_param.shape)
     tgt_param[:] = 0
     tgt_param[slices] = src_param
     return tgt_param
@@ -116,6 +127,7 @@ class TPDegreeCheckpointConverter:
         tgt_config = self.get_target_config_file(src_hid_dim, src_n_head)
         tgt_config = self.config(**tgt_config)
         tgt_hid_dim, tgt_n_head = self.get_config_info(tgt_config)
+        tgt_config = self.model_based_config_change(tgt_config, src_hid_dim, tgt_hid_dim)
         tgt_model_cpu = AutoModelForCausalLM.from_config(tgt_config)
         tgt_model_cpu.eval()
         rules = self.rules
@@ -129,7 +141,13 @@ class TPDegreeCheckpointConverter:
         """ Each model-specific child should implement this and assign model specific variables
         """
         raise NotImplemented
-        
+
+    def model_based_config_change(self, config, src_hid_dim, tgt_hid_dim):
+        """ Each model-specific child can implement extra modifications to config. 
+        If not implemented in child, do nothing.
+        """
+        return config
+
     def get_target_config_file(self, src_hid_dim, src_n_head):
         """ Calculate needed extra heads and create a corresponding target config 
 
@@ -284,7 +302,7 @@ class GPT2TPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
         print(f"[CPU accuracy] Check padded checkpoint with original one (both on cpu): {self.pass_fail_messages[accurate]}")
         print("===================" * 4)
     
-    def save_neuron_model(self, model):        
+    def save_neuron_model(self, model):
         amp_callback_gpt2(model, torch.bfloat16)
         save_pretrained_split(model, self.neuron_folder)
     
@@ -313,11 +331,20 @@ class OPTTPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
     """    
     def set_model_specific_props(self):
         self.config = OPTConfig
-        self.rules = None
+        self.rules = {"fc1": rule_mlp, "fc2": rule_mlp}
         self.options = {
             "hid_dim": "hidden_size",
             "n_head": "num_attention_heads",
         }
+
+    def save_neuron_model(self, model):
+        amp_callback_opt(model, torch.bfloat16)
+        save_pretrained_split(model, self.neuron_folder)
+
+    def model_based_config_change(self, config, src_hid_dim, tgt_hid_dim):
+        if hasattr(config, "word_embed_proj_dim"):
+            config.word_embed_proj_dim = (config.word_embed_proj_dim * tgt_hid_dim) // src_hid_dim
+        return config
 
 def save_pretrained_split_tp_degree(model, save_directory, tp_degree):
     model_type = model.config.model_type
