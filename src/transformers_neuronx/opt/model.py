@@ -234,7 +234,7 @@ class OPTForSamplingNoEmbeddingHlo:
         allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
         triu_comparison = 'LT' if allow_kv_dot_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
-                                                       triu_comparison, self.allow_kv_dot_prefetch,
+                                                       triu_comparison, allow_kv_dot_prefetch,
                                                        self.start_mask)
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 

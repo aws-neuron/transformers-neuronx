@@ -45,8 +45,8 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
     return sizes
 
 
-def pad_vocab_size(vocab_size, tp_degree):
-    return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
+def pad_vocab_size(vocab_size, divisor):
+    return ((vocab_size // divisor + 1) * divisor - vocab_size) % divisor
 
 
 def amp_is_u8(amp):
