@@ -16,7 +16,8 @@ import os
 import json
 import torch
 import numpy as np
-from cpu_layernorm import LayerNormCPU
+from transformers_neuronx.dtypes import to_torch_dtype
+from transformers_neuronx.pad.layernorm_padded_cpu import LayerNormCPU
 from transformers_neuronx.gpt2.model import GPT2ForSampling
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -40,28 +41,47 @@ Solution:
         1) Both checkpoints generate same results
         2) The condition n_head % tp_degree == 0 be satisfied.
 
-    This creates a new checkpoint saved in save_dir/extra_heads_n.
-        The reason for this naming instead of save_dir/tp_degree_n is to avoid
-        recreation of checkpoint when different tp_degree needs same extra head.
 Usage:
     GPT2
     ----
-    >>> from transformers_neuronx.convert_checkpoint import save_pretrained_split_tp_degree
+    >>> from transformers_neuronx.pad.checkpoint import save_pretrained_split_tp_degree
     >>> model = AutoModelForCausalLM.from_pretrained('gpt2')
-    >>> save_pretrained_split_tp_degree(model, "./gpt2_split", tp_degree=8)
-    >>> neuron_model = GPT2ForSampling.from_pretrained("./gpt2_split/extra_heads_4", tp_degree=8)
+    >>> save_pretrained_split_tp_degree(model, "./gpt2_split_tp8", tp_degree=8)
+    >>> neuron_model = GPT2ForSampling.from_pretrained("./gpt2_split_tp8", tp_degree=8)
     >>> neuron_model.to_neuron()
 
     OPT
     ----
-    >>> from transformers_neuronx.convert_checkpoint import save_pretrained_split_tp_degree
+    >>> from transformers_neuronx.pad.checkpoint import save_pretrained_split_tp_degree
     >>> model = AutoModelForCausalLM.from_pretrained('facebook/opt-125m')
-    >>> save_pretrained_split_tp_degree(model, "./opt_125m_split", tp_degree=8)
-    >>> neuron_model = OPTForSampling.from_pretrained("./opt_125m_split/extra_heads_4", tp_degree=8)
+    >>> save_pretrained_split_tp_degree(model, "./opt_125m_split_tp8", tp_degree=8)
+    >>> neuron_model = OPTForSampling.from_pretrained("./opt_125m_split_tp8", tp_degree=8)
     >>> neuron_model.to_neuron()
 """
 
-def rule_mlp(src_param, tgt_param):
+def rule_copy_to_padded(src_param, tgt_param, src_hid_dim, tgt_hid_dim):
+    shape_diffs = [tgt_shape // tgt_hid_dim for tgt_shape, src_shape in zip(tgt_param.shape, src_param.shape) if tgt_shape != src_shape]
+    if len(shape_diffs) > 0:
+        max_n_partitions = max(shape_diffs)
+        tgt_param[:] = 0
+        for i in range(max_n_partitions):
+            src_slices = []
+            tgt_slices = []
+            for tgt_shape, src_shape in zip(tgt_param.shape, src_param.shape):
+                if tgt_shape == src_shape or tgt_shape // tgt_hid_dim == 1:
+                    src_slice = slice(0, src_shape)
+                    tgt_slice = slice(0, src_shape)
+                else:
+                    src_slice = slice(i * src_hid_dim, (i + 1) * src_hid_dim)
+                    tgt_slice = slice(i * tgt_hid_dim, i * tgt_hid_dim + src_hid_dim)
+                src_slices.append(src_slice)
+                tgt_slices.append(tgt_slice)
+            tgt_param[tgt_slices] = src_param[src_slices]
+    else:
+        tgt_param[:] = src_param
+    return tgt_param
+
+def rule_mlp(src_param, tgt_param, src_hid_dim, tgt_hid_dim):
     """ Specific rule for mlp conversion
 
     Args:
@@ -94,7 +114,7 @@ def get_number_of_extra_heads(n_head, tp_degree):
     return extra_heads
 
 class TPDegreeCheckpointConverter:
-    def __init__(self, model_cpu, save_directory, tp_degree, check_accuracy=False):
+    def __init__(self, model_cpu, save_directory, tp_degree, amp="bf16", check_accuracy=False):
         """ Base class to perform checkpoint conversion
 
         Args:
@@ -104,19 +124,19 @@ class TPDegreeCheckpointConverter:
         """
         self.tp_degree = tp_degree
         self.tolerance = 1e-2
+        self.amp = amp
+        self.amp_torch = to_torch_dtype(amp)
         self.src_config = model_cpu.config
         self.pass_fail_messages = ["Fail", "Pass"]
         self.set_model_specific_props()
         model_cpu.eval()
         src_hid_dim, src_n_head = self.get_config_info(self.src_config)
         extra_heads = get_number_of_extra_heads(src_n_head, tp_degree)
-        self.save_directory = os.path.join(save_directory, f"extra_heads_{extra_heads}")
+        self.save_directory = save_directory
         self.neuron_folder = self.save_directory
 
         if os.path.exists(self.neuron_folder):
-            print("===================" * 4)
             print(f"Folder {self.neuron_folder} already exists, passing checkpoint generation!")
-            print("===================" * 4)
             return
         
         if extra_heads == 0:
@@ -131,7 +151,7 @@ class TPDegreeCheckpointConverter:
         tgt_model_cpu = AutoModelForCausalLM.from_config(tgt_config)
         tgt_model_cpu.eval()
         rules = self.rules
-        tgt_model_cpu = self.transfer_model(model_cpu, tgt_model_cpu, src_hid_dim, tgt_hid_dim, rules)        
+        tgt_model_cpu = self.transfer_model(model_cpu, tgt_model_cpu, src_hid_dim, tgt_hid_dim, rules)
         self.save_neuron_model(tgt_model_cpu)
         if check_accuracy:
             self.check_accuracy_cpu_model(model_cpu, tgt_model_cpu, src_hid_dim, tgt_hid_dim)
@@ -161,7 +181,7 @@ class TPDegreeCheckpointConverter:
         tgt_n_head = src_n_head + get_number_of_extra_heads(src_n_head, self.tp_degree)
         tgt_hid_dim = tgt_n_head * src_hid_dim // src_n_head
         tgt_config = {**self.src_config.__dict__}
-        properties = {"hid_dim": tgt_hid_dim, "n_head": tgt_n_head}
+        properties = {"hid_dim": tgt_hid_dim, "n_head": tgt_n_head, "tgt_src_ratio": tgt_hid_dim / src_hid_dim}
         tgt_config = self.set_config_info(tgt_config, properties)
         return tgt_config
 
@@ -209,14 +229,14 @@ class TPDegreeCheckpointConverter:
         self.param_names = param_names = list([x[0] for x in tgt.named_parameters()])
         with torch.no_grad():
             for name, tgt_param, src_param in zip(param_names, tgt.parameters(), src.parameters()):
-                print(name, src_param.shape, "->", tgt_param.shape)
+                # print(name, src_param.shape, "->", tgt_param.shape)
                 src_param.to(tgt_param.dtype)
 
                 # Specific rules
                 found_rule = False
                 for pattern, rule in pattern_to_rule.items():
                     if pattern in name:
-                        tgt_param = rule(src_param, tgt_param)
+                        tgt_param = rule(src_param, tgt_param, src_hid_dim, tgt_hid_dim)
                         found_rule = True
                         break
                 
@@ -224,25 +244,7 @@ class TPDegreeCheckpointConverter:
                     continue
 
                 # Default rules
-                shape_diffs = [tgt_shape // tgt_hid_dim for tgt_shape, src_shape in zip(tgt_param.shape, src_param.shape) if tgt_shape != src_shape]
-                if len(shape_diffs) > 0:
-                    max_n_partitions = max(shape_diffs)
-                    tgt_param[:] = 0
-                    for i in range(max_n_partitions):
-                        src_slices = []
-                        tgt_slices = []
-                        for tgt_shape, src_shape in zip(tgt_param.shape, src_param.shape):
-                            if tgt_shape == src_shape or tgt_shape // tgt_hid_dim == 1:
-                                src_slice = slice(0, src_shape)
-                                tgt_slice = slice(0, src_shape)
-                            else:
-                                src_slice = slice(i * src_hid_dim, (i + 1) * src_hid_dim)
-                                tgt_slice = slice(i * tgt_hid_dim, i * tgt_hid_dim + src_hid_dim)
-                            src_slices.append(src_slice)
-                            tgt_slices.append(tgt_slice)
-                        tgt_param[tgt_slices] = src_param[src_slices]                
-                else:
-                    tgt_param[:] = src_param
+                tgt_param = rule_copy_to_padded(src_param, tgt_param, src_hid_dim, tgt_hid_dim)
         return tgt
     
     def check_accuracy_cpu_model(self, src_model_cpu, tgt_model_cpu, src_hid_dim, tgt_hid_dim):
@@ -269,6 +271,7 @@ class GPT2TPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
         self.options = {
             "hid_dim": "n_embd",
             "n_head": "n_head",
+            "tgt_src_ratio": "tgt_src_ratio"
         }
 
     def gpt2_get_input_ids(self):
@@ -298,26 +301,22 @@ class GPT2TPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
         tgt_outs = tgt_model_cpu(input_ids)
         src_outs = src_model_cpu(input_ids)
         accurate = np.allclose(src_outs.logits.detach(), tgt_outs.logits.detach(), rtol=self.tolerance)        
-        print("===================" * 4)
         print(f"[CPU accuracy] Check padded checkpoint with original one (both on cpu): {self.pass_fail_messages[accurate]}")
-        print("===================" * 4)
     
     def save_neuron_model(self, model):
-        amp_callback_gpt2(model, torch.bfloat16)
+        amp_callback_gpt2(model, self.amp_torch)
         save_pretrained_split(model, self.neuron_folder)
     
     def check_accuracy_neuron_model(self, src_model_cpu, src_hid_dim, tgt_hid_dim):
         sequence_length = 128
         os.environ["n_heads_expansion_ratio"] = str(tgt_hid_dim / src_hid_dim)
-        gpt2 = GPT2ForSampling.from_pretrained(self.neuron_folder, tp_degree=self.tp_degree, amp='bf16', batch_size=1, n_positions=sequence_length)
+        gpt2 = GPT2ForSampling.from_pretrained(self.neuron_folder, tp_degree=self.tp_degree, amp=self.amp, batch_size=1, n_positions=sequence_length)
         gpt2.to_neuron()
         input_ids = self.gpt2_get_input_ids()
         output_ids_neuron = gpt2.sample(input_ids, sequence_length=sequence_length, top_k=1)
         output_ids_cpu = src_model_cpu.generate(input_ids, max_length=128)
         accurate = np.allclose(output_ids_neuron, output_ids_cpu, rtol=self.tolerance)
-        print("===================" * 4)        
         print(f"[Neuron accuracy] Check neuron result with cpu result: {self.pass_fail_messages[accurate]}")
-        print("===================" * 4)        
         if not accurate:
             print("\ninput_ids\n", input_ids)
             print("\noutput_ids_neuron\n", output_ids_neuron)
@@ -335,10 +334,11 @@ class OPTTPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
         self.options = {
             "hid_dim": "hidden_size",
             "n_head": "num_attention_heads",
+            "tgt_src_ratio": "tgt_src_ratio"
         }
 
     def save_neuron_model(self, model):
-        amp_callback_opt(model, torch.bfloat16)
+        amp_callback_opt(model, self.amp_torch)
         save_pretrained_split(model, self.neuron_folder)
 
     def model_based_config_change(self, config, src_hid_dim, tgt_hid_dim):
@@ -352,3 +352,5 @@ def save_pretrained_split_tp_degree(model, save_directory, tp_degree):
         GPT2TPDegreeCheckpointConverter(model, save_directory, tp_degree)
     elif model_type == "opt":
         OPTTPDegreeCheckpointConverter(model, save_directory, tp_degree)
+    else:
+        raise NotImplemented("Checkpoint padding is implemented only for GPT2 and OPT!")
