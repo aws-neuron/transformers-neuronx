@@ -478,7 +478,8 @@ class DecoderLayer(torch.nn.Module):
     def init_caches(self):
         hidden_size, _ = self.attn_q_weight.shape
         n_heads = hidden_size // self.attention_head_size
-        cache_shape = [self.n_positions, self.batch_size, n_heads, self.attention_head_size]
+        n_heads_kv_cache = n_heads * self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1]
+        cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache, self.attention_head_size]
         cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
         self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=2)
