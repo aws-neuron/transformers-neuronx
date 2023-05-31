@@ -310,12 +310,14 @@ class OPTForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
         pred = scribe.pred
         hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
-        max_ctx_plus_n_active_tokens, _, n_heads_tp_kv_cache, d_head = cached_keys.sizes
-        n_heads_tp = n_heads_tp_kv_cache * q_weight.sizes[-1] // k_weight.sizes[-1]
+        max_ctx_plus_n_active_tokens, _, n_groups, d_head = cached_keys.sizes
+        n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
+        n_heads_per_group = n_heads_tp // n_groups
         attn_size = hidden_size // self.tp_degree
         hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-        active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-        active_kv_sizes = n_active_tokens, n_seqs, n_heads_tp_kv_cache, d_head
+        # active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+        active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
+        active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
 
         hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
         active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
@@ -335,7 +337,7 @@ class OPTForSamplingNoEmbeddingHlo:
         scale = dtype.Constant(constant_value=scale_attn)
         scale_attn_br = dtype[active_q_sizes].Broadcast(scale, dimensions=[])
         active_q = dtype[active_q_sizes].Divide(active_q, scale_attn_br)
-        dot_dims = dict(lhs_contracting_dimensions=[3],
+        dot_dims = dict(lhs_contracting_dimensions=[4],
                         lhs_batch_dimensions=[1, 2],
                         rhs_contracting_dimensions=[3],
                         rhs_batch_dimensions=[1, 2])
@@ -363,10 +365,13 @@ class OPTForSamplingNoEmbeddingHlo:
                 cached_keys = dtype[cached_keys.sizes].Scatter(
                     cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
 
+        score_sizes_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, max_ctx_plus_n_active_tokens
+        score_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, max_ctx_plus_n_active_tokens
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
-        cached_keys_br_sizes = max_ctx_plus_n_active_tokens, n_seqs, n_heads_tp, d_head
-        cached_keys_br = dtype[cached_keys_br_sizes].Broadcast(cached_keys, dimensions=[0, 1, 2, 3])
-        score = dtype[score_sizes].Dot(active_q, cached_keys_br, dot_dimension_numbers=dot_dims)
+        # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+        score_dot = dtype[score_sizes_dot].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+        score_permute = dtype[score_sizes_permute].Transpose(score_dot, dimensions=[0, 2, 1, 3, 4])
+        score = dtype[score_sizes].Reshape(score_permute)
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
         if len(mask.sizes) == 2:
@@ -376,7 +381,7 @@ class OPTForSamplingNoEmbeddingHlo:
         score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
         score = f32[score_sizes].Convert(score)
 
-        dot_dims = dict(lhs_contracting_dimensions=[3],
+        dot_dims = dict(lhs_contracting_dimensions=[4],
                         lhs_batch_dimensions=[0, 1],
                         rhs_contracting_dimensions=[0],
                         rhs_batch_dimensions=[1, 2])
@@ -431,8 +436,9 @@ class OPTForSamplingNoEmbeddingHlo:
                     cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
             probs = hlo.softmax(score)
             probs = dtype[probs.sizes].Convert(probs)
-            cached_values_br = dtype[cached_keys_br_sizes].Broadcast(cached_keys, dimensions=[0, 1, 2, 3])
-            output = dtype[sizes].Dot(probs, cached_values_br, dot_dimension_numbers=dot_dims)
+            probs_reshape = dtype[score_sizes_permute].Reshape(probs)
+            output_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+            output = dtype[output_sizes].Dot(probs_reshape, cached_values, dot_dimension_numbers=dot_dims)
 
         sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
