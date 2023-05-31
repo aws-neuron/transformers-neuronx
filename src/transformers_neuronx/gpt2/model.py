@@ -88,12 +88,13 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
             new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
                                                    layer.ln_1.bias.detach())
             new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
-            if c_attn_weight.shape[-1] < n_embd * 3:
-                n_grp = (c_attn_weight.shape[-1] - n_embd) // 2
-                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_grp],
-                                            c_attn_bias[n_embd:n_embd+n_grp])
-                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_grp:],
-                                              c_attn_bias[n_embd+n_grp:])
+            _, n_embd_qkv = c_attn_weight.shape
+            if n_embd_qkv < n_embd * 3:
+                n_group = (n_embd_qkv - n_embd) // 2
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_group],
+                                            c_attn_bias[n_embd:n_embd+n_group])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_group:],
+                                              c_attn_bias[n_embd+n_group:])
             else:
                 new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
                                             c_attn_bias[n_embd:n_embd*2])
@@ -233,12 +234,13 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
             new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
                                                    layer.ln_1.bias.detach())
             new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
-            if c_attn_weight.shape[-1] < n_embd * 3:
-                n_grp = (c_attn_weight.shape[-1] - n_embd) // 2
-                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_grp],
-                                            c_attn_bias[n_embd:n_embd+n_grp])
-                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_grp:],
-                                              c_attn_bias[n_embd+n_grp:])
+            _, n_embd_qkv = c_attn_weight.shape
+            if n_embd_qkv < n_embd * 3:
+                n_group = (n_embd_qkv - n_embd) // 2
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_group],
+                                            c_attn_bias[n_embd:n_embd+n_group])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_group:],
+                                              c_attn_bias[n_embd+n_group:])
             else:
                 new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
                                             c_attn_bias[n_embd:n_embd*2])
