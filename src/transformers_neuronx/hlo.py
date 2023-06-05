@@ -723,3 +723,8 @@ def cumsum(tensor, dim):
         ),
     )
 
+
+def cast(value, dtype):
+    if value.dtype != dtype:
+        return dtype[value.sizes].Convert(value)
+    return value
