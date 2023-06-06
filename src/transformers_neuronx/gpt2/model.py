@@ -25,6 +25,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import tensor_pool
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
@@ -421,31 +422,49 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             target_caches.append(layer.attn_k_cache)
             target_caches.append(layer.attn_v_cache)
         self.broadcaster.setup(source_caches, target_caches)
+        self.tensor_pool = tensor_pool.TensorPool()
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.
         self.reset()
-        
+
     def reset(self):
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+        logits = self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+        return logits
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
+        logits = self._forward(self.decoder_lm_head_for_context, input_ids,
+                               cache_ids, start_ids, is_context_encode=True)
+        return logits
 
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
+    def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
+        if is_context_encode:
+            self.tensor_pool.push([inputs_embeds, position_embeds])
+        return hidden, start_ids
+
+    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode=False):
+        hidden, start_ids = self._embedding(decoder_lm_head, input_ids, cache_ids, 
+                                            start_ids, is_context_encode)
+        if is_context_encode:
+            # The big tensor destruction is slow in CPU. Use asynchronous clear 
+            # to parallel the tensor free with the context encoding execution.
+            task = self.tensor_pool.async_clear()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
+        if is_context_encode:
+            task.wait()
+            self.tensor_pool.push(hidden)
         return logits
 
     @torch.no_grad()
