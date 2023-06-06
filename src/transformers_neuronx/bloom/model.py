@@ -55,25 +55,6 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
 
-    def build_alibi_slopes(self):
-        # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/bloom/modeling_bloom.py#L86
-        num_heads = self.config.n_head
-
-        closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
-        base = 2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3)))
-        powers = range(1, 1 + closest_power_of_2)
-        slopes = list(map(lambda x: math.pow(base, x), powers))
-
-        if closest_power_of_2 != num_heads:
-            extra_base = 2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3)))
-            num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
-            extra_powers = range(1, 1 + 2 * num_remaining_heads, 2)
-            extra_slopes = list(map(lambda x: math.pow(extra_base, x), extra_powers))
-            slopes.extend(extra_slopes)
-
-        assert len(slopes) == num_heads
-        return torch.tensor(slopes).view(num_heads, 1)
-
     def to_neuron(self):
 
         # Materialize the embedding to CPU
@@ -142,7 +123,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
-        slopes = self.build_alibi_slopes()
+        slopes = build_alibi_slopes(self.config.n_head)
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0)
         self.decoder_lm_head.to_neuron()
 
@@ -194,3 +175,22 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         return sampling.sample_loop(
             self, input_ids, start_ids, next_token_scores, sequence_length,
             eos_token_id=self.config.eos_token_id, top_k=top_k)
+
+
+def build_alibi_slopes(num_heads):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/bloom/modeling_bloom.py#L86
+
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = 2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3)))
+    powers = range(1, 1 + closest_power_of_2)
+    slopes = list(map(lambda x: math.pow(base, x), powers))
+
+    if closest_power_of_2 != num_heads:
+        extra_base = 2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3)))
+        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+        extra_powers = range(1, 1 + 2 * num_remaining_heads, 2)
+        extra_slopes = list(map(lambda x: math.pow(extra_base, x), extra_powers))
+        slopes.extend(extra_slopes)
+
+    assert len(slopes) == num_heads
+    return torch.tensor(slopes).view(num_heads, 1)
