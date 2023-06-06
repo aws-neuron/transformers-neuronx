@@ -29,17 +29,17 @@ from transformers_neuronx.module import save_pretrained_split
 """
 TPDegreeCheckpointConverter
 ===============================
-A class to convert checkpoint by padding the weight tensors
+A class to pad a checkpoint to make its number of heads is divisible by a given tp-degree.
 
 Issue:
-    Currently transformers_neuronx has following limitation: 
+    Currently, transformers_neuronx has the following limitation: 
         n_head % tp_degree == 0
 
 Solution:
-    To overcome this limitation, a feature is added to convert checkpoint 
+    To overcome this limitation, a feature is added to convert a checkpoint 
     to a new checkpoint with extra n_head and pad the tensors such that
         1) Both checkpoints generate same results
-        2) The condition n_head % tp_degree == 0 be satisfied.
+        2) The condition n_head % tp_degree == 0 is satisfied.
 
 Usage:
     GPT2
@@ -60,6 +60,17 @@ Usage:
 """
 
 def rule_copy_to_padded(src_param, tgt_param, src_hid_dim, tgt_hid_dim):
+    """ Default rule for padding and conversion of source parameters tensor to target tensor
+
+    Args:
+        src_param (torch.tensor): source parameters
+        tgt_param (torch.tensor): target parameters
+        src_hid_dim (int): hidden dimension of source 
+        tgt_hid_dim (int): hidden dimension of target 
+
+    Returns:
+        torch.tensor: modified target parameters
+    """
     shape_diffs = [tgt_shape // tgt_hid_dim for tgt_shape, src_shape in zip(tgt_param.shape, src_param.shape) if tgt_shape != src_shape]
     if len(shape_diffs) > 0:
         max_n_partitions = max(shape_diffs)
@@ -87,6 +98,8 @@ def rule_mlp(src_param, tgt_param, src_hid_dim, tgt_hid_dim):
     Args:
         src_param (torch.tensor): source parameters
         tgt_param (torch.tensor): target parameters
+        src_hid_dim (int): hidden dimension of source 
+        tgt_hid_dim (int): hidden dimension of target 
 
     Returns:
         torch.tensor: modified target parameters
@@ -160,7 +173,7 @@ class TPDegreeCheckpointConverter:
     def set_model_specific_props(self):
         """ Each model-specific child should implement this and assign model specific variables
         """
-        raise NotImplemented
+        raise NotImplementedError("set_model_specific_props is not implemented!")
 
     def model_based_config_change(self, config, src_hid_dim, tgt_hid_dim):
         """ Each model-specific child can implement extra modifications to config. 
@@ -249,15 +262,15 @@ class TPDegreeCheckpointConverter:
     
     def check_accuracy_cpu_model(self, src_model_cpu, tgt_model_cpu, src_hid_dim, tgt_hid_dim):
         # Check accuracy of padded model on cpu
-        raise NotImplemented
+        raise NotImplementedError("check_accuracy_cpu_model is not implemented!")
     
     def save_neuron_model(self, model):
         # Save neuron model
-        raise NotImplemented
+        raise NotImplementedError("save_neuron_model is not implemented!")
     
     def check_accuracy_neuron_model(self, src_model_cpu, src_hid_dim, tgt_hid_dim):
         # Check accuracy of padded model on neuron
-        raise NotImplemented
+        raise NotImplementedError("check_accuracy_neuron_model is not implemented!")
 
 class GPT2TPDegreeCheckpointConverter(TPDegreeCheckpointConverter):
     """ 
@@ -353,4 +366,4 @@ def save_pretrained_split_tp_degree(model, save_directory, tp_degree):
     elif model_type == "opt":
         OPTTPDegreeCheckpointConverter(model, save_directory, tp_degree)
     else:
-        raise NotImplemented("Checkpoint padding is implemented only for GPT2 and OPT!")
+        raise NotImplementedError("Checkpoint padding is implemented only for GPT2 and OPT!")
