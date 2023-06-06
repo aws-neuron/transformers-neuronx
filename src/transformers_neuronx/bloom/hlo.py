@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import copy
 from transformers_neuronx import hlo
+from transformers_neuronx.layers import attention, transformer
 
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -31,15 +31,27 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
-                                                       'LE', False, self.start_mask)
+
+        # NOTE: When using token generation network, we generate a mask for the
+        #       past tokens and the current tokens separately. This allows us
+        #       use the split "prefetch" attention layer.
+        token_generation = n_active_tokens == 1
+        triu_comparison = 'LT' if token_generation else 'LE'
+        mask, active_mask = hlo.decoder_attention_mask(
+            start_ids,
+            cache_ids,
+            n_positions,
+            triu_comparison=triu_comparison,
+            allow_kv_dot_prefetch=token_generation,
+            start_mask=self.start_mask
+        )
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
-        alibi = build_alibi_from_slopes(slopes, mask, self.num_heads, self.tp_degree)
-        return hidden, cache_ids, mask, active_mask, alibi
+        prior_alibi, active_alibi = build_alibi_from_slopes(slopes, mask, active_mask, self.num_heads, self.tp_degree)
+        return hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
-    def layer(self, hidden, cache_ids, mask, active_mask, alibi, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -54,7 +66,8 @@ class BloomForSamplingNoEmbeddingHlo:
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, mask, active_mask, alibi, attn_k_cache, attn_v_cache,
+            ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
+            attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -72,164 +85,239 @@ class BloomForSamplingNoEmbeddingHlo:
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
-        hidden_size, n_active_tokens, batch_size = hidden.sizes
-        dtype = hidden.dtype
-        slice_threshold = 2  # 1 doesn't work for now; see P86509517
-        if n_active_tokens > slice_threshold:
-            slice_dimensions = [
-                dict(start=0, limit=hidden_size, stride=1),
-                dict(start=n_active_tokens-slice_threshold, limit=n_active_tokens, stride=1),
-                dict(start=0, limit=batch_size, stride=1),
-            ]
-            n_active_tokens = slice_threshold
-            sizes = hidden_size, n_active_tokens, batch_size
-            hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
-        ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
-        ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
-        logits = hlo.dot00(lm_head_weight, ln_hidden)
-        if lm_head_bias is not None:
-            lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
-            logits = dtype[logits.sizes].Add(logits, lm_head_bias)
-        vocab_size, _ = logits.sizes
-        result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
-        return result
+        return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
 
-    def attention(self, hidden, cache_ids, mask, active_mask, alibi,
-                  cached_keys, cached_values,
-                  q_weight, q_scales, q_bias,
-                  k_weight, k_scales, k_bias,
-                  v_weight, v_scales, v_bias,
-                  out_weight, out_scales, out_bias,
-                  neuron_config=None):
+    def attention(self, hidden, *args, **kwargs):
+        hidden_size, n_active_tokens, n_seqs = hidden.sizes
+        if n_active_tokens > 1:
+            return self.attention_context(hidden, *args, **kwargs)
+        return self.attention_token(hidden, *args, **kwargs)
 
-        enable_quantize = neuron_config and neuron_config.quant
-        if enable_quantize and not neuron_config.quant.quantize_attn:
-            neuron_config = copy.deepcopy(neuron_config)
-            neuron_config.quant = None
-            enable_quantize = False
+    def attention_context(
+        self,
+        hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
+        cached_keys, cached_values,
+        q_weight, q_scales, q_bias,
+        k_weight, k_scales, k_bias,
+        v_weight, v_scales, v_bias,
+        out_weight, out_scales, out_bias,
+        neuron_config=None
+    ):
+        """
+        Attention layer for populating the key/value cache from input context.
 
-        dtype = hidden.dtype
+        This attentiona layer assumes that there are are `n_active_tokens > 1`
+        and that we can ignore doing any computation on the key/value cache
+        items.
+        """
+        d_head = self.hidden_size // self.num_heads
+
+        # dtype = hidden.dtype
         scribe = hidden.scribe
         f32 = scribe.f32
-        pred = scribe.pred
-        hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
-        max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
-        attn_size = hidden_size // self.tp_degree
-        hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-        active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
 
-        hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
-        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
-        active_q = dtype[active_sizes].Reshape(active_q)
+        query, key, value = attention.query_key_value(
+            hidden,
+            q_weight, q_scales, q_bias,
+            k_weight, k_scales, k_bias,
+            v_weight, v_scales, v_bias,
+            d_head,
+            neuron_config=neuron_config,
+        )
 
-        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
-        active_k = dtype[active_sizes].Reshape(active_k)
+        # Q = Q / sqrt(d_head)
+        query = attention.scale(query, d_head)
 
-        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
-        active_v = dtype[active_sizes].Reshape(active_v)
+        # NOTE: During context encoding, ignore KV-cache for score/context
 
-        # compute self-attention: V x Softmax(QK^T)
-        # Keep the attention weights computation in fp32 to avoid overflow issues
-        scale_attn = d_head ** 0.5
-        dot_dims = dict(lhs_contracting_dimensions=[3],
-                        lhs_batch_dimensions=[1, 2],
-                        rhs_contracting_dimensions=[3],
-                        rhs_batch_dimensions=[1, 2])
+        # S = Q @ K + A
+        score = attention.score(query, key)
+        score = f32[score.sizes].Convert(score)
+        score = f32[score.sizes].Add(score, active_alibi)
+        score = attention.mask(score, mask)
 
-        scatter_dims = dict(update_window_dims=[1,2,3],
-                            inserted_window_dims=[0],
-                            scatter_dims_to_operand_dims=[0],
-                            index_vector_dim=1)
-        assign_func = hlo.gen_assign_func(dtype)
+        # C = softmax(S) @ V
+        context = attention.context_combined(score, value)
+        output = attention.output(context, out_weight, out_scales, out_bias, self.tp_degree, neuron_config)
 
-        cached_keys = dtype[cached_keys.sizes].Scatter(
-            cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
-        score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
-        score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+        # KCache[I] = K
+        # VCache[I] = V
+        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+        updated_values = attention.update_cache(cached_values, cache_ids, value)
 
-        # Bloom-specific logic - Add alibi as QK bias
-        # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/bloom/modeling_bloom.py#L317
-        score = f32[score_sizes].Convert(score)
-        scale = f32.Constant(constant_value=scale_attn)
-        scale_attn_br = f32[score_sizes].Broadcast(scale, dimensions=[])
-        scale_score = f32[score_sizes].Divide(score, scale_attn_br)
-        score = f32[score_sizes].Add(scale_score, alibi)
+        return output, updated_keys, updated_values
 
-        # Masking
-        large_neg = f32.Constant(constant_value=-65535.0)
-        large_neg_br = f32[score_sizes].Broadcast(large_neg, dimensions=[])
-        if len(mask.sizes) == 2:
-            mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
-        else:
-            mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
-        score = f32[score_sizes].Select(mask_br, score, large_neg_br)
+    def attention_token(self,
+        hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
+        cached_keys, cached_values,
+        q_weight, q_scales, q_bias,
+        k_weight, k_scales, k_bias,
+        v_weight, v_scales, v_bias,
+        out_weight, out_scales, out_bias,
+        neuron_config=None
+    ):
+        """
+        An attention layer for generating a next token.
 
-        # Compute probabilities
-        probs = hlo.softmax(score)
-        probs = dtype[score_sizes].Convert(probs)
+        This is a more optimized attention layer that computes the attention
+        `context` using split prior/active key & value tensors. This allows
+        the cache updates to occur asynchronously with the attention
+        computation which improves performance on Neuron hardware.
+        """
+        scribe = hidden.scribe
+        f32 = scribe.f32
+        d_head = self.hidden_size // self.num_heads
 
-        # Update value cache
-        dot_dims = dict(lhs_contracting_dimensions=[3],
-                        lhs_batch_dimensions=[0, 1],
-                        rhs_contracting_dimensions=[0],
-                        rhs_batch_dimensions=[1, 2])
-        sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-        cached_values = dtype[cached_values.sizes].Scatter(
-                cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+        # Q = (hidden @ wQ) + bQ
+        # K = (hidden @ wK) + bK
+        # V = (hidden @ wV) + bV
+        query, key, value = attention.query_key_value(
+            hidden,
+            q_weight, q_scales, q_bias,
+            k_weight, k_scales, k_bias,
+            v_weight, v_scales, v_bias,
+            d_head,
+            neuron_config=neuron_config,
+        )
 
-        output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
-        sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-        output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+        # Q = Q / sqrt(d_head)
+        query = attention.scale(query, d_head)
 
-        if enable_quantize:
-            out_weight = dtype[out_weight.sizes].Convert(out_weight)
-        output_sizes_2d = n_active_tokens*n_seqs, attn_size
-        output = dtype[output_sizes_2d].Reshape(output)
-        dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
-        output = dtype[hidden_r_sizes].Dot(out_weight, output, dot_dimension_numbers=dot_dims)
-        if enable_quantize:
-            output = hlo.dequantize(output, out_scales, neuron_config, 0)
-        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
-        output = dtype[hidden_r_sizes].Add(output, out_bias)
-        output = dtype[hidden_sizes].Reshape(output)
+        # Sp = Q @ Kp + Ap
+        prior_scores = attention.score(query, cached_keys)
+        prior_scores = f32[prior_scores.sizes].Convert(prior_scores)
+        prior_scores = f32[prior_scores.sizes].Add(prior_scores, prior_alibi)
+        prior_scores = attention.mask(prior_scores, mask)
 
-        if self.tp_degree == 1:
-            return output, cached_keys, cached_values
-        replica_groups = [list(range(self.tp_degree))]
-        add_func = hlo.gen_add_func(dtype)
-        output = dtype[hidden_sizes].AllReduce(output, replica_groups=replica_groups, to_apply=add_func)
+        # Sa = Q @ Ka + Aa
+        active_score = attention.score(query, key)
+        active_score = f32[active_score.sizes].Convert(active_score)
+        active_score = f32[active_score.sizes].Add(active_score, active_alibi)
+        active_mask_sh = hlo.unsqueeze(active_mask, 1)
+        active_score = attention.mask(active_score, active_mask_sh)
 
-        return output, cached_keys, cached_values
+        # C = softmax(Sa, Sp) @ (Va, Vp)
+        context = attention.context(prior_scores, active_score, cached_values, value)
+
+        # O = (C @ wO) + bO
+        output = attention.output(context, out_weight, out_scales, out_bias, self.tp_degree, neuron_config)
+
+        # KCache[I] = K
+        # VCache[I] = V
+        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+        updated_values = attention.update_cache(cached_values, cache_ids, value)
+
+        return output, updated_keys, updated_values
 
 
-def build_alibi_from_slopes(slopes, attention_mask, num_heads, tp_degree=1):
+    def attention_reference(self,
+        hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
+        cached_keys, cached_values,
+        q_weight, q_scales, q_bias,
+        k_weight, k_scales, k_bias,
+        v_weight, v_scales, v_bias,
+        out_weight, out_scales, out_bias,
+        neuron_config=None
+    ):
+        """
+        A generic reference implementation of the attention layer.
+
+        PERF: This is not optimized for any task (context encoding / token
+        generation) and uses a problematic data dependency by computing the
+        score on the updated cache (introduces a slow data dependency on a
+        scatter result).
+        """
+
+        scribe = hidden.scribe
+        f32 = scribe.f32
+        d_head = self.hidden_size // self.num_heads
+
+        # Q = (hidden @ wQ) + bQ
+        # K = (hidden @ wK) + bK
+        # V = (hidden @ wV) + bV
+        query, key, value = attention.query_key_value(
+            hidden,
+            q_weight, q_scales, q_bias,
+            k_weight, k_scales, k_bias,
+            v_weight, v_scales, v_bias,
+            d_head,
+            neuron_config=neuron_config,
+        )
+
+        # KCache[I] = K
+        # VCache[I] = V
+        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+        updated_values = attention.update_cache(cached_values, cache_ids, value)
+
+        # Q = Q / sqrt(d_head)
+        query = attention.scale(query, d_head)
+
+        # S = Q @ K + alibi
+        score = attention.score(query, updated_keys)
+        score = f32[score.sizes].Convert(score)
+        score = f32[score.sizes].Add(score, active_alibi)
+        score = attention.mask(score, mask)
+
+        # C = softmax(S) @ V
+        context = attention.context_combined(score, cached_values)
+
+        # O = (C @ wO) + bO
+        output = attention.output(context, out_weight, out_scales, out_bias, self.tp_degree, neuron_config)
+        return output, updated_keys, updated_values
+
+
+def build_alibi_from_slopes(slopes, attention_mask, active_mask, num_heads, tp_degree=1):
 
     assert num_heads % tp_degree == 0, (
         f"Attention heads ({num_heads}) must be divisible by tensor parellism degree {tp_degree}"
     )
-    num_heads_tp = num_heads // tp_degree
 
     scribe = attention_mask.scribe
     dtype = scribe.f32
-    size = attention_mask.sizes
+    num_heads_tp = num_heads // tp_degree
 
-    batch_size, n_active_tokens, seq_length = attention_mask.sizes
+    def _alibi(summation, mask):
 
-    mask_cast = dtype[size].Convert(attention_mask)
+        size = mask.sizes
+        batch_size, n_active_tokens, seq_length = mask.sizes
+
+        one = dtype.Constant(constant_value=1)
+        one_br = dtype[size].Broadcast(one, dimensions=[])
+        summation_sub = dtype[size].Subtract(summation, one_br)
+        sum_mul = dtype[size].Multiply(summation_sub, mask)
+
+        slopes_sh = dtype[batch_size, n_active_tokens, num_heads_tp, 1].Broadcast(slopes, dimensions=[2, 3])
+        sum_sh = dtype[batch_size, n_active_tokens, 1, seq_length].Reshape(sum_mul)
+        dot_dims = dict(
+            lhs_contracting_dimensions=[3],
+            lhs_batch_dimensions=[0, 1],
+            rhs_contracting_dimensions=[2],
+            rhs_batch_dimensions=[0, 1]
+        )
+        product = dtype[batch_size, n_active_tokens, num_heads_tp, seq_length].Dot(slopes_sh, sum_sh, dot_dimension_numbers=dot_dims)
+        result = dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Transpose(product, dimensions=[0, 2, 1, 3])
+        return result
+
+    scribe = attention_mask.scribe
+    fp32 = scribe.f32
+
+    # Create alibi for the `attention_mask` tokens
+    mask_cast = hlo.cast(attention_mask, fp32)
     summation = hlo.cumsum(mask_cast, -1)
-    one = dtype.Constant(constant_value=1)
-    one_br = dtype[size].Broadcast(one, dimensions=[])
-    summation_sub = dtype[size].Subtract(summation, one_br)
-    sum_mul = dtype[size].Multiply(summation_sub, mask_cast)
+    alibi = _alibi(summation, attention_mask)
 
-    slopes_sh = dtype[batch_size, n_active_tokens, num_heads_tp, 1].Broadcast(slopes, dimensions=[2, 3])
-    sum_sh = dtype[batch_size, n_active_tokens, 1, seq_length].Reshape(sum_mul)
-    dot_dims = dict(
-        lhs_contracting_dimensions=[3],
-        lhs_batch_dimensions=[0, 1],
-        rhs_contracting_dimensions=[2],
-        rhs_batch_dimensions=[0, 1]
-    )
-    product = dtype[batch_size, n_active_tokens, num_heads_tp, seq_length].Dot(slopes_sh, sum_sh, dot_dimension_numbers=dot_dims)
-    result = dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Transpose(product, dimensions=[0, 2, 1, 3])
-    return result
+    # Create alibi for the `active_mask` tokens:
+    #    Since the prior token mask is the `attention_mask` and the
+    #    active token mask is the `active_mask`, we need to combine both masks to
+    #    find the true cumulative sum.
+    if active_mask is not None:
+        total = hlo.reduce_sum(mask_cast, 2)
+        active_cast = hlo.cast(active_mask, fp32)
+        total = fp32[total.sizes].Add(total, active_cast)
+        total_sh = hlo.unsqueeze(total, 1)
+        active_cast_sh = hlo.unsqueeze(active_cast, 1)
+        active_alibi = _alibi(total_sh, active_cast_sh)
+        return alibi, active_alibi
+
+    # When no active mask, we do not have a "prior" alibi
+    return None, alibi
