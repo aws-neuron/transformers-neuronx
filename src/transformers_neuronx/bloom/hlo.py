@@ -209,7 +209,6 @@ class BloomForSamplingNoEmbeddingHlo:
 
         return output, updated_keys, updated_values
 
-
     def attention_reference(self,
         hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
         cached_keys, cached_values,
@@ -304,7 +303,7 @@ def build_alibi_from_slopes(slopes, attention_mask, active_mask, num_heads, tp_d
     # Create alibi for the `attention_mask` tokens
     mask_cast = hlo.cast(attention_mask, fp32)
     summation = hlo.cumsum(mask_cast, -1)
-    alibi = _alibi(summation, attention_mask)
+    alibi = _alibi(summation, mask_cast)
 
     # Create alibi for the `active_mask` tokens:
     #    Since the prior token mask is the `attention_mask` and the
