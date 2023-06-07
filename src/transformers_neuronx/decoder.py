@@ -83,7 +83,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.lm_head_bias = bias
 
     def to_neuron(self):
-        manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        manipulator = MaybeParallelTensorManipulator(self.tp_degree)
         self.pre_layer_parameters = [
             manipulator.duplicate_or_shard_along(param, dim)
             for param, dim in self.pre_layer_parameters
@@ -97,6 +97,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
         ln_lm_head_params = [*self.pre_layer_parameters, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
+        ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
@@ -129,10 +130,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
                 new_layer.assign_caches(layer)
             else:
                 new_layer.init_caches()
+            new_layer.extra_parameters = layer.extra_parameters
         new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
         new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
         ln_lm_head_params = [*new.pre_layer_parameters, new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
+        ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
         new.program = new._build_program()
@@ -378,6 +381,10 @@ class DecoderLayer(torch.nn.Module):
         dtype, _, _ = utils.parse_amp(amp)
         self.cache_dtype = dtypes.to_torch_dtype(dtype)
         self.neuron_config = neuron_config
+        self.extra_parameters = []
+
+    def add_parameter(self, param, sharding=None):
+        self.extra_parameters.append((param, sharding))
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -473,6 +480,10 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
+        self.extra_parameters = [
+            maybe_manipulator.duplicate_or_shard_along(param, dim)
+            for param, dim in self.extra_parameters
+        ]
         self.init_caches()
 
     def init_caches(self):
@@ -513,6 +524,7 @@ class DecoderLayer(torch.nn.Module):
             self.mlp_out_bias,
             self.post_mlp_ln_weight,
             self.post_mlp_ln_bias,
+            *self.extra_parameters,
         ]
 
     def valid_parameters(self):
@@ -657,6 +669,7 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_in_max = layer.mlp_in_max
         self.mlp_out_min = layer.mlp_out_min
         self.mlp_out_max = layer.mlp_out_max
+        self.extra_parameters = layer.extra_parameters
 
     def assign_caches(self, layer):
         self.attn_k_cache = layer.attn_k_cache
@@ -682,6 +695,11 @@ class MaybeParallelTensorManipulator:
         if tensor is None:
             return None
         return self.manipulator.primary_only(tensor)
+
+    def duplicate_or_shard_along(self, tensor, dim):
+        if dim is None:
+            return self.duplicate(tensor)
+        return self.shard_along(tensor, dim)
 
 
 class DecoderParameterBuilder:
