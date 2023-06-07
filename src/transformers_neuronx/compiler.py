@@ -65,7 +65,6 @@ def compile_hlo_module(hlo_module):
                             hlo_module_path, f'--output={neff_path}', '--verbose=35']
             if dump_to is not None:
                 command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-                command_line.append('--tensorizer-options=--dump-after-all=penguin')
             flags = os.environ.get('NEURON_CC_FLAGS', '')
             flags = shlex.split(flags)
             command_line.extend(flags)
