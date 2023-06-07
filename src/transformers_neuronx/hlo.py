@@ -18,6 +18,7 @@ import operator
 from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
 
+
 def layer_norm(hidden, weight, bias):
     scribe = hidden.scribe
     dtype = hidden.dtype
@@ -43,6 +44,31 @@ def layer_norm(hidden, weight, bias):
     return output
 
 
+def rms_norm(hidden, weight, eps=1e-6):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
+
+    hidden_size, n_active_tokens, batch_size = size = hidden.sizes
+    dtype = hidden.dtype
+
+    # PERF: Is it better to use BatchNormTraining operation here?
+    square = dtype[hidden.sizes].Multiply(hidden, hidden)
+    variance = reduce_mean(square, 0)
+    eps = dtype.Constant(constant_value=eps)
+    eps_br = dtype[variance.sizes].Broadcast(eps, dimensions=[])
+    mean_eps = dtype[variance.sizes].Add(variance, eps_br)
+    rsqrt = dtype[variance.sizes].Rsqrt(mean_eps)
+    rsqrt_br = dtype[size].Broadcast(rsqrt, dimensions=[1, 2])
+    scaled = dtype[size].Multiply(hidden, rsqrt_br)
+
+    if weight is None:
+        return scaled
+
+    weight_br = dtype[size].Broadcast(weight, dimensions=[0])
+    result = dtype[size].Multiply(scaled, weight_br)
+
+    return result
+
+
 def dot00(lhs, rhs):
     dtype = lhs.dtype
     _, lhs_size = lhs.sizes
@@ -52,38 +78,42 @@ def dot00(lhs, rhs):
 
 
 def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype
+    dtype = bias.dtype if bias is not None else rhs.dtype
     enable_quantize = neuron_config and neuron_config.quant
     if enable_quantize:
         if rhs.dtype != dtype:
             rhs = dtype[rhs.sizes].Convert(rhs)
         if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)        
+            lhs = dtype[lhs.sizes].Convert(lhs)
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[0])
     if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 0)    
+        dot = dequantize(dot, scales, neuron_config, 0)
+    if bias is None:
+        return dot
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[0])
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype
+    dtype = bias.dtype if bias is not None else rhs.dtype
     enable_quantize = neuron_config and neuron_config.quant
     if enable_quantize:
         if rhs.dtype != dtype:
             rhs = dtype[rhs.sizes].Convert(rhs)
         if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs) 
+            lhs = dtype[lhs.sizes].Convert(lhs)
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
     if enable_quantize:
         dot = dequantize(dot, scales, neuron_config, 1)
+    if bias is None:
+        return dot
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
@@ -152,6 +182,55 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     return hidden
 
 
+def gated_mlp(
+    hidden,
+    in0_weight,
+    in1_weight,
+    out_weight,
+    in0_bias=None,
+    in1_bias=None,
+    out_bias=None,
+    activation_function='silu',
+    tp_degree=1
+):
+    """
+    An attention MLP using 2 input projections as found in LLama.
+
+    Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/llama/modeling_llama.py#L144
+
+    TODO: Support quantization
+
+    Sizes:
+        hidden:     [h, a, b]
+        in0_weight: [h, n / tp]
+        in1_weight: [h, n / tp]
+        out_weight: [n / tp, h]
+        in0_bias:   [n / tp]
+        in1_bias:   [n / tp]
+        out_bias:   [h]
+        result:     [h, a, b]
+    """
+
+    dtype = hidden.dtype
+    hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
+    hidden_r_sizes = hidden_size, n_active_tokens * batch_size
+
+    hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
+
+    hidden_active = dot00_add0(in0_weight, hidden, in0_bias)
+    hidden_active = getattr(activations, activation_function)(hidden_active)
+    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias)
+    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+
+    result = dot00_add0(out_weight, hidden_states, out_bias)
+    result = dtype[hidden_sizes].Reshape(result)
+
+    if tp_degree != 1:
+        result = all_reduce_sum(result, tp_degree)
+
+    return result
+
+
 def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
     sizes = weight.sizes
     weight = dequant_dtype[sizes].Convert(weight)
@@ -201,6 +280,7 @@ def transfer_with_static_ring(shape):
 
 def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
                            allow_kv_dot_prefetch=False, start_mask=True):
+
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     triu_sizes = n_active_tokens, n_positions
@@ -208,14 +288,14 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     pred = position_ids.scribe.pred
     iota1 = int_dtype[n_positions].Iota(dimensions=[0])
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
-    position_ids = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
-    mask_triu = pred[triu_sizes].Compare(iota1t, position_ids, comparison_direction=triu_comparison)
+    position_ids_br = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
+    mask_triu = pred[triu_sizes].Compare(iota1t, position_ids_br, comparison_direction=triu_comparison)
     if not start_mask:
         return mask_triu, None
     start_sizes = batch_size, n_positions
     iota1s = int_dtype[start_sizes].Broadcast(iota1, dimensions=[1])
-    start_ids = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
-    mask_start = pred[start_sizes].Compare(iota1s, start_ids, comparison_direction='GE')
+    start_ids_br = int_dtype[start_sizes].Broadcast(start_ids, dimensions=[0])
+    mask_start = pred[start_sizes].Compare(iota1s, start_ids_br, comparison_direction='GE')
     mask_sizes = batch_size, n_active_tokens, n_positions
     mask_triu = pred[mask_sizes].Broadcast(mask_triu, dimensions=[1, 2])
     mask_start = pred[mask_sizes].Broadcast(mask_start, dimensions=[0, 2])
@@ -663,30 +743,6 @@ def reduce_mean(tensor, dims, keepdim=False):
     return value
 
 
-def rms_norm(tensor, normalized_shape, weight, eps):
-    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
-
-    dtype = tensor.dtype
-    dims = tuple(range(len(tensor.sizes)))
-    reduce_dims = dims[len(normalized_shape) + 1:]
-    initial_dims = dims[:len(normalized_shape) + 1]
-
-    # PERF: Is it better to use BatchNormTraining operation here?
-    square = dtype[tensor.sizes].Multiply(tensor, tensor)
-    variance = reduce_mean(square, reduce_dims)
-
-    eps = dtype.Constant(constant_value=eps)
-    eps_br = dtype[variance.sizes].Broadcast(eps, dimensions=[])
-    mean_eps = dtype[variance.sizes].Add(variance, eps_br)
-    rsqrt = dtype[variance.sizes].Rsqrt(mean_eps)
-    rsqrt_br = dtype[tensor.sizes].Broadcast(rsqrt, dimensions=initial_dims)
-    scaled = dtype[tensor.sizes].Multiply(tensor, rsqrt_br)
-
-    if weight is None:
-        return scaled
-
-    weight_br = dtype[tensor.sizes].Broadcast(weight, dimensions=reduce_dims)
-    return dtype[tensor.sizes].Multiply(scaled, weight_br)
 
 
 def cumsum(tensor, dim):
