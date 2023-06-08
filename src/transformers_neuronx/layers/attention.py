@@ -113,7 +113,7 @@ def scale(query, d_head):
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, active_mask=None):
+def score(query, keys):
     """
     Compute the attention score by combining scaled-query & keys.
 
@@ -135,11 +135,6 @@ def score(query, keys, active_mask=None):
                     rhs_batch_dimensions=[1, 2])
     result = dtype[size].Dot(query, keys, dot_dimension_numbers=dot_dims)
 
-    if active_mask is not None:
-        large_neg = dtype.Constant(constant_value=-65535.0)
-        large_neg_br = dtype[size].Broadcast(large_neg, dimensions=[])
-        active_mask_br = pred[size].Broadcast(active_mask, dimensions=[0, 3])
-        result = dtype[size].Select(active_mask_br, result, large_neg_br)
     return result
 
 
@@ -154,7 +149,8 @@ def mask(score, mask):
     score_sizes = score.sizes
     pred = scribe.pred
 
-    large_neg = dtype.Constant(constant_value=-65535.0) # Valid for fp32/fp16/bf16
+    # Note: This value can cause NaN issues if it is too large
+    large_neg = dtype.Constant(constant_value=-30000) # Valid for fp32/fp16/bf16
     large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
     if len(mask.sizes) == 2:
         mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
@@ -186,8 +182,6 @@ def context(past_scores, active_score, past_values, active_values):
     # Upcast to f32 before computation
     past_scores = hlo.cast(past_scores, f32)
     active_score = hlo.cast(active_score, f32)
-    past_values = hlo.cast(past_values, f32)
-    active_values = hlo.cast(active_values, f32)
 
     # Compute maximum of both past_scores and active_scores
     reduce_sizes = n_seqs, n_heads_tp, n_active_tokens
