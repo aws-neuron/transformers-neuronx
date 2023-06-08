@@ -110,11 +110,10 @@ class BloomForSamplingNoEmbeddingHlo:
         and that we can ignore doing any computation on the key/value cache
         items.
         """
-        d_head = self.hidden_size // self.num_heads
-
-        # dtype = hidden.dtype
         scribe = hidden.scribe
         f32 = scribe.f32
+        dtype = hidden.dtype
+        d_head = self.hidden_size // self.num_heads
 
         query, key, value = attention.query_key_value(
             hidden,
@@ -135,6 +134,7 @@ class BloomForSamplingNoEmbeddingHlo:
         score = f32[score.sizes].Convert(score)
         score = f32[score.sizes].Add(score, active_alibi)
         score = attention.mask(score, mask)
+        score = hlo.cast(score, dtype)
 
         # C = softmax(S) @ V
         context = attention.context_combined(score, value)
@@ -166,6 +166,7 @@ class BloomForSamplingNoEmbeddingHlo:
         """
         scribe = hidden.scribe
         f32 = scribe.f32
+        dtype = hidden.dtype
         d_head = self.hidden_size // self.num_heads
 
         # Q = (hidden @ wQ) + bQ
@@ -188,6 +189,7 @@ class BloomForSamplingNoEmbeddingHlo:
         prior_scores = f32[prior_scores.sizes].Convert(prior_scores)
         prior_scores = f32[prior_scores.sizes].Add(prior_scores, prior_alibi)
         prior_scores = attention.mask(prior_scores, mask)
+        prior_scores = hlo.cast(prior_scores, dtype)
 
         # Sa = Q @ Ka + Aa
         active_score = attention.score(query, key)
@@ -195,6 +197,7 @@ class BloomForSamplingNoEmbeddingHlo:
         active_score = f32[active_score.sizes].Add(active_score, active_alibi)
         active_mask_sh = hlo.unsqueeze(active_mask, 1)
         active_score = attention.mask(active_score, active_mask_sh)
+        active_score = hlo.cast(active_score, dtype)
 
         # C = softmax(Sa, Sp) @ (Va, Vp)
         context = attention.context(prior_scores, active_score, cached_values, value)
@@ -226,9 +229,9 @@ class BloomForSamplingNoEmbeddingHlo:
         score on the updated cache (introduces a slow data dependency on a
         scatter result).
         """
-
         scribe = hidden.scribe
         f32 = scribe.f32
+        dtype = hidden.dtype
         d_head = self.hidden_size // self.num_heads
 
         # Q = (hidden @ wQ) + bQ
@@ -256,6 +259,7 @@ class BloomForSamplingNoEmbeddingHlo:
         score = f32[score.sizes].Convert(score)
         score = f32[score.sizes].Add(score, active_alibi)
         score = attention.mask(score, mask)
+        score = hlo.cast(score, dtype)
 
         # C = softmax(S) @ V
         context = attention.context_combined(score, cached_values)
