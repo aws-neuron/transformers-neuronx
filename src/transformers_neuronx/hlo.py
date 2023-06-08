@@ -49,22 +49,29 @@ def rms_norm(hidden, weight, eps=1e-6):
 
     hidden_size, n_active_tokens, batch_size = size = hidden.sizes
     dtype = hidden.dtype
+    scribe = hidden.scribe
+    f32 = scribe.f32
+
+    hidden = cast(hidden, f32)
 
     # PERF: Is it better to use BatchNormTraining operation here?
-    square = dtype[hidden.sizes].Multiply(hidden, hidden)
+    square = f32[hidden.sizes].Multiply(hidden, hidden)
     variance = reduce_mean(square, 0)
-    eps = dtype.Constant(constant_value=eps)
-    eps_br = dtype[variance.sizes].Broadcast(eps, dimensions=[])
-    mean_eps = dtype[variance.sizes].Add(variance, eps_br)
-    rsqrt = dtype[variance.sizes].Rsqrt(mean_eps)
-    rsqrt_br = dtype[size].Broadcast(rsqrt, dimensions=[1, 2])
-    scaled = dtype[size].Multiply(hidden, rsqrt_br)
+    eps = f32.Constant(constant_value=eps)
+    eps_br = f32[variance.sizes].Broadcast(eps, dimensions=[])
+    mean_eps = f32[variance.sizes].Add(variance, eps_br)
+    rsqrt = f32[variance.sizes].Rsqrt(mean_eps)
+    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=[1, 2])
+    scaled = f32[size].Multiply(hidden, rsqrt_br)
 
     if weight is None:
+        scaled = cast(scaled, dtype)
         return scaled
 
-    weight_br = dtype[size].Broadcast(weight, dimensions=[0])
-    result = dtype[size].Multiply(scaled, weight_br)
+    weight = cast(weight, f32)
+    weight_br = f32[size].Broadcast(weight, dimensions=[0])
+    result = f32[size].Multiply(scaled, weight_br)
+    result = cast(result, dtype)
 
     return result
 
