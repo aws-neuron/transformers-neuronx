@@ -55,7 +55,7 @@ def query_key_value(
     return active_q, active_k, active_v
 
 
-def query_key_projection(query, key, qk_weight, hidden_size):
+def query_key_projection(query, key, qk_weight):
     """
     A secondary projection to apply to input query/key projections (used in
     specific models: GPT-J/GPT-NeoX/Llama).
@@ -64,8 +64,8 @@ def query_key_projection(query, key, qk_weight, hidden_size):
     K = K @ W
     """
     dtype = key.dtype
-    n_active_tokens, n_seqs, n_heads_tp, d_head = active_sizes = key.shape
-    active_r_sizes = hidden_size, n_active_tokens * n_seqs
+    n_active_tokens, n_seqs, n_heads_tp, d_head = active_sizes = key.sizes
+    active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
 
     dot_dims = dict(
         lhs_batch_dimensions=[0],
@@ -75,10 +75,12 @@ def query_key_projection(query, key, qk_weight, hidden_size):
     )
 
     # Q = Q @ W
+    query = dtype[active_r_sizes].Reshape(query)
     query = dtype[active_r_sizes].Dot(query, qk_weight, dot_dimension_numbers=dot_dims)
     query = dtype[active_sizes].Reshape(query)
 
     # K = K @ W
+    key = dtype[active_r_sizes].Reshape(key)
     key = dtype[active_r_sizes].Dot(key, qk_weight, dot_dimension_numbers=dot_dims)
     key = dtype[active_sizes].Reshape(key)
 
@@ -289,8 +291,11 @@ def output(
     result = dtype[hidden_r_sizes].Dot(out_weight, result, dot_dimension_numbers=dot_dims)
     if enable_quantize:
         result = hlo.dequantize(result, out_scales, neuron_config, 0)
-    out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
-    result = dtype[hidden_r_sizes].Add(result, out_bias)
+
+    if out_bias is not None:
+        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
+        result = dtype[hidden_r_sizes].Add(result, out_bias)
+
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree == 1:
@@ -300,4 +305,3 @@ def output(
     add_func = hlo.gen_add_func(dtype)
     result = dtype[hidden_sizes].AllReduce(result, replica_groups=replica_groups, to_apply=add_func)
     return result
-
