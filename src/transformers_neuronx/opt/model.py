@@ -315,7 +315,6 @@ class OPTForSamplingNoEmbeddingHlo:
         n_heads_per_group = n_heads_tp // n_groups
         attn_size = hidden_size // self.tp_degree
         hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-        # active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
         active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
 
@@ -350,8 +349,14 @@ class OPTForSamplingNoEmbeddingHlo:
         # For the best perf, we only use kv prefetch in the token generation stage
         allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
         if allow_kv_dot_prefetch:
+            # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+            active_score_sizes_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, n_active_tokens
+            active_score_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_active_tokens
             active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
-            active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_score_dot = dtype[active_score_sizes_dot].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_score_permute = dtype[active_score_sizes_permute].Transpose(active_score_dot, dimensions=[0, 1, 3, 2, 4])
+            active_score = dtype[active_score_sizes].Reshape(active_score_permute)
+
             if active_mask is not None:
                 large_neg = dtype.Constant(constant_value=-30000)
                 large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
@@ -365,13 +370,14 @@ class OPTForSamplingNoEmbeddingHlo:
                 cached_keys = dtype[cached_keys.sizes].Scatter(
                     cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
 
+        # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
         score_sizes_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, max_ctx_plus_n_active_tokens
         score_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, max_ctx_plus_n_active_tokens
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
-        # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
         score_dot = dtype[score_sizes_dot].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
-        score_permute = dtype[score_sizes_permute].Transpose(score_dot, dimensions=[0, 2, 1, 3, 4])
+        score_permute = dtype[score_sizes_permute].Transpose(score_dot, dimensions=[0, 1, 3, 2, 4])
         score = dtype[score_sizes].Reshape(score_permute)
+
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
         if len(mask.sizes) == 2:
@@ -419,8 +425,10 @@ class OPTForSamplingNoEmbeddingHlo:
             denom = f32[reduce_sizes].Add(denom, active_denom)
             active_exp = dtype[active_exp.sizes].Convert(active_exp)
             denom = dtype[denom.sizes].Convert(denom)
-            output = dtype[sizes].Dot(exp, cached_values, dot_dimension_numbers=dot_dims)
-            active_output = dtype[sizes].Dot(active_exp, active_v, dot_dimension_numbers=dot_dims)
+            exp_reshape = dtype[score_sizes_permute].Reshape(exp)
+            output = dtype[sizes].Dot(exp_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            active_exp_reshape = dtype[active_score_sizes_permute].Reshape(active_exp)
+            active_output = dtype[sizes].Dot(active_exp_reshape, active_v, dot_dimension_numbers=dot_dims)
             output = dtype[sizes].Add(output, active_output)
             denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
             output = dtype[sizes].Divide(output, denom_br)
