@@ -1,6 +1,6 @@
 # Transformers Neuron (``transformers-neuronx``) Developer Guide
 
-Transformers Neuron for Trn1/Inf2 is a software package that enables
+Transformers Neuron for Trn1 and Inf2 is a software package that enables
 PyTorch users to perform large language model (LLM) inference on
 second-generation Neuron hardware (See: [NeuronCore-v2](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-hardware/neuron-core-v2.html)).
 
@@ -29,7 +29,7 @@ new features are developed.
 To install the most rigorously tested stable release, use the PyPI pip wheel:
 
 ```
-pip install transformers-neuronx
+pip install transformers-neuronx --extra-index-url=https://pip.repos.neuron.amazonaws.com
 ```
 
 ## Development Version
@@ -158,10 +158,12 @@ API via the ``HuggingFaceGenerationModelAdapter`` adapter class. In the followin
 demonstrate how to run sampling with temperature using the ``GPT2`` model:
 
 ```
+import os
 from transformers_neuronx.gpt2.model import GPT2ForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 from transformers_neuronx.module import save_pretrained_split
 from transformers import AutoModelForCausalLM, AutoTokenizer
+os.environ['NEURON_CC_FLAGS'] = '--model-type=transformer-inference'
 
 # Load and save the CPU model
 model_cpu = AutoModelForCausalLM.from_pretrained('gpt2')
@@ -193,18 +195,167 @@ sample_output = model.generate(
 print([tokenizer.decode(tok) for tok in sample_output])
 ```
 
-## Serialization support
+## int8 weight storage support
 
-Transformers Neuron supports model serialization (model saving and loading) for
-the ``GPT2`` model class. Serialization support for additional model classes
+Transformers Neuron supports int8 weight storage for the `GPT2` model class.
+int8 weight storage can be used to reduce memory bandwidth usage to improve
+model performace. int8 weight storage support for additional model classes
 will be added in an uncoming relesae. In the following example we demonstrate
-how to save and load the ``GPT2`` model:
+how to apply int8 weight storage to the `GPT2` model via the
+`QuantizationConfig` and `NeuronConfig` configs:
 
 ```
+import os
+import torch
+from transformers_neuronx.gpt2.model import GPT2ForSampling
+from transformers_neuronx.module import save_pretrained_split
+from transformers_neuronx.config import NeuronConfig, QuantizationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+os.environ['NEURON_CC_FLAGS'] = '--model-type=transformer-inference'
+
+# Cast attention and mlp layers to low precisions only; layernorms stay as f32
+def amp_callback(model, dtype):
+    for block in model.transformer.h:
+        block.attn.to(dtype)
+        block.mlp.to(dtype)
+    model.lm_head.to(dtype)
+
+# Load and save the CPU model with bfloat16 casting
+model_cpu = AutoModelForCausalLM.from_pretrained('gpt2')
+amp_callback(model_cpu, torch.bfloat16)
+save_pretrained_split(model_cpu, 'gpt2-split')
+
+# Set the weight storage config use int8 quantization and bf16 dequantization
+neuron_config = NeuronConfig(
+    quant=QuantizationConfig(quant_dtype='s8', dequant_dtype='bf16'),
+)
+
+# Create and compile the Neuron model
+model_neuron = GPT2ForSampling.from_pretrained('gpt2-split', batch_size=1, tp_degree=2, n_positions=256, amp='bf16', neuron_config=neuron_config)
+model_neuron.to_neuron()
+
+# Get a tokenizer and exaple input
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+text = "Hello, I'm a language model,"
+encoded_input = tokenizer(text, return_tensors='pt')
+
+# Run inference
+with torch.inference_mode():
+    generated_sequence = model_neuron.sample(encoded_input.input_ids, sequence_length=256, start_ids=None)
+    print([tokenizer.decode(tok) for tok in generated_sequence])
+
+```
+
+## Parallel Input Prompt Context Encoding
+
+Transformers Neuron supports parallel input prompt context encoding for the `GPT2`
+model class. Parallel context encoding can be used to significantly reduce
+the latency of the input prompt context encoding before the autoregressive
+decoder token generation loop. Parallel context encoding support for additional
+model classes will be added in an uncoming release.
+
+The `GPT2ForSamplingWithContextBroadcasting` class has a `context_length_estimate`
+variable that determines the number of input prompt tokens that will be processed in
+parallel. For optimal results, this should be set to a power of 2 that is
+closest to the most frequently seen input prompt length.
+In the following example we demonstrate how to apply parallel context encoding
+to the `GPT2` model via the `GPT2ForSamplingWithContextBroadcasting` class.
+In this example, we set the `context_length_estimate` to be 128, which is
+the closest power of 2 the length of the input prompt (97 tokens).
+
+```
+import os
+import math
+import torch
+from transformers_neuronx.gpt2.model import GPT2ForSamplingWithContextBroadcasting
+from transformers_neuronx.module import save_pretrained_split
+from transformers import AutoModelForCausalLM, AutoTokenizer
+os.environ['NEURON_CC_FLAGS'] = '--model-type=transformer-inference' # Apply optimal
+
+# Load and save the CPU model with bfloat16 casting
+model_cpu = AutoModelForCausalLM.from_pretrained('gpt2')
+save_pretrained_split(model_cpu, 'gpt2-split')
+
+# Get a tokenizer and exaple input
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+text = "Hello, I'm a generative AI language model. Generative AI is a type of AI that can create new content and ideas, including conversations, stories, images, videos, and music. It is powered by large models that are pre-trained on vast amounts of data and commonly referred to as foundation models (FMs). With generative AI on AWS, you can reinvent your applications, create entirely new customer experiences, drive unprecedented levels of productivity, and transform your business. "
+encoded_input = tokenizer(text, return_tensors='pt')
+
+# Set the number of tokens that will be processed in parallel
+prompt_len = encoded_input.input_ids.shape[1]
+context_length_estimate = int(2 ** math.ceil(math.log(prompt_len, 2))) # Use the closest power of two bucket size
+
+# Create and compile the Neuron model
+model_neuron = GPT2ForSamplingWithContextBroadcasting.from_pretrained('gpt2-split', batch_size=1, tp_degree=2, n_positions=256, amp='bf16', context_length_estimate=context_length_estimate)
+model_neuron.to_neuron()
+
+# Run inference
+with torch.inference_mode():
+    generated_sequence = model_neuron.sample(encoded_input.input_ids, sequence_length=256, start_ids=None)
+    print([tokenizer.decode(tok) for tok in generated_sequence])
+```
+
+The `GPT2ForSamplingWithContextBroadcasting` class can also process
+an input prompt that has a different batch size from the batch size of the
+autoregressive decoder output. For example, an input prompt with batch size = 1 can
+be used to produce an output of batch size = 5 to generate multiple suggestions
+for the same input prompt. The input prompt batch size can be specified using
+the `prompt_batch_size` argument and the autoregressive decoder output batch
+size can be specified using the `batch_size` argument. In the following example
+we demonstrate how to apply parallel context encoding to the `GPT2` model
+to generate 5 outputs for a single input.
+
+```
+import os
+import math
+import torch
+from transformers_neuronx.gpt2.model import GPT2ForSamplingWithContextBroadcasting
+from transformers_neuronx.module import save_pretrained_split
+from transformers import AutoModelForCausalLM, AutoTokenizer
+os.environ['NEURON_CC_FLAGS'] = '--model-type=transformer-inference'
+
+# Load and save the CPU model with bfloat16 casting
+model_cpu = AutoModelForCausalLM.from_pretrained('gpt2')
+save_pretrained_split(model_cpu, 'gpt2-split')
+
+# Get a tokenizer and exaple input
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+text = "Hello, I'm a generative AI language model. Generative AI is a type of AI that can create new content and ideas, including conversations, stories, images, videos, and music. It is powered by large models that are pre-trained on vast amounts of data and commonly referred to as foundation models (FMs). With generative AI on AWS, you can reinvent your applications, create entirely new customer experiences, drive unprecedented levels of productivity, and transform your business. "
+encoded_input = tokenizer(text, return_tensors='pt')
+
+# Set the number of tokens that will be processed in parallel
+prompt_len = encoded_input.input_ids.shape[1]
+context_length_estimate = int(2 ** math.ceil(math.log(prompt_len, 2))) # Use the closest power of two bucket size
+
+# Create and compile the Neuron model
+model_neuron = GPT2ForSamplingWithContextBroadcasting.from_pretrained('gpt2-split', prompt_batch_size=1, batch_size=5, tp_degree=2, n_positions=256, amp='bf16', context_length_estimate=context_length_estimate)
+model_neuron.to_neuron()
+
+# Run inference
+with torch.inference_mode():
+    generated_sequence = model_neuron.sample(encoded_input.input_ids, sequence_length=256, start_ids=None)
+for i, output in enumerate(generated_sequence):
+    print('-'*50)
+    print(f'Batch {i} output:')
+    print(tokenizer.decode(output))
+```
+
+
+## [Experimental] Serialization support
+
+Transformers Neuron supports model serialization (model saving and loading) for
+the `GPT2` model class. Serialization support for additional model classes
+will be added in an uncoming relesae. In the following example we demonstrate
+how to save and load the `GPT2` model:
+
+```
+import os
+import torch
 from transformers_neuronx.gpt2.model import GPT2ForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 from transformers_neuronx.module import save_pretrained_split
 from transformers import AutoModelForCausalLM, AutoTokenizer
+os.environ['NEURON_CC_FLAGS'] = '--model-type=transformer-inference'
 
 # Load and save the CPU model
 model_cpu = AutoModelForCausalLM.from_pretrained('gpt2')
@@ -221,7 +372,39 @@ model_neuron._save_compiled_artifacts('gpt2-neuron')
 model_neuron = GPT2ForSampling.from_pretrained('gpt2-split', batch_size=1, tp_degree=2, n_positions=256, amp='f32', unroll=None)
 model_neuron._load_compiled_artifacts('gpt2-neuron') # Load the compiled Neuron artifacts
 model_neuron.to_neuron() # Load the model weights but skip compilation
+# Get a tokenizer and exaple input
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+text = "Hello, I'm a language model,"
+encoded_input = tokenizer(text, return_tensors='pt')
+
+# Run inference
+with torch.inference_mode():
+    generated_sequence = model_neuron.sample(encoded_input.input_ids, sequence_length=256, start_ids=None)
+    print([tokenizer.decode(tok) for tok in generated_sequence])
 ```
+
+## model-type=transformer-inference Compiler Flag
+
+We recommend using the `--model-type=transformer-inference` compiler flag for optimized
+decoder-only LLM inference. In a future release, this compiler flag may be enabled
+by default. This compiler flag can be enabled via the `NEURON_CC_FLAGS` environment
+variable:
+
+```
+export NEURON_CC_FLAGS="--model-type=transformer-inference"
+```
+
+## Running inference with multiple models
+
+Multiple transformers-neuronx models can be loaded at the same time as long
+as the total number of consumed NeuronCores is less than or equal to the total
+number of NeuronCores on the instance. For example, three tp-degree=8 models can be
+loaded and run in parallel on an inf2.48xlarge which has 24 NeuronCores. The
+`NEURON_RT_NUM_CORES` and `NEURON_RT_VISIBLE_CORES` environment variables
+can be used to allocate the necessary number of NeuronCores to each process
+to run multiple transformers-neuronx models in parallel. See the
+[NeuronCore Allocation and Model Placement for Inference](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/torch-neuronx/programming-guide/inference/core-placement.html#torch-neuronx-core-placement-guide)
+section for additional information about how to use these environment variables.
 
 # Examples
 
