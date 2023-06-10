@@ -114,6 +114,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()
 
     def reset(self):
         self.decoder_lm_head.reset()
@@ -260,6 +263,9 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()   
 
     def reset(self):
         # self.decoder_lm_head.reset()
@@ -415,7 +421,10 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             target_caches.append(layer.attn_k_cache)
             target_caches.append(layer.attn_v_cache)
         self.broadcaster.setup(source_caches, target_caches)
-
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()
+        
     def reset(self):
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context.reset()
