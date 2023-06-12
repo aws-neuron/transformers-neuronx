@@ -29,8 +29,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
-                 activation='gelu', unroll=None, neuron_config=None, **kwargs):
-        config = BloomConfig(config, n_positions, batch_size, amp, tp_degree, activation, **kwargs)
+                 unroll=None, neuron_config=None, **kwargs):
+        config = BloomConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(BloomForCausalLM, config)
         self.config = config
         self.neuron_config =  neuron_config
@@ -48,7 +48,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
         )
-        hlo_builder = BloomForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size, 'gelu_new', config.n_head, True, neuron_config=neuron_config)
+        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
