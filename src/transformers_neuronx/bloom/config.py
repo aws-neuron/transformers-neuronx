@@ -23,7 +23,6 @@ class BloomConfig:
             batch_size,
             amp,
             tp_degree,
-            activation='gelu',
             **kwargs
         ):
 
@@ -45,4 +44,3 @@ class BloomConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
-        self.activation = activation
