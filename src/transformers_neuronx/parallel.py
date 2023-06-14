@@ -103,6 +103,12 @@ class ParallelTensorManipulator:
             slices[dim] = slice(start, start+shard_size, 1)
             shard = tensor[tuple(slices)].contiguous()
             tensors.append(shard)
+        if len(tensors) != self.tp_degree:
+            raise ValueError(
+                f'Weight with shape {tensor.shape} cannot be sharded along dimension {dim}. '
+                f'This results in {len(tensors)} weight partitions which cannot be distributed to {self.tp_degree} NeuronCores evenly. '
+                f'To fix this issue either the model parameters or the `tp_degree` must be changed to allow the weight to be evenly split'
+            )
         return tensors
 
     def shard_along(self, tensor, dim):
