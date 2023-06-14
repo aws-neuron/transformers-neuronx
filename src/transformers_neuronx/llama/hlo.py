@@ -50,7 +50,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=token_generation,
             start_mask=True,
         )
-        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, None, 0, None)
+        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, 0, 0, None)
 
     def layer(
             self, hidden, pos_embed, cache_ids, mask, active_mask,
