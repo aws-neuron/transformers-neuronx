@@ -15,6 +15,7 @@
 import pickle
 import os
 import torch
+import torch.nn.functional as F
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -383,8 +384,8 @@ class DecoderLayer(torch.nn.Module):
         self.neuron_config = neuron_config
         self.extra_parameters = []
 
-    def add_parameter(self, param, sharding=None):
-        self.extra_parameters.append((param, sharding))
+    def add_parameter(self, param, sharding=None, allow_pad=False):
+        self.extra_parameters.append((param, sharding, allow_pad))
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -480,10 +481,16 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
-        self.extra_parameters = [
-            maybe_manipulator.duplicate_or_shard_along(param, dim)
-            for param, dim in self.extra_parameters
-        ]
+
+        extras = []
+        for param, dim, allow_pad in self.extra_parameters:
+            if allow_pad:
+                pad_size = utils.pad_size(param.shape, dim, self.tp_degree)
+                if pad_size is not None:
+                    param = F.pad(param, pad_size)
+            extras.append(maybe_manipulator.duplicate_or_shard_along(param, dim))
+        self.extra_parameters = extras
+
         self.init_caches()
 
     def init_caches(self):
