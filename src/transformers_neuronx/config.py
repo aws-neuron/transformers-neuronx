@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Literal
+
 
 class QuantizationConfig:
     """ The config class that contains all quantization related settings """
@@ -28,14 +28,14 @@ class QuantizationConfig:
             raise NotImplementedError(f"{self.quant_dtype} is not implemented. \
                                       Available options are {','.join(QUANT_DTYPE_LIST)}")
 
-        # The data type that is dequantized to 
+        # The data type that is dequantized to
         self.dequant_dtype = dequant_dtype
 
         # Which quantization algorithm to use
         self.quantize_method = quantize_method
         if self.quantize_method not in QUANTIZE_METHOD_LIST:
             raise NotImplementedError(f"{self.quantize_method} is not implemented. \
-                                      Available options are {','.join(QUANTIZE_METHOD_LIST)}")        
+                                      Available options are {','.join(QUANTIZE_METHOD_LIST)}")
 
         # Decide whether the attention layer needs be quantized
         self.quantize_attn = quantize_attn
