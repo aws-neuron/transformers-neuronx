@@ -71,9 +71,12 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
             new_layer.add_attention_output(attn.o_proj.weight.detach().T, None)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
-            new_layer.add_parameter(mlp.gate_proj.weight.T, sharding=1)
-            new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1)
-            new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0)
+
+            # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
+            new_layer.add_parameter(mlp.gate_proj.weight.T, sharding=1, allow_pad=True)
+            new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1, allow_pad=True)
+            new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True)
+
             new_layer.to_neuron()
             layer.nullify()
 
