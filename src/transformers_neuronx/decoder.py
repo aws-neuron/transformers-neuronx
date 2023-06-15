@@ -20,12 +20,12 @@ from transformers_neuronx import hlo
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import utils
-
+from transformers_neuronx import quantize
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, unroll=None):
+                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -37,6 +37,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
+        self.neuron_config = neuron_config
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
         self.ln_f_bias = None
@@ -60,7 +61,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def new_layer(self):
         *_, n_positions = self.n_positions_list
-        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size, self.amp)
+        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size, self.amp, self.neuron_config)
         self.layers.append(layer)
         return layer
 
@@ -100,7 +101,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             unroll = self.unroll
         new = DecoderLmHeadForSamplingNoEmbedding(
             self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-            self.amp, self.num_layers, unroll,
+            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config
         )
         new.add_inputs_builder(self.inputs_builder)
         new.add_layer_builder(self.layer_builder)
@@ -298,25 +299,31 @@ def maybe_transfer_with_static_ring(shape):
 
 class DecoderLayer(torch.nn.Module):
 
-    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp):
+    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp, neuron_config=None):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
         self.attn_q_weight = None
+        self.attn_q_scales = None
         self.attn_q_bias = None
         self.attn_k_weight = None
+        self.attn_k_scales = None
         self.attn_k_bias = None
         self.attn_v_weight = None
+        self.attn_v_scales = None
         self.attn_v_bias = None
         self.attn_out_weight = None
+        self.attn_out_scales = None
         self.attn_out_bias = None
         self.post_attn_ln_weight = None
         self.post_attn_ln_bias = None
         self.pre_mlp_ln_weight = None
         self.pre_mlp_ln_bias = None
         self.mlp_in_weight = None
+        self.mlp_in_scales = None
         self.mlp_in_bias = None
         self.mlp_out_weight = None
+        self.mlp_out_scales = None
         self.mlp_out_bias = None
         self.post_mlp_ln_weight = None
         self.post_mlp_ln_bias = None
@@ -341,6 +348,7 @@ class DecoderLayer(torch.nn.Module):
         self.amp = amp
         dtype, _, _ = utils.parse_amp(amp)
         self.cache_dtype = dtypes.to_torch_dtype(dtype)
+        self.neuron_config = neuron_config
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -390,6 +398,22 @@ class DecoderLayer(torch.nn.Module):
             self.attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(self.attn_out_weight)
             self.mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(self.mlp_in_weight)
             self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
+        if self.neuron_config and self.neuron_config.quant:
+            self.mlp_in_weight, self.mlp_in_scales = \
+                quantize.quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
+            self.mlp_out_weight, self.mlp_out_scales = \
+                quantize.quantize_weights(self.mlp_out_weight, self.neuron_config.quant)
+
+            if self.neuron_config.quant.quantize_attn:
+                self.attn_q_weight, self.attn_q_scales = \
+                    quantize.quantize_weights(self.attn_q_weight, self.neuron_config.quant)
+                self.attn_k_weight, self.attn_k_scales = \
+                    quantize.quantize_weights(self.attn_k_weight, self.neuron_config.quant)
+                self.attn_v_weight, self.attn_v_scales = \
+                    quantize.quantize_weights(self.attn_v_weight, self.neuron_config.quant)
+                self.attn_out_weight, self.attn_out_scales = \
+                    quantize.quantize_weights(self.attn_out_weight, self.neuron_config.quant)
+
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
@@ -397,20 +421,26 @@ class DecoderLayer(torch.nn.Module):
         self.pre_attn_ln_weight = maybe_duplicate(self.pre_attn_ln_weight)
         self.pre_attn_ln_bias = maybe_duplicate(self.pre_attn_ln_bias)
         self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
+        self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
         self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
         self.attn_k_weight = maybe_shard_along(self.attn_k_weight, dim=1)
+        self.attn_k_scales = maybe_shard_along(self.attn_k_scales, dim=0)
         self.attn_k_bias = maybe_shard_along(self.attn_k_bias, dim=0)
         self.attn_v_weight = maybe_shard_along(self.attn_v_weight, dim=1)
+        self.attn_v_scales = maybe_shard_along(self.attn_v_scales, dim=0)
         self.attn_v_bias = maybe_shard_along(self.attn_v_bias, dim=0)
         self.attn_out_weight = maybe_shard_along(self.attn_out_weight, dim=0)
+        self.attn_out_scales = maybe_duplicate(self.attn_out_scales)
         self.attn_out_bias = maybe_primary_only(self.attn_out_bias)
         self.post_attn_ln_weight = maybe_duplicate(self.post_attn_ln_weight)
         self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
         self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
         self.pre_mlp_ln_bias = maybe_duplicate(self.pre_mlp_ln_bias)
         self.mlp_in_weight = maybe_shard_along(self.mlp_in_weight, dim=1)
+        self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
         self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
         self.mlp_out_weight = maybe_shard_along(self.mlp_out_weight, dim=0)
+        self.mlp_out_scales = maybe_duplicate(self.mlp_out_scales)
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
@@ -430,20 +460,26 @@ class DecoderLayer(torch.nn.Module):
             self.pre_attn_ln_weight,
             self.pre_attn_ln_bias,
             self.attn_q_weight,
+            self.attn_q_scales,
             self.attn_q_bias,
             self.attn_k_weight,
+            self.attn_k_scales,
             self.attn_k_bias,
             self.attn_v_weight,
+            self.attn_v_scales,
             self.attn_v_bias,
             self.attn_out_weight,
+            self.attn_out_scales,
             self.attn_out_bias,
             self.post_attn_ln_weight,
             self.post_attn_ln_bias,
             self.pre_mlp_ln_weight,
             self.pre_mlp_ln_bias,
             self.mlp_in_weight,
+            self.mlp_in_scales,
             self.mlp_in_bias,
             self.mlp_out_weight,
+            self.mlp_out_scales,
             self.mlp_out_bias,
             self.post_mlp_ln_weight,
             self.post_mlp_ln_bias,
@@ -490,20 +526,26 @@ class DecoderLayer(torch.nn.Module):
             pre_attn_ln_weight,
             pre_attn_ln_bias,
             attn_q_weight,
+            attn_q_scales,
             attn_q_bias,
             attn_k_weight,
+            attn_k_scales,
             attn_k_bias,
             attn_v_weight,
+            attn_v_scales,
             attn_v_bias,
             attn_out_weight,
+            attn_out_scales,
             attn_out_bias,
             post_attn_ln_weight,
             post_attn_ln_bias,
             pre_mlp_ln_weight,
             pre_mlp_ln_bias,
             mlp_in_weight,
+            mlp_in_scales,
             mlp_in_bias,
             mlp_out_weight,
+            mlp_out_scales,
             mlp_out_bias,
             post_mlp_ln_weight,
             post_mlp_ln_bias,
@@ -515,20 +557,26 @@ class DecoderLayer(torch.nn.Module):
             pre_attn_ln_weight,
             pre_attn_ln_bias,
             attn_q_weight,
+            attn_q_scales,
             attn_q_bias,
             attn_k_weight,
+            attn_k_scales,
             attn_k_bias,
             attn_v_weight,
+            attn_v_scales,
             attn_v_bias,
             attn_out_weight,
+            attn_out_scales,
             attn_out_bias,
             post_attn_ln_weight,
             post_attn_ln_bias,
             pre_mlp_ln_weight,
             pre_mlp_ln_bias,
             mlp_in_weight,
+            mlp_in_scales,
             mlp_in_bias,
             mlp_out_weight,
+            mlp_out_scales,
             mlp_out_bias,
             post_mlp_ln_weight,
             post_mlp_ln_bias,
@@ -544,20 +592,26 @@ class DecoderLayer(torch.nn.Module):
         self.pre_attn_ln_weight = layer.pre_attn_ln_weight
         self.pre_attn_ln_bias = layer.pre_attn_ln_bias
         self.attn_q_weight = layer.attn_q_weight
+        self.attn_q_scales = layer.attn_q_scales
         self.attn_q_bias = layer.attn_q_bias
         self.attn_k_weight = layer.attn_k_weight
+        self.attn_k_scales = layer.attn_k_scales
         self.attn_k_bias = layer.attn_k_bias
         self.attn_v_weight = layer.attn_v_weight
+        self.attn_v_scales = layer.attn_v_scales
         self.attn_v_bias = layer.attn_v_bias
         self.attn_out_weight = layer.attn_out_weight
+        self.attn_out_scales = layer.attn_out_scales
         self.attn_out_bias = layer.attn_out_bias
         self.post_attn_ln_weight = layer.post_attn_ln_weight
         self.post_attn_ln_bias = layer.post_attn_ln_bias
         self.pre_mlp_ln_weight = layer.pre_mlp_ln_weight
         self.pre_mlp_ln_bias = layer.pre_mlp_ln_bias
         self.mlp_in_weight = layer.mlp_in_weight
+        self.mlp_in_scales = layer.mlp_in_scales
         self.mlp_in_bias = layer.mlp_in_bias
         self.mlp_out_weight = layer.mlp_out_weight
+        self.mlp_out_scales = layer.mlp_out_scales
         self.mlp_out_bias = layer.mlp_out_bias
         self.post_mlp_ln_weight = layer.post_mlp_ln_weight
         self.post_mlp_ln_bias = layer.post_mlp_ln_bias

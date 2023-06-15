@@ -16,7 +16,7 @@ import functools
 import operator
 
 from transformers_neuronx import activations
-
+from transformers_neuronx.config import NeuronConfig
 
 def layer_norm(hidden, weight, bias):
     scribe = hidden.scribe
@@ -51,23 +51,39 @@ def dot00(lhs, rhs):
     return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
 
 
-def dot00_add0(lhs, rhs, bias):
-    dtype = lhs.dtype
+def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
+    dtype = bias.dtype
+    enable_quantize = neuron_config and neuron_config.quant
+    if enable_quantize:
+        if rhs.dtype != dtype:
+            rhs = dtype[rhs.sizes].Convert(rhs)
+        if lhs.dtype != dtype:
+            lhs = dtype[lhs.sizes].Convert(lhs)        
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
     bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[0])
+    if enable_quantize:
+        dot = dequantize(dot, scales, neuron_config, 0)    
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
-def dot00_add1(lhs, rhs, bias):
-    dtype = lhs.dtype
+def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    dtype = bias.dtype
+    enable_quantize = neuron_config and neuron_config.quant
+    if enable_quantize:
+        if rhs.dtype != dtype:
+            rhs = dtype[rhs.sizes].Convert(rhs)
+        if lhs.dtype != dtype:
+            lhs = dtype[lhs.sizes].Convert(lhs) 
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
     bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
+    if enable_quantize:
+        dot = dequantize(dot, scales, neuron_config, 1)
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
@@ -102,7 +118,7 @@ def gen_max_func(dtype):
 
 
 def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-        dequant_dtype=None, u8_bounds=None):
+        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
@@ -124,9 +140,9 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-    hidden = dot00_add0(in_weight, hidden, in_bias)
+    hidden = dot00_add0(in_weight, hidden, in_bias, in_scales, neuron_config)
     hidden = getattr(activations, activation_function)(hidden)
-    hidden = dot00_add0(out_weight, hidden, out_bias)
+    hidden = dot00_add0(out_weight, hidden, out_bias, out_scales, neuron_config)
     hidden = dtype[hidden_sizes].Reshape(hidden)
     if tp_degree == 1:
         return hidden
@@ -294,6 +310,22 @@ def all_gather(tensor, dim, tp_degree):
         tensor,
         dimensions=[dim],
         replica_groups=[list(range(tp_degree))],
+    )
+
+
+def all_reduce_sum(tensor, tp_degree):
+    size = tensor.sizes
+    dtype = tensor.dtype
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    return dtype[size].AllReduce(
+        tensor,
+        replica_groups=[list(range(tp_degree))],
+        to_apply=reducer
     )
 
 
@@ -471,18 +503,77 @@ def embedding(weight, index, tp_degree=1, dim=1):
     data is replicated across all nodes.
 
     When `tp_degree` > 1, this function assumes that the index is identical
-    across nodes and the embedding data is partitioned along the
-    `dim` dimension. This allows each partition to gather from their
-    embedding weight matrices idependently and the results can be combined
-    with an AllGather concatenation along `dim`.
+    across replicas and the embedding data is partitioned across them. This
+    allows each partition to gather from their embedding weight matrices
+    independently and the results can be combined with a collective compute
+    operation. The combination strategy is based on how the embedding was
+    partitioned:
+    - When `dim` == 0, this function assumes that the embedding has been
+      partitioned with distinct vocabulary tokens on each device. This uses
+      AllReduce to combine results with a masked summation.
+    - When `dim` == 1, this function assumes that each partition has the all
+      vocabulary tokens but only a portion of the embedding. This uses
+      AllGather to combine results with concatenation.
     """
-    result = _embedding(weight, index)
+    partition_size, embed_size = weight.sizes
 
-    # Early exit if not combining results from multiple partitions
+    # Use (index % partition_size) with partitioned vocabulary
+    offset = index
+    if tp_degree > 1 and dim == 0:
+        const = index.dtype.Constant(constant_value=partition_size)
+        const_br = index.dtype[index.sizes].Broadcast(const, dimensions=[])
+        offset = index.dtype[index.sizes].Remainder(index, const_br)
+
+    # Replica-local embedding
+    result = _embedding(weight, offset)
+
+    # Case 1: Early exit if not combining results from multiple replicas
     if tp_degree == 1:
         return result
 
-    return all_gather(result, dim=dim, tp_degree=tp_degree)
+    # Case 2: Partitioned vocabulary - Sum masked embeddings
+    if dim == 0:
+
+        raise NotImplementedError(
+            f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
+        )
+
+        pred = index.scribe.pred
+
+        # Compute embedding mask
+        replica_id = index.dtype.ReplicaId() # XXX: Unsupported
+        vocab_size = index.dtype.Constant(constant_value=partition_size)
+        one = index.dtype.Constant(constant_value=1)
+
+        minimum = index.dtype.Multiply(replica_id, vocab_size)
+        next_replica_id = index.dtype.Add(replica_id, one)
+        maximum = index.dtype.Multiply(next_replica_id, vocab_size)
+
+        minimum_br = index.dtype[index.sizes].Broadcast(minimum, dimensions=[])
+        maximum_br = index.dtype[index.sizes].Broadcast(maximum, dimensions=[])
+
+        mask_min = pred[index.sizes].Compare(index, minimum_br, comparison_direction='GE')
+        mask_max = pred[index.sizes].Compare(index, maximum_br, comparison_direction='LT')
+
+        mask = pred[index.sizes].And(mask_min, mask_max)
+        dims = range(len(result.sizes))[:-1] # All but the embedding dimension
+        mask_br = pred[result.sizes].Broadcast(mask, dimensions=dims)
+
+        # Zero out embeddings which are not contained in this partition
+        zero = result.dtype.Constant(constant_value=0)
+        zero_br = result.dtype[result.sizes].Broadcast(zero, dimensions=[])
+        masked_result = result.dtype[result.sizes].Select(mask_br, result, zero_br)
+
+        # Combine embeddings from all partitions
+        return all_reduce_sum(masked_result, tp_degree=tp_degree)
+
+    # Case 3: Partitioned embedding: Concatenate embedding pieces
+    if dim == 1:
+        return all_gather(result, dim, tp_degree=tp_degree)
+
+    raise NotImplementedError(
+        f'Embedding operation does not support dim={dim}'
+    )
 
 
 def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_head, amp, n_layer):
@@ -503,3 +594,132 @@ def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_h
         return scribe.tuple(*root_shapes).Tuple(*outputs)
 
     return cache_broadcast_impl
+
+
+def quantize(tensor, neuron_config: NeuronConfig, scales_dim):
+    scribe = tensor.scribe
+    quant_dtype = getattr(scribe, neuron_config.quant.quant_dtype)
+    dtype = tensor.dtype
+    abs_tensor = dtype[tensor.sizes].Abs(tensor)
+    max_vals = reduce_max(abs_tensor, dim=scales_dim)
+    constant = dtype.Constant(constant_value=127.0)
+    broadcast0 = dtype[max_vals.sizes].Broadcast(constant, dimensions=[])
+    scales = dtype[max_vals.sizes].Divide(max_vals, broadcast0)
+    bdim = list(range(0, len(tensor.sizes)))
+    bdim.remove(scales_dim)
+    broadcast1 = dtype[tensor.sizes].Broadcast(scales, dimensions=bdim)
+    quantized_tensor = dtype[tensor.sizes].Divide(tensor, broadcast1)
+    clamp_upper_bound = dtype[tensor.sizes].Broadcast(dtype.Constant(constant_value=127.0), dimensions=[])
+    clamp_lower_bound = dtype[tensor.sizes].Broadcast(dtype.Constant(constant_value=-128.0), dimensions=[])
+    quantized_tensor = dtype[tensor.sizes].Clamp(clamp_lower_bound, quantized_tensor, clamp_upper_bound)
+    quantized_tensor = quant_dtype[tensor.sizes].Convert(quantized_tensor)
+    return quantized_tensor, scales
+
+
+def dequantize(tensor, scales, neuron_config: NeuronConfig, scales_dim):
+    scribe = tensor.scribe
+    f32 = scribe.f32
+    dtype = getattr(scribe, neuron_config.quant.dequant_dtype)
+    tensor = f32[tensor.sizes].Convert(tensor)
+    scales = f32[tensor.sizes].Broadcast(scales, dimensions=[scales_dim])
+    tensor = f32[tensor.sizes].Multiply(tensor, scales)
+    tensor = dtype[tensor.sizes].Convert(tensor)
+    return tensor
+
+
+def reduce_mean(tensor, dims, keepdim=False):
+
+    dtype = tensor.dtype
+
+    if dims is None:
+        dims = list(range(len(tensor.sizes)))
+
+    if isinstance(dims, int):
+        dims = [dims]
+
+    elements = 1
+    reduce_shape = list(tensor.sizes)
+    for dim in sorted(dims, reverse=True):
+        elements *= reduce_shape[dim]
+        reduce_shape.pop(dim)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    minimum = dtype.Constant(constant_value=0)
+    value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=dims, to_apply=reducer)
+    divisor = dtype.Constant(constant_value=1.0 / elements)
+    divisor_br = dtype[reduce_shape].Broadcast(divisor)
+    value = dtype[reduce_shape].Multiply(value, divisor_br)
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        for dim in dims:
+            keepdim_shape[dim] = 1
+        value = dtype[keepdim_shape].Reshape(value)
+
+    return value
+
+
+def rms_norm(tensor, normalized_shape, weight, eps):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
+
+    dtype = tensor.dtype
+    dims = tuple(range(len(tensor.sizes)))
+    reduce_dims = dims[len(normalized_shape) + 1:]
+    initial_dims = dims[:len(normalized_shape) + 1]
+
+    # PERF: Is it better to use BatchNormTraining operation here?
+    square = dtype[tensor.sizes].Multiply(tensor, tensor)
+    variance = reduce_mean(square, reduce_dims)
+
+    eps = dtype.Constant(constant_value=eps)
+    eps_br = dtype[variance.sizes].Broadcast(eps, dimensions=[])
+    mean_eps = dtype[variance.sizes].Add(variance, eps_br)
+    rsqrt = dtype[variance.sizes].Rsqrt(mean_eps)
+    rsqrt_br = dtype[tensor.sizes].Broadcast(rsqrt, dimensions=initial_dims)
+    scaled = dtype[tensor.sizes].Multiply(tensor, rsqrt_br)
+
+    if weight is None:
+        return scaled
+
+    weight_br = dtype[tensor.sizes].Broadcast(weight, dimensions=reduce_dims)
+    return dtype[tensor.sizes].Multiply(scaled, weight_br)
+
+
+def cumsum(tensor, dim):
+
+    dtype = tensor.dtype
+
+    init = dtype.Constant(constant_value=0)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    sizes = [1] * len(tensor.sizes)
+    strides = [1] * len(tensor.sizes)
+    pads = [0] * len(tensor.sizes)
+
+    sizes[dim] = tensor.sizes[dim]
+    pads[dim] = tensor.sizes[dim] - 1
+
+    return dtype[tensor.sizes].ReduceWindow(
+        tensor,
+        init,
+        to_apply=reducer,
+        window=dict(
+            dimensions=[
+                dict(
+                    size=size,
+                    stride=stride,
+                    padding_low=pad,
+                )
+                for (size, stride, pad) in zip(sizes, strides, pads)
+            ],
+        ),
+    )
+
