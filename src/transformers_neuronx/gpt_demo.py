@@ -25,6 +25,7 @@ from transformers import GPT2Config as GPT2ConfigTransformer
 from transformers import GPTJConfig as GPTJConfigTransformer
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
+from transformers_neuronx.config import NeuronConfig, QuantizationConfig
 
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
@@ -50,6 +51,7 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--print_latency', action='store_true', help="Print latency for generation of each output token")
+    run_parser.add_argument('--quantize', action='store_true', help="Quantize model")
     args = parser.parse_args()
     if args.model_name is not None:
         model_name = args.model_name
@@ -86,9 +88,13 @@ def run(args, model_name, model_cls):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     prompt_text = "Hello, I'm a language model,"
     print(f'running {model_cls.__name__}.from_pretrained')
+    neuron_config = None
+    if args.quantize:
+        neuron_config = NeuronConfig(
+                            quant=QuantizationConfig(dequant_dtype=args.amp))
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                      unroll=args.unroll)
+                                      unroll=args.unroll, neuron_config=neuron_config)
     if args.print_latency:
         latency_printer = LatencyPrinter()
         model.register_forward_pre_hook(latency_printer.pre_hook)
