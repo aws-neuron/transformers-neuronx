@@ -180,7 +180,6 @@ def build_alibi_from_slopes(slopes, attention_mask, active_mask, tp_degree=1):
     num_heads_tp, *_ = slopes.sizes
     scribe = attention_mask.scribe
     dtype = scribe.f32
-    # num_heads_tp = num_heads // tp_degree
 
     def _alibi(summation, mask):
 
