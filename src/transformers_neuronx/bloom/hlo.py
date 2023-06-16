@@ -44,7 +44,7 @@ class BloomForSamplingNoEmbeddingHlo:
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
-        prior_alibi, active_alibi = build_alibi_from_slopes(slopes, mask, active_mask, self.config.n_head, self.config.tp_degree)
+        prior_alibi, active_alibi = build_alibi_from_slopes(slopes, mask, active_mask, self.config.tp_degree)
         return hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
     def layer(self, hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
@@ -100,6 +100,9 @@ class BloomForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
         dtype = hidden.dtype
         d_head = self.config.hidden_size // self.config.n_head
+        hidden_size, *_ = hidden.sizes
+
+        hidden = attention.pad(hidden, d_head, self.config.tp_degree)
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -162,6 +165,7 @@ class BloomForSamplingNoEmbeddingHlo:
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, self.config.tp_degree, neuron_config)
+        output = attention.unpad(output, hidden_size)
 
         # KCache[I] = K
         # VCache[I] = V
@@ -171,15 +175,12 @@ class BloomForSamplingNoEmbeddingHlo:
         return output, updated_keys, updated_values
 
 
-def build_alibi_from_slopes(slopes, attention_mask, active_mask, num_heads, tp_degree=1):
+def build_alibi_from_slopes(slopes, attention_mask, active_mask, tp_degree=1):
 
-    assert num_heads % tp_degree == 0, (
-        f"Attention heads ({num_heads}) must be divisible by tensor parellism degree {tp_degree}"
-    )
-
+    num_heads_tp, *_ = slopes.sizes
     scribe = attention_mask.scribe
     dtype = scribe.f32
-    num_heads_tp = num_heads // tp_degree
+    # num_heads_tp = num_heads // tp_degree
 
     def _alibi(summation, mask):
 

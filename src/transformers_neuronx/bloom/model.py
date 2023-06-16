@@ -46,7 +46,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config
+            config.n_layer, unroll, neuron_config=neuron_config, allow_pad=True
         )
         hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
@@ -124,7 +124,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         slopes = build_alibi_slopes(self.config.n_head)
-        self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0)
+        self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
         self.decoder_lm_head.to_neuron()
 
         if self.context_length_estimate is not None:
