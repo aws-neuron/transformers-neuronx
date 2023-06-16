@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import tarfile
 import tempfile
+import numpy as np
 from textwrap import dedent
 import torch
 from torch_neuronx.pyhlo import xla_data_pb2
@@ -64,7 +65,6 @@ def compile_hlo_module(hlo_module):
                             hlo_module_path, f'--output={neff_path}', '--verbose=35']
             if dump_to is not None:
                 command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-                command_line.append('--tensorizer-options=--dump-after-all=penguin')
             flags = os.environ.get('NEURON_CC_FLAGS', '')
             flags = shlex.split(flags)
             command_line.extend(flags)
@@ -243,12 +243,39 @@ class ParallelMemory:
 
 
 class ParallelKernel:
-
+    hlo_snapshot_iter = 0
     def __init__(self, hlo_module, tp_degree):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
         self.model = None
+        self.hlo_snapshot = None
+        self.generate_hlo_snapshot()
+
+
+    def generate_hlo_snapshot(self, tensors=None):
+        if tensors is None:
+            self.hlo_snapshot_folder = os.environ.get("HLO_SNAPSHOT_PATH", None)
+            self.hlo_snapshot = self.hlo_snapshot_folder is not None
+            if self.hlo_snapshot:
+                os.makedirs(f"{self.hlo_snapshot_folder}", exist_ok=True)
+        elif self.hlo_snapshot:
+            folder = os.path.join(self.hlo_snapshot_folder, f"iter{ParallelKernel.hlo_snapshot_iter}")
+            os.makedirs(folder, exist_ok=True)
+            for i, tensor in enumerate(tensors):
+                filename = os.path.join(folder, f"{i}.npy")
+                tensor_cpu = ops.parallel_cpu(tensor)
+                if isinstance(tensor_cpu, list):
+                    tensor_cpu = tensor_cpu[0]
+                if tensor_cpu.dtype == torch.bfloat16:
+                    tensor_cpu = tensor_cpu.view(torch.int16)
+                    tensor_cpu = tensor_cpu.numpy()
+                    tensor_cpu = tensor_cpu.view('|V2')
+                else:
+                    tensor_cpu = tensor_cpu.detach().numpy()
+                np.save(filename, tensor_cpu)
+            ParallelKernel.hlo_snapshot_iter += 1
+
 
     def build_memory(self):
         return ParallelMemory(self.hlo_module, self.tp_degree)
@@ -264,6 +291,8 @@ class ParallelKernel:
         self.model.load()
 
     def __call__(self, memory):
+        if self.hlo_snapshot:
+            self.generate_hlo_snapshot(memory.input_tensors)
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
 

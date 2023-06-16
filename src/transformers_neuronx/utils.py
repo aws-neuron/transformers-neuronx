@@ -14,10 +14,11 @@
 # ==============================================================================
 import torch
 import math
+import itertools
 
 
 def get_closest_pow2_bucket_size(size):
-    # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)? 
+    # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)?
     # Elapsed time for these 2 cases:
     #   2^k bucket:       parallel_time + (n - 2^k) * serial_time
     #   2^(k+1) bucket:   2 * parallel_time
@@ -45,8 +46,17 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
     return sizes
 
 
-def pad_vocab_size(vocab_size, tp_degree):
-    return ((vocab_size // tp_degree + 1) * tp_degree - vocab_size) % tp_degree
+def pad_size(shape, dim, tp_degree):
+    if shape[dim] % tp_degree == 0:
+        return None
+    lhs = [0] * len(shape)
+    rhs = [0] * len(shape)
+    rhs[len(shape) - 1 - dim] = pad_vocab_size(shape[dim], tp_degree)
+    return tuple(itertools.chain(*zip(lhs, rhs)))
+
+
+def pad_vocab_size(vocab_size, divisor):
+    return ((vocab_size // divisor + 1) * divisor - vocab_size) % divisor
 
 
 def amp_is_u8(amp):

@@ -25,6 +25,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import tensor_pool
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
@@ -32,10 +33,11 @@ from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
+        self.neuron_config = neuron_config
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
@@ -48,10 +50,10 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll,
+            config.n_layer, unroll, neuron_config=neuron_config
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -87,10 +89,18 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
             new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
                                                    layer.ln_1.bias.detach())
             new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
-            new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
-                                        c_attn_bias[n_embd:n_embd*2])
-            new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
-                                          c_attn_bias[n_embd*2:n_embd*3])
+            _, n_embd_qkv = c_attn_weight.shape
+            if n_embd_qkv < n_embd * 3:
+                n_group = (n_embd_qkv - n_embd) // 2
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_group],
+                                            c_attn_bias[n_embd:n_embd+n_group])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_group:],
+                                              c_attn_bias[n_embd+n_group:])
+            else:
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
+                                            c_attn_bias[n_embd:n_embd*2])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
+                                              c_attn_bias[n_embd*2:n_embd*3])
             new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
@@ -105,6 +115,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()
 
     def reset(self):
         self.decoder_lm_head.reset()
@@ -225,10 +238,18 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
             new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
                                                    layer.ln_1.bias.detach())
             new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
-            new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
-                                        c_attn_bias[n_embd:n_embd*2])
-            new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
-                                          c_attn_bias[n_embd*2:n_embd*3])
+            _, n_embd_qkv = c_attn_weight.shape
+            if n_embd_qkv < n_embd * 3:
+                n_group = (n_embd_qkv - n_embd) // 2
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_group],
+                                            c_attn_bias[n_embd:n_embd+n_group])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_group:],
+                                              c_attn_bias[n_embd+n_group:])
+            else:
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
+                                            c_attn_bias[n_embd:n_embd*2])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
+                                              c_attn_bias[n_embd*2:n_embd*3])
             new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
@@ -243,6 +264,9 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()   
 
     def reset(self):
         # self.decoder_lm_head.reset()
@@ -315,7 +339,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -331,10 +355,11 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         n_positions_list = [config.n_positions]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll,
+            config.n_layer, unroll, neuron_config=neuron_config
         )
         start_mask = prompt_batch_size > 1
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
+                                                   neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -397,28 +422,49 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             target_caches.append(layer.attn_k_cache)
             target_caches.append(layer.attn_v_cache)
         self.broadcaster.setup(source_caches, target_caches)
+        self.tensor_pool = tensor_pool.TensorPool()
+        # We need to reset once, since there might be NaN initially in KVcache.
+        # This is done right after weight loading which is shared for different generation methods.
+        self.reset()
 
     def reset(self):
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+        logits = self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+        return logits
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
+        logits = self._forward(self.decoder_lm_head_for_context, input_ids,
+                               cache_ids, start_ids, is_context_encode=True)
+        return logits
 
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
+    def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, -1)
+        if is_context_encode:
+            self.tensor_pool.push([inputs_embeds, position_embeds])
+        return hidden, start_ids
+
+    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode=False):
+        hidden, start_ids = self._embedding(decoder_lm_head, input_ids, cache_ids, 
+                                            start_ids, is_context_encode)
+        if is_context_encode:
+            # The big tensor destruction is slow in CPU. Use asynchronous clear 
+            # to parallel the tensor free with the context encoding execution.
+            task = self.tensor_pool.async_clear()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
+        if is_context_encode:
+            task.wait()
+            self.tensor_pool.push(hidden)
         return logits
 
     @torch.no_grad()
