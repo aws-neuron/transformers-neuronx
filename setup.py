@@ -61,6 +61,7 @@ setup(
             'gpt2_generation_demo=transformers_neuronx.gpt2.generation_demo:main',
             'gpt2_demo=transformers_neuronx.gpt2.demo:main',
             'gptj_demo=transformers_neuronx.gptj.demo:main',
+            'gptneox_demo=transformers_neuronx.gptneox.demo:main',
             'opt_demo=transformers_neuronx.opt.demo:main',
             'opt_gen_random_pretrained=transformers_neuronx.opt.gen_random_pretrained:main',
             'gen_randn_hlo_snapshot=transformers_neuronx.tools.gen_hlo_snapshot:main_randn',

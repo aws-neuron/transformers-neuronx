@@ -14,11 +14,11 @@
 # ==============================================================================
 import argparse
 import itertools
-import math
-import time
-import json
+import sys
 import os
 import torch
+import neuronxcc
+import shutil
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import AutoConfig
@@ -66,12 +66,13 @@ def main():
     run_parser = subparsers.add_parser(run_name)
     run_parser.set_defaults(which=run_name)
     run_parser.add_argument('load')
-    run_parser.add_argument('--batch_size', type=int, default=2, help="Input batch size")
+    # compilation configuration
+    run_parser.add_argument('--batch_size', type=int, default=1, help="Input batch size")
     run_parser.add_argument('--n_positions', type=int, default=128, help="Input sequence length")
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
-    run_parser.add_argument('--print_latency', action='store_true', help="Print latency for generation of each output token")
     run_parser.add_argument('--device', type=str, default="cpu")
+    # generation configuration
     run_parser.add_argument('--beam', type=int, default=1)
     run_parser.add_argument('--do_sample', action='store_true')
     run_parser.add_argument('--max_length', type=int, default=30)
@@ -79,8 +80,17 @@ def main():
     run_parser.add_argument('--top_p', type=float, default=1.0)
     run_parser.add_argument('--temperature', type=float, default=1.0)
     run_parser.add_argument('--no_repeat_ngram_size', type=int, default=0)
+    # input prompt
     run_parser.add_argument('--various', action='store_true', help="Generated batched sequence with different length if set; otherwise using same length")
-    run_parser.add_argument('--prompt_len', type=int, default=30)
+    run_parser.add_argument('--prompt', type=str, default= "Hello, I'm a language model, not a programming language. " \
+        "I don't know how to write a program, but I know that I can do it. " \
+        "I'm not going to tell you how I learned to code, or how much I've learned. " \
+        "But I will tell the story of my first programming experience, and how it changed my life.")
+    run_parser.add_argument('--prompt_len', type=int, default=None)
+    # neuron_utils utils 
+    run_parser.add_argument('--snapshot', action='store_true')
+    run_parser.add_argument('--cache', action='store_true')
+    run_parser.add_argument('--pack_artifacts', action='store_true')
 
     args = parser.parse_args()
 
@@ -117,10 +127,7 @@ def save(args, hf_model_name, model_type):
 def run(args, hf_model_name, model_cls):
     torch.manual_seed(15213)
 
-    full_prompt_text = "Hello, I'm a language model, not a programming language. \
-        I don't know how to write a program, but I know that I can do it.\n\n \
-        I'm not going to tell you how I learned to code, or how much I've learned. \
-        But I will tell the story of my first programming experience, and how it changed my life."
+    full_prompt_text = args.prompt
     if args.various:
         batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
             len(full_prompt_text), (args.batch_size,)).tolist()
@@ -135,15 +142,34 @@ def run(args, hf_model_name, model_cls):
 
     encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
     print(encoded_text)
-    input_ids = torch.as_tensor(encoded_text.input_ids)
 
+    compile_batch_size = args.batch_size*args.beam
     if args.device == "neuron":
-        os.environ["NEURONX_CACHE"] = "on"
-        os.environ["NEURONX_DUMP_TO"] = f"neruonx_cache_{hf_model_name}_{args.batch_size}"
+        suffix = f"{neuronxcc.__version__}_{hf_model_name}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
+        cache_path = f"neuronx_cache_{suffix}"
+        snapshot_path = f"neuronx_snapshot_{suffix}"
+        if args.cache or args.snapshot:
+            os.environ["NEURONX_CACHE"] = "on"
+            os.environ["NEURONX_DUMP_TO"] = cache_path
+            print("Set cache path:", cache_path)
+        if args.snapshot:
+            os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
+            print("Set snapshot path:", snapshot_path)
+
+        if args.pack_artifacts:
+            compiler_artifacts_dir = f"compiler_artifacts_{suffix}"
+            print(f"Save artifacts at: {compiler_artifacts_dir}")
+            os.makedirs(compiler_artifacts_dir, exist_ok=True)
+            if os.path.exists(cache_path):
+                shutil.copytree(cache_path, os.path.join(compiler_artifacts_dir, cache_path))
+            if os.path.exists(snapshot_path):
+                shutil.copytree(snapshot_path, os.path.join(compiler_artifacts_dir, snapshot_path))
+            with open(os.path.join(compiler_artifacts_dir, "command.txt"), 'w') as f:
+                f.write(f"{' '.join(sys.argv)}\n")
 
         print(f'running {model_cls.__name__}.from_pretrained')
         config = AutoConfig.from_pretrained(args.load)
-        neuron_model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
+        neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                         tp_degree=args.tp_degree, n_positions=args.n_positions,
                                         unroll=args.unroll)
         neuron_model.to_neuron()
