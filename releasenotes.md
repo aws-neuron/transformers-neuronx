@@ -1,3 +1,22 @@
+# Transformers Neuron 0.4.0 Release Notes
+
+Date: 2023-06-12
+
+## What's New?
+
+- Added ``int8`` weight storage for `GPT2` models.
+- Improved prompt context encoding performance for `GPT2` models.
+- Improved collective communications performance for tp-degrees 4, 8, and 24 on Inf2.
+- Improved collective communications performance for tp-degrees 8 and 32 on Trn1.
+- Support for the ``--model-type=transformer-inference`` compiler flag for optimized decoder-only LLM inference.
+
+## Bug Fixes
+
+- Added padding to the `GPT-J` ``linear`` layer to correctly handle odd vocabulary sizes.
+- Issues where the HuggingFace `generate` method produces incorrect results when
+`beam_search` is used have been resolved.
+
+
 # Transformers Neuron 0.3.0 Release Notes
 
 Date: 2023-04-28

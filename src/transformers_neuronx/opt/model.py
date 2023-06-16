@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import os
+import copy
 import warnings
 import torch
 from transformers_neuronx import dtypes
@@ -29,7 +30,7 @@ from transformers_neuronx.opt.config import OPTConfig
 class OPTForSampling(module.WrappingCheckpointCompatibleModel):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, context_length_estimate=None, context_unroll=1, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
@@ -50,17 +51,19 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         attention_head_size = config.hidden_size // config.num_attention_heads
         self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.num_hidden_layers, unroll,
+            config.num_hidden_layers, unroll, neuron_config=neuron_config
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
-                                                   config.activation_function, start_mask)
+                                                   config.activation_function, start_mask,
+                                                   neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
+        self.neuron_config = neuron_config
 
     def to_neuron(self):
         ops.init()
@@ -214,41 +217,56 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True):
+    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
+        self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        triu_comparison = 'LT' if self.allow_kv_dot_prefetch else 'LE'
+        # For the best perf, we only use kv prefetch in the token generation stage
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        triu_comparison = 'LT' if allow_kv_dot_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
-                                                       triu_comparison, self.allow_kv_dot_prefetch,
+                                                       triu_comparison, allow_kv_dot_prefetch,
                                                        self.start_mask)
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def layer(self, hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
-              pre_attn_ln_weight, pre_attn_ln_bias, attn_q_weight, attn_q_bias,
-              attn_k_weight, attn_k_bias, attn_v_weight, attn_v_bias,
-              attn_out_weight, attn_out_bias, post_attn_ln_weight, post_attn_ln_bias,
-              pre_mlp_ln_weight, pre_mlp_ln_bias, mlp_in_weight, mlp_in_bias,
-              mlp_out_weight, mlp_out_bias, post_mlp_ln_weight, post_mlp_ln_bias):
+              pre_attn_ln_weight, pre_attn_ln_bias, 
+              attn_q_weight, attn_q_scales, attn_q_bias,
+              attn_k_weight, attn_k_scales, attn_k_bias, 
+              attn_v_weight, attn_v_scales, attn_v_bias,
+              attn_out_weight, attn_out_scales, attn_out_bias, 
+              post_attn_ln_weight, post_attn_ln_bias,
+              pre_mlp_ln_weight, pre_mlp_ln_bias, 
+              mlp_in_weight, mlp_in_scales, mlp_in_bias,
+              mlp_out_weight, mlp_out_scales, mlp_out_bias,
+              post_mlp_ln_weight, post_mlp_ln_bias):
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == attn_k_weight.sizes[-1], \
+            f"kv cache shape ({attn_k_cache.sizes}) doesn't match kv weight shape ({attn_k_weight.sizes})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
-            attn_q_weight, attn_q_bias, attn_k_weight, attn_k_bias,
-            attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
+            attn_q_weight, attn_q_scales, attn_q_bias, 
+            attn_k_weight, attn_k_scales, attn_k_bias,
+            attn_v_weight, attn_v_scales, attn_v_bias,
+            attn_out_weight, attn_out_scales, attn_out_bias,
+            neuron_config=self.neuron_config
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
         ln_hidden = hlo.layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
         mlp_hidden = hlo.mlp(ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-                             activation_function=self.activation_function, tp_degree=self.tp_degree)
+                             activation_function=self.activation_function, tp_degree=self.tp_degree,
+                             in_scales=mlp_in_scales, out_scales=mlp_out_scales,
+                             neuron_config=self.neuron_config)
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
@@ -274,27 +292,41 @@ class OPTForSamplingNoEmbeddingHlo:
         vocab_size, _ = logits.sizes
         return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-    def attention(self, hidden, cache_ids, mask, active_mask, cached_keys, cached_values,
-                  q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias):
+    def attention(self, hidden, cache_ids, mask, active_mask, 
+                  cached_keys, cached_values,
+                  q_weight, q_scales, q_bias,
+                  k_weight, k_scales, k_bias,
+                  v_weight, v_scales, v_bias,
+                  out_weight, out_scales, out_bias, 
+                  neuron_config=None):
+        enable_quantize = neuron_config and neuron_config.quant
+        if enable_quantize and not neuron_config.quant.quantize_attn:
+            neuron_config = copy.deepcopy(neuron_config)
+            neuron_config.quant = None
+            enable_quantize = False
+
         dtype = hidden.dtype
         scribe = hidden.scribe
         f32 = scribe.f32
         pred = scribe.pred
         hidden_size, n_active_tokens, n_seqs = hidden_sizes = hidden.sizes
-        max_ctx_plus_n_active_tokens, _, n_heads_tp, d_head = cached_keys.sizes
+        max_ctx_plus_n_active_tokens, _, n_groups, d_head = cached_keys.sizes
+        n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
+        n_heads_per_group = n_heads_tp // n_groups
         attn_size = hidden_size // self.tp_degree
         hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-        active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+        active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
+        active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
 
         hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
-        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias)
-        active_q = dtype[active_sizes].Reshape(active_q)
+        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
+        active_q = dtype[active_q_sizes].Reshape(active_q)
 
-        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias)
-        active_k = dtype[active_sizes].Reshape(active_k)
+        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
+        active_k = dtype[active_kv_sizes].Reshape(active_k)
 
-        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias)
-        active_v = dtype[active_sizes].Reshape(active_v)
+        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
+        active_v = dtype[active_kv_sizes].Reshape(active_v)
 
         can_skip_scatter = n_active_tokens == max_ctx_plus_n_active_tokens
 
@@ -302,9 +334,9 @@ class OPTForSamplingNoEmbeddingHlo:
         # Keep the attention weights computation in fp32 to avoid overflow issues
         scale_attn = d_head ** 0.5
         scale = dtype.Constant(constant_value=scale_attn)
-        scale_attn_br = dtype[active_sizes].Broadcast(scale, dimensions=[])
-        active_q = dtype[active_sizes].Divide(active_q, scale_attn_br)
-        dot_dims = dict(lhs_contracting_dimensions=[3],
+        scale_attn_br = dtype[active_q_sizes].Broadcast(scale, dimensions=[])
+        active_q = dtype[active_q_sizes].Divide(active_q, scale_attn_br)
+        dot_dims = dict(lhs_contracting_dimensions=[4],
                         lhs_batch_dimensions=[1, 2],
                         rhs_contracting_dimensions=[3],
                         rhs_batch_dimensions=[1, 2])
@@ -314,9 +346,17 @@ class OPTForSamplingNoEmbeddingHlo:
                             scatter_dims_to_operand_dims=[0],
                             index_vector_dim=1)
         assign_func = hlo.gen_assign_func(dtype)
-        if self.allow_kv_dot_prefetch:
+        # For the best perf, we only use kv prefetch in the token generation stage
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        if allow_kv_dot_prefetch:
+            # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+            active_score_sizes_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, n_active_tokens
+            active_score_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_active_tokens
             active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
-            active_score = dtype[active_score_sizes].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_score_dot = dtype[active_score_sizes_dot].Dot(active_q, active_k, dot_dimension_numbers=dot_dims)
+            active_score_permute = dtype[active_score_sizes_permute].Transpose(active_score_dot, dimensions=[0, 1, 3, 2, 4])
+            active_score = dtype[active_score_sizes].Reshape(active_score_permute)
+
             if active_mask is not None:
                 large_neg = dtype.Constant(constant_value=-30000)
                 large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
@@ -330,8 +370,14 @@ class OPTForSamplingNoEmbeddingHlo:
                 cached_keys = dtype[cached_keys.sizes].Scatter(
                     cached_keys, cache_ids, active_k, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
 
+        # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+        score_sizes_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, max_ctx_plus_n_active_tokens
+        score_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, max_ctx_plus_n_active_tokens
         score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
-        score = dtype[score_sizes].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+        score_dot = dtype[score_sizes_dot].Dot(active_q, cached_keys, dot_dimension_numbers=dot_dims)
+        score_permute = dtype[score_sizes_permute].Transpose(score_dot, dimensions=[0, 1, 3, 2, 4])
+        score = dtype[score_sizes].Reshape(score_permute)
+
         large_neg = dtype.Constant(constant_value=-30000)
         large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
         if len(mask.sizes) == 2:
@@ -341,13 +387,13 @@ class OPTForSamplingNoEmbeddingHlo:
         score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
         score = f32[score_sizes].Convert(score)
 
-        dot_dims = dict(lhs_contracting_dimensions=[3],
+        dot_dims = dict(lhs_contracting_dimensions=[4],
                         lhs_batch_dimensions=[0, 1],
                         rhs_contracting_dimensions=[0],
                         rhs_batch_dimensions=[1, 2])
         sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
 
-        if self.allow_kv_dot_prefetch:
+        if allow_kv_dot_prefetch:
             # Main logic:
             # 1. Split softmax into exp / sum(exp) where exp is independent along axis 3
             #   probs_post_scatter = softmax(score_post_scatter)
@@ -379,8 +425,10 @@ class OPTForSamplingNoEmbeddingHlo:
             denom = f32[reduce_sizes].Add(denom, active_denom)
             active_exp = dtype[active_exp.sizes].Convert(active_exp)
             denom = dtype[denom.sizes].Convert(denom)
-            output = dtype[sizes].Dot(exp, cached_values, dot_dimension_numbers=dot_dims)
-            active_output = dtype[sizes].Dot(active_exp, active_v, dot_dimension_numbers=dot_dims)
+            exp_reshape = dtype[score_sizes_permute].Reshape(exp)
+            output = dtype[sizes].Dot(exp_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            active_exp_reshape = dtype[active_score_sizes_permute].Reshape(active_exp)
+            active_output = dtype[sizes].Dot(active_exp_reshape, active_v, dot_dimension_numbers=dot_dims)
             output = dtype[sizes].Add(output, active_output)
             denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
             output = dtype[sizes].Divide(output, denom_br)
@@ -396,15 +444,21 @@ class OPTForSamplingNoEmbeddingHlo:
                     cached_values, cache_ids, active_v, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
             probs = hlo.softmax(score)
             probs = dtype[probs.sizes].Convert(probs)
-            output = dtype[sizes].Dot(probs, cached_values, dot_dimension_numbers=dot_dims)
+            probs_reshape = dtype[score_sizes_permute].Reshape(probs)
+            output_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+            output = dtype[output_sizes].Dot(probs_reshape, cached_values, dot_dimension_numbers=dot_dims)
 
         sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
 
+        if enable_quantize:
+            out_weight = dtype[out_weight.sizes].Convert(out_weight)
         output_sizes_2d = n_active_tokens*n_seqs, attn_size
         output = dtype[output_sizes_2d].Reshape(output)
         dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
         output = dtype[hidden_r_sizes].Dot(out_weight, output, dot_dimension_numbers=dot_dims)
+        if enable_quantize:
+            output = hlo.dequantize(output, out_scales, neuron_config, 0)
         out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
         output = dtype[hidden_r_sizes].Add(output, out_bias)
         output = dtype[hidden_sizes].Reshape(output)
