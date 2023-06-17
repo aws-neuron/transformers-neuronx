@@ -57,8 +57,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
 
-    def add_pre_layer_parameter(self, param, sharding=None):
-        self.pre_layer_parameters.append((param, sharding))
+    def add_pre_layer_parameter(self, param, sharding=None, allow_pad=False):
+        self.pre_layer_parameters.append((param, sharding, allow_pad))
 
     def add_pre_layer_builder(self, builder):
         self.pre_layer_builder = builder
@@ -85,10 +85,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def to_neuron(self):
         manipulator = MaybeParallelTensorManipulator(self.tp_degree)
-        self.pre_layer_parameters = [
-            manipulator.duplicate_or_shard_along(param, dim)
-            for param, dim in self.pre_layer_parameters
-        ]
+
+        extras = []
+        for param, dim, allow_pad in self.pre_layer_parameters:
+            if allow_pad:
+                size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                param = utils.pad(param, dim, size)
+            extras.append(manipulator.duplicate_or_shard_along(param, dim))
+        self.pre_layer_parameters = extras
+
         self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
         self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
         _, vocab_size = self.lm_head_weight.shape
