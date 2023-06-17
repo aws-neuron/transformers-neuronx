@@ -285,7 +285,7 @@ def output(
     if enable_quantize:
         out_weight = dtype[out_weight.sizes].Convert(out_weight)
 
-    result_sizes_2d = n_active_tokens * n_seqs, attn_size
+    result_sizes_2d = n_active_tokens * n_seqs, n_heads_tp * d_head
     result = dtype[result_sizes_2d].Reshape(context)
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
     result = dtype[hidden_r_sizes].Dot(out_weight, result, dot_dimension_numbers=dot_dims)

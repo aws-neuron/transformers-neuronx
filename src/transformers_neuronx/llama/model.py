@@ -45,7 +45,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
-            config.num_hidden_layers, unroll, neuron_config=neuron_config
+            config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
         )
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
