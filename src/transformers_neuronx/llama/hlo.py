@@ -32,6 +32,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
+
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         pos_embed = hidden_dtype[n_active_tokens, head_dim, head_dim].Parameter(parameter_number=1)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=2)
@@ -104,6 +105,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         neuron_config=None
     ):
         d_head = self.config.attention_head_size
+        tp_degree = self.config.tp_degree
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -148,7 +150,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
 
         # O = (C @ wO) + bO
-        output = attention.output(context, out_weight, out_scales, out_bias, self.config.tp_degree, neuron_config)
+        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, neuron_config)
 
         # KCache[I] = K
         # VCache[I] = V

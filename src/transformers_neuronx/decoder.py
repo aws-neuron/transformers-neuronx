@@ -15,7 +15,6 @@
 import pickle
 import os
 import torch
-import torch.nn.functional as F
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -27,7 +26,7 @@ from transformers_neuronx import quantize
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None):
+                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=False):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -53,6 +52,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.compiler_artifacts_path = None
         self.pre_layer_parameters = []
         self.pre_layer_builder = None
+        self.allow_pad = allow_pad
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
@@ -71,7 +71,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def new_layer(self):
         *_, n_positions = self.n_positions_list
-        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size, self.amp, self.neuron_config)
+        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size, self.amp, self.neuron_config, self.allow_pad)
         self.layers.append(layer)
         return layer
 
@@ -330,9 +330,18 @@ def maybe_transfer_with_static_ring(shape):
     return hlo.transfer_with_static_ring(shape)
 
 
+class MaybePadder:
+
+    def __init__(self, size) -> None:
+        self.size = size
+
+    def __call__(self, weight, dim):
+        return utils.pad(weight, dim, self.size)
+
+
 class DecoderLayer(torch.nn.Module):
 
-    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp, neuron_config=None):
+    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp, neuron_config=None, allow_pad=False):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -383,6 +392,7 @@ class DecoderLayer(torch.nn.Module):
         self.cache_dtype = dtypes.to_torch_dtype(dtype)
         self.neuron_config = neuron_config
         self.extra_parameters = []
+        self.allow_pad = allow_pad
 
     def add_parameter(self, param, sharding=None, allow_pad=False):
         self.extra_parameters.append((param, sharding, allow_pad))
@@ -428,6 +438,39 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = bias
 
     def to_neuron(self):
+
+        # If we allow padding then we need to pad non-sharded QKV weight dimensions
+        if self.allow_pad:
+
+            # Hidden size padding
+            hidden_size, _ = self.attn_q_weight.shape
+            n_heads = hidden_size // self.attention_head_size
+            n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
+            hidden_size_padded = n_heads_padded * self.attention_head_size
+            maybe_pad = MaybePadder(hidden_size_padded)
+
+            self.attn_q_weight = maybe_pad(self.attn_q_weight, dim=1)
+            self.attn_q_bias = maybe_pad(self.attn_q_bias, dim=0)
+
+            self.attn_k_weight = maybe_pad(self.attn_k_weight, dim=1)
+            self.attn_k_bias = maybe_pad(self.attn_k_bias, dim=0)
+
+            self.attn_v_weight = maybe_pad(self.attn_v_weight, dim=1)
+            self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
+
+            self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=0)
+            self.attn_out_bias = maybe_pad(self.attn_out_bias, dim=0)
+
+            # Intermediate MLP layer padding
+            if self.mlp_in_weight is not None:
+                intermediate_size, _ = self.mlp_in_weight.shape
+                intermediate_size_padded = utils.round_up_to_divisor(intermediate_size, self.tp_degree)
+                maybe_pad = MaybePadder(intermediate_size_padded)
+
+                self.mlp_in_weight = maybe_pad(self.mlp_in_weight, dim=1)
+                self.mlp_in_bias = maybe_pad(self.mlp_in_bias, dim=0)
+                self.mlp_out_weight = maybe_pad(self.mlp_out_weight, dim=0)
+
         if utils.amp_is_u8(self.amp):
             self.attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(self.attn_q_weight)
             self.attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(self.attn_k_weight)
@@ -485,16 +528,26 @@ class DecoderLayer(torch.nn.Module):
         extras = []
         for param, dim, allow_pad in self.extra_parameters:
             if allow_pad:
-                pad_size = utils.pad_size(param.shape, dim, self.tp_degree)
-                if pad_size is not None:
-                    param = F.pad(param, pad_size)
+                size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                param = utils.pad(param, dim, size)
             extras.append(maybe_manipulator.duplicate_or_shard_along(param, dim))
         self.extra_parameters = extras
 
         self.init_caches()
 
     def init_caches(self):
+
         hidden_size, _ = self.attn_q_weight.shape
+
+        # When padding, compute the hidden size based on the padding. We must
+        # allow the KV cache to be padded so it can be evenly divisible across
+        # NeuronCores.
+        if self.allow_pad:
+            hidden_size, _ = self.attn_q_weight.shape
+            n_heads = hidden_size // self.attention_head_size
+            n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
+            hidden_size = n_heads_padded * self.attention_head_size
+
         n_heads = hidden_size // self.attention_head_size
         n_heads_kv_cache = n_heads * self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1]
         cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache, self.attention_head_size]

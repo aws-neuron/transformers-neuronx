@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import torch
 import math
 import itertools
+
+import torch
+import torch.nn.functional as F
 
 
 def get_closest_pow2_bucket_size(size):
@@ -27,6 +29,7 @@ def get_closest_pow2_bucket_size(size):
     criteria = 1 - 40 / 2048
     size = 2 ** math.ceil(math.log(criteria * size, 2))
     return size
+
 
 def maybe_override_attributes(self, kwargs):
     for key, value in kwargs.items():
@@ -46,13 +49,34 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
     return sizes
 
 
-def pad_size(shape, dim, tp_degree):
-    if shape[dim] % tp_degree == 0:
-        return None
+def pad_sizes(shape, dims, sizes):
+    if isinstance(dims, int):
+        dims = (dims,)
+    if isinstance(sizes, int):
+        sizes = (sizes,) * len(dims)
     lhs = [0] * len(shape)
     rhs = [0] * len(shape)
-    rhs[len(shape) - 1 - dim] = pad_vocab_size(shape[dim], tp_degree)
-    return tuple(itertools.chain(*zip(lhs, rhs)))
+    for dim, size in zip(dims, sizes):
+        rhs[dim] = size - shape[dim]
+    sizes = tuple(itertools.chain(*zip(lhs, reversed(rhs))))
+    if sum(sizes) == 0:
+        return None
+    return sizes
+
+
+def pad(weight, dims, sizes):
+    if weight is None:
+        return weight
+    padding = pad_sizes(weight.shape, dims, sizes)
+    if padding is not None:
+        if isinstance(weight, torch.nn.Parameter):
+            weight = weight.detach()
+        return F.pad(weight, padding)
+    return weight
+
+
+def round_up_to_divisor(value, divisor):
+    return math.ceil(value / divisor) * divisor
 
 
 def pad_vocab_size(vocab_size, divisor):
