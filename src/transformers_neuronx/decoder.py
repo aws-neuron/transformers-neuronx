@@ -463,7 +463,7 @@ class DecoderLayer(torch.nn.Module):
 
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
-                intermediate_size, _ = self.mlp_in_weight.shape
+                _, intermediate_size = self.mlp_in_weight.shape
                 intermediate_size_padded = utils.round_up_to_divisor(intermediate_size, self.tp_degree)
                 maybe_pad = MaybePadder(intermediate_size_padded)
 
