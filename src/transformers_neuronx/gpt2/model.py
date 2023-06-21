@@ -411,16 +411,19 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         n_heads_tp = config.n_head // config.tp_degree
         d_head = n_embd // config.n_head
         self.broadcaster = decoder.FastCacheBroadcaster(
-            config.n_positions, self.prompt_batch_size, self.decoder_lm_head.batch_size,
+            self.context_length_estimate, self.prompt_batch_size, self.decoder_lm_head.batch_size,
             n_heads_tp, d_head, config.amp, config.tp_degree, config.n_layer)
         source_caches = []
         for layer in self.decoder_lm_head_for_context.layers:
             source_caches.append(layer.attn_k_cache)
             source_caches.append(layer.attn_v_cache)
+        manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         target_caches = []
         for layer in self.decoder_lm_head.layers:
-            target_caches.append(layer.attn_k_cache)
-            target_caches.append(layer.attn_v_cache)
+            attn_k_cache = manipulator.slice_on_nc(layer.attn_k_cache, 0, start=0, end=self.context_length_estimate, step=1)
+            attn_v_cache = manipulator.slice_on_nc(layer.attn_v_cache, 0, start=0, end=self.context_length_estimate, step=1)
+            target_caches.append(attn_k_cache)
+            target_caches.append(attn_v_cache)
         self.broadcaster.setup(source_caches, target_caches)
         self.tensor_pool = tensor_pool.TensorPool()
         # We need to reset once, since there might be NaN initially in KVcache.
