@@ -391,6 +391,7 @@ class OPTForSamplingNoEmbeddingHlo:
                         lhs_batch_dimensions=[0, 1],
                         rhs_contracting_dimensions=[0],
                         rhs_batch_dimensions=[1, 2])
+        dot_sizes = n_seqs, n_groups, n_heads_per_group, n_active_tokens, d_head
         sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
 
         if allow_kv_dot_prefetch:
@@ -426,9 +427,11 @@ class OPTForSamplingNoEmbeddingHlo:
             active_exp = dtype[active_exp.sizes].Convert(active_exp)
             denom = dtype[denom.sizes].Convert(denom)
             exp_reshape = dtype[score_sizes_permute].Reshape(exp)
-            output = dtype[sizes].Dot(exp_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            output_dot = dtype[dot_sizes].Dot(exp_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            output = dtype[sizes].Reshape(output_dot)
             active_exp_reshape = dtype[active_score_sizes_permute].Reshape(active_exp)
-            active_output = dtype[sizes].Dot(active_exp_reshape, active_v, dot_dimension_numbers=dot_dims)
+            active_output_dot = dtype[dot_sizes].Dot(active_exp_reshape, active_v, dot_dimension_numbers=dot_dims)
+            active_output = dtype[sizes].Reshape(active_output_dot)
             output = dtype[sizes].Add(output, active_output)
             denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
             output = dtype[sizes].Divide(output, denom_br)
@@ -445,8 +448,10 @@ class OPTForSamplingNoEmbeddingHlo:
             probs = hlo.softmax(score)
             probs = dtype[probs.sizes].Convert(probs)
             probs_reshape = dtype[score_sizes_permute].Reshape(probs)
+            output_dot_sizes = n_seqs, n_groups, n_heads_per_group, n_active_tokens, d_head
             output_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-            output = dtype[output_sizes].Dot(probs_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            output_dot = dtype[output_dot_sizes].Dot(probs_reshape, cached_values, dot_dimension_numbers=dot_dims)
+            output = dtype[output_sizes].Reshape(output_dot)
 
         sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
