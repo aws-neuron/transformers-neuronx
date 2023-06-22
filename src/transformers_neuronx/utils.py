@@ -49,30 +49,31 @@ def power_of_two_bucket_sizes(min_bucket_size, max_bucket_size):
     return sizes
 
 
-def pad_sizes(shape, dims, sizes):
+def pad_sizes(shape, dims, sizes, left=False):
     if isinstance(dims, int):
         dims = (dims,)
     if isinstance(sizes, int):
         sizes = (sizes,) * len(dims)
     lhs = [0] * len(shape)
     rhs = [0] * len(shape)
+    side = lhs if left else rhs
     for dim, size in zip(dims, sizes):
-        rhs[dim] = size - shape[dim]
-    sizes = tuple(itertools.chain(*zip(lhs, reversed(rhs))))
+        side[dim] = size - shape[dim]
+    sizes = tuple(itertools.chain(*zip(reversed(lhs), reversed(rhs))))
     if sum(sizes) == 0:
         return None
     return sizes
 
 
-def pad(weight, dims, sizes):
-    if weight is None:
-        return weight
-    padding = pad_sizes(weight.shape, dims, sizes)
+def pad(tensor, dims, sizes, left=False):
+    if tensor is None:
+        return tensor
+    padding = pad_sizes(tensor.shape, dims, sizes, left=left)
     if padding is not None:
-        if isinstance(weight, torch.nn.Parameter):
-            weight = weight.detach()
-        return F.pad(weight, padding)
-    return weight
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor = tensor.detach()
+        return F.pad(tensor, padding)
+    return tensor
 
 
 def round_up_to_divisor(value, divisor):

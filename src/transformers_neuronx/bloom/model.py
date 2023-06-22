@@ -138,43 +138,85 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids=None):
+    def context(self, hidden, cache_ids, start_ids):
+        context_length = hidden.shape[1]
+        current = 0
+        estimate = self.context_length_estimate
+        if estimate is not None:
+            hidden_context = hidden
+            cache_context = cache_ids
+
+            # Slice context that when it is too large
+            if context_length > estimate:
+                current = estimate
+                hidden_context = hidden[:, :estimate]
+                cache_context = cache_ids[:estimate]
+
+            # Cannot use context encoding for a context that is too small. This
+            # is because the caller must be aware of the cache-ids/start-ids
+            # used.
+            elif context_length < estimate:
+                current = 0
+
+            # Directly pass input to the context network when exactly sized
+            else:
+                current = estimate
+
+            if current == estimate:
+                logits = self.decoder_lm_head_for_context(hidden_context, cache_context, start_ids)
+
+        for i in range(current, context_length):
+            cache_ids = torch.as_tensor([i], dtype=torch.int32)
+            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids)
+
+        return logits
+
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
+
+        batch_size, context_length = input_ids.shape
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
         hidden = hidden.transpose(0, -1)
-        logits = decoder_lm_head(hidden, cache_ids, start_ids)
+
+        if context_length > 1:
+            logits = self.context(hidden, cache_ids, start_ids)
+        else:
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
         return logits
 
-    def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
-
-    def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
-
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        if self.context_length_estimate is None:
-            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+
+        # To enable optimized context encoding network, we must pad
+        # up to the context length estimate or we will not correctly
+        # select the final context logits (See: layers/transformer.py).
+        # This also means we need to shift the start_ids over to correct
+        # for padding.
+        offset = 0
+        if self.context_length_estimate:
+            batch_size, context_length = input_ids.shape
+            estimate = self.context_length_estimate
+            if context_length < self.context_length_estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=True)
+                offset = estimate - context_length
+                if start_ids is None:
+                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                start_ids += offset
+                sequence_length += offset
+
+        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
 
-        _, start = input_ids.shape
-        context_length = self.context_length_estimate
-        cache_ids = torch.arange(context_length, dtype=torch.int32)
-        input_context = input_ids[:, :context_length]
-        if start < context_length:
-            input_pad = context_length - start
-            input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
-        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
-        for cur_len in range(context_length, start):
-            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-            next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
-        return sampling.sample_loop(
-            self, input_ids, start_ids, next_token_scores, sequence_length,
-            eos_token_id=self.config.eos_token_id, top_k=top_k)
+        return result[:, offset:]
 
 
 def build_alibi_slopes(num_heads):
