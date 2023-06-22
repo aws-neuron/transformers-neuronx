@@ -92,6 +92,9 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         inputs = torch.gather(topk_indices, 1, inputs_in_topk)
         tokens.append(inputs)
 
+        if next_len >= sequence_length:
+            break
+
         # forward pass to get next token
         cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
