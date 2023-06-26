@@ -26,7 +26,7 @@ from transformers_neuronx import quantize
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=False):
+                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=True):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -89,8 +89,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         extras = []
         for param, dim, allow_pad in self.pre_layer_parameters:
             if allow_pad:
-                size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
-                param = utils.pad(param, dim, size)
+                if param.shape[dim] % self.tp_degree != 0:
+                    size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                    param = utils.pad(param, dim, size)
             extras.append(manipulator.duplicate_or_shard_along(param, dim))
         self.pre_layer_parameters = extras
 
