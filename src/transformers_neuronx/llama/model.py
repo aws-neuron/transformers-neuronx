@@ -52,6 +52,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
+        head_dim = config.hidden_size // config.num_attention_heads
+        position_ids = torch.arange(config.max_position_embeddings)
+        positional_embedding = rotary_embedding(head_dim, head_dim, position_ids)
+        self.head_dim = head_dim
+        self.positional_embedding = positional_embedding.reshape([-1, head_dim * head_dim])
 
     def to_neuron(self):
 
@@ -105,10 +110,10 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
         # TODO: Move embedding and rotary embedding to Neuron
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-        pos_embd = rotary_embedding(head_dim, head_dim, cache_ids)
+        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        pos_embd = torch.nn.functional.embedding(position_ids, self.positional_embedding)
+        pos_embd = pos_embd.view([-1, self.head_dim, self.head_dim])
 
-        start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
         hidden = hidden.transpose(0, -1)
         logits = decoder_lm_head(hidden, pos_embd, cache_ids, start_ids)
         logits = logits.to(torch.float32)
@@ -146,8 +151,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
 
 def rotary_embedding(dim, head_dim, cache_ids, base=10000):
-
-    # TODO: Support start_id masking for left padded sequences
 
     embs = []
 
