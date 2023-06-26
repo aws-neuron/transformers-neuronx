@@ -313,7 +313,7 @@ class OPTForSamplingNoEmbeddingHlo:
         max_ctx_plus_n_active_tokens, _, n_groups, d_head = cached_keys.sizes
         n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
         n_heads_per_group = n_heads_tp // n_groups
-        attn_size = hidden_size // self.tp_degree
+        attn_size = n_heads_tp * d_head
         hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
         active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
         active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
