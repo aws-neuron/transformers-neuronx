@@ -17,6 +17,7 @@ import operator
 
 from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx import utils
 
 
 def layer_norm(hidden, weight, bias):
@@ -750,8 +751,6 @@ def reduce_mean(tensor, dims, keepdim=False):
     return value
 
 
-
-
 def cumsum(tensor, dim):
 
     dtype = tensor.dtype
@@ -791,3 +790,131 @@ def cast(value, dtype):
     if value.dtype != dtype:
         return dtype[value.sizes].Convert(value)
     return value
+
+
+def slice_along(tensor, dim, limit, start=0):
+    """
+    Slice along a dimension.
+    """
+    dimensions = [
+        dict(start=0, limit=size, stride=1) for size in tensor.sizes
+    ]
+    dimensions[dim] = dict(start=start, limit=limit, stride=1)
+
+    sizes = list(tensor.sizes)
+    sizes[dim] = limit - start
+
+    return tensor.dtype[sizes].Slice(
+        tensor,
+        slice_dimensions=dimensions
+    )
+
+
+def _topk(tensor, dim, k):
+    """
+    Performs topk on a single partition.
+    """
+    scribe = tensor.scribe
+    u32 = scribe.u32
+    dtype = tensor.dtype
+
+    sizes = list(tensor.sizes)
+    sizes[dim] = k
+
+    results = scribe.tuple(dtype[sizes], u32.dtype[sizes]).CustomCall(
+        tensor,
+        custom_call_target='AwsNeuronTopK',
+        backend_config=str(k).encode(),
+    )
+
+    value = dtype[sizes].GetTupleElement(results, tuple_index=0)
+    index = u32[sizes].GetTupleElement(results, tuple_index=1)
+    return value, index
+
+
+def topk(tensor, dim, k=50, tp_degree=1):
+    """
+    Get the top `k` values and indices along a dimension.
+
+    Implementation Notes:
+    ---------------------
+    - The `k` value must be a multiple of 8 for compilation correctness.
+      Correct for this by padding up to nearest multiple and then slice at the
+      end.
+    - The `k` value may not be larger than tensor.shape[dim]. The dimension size
+      may be smaller than anticipated with large tensor parallel degrees.
+    """
+
+    # Output slicing helper
+    output_k = k
+    def trim(tensor):
+        if tensor.sizes[dim] == output_k:
+            return tensor
+        return slice_along(tensor, dim, output_k)
+
+    # Compiler requirement: Ensure k is a factor of 8
+    k = utils.round_up_to_divisor(k, 8)
+
+    # When tensor sizes are small, gather first
+    if k > tensor.sizes[dim] and tp_degree > 1:
+        tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
+        # TODO: If tensor size is still smaller than k after all_gather, we may run into a compiler error
+        tp_degree = 1
+
+    # Initial reduction
+    value, index = _topk(tensor, dim, k)
+
+    # Early exit if not doing a tensor parallel computation
+    if tp_degree == 1:
+        return trim(value), trim(index)
+
+    # Combine initial reduction from all ranks
+    value = all_gather(value, dim=dim, tp_degree=tp_degree)
+    index = all_gather(index, dim=dim, tp_degree=tp_degree)
+
+    # Correct index so that it is global
+    dtype = index.dtype
+    sizes = index.sizes
+    rank_size = dtype.Constant(constant_value=tensor.sizes[dim])
+    rank_size_br = dtype[sizes].Broadcast(rank_size, dimensions=[])
+    k_size = dtype.Constant(constant_value=k)
+    k_size_br = dtype[sizes].Broadcast(k_size, dimensions=[])
+    iota = dtype[sizes].Iota(dimensions=[dim])
+    group_id = dtype[sizes].Divide(iota, k_size_br)
+    offset = dtype[sizes].Multiply(group_id, rank_size_br)
+    index = dtype[sizes].Add(index, offset)
+
+    # Find the final global index
+    value, replica_index = _topk(value, dim, k)
+
+    # Get the real indices
+    index = gather(index, dim, replica_index)
+
+    return trim(value), trim(index)
+
+
+def multinomial(probabilities, dim):
+    """
+    Single sample multinomial selection along a dimension.
+    """
+    scribe = probabilities.scribe
+    dtype = probabilities.dtype
+    pred = scribe.pred
+    u32 = scribe.u32
+
+    cumprob = cumsum(probabilities, dim)
+
+    minimum = dtype.Constant(constant_value=0)
+    maximum = dtype.Constant(constant_value=1)
+    sizes = list(probabilities.sizes)
+    sizes.pop(dim)
+    uniform = dtype[sizes].Rng(minimum, maximum, distribution=1) # Uniform distribution
+
+    dims = list(range(len(probabilities.sizes)))
+    dims.pop(dim)
+    uniform = dtype[probabilities.sizes].Broadcast(uniform, dimensions=dims)
+
+    cmp = pred[probabilities.sizes].Compare(uniform, cumprob, comparison_direction='GT')
+    result = cast(cmp, u32)
+    summation = reduce_sum(result, dim, keepdim=True)
+    return summation
