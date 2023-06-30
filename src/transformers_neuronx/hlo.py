@@ -316,7 +316,6 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     active_mask = pred[sizes].Compare(position_ids_br, start_ids_br, comparison_direction='GE')
     return mask, active_mask
 
-
 class ParameterBuilder:
 
     def __init__(self, dtype):
@@ -346,6 +345,71 @@ def decoder_attention_mask_legacy(position_ids, dtype, n_positions):
     return dtype[sizes].Multiply(mask, triu)
 
 
+def legalize_cache_ids(cache_ids):
+    """
+    Updates cache ids with valid indices and returns the final non-padding
+    position.
+
+    This function allows the `cache_id` tensor to be 0 padded without
+    updating incorrect cache lines. This does so by inserting linear ids
+    into the pad values. This also computes the last non-padding cache
+    id position so that the index can be used during hidden state selection.
+
+    This function assumes that the non-padded portion of the `cache_ids` input
+    begins at tensor position 0 and is linearly increasing.
+
+    Examples:
+
+    | Scenario                 | input          | cache_ids        | index |
+    |--------------------------|----------------|------------------|-------|
+    | Padded Prompt Encoding   | [14, 15, 0, 0] | [14, 15, 16, 17] | 1     |
+    | Unpadded Prompt Encoding | [5, 6, 7]      | [5, 6, 7]        | 2     |
+    | Token Generation         | [29]           | [29]             | 0     |
+
+    Arguments:
+        cache_ids: The cache ids to update the cache for (may be padded)
+
+    Returns:
+        cache_ids: The original cache_ids with padding removed
+        index: The index of the maximum valid cache id
+    """
+    dtype = cache_ids.dtype
+    sizes = cache_ids.sizes
+
+    # During token generation, do not compute the end index
+    if sizes[0] == 1:
+        return cache_ids, dtype.Constant(constant_value=0)
+
+    value = reduce_max(cache_ids, 0)
+    index = argmax(cache_ids, 0)
+    index = cast(index, dtype)
+
+    positions = dtype[sizes].Iota(dimensions=[0])
+    value_br = dtype[sizes].Broadcast(value, dimensions=[])
+    index_br = dtype[sizes].Broadcast(index, dimensions=[])
+
+    offset = dtype[sizes].Subtract(positions, index_br)
+    cache_ids = dtype[sizes].Add(value_br, offset)
+
+    return cache_ids, index
+
+
+def dtype_minimum(dtype):
+    scribe = dtype.scribe
+    minimums = {
+         scribe.s64: -2 ** 63,
+         scribe.s32: -2 ** 31,
+         scribe.s16: -2 ** 15,
+         scribe.s8: -2 ** 7,
+         scribe.u64: 0,
+         scribe.u32: 0,
+         scribe.u16: 0,
+         scribe.u8: 0,
+         scribe.pred: False,
+    }
+    return minimums.get(dtype, float('-inf'))
+
+
 def reduce_max(tensor, dim, keepdim=False):
 
     dtype = tensor.dtype
@@ -357,7 +421,7 @@ def reduce_max(tensor, dim, keepdim=False):
         p1 = dtype.Parameter(parameter_number=1)
         return dtype.Maximum(p0, p1)
 
-    minimum = dtype.Constant(constant_value=float('-inf')) # XXX: Does not handle integer min value
+    minimum = dtype.Constant(constant_value=dtype_minimum(dtype))
     value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=[dim], to_apply=reducer)
 
     if keepdim:
