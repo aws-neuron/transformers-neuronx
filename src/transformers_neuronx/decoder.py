@@ -22,6 +22,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import utils
 from transformers_neuronx import quantize
+from concurrent.futures import ThreadPoolExecutor
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
@@ -802,8 +803,13 @@ class DecoderProgram:
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
+
+        # Compile modules in parallel
+        with ThreadPoolExecutor(max_workers=None) as executor:
+            for kernel in self.kernels:
+                executor.submit(kernel.build)
+
         for kernel in self.kernels:
-            kernel.build()
             kernel.load()
 
     def get_neff_bytes(self):
