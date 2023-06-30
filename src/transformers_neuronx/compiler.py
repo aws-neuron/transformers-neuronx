@@ -52,7 +52,7 @@ def build_parallel_kernel(hlo_module, tp_degree):
     return kernel
 
 
-def compile_hlo_module(hlo_module, tag):
+def compile_hlo_module(hlo_module, tag=None):
     hash = get_hash_module(hlo_module)
     # By default cache is on since hash of HLO is used to store neff and no collision can occur
     cache = os.environ.get('NEURONX_CACHE', 'on')
