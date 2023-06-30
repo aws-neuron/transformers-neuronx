@@ -41,10 +41,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
         if unroll is None:
             unroll = config.num_hidden_layers
-        self.n_positions_list = utils.power_of_two_bucket_sizes(32, n_positions)
-
-        if n_positions > config.max_position_embeddings:
-            raise ValueError(f"sequence-length [{n_positions}] should be less than or equal to max_position_embeddings [{config.max_position_embeddings}]")
+        # Bucket sizes below 128 do not provide significant latency benefit and add bucket switching overhead
+        self.n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
         
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
@@ -56,7 +54,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
         head_dim = config.hidden_size // config.num_attention_heads
-        position_ids = torch.arange(config.max_position_embeddings)
+        position_ids = torch.arange(n_positions)
         positional_embedding = rotary_embedding(head_dim, head_dim, position_ids)
         self.head_dim = head_dim
         self.positional_embedding = positional_embedding.reshape([-1, head_dim * head_dim])
