@@ -806,8 +806,8 @@ class DecoderProgram:
 
         # Compile modules in parallel
         with ThreadPoolExecutor(max_workers=None) as executor:
-            for kernel in self.kernels:
-                executor.submit(kernel.build)
+            for kernel, bucket_size in zip(self.kernels, self.n_positions_list):
+                executor.submit(kernel.build, bucket_size)
 
         for kernel in self.kernels:
             kernel.load()
