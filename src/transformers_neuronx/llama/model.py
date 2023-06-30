@@ -43,6 +43,9 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             unroll = config.num_hidden_layers
         self.n_positions_list = utils.power_of_two_bucket_sizes(32, n_positions)
 
+        if n_positions > config.max_position_embeddings:
+            raise ValueError(f"sequence-length [{n_positions}] should be less than or equal to max_position_embeddings [{config.max_position_embeddings}]")
+        
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
             config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
