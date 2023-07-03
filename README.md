@@ -129,11 +129,11 @@ of NeuronCores participating in sharded matrix multiply operations) for
 Neuron-optimized transformer decoder models.
 
 1. The number of attention heads needs to be divisible by the
-   tensor-parallelism degree.
+   tensor-parallelism degree. (Not apply to GPT2, OPT and BLOOM, with 1-axis padding).
 2. The total data size of model weights and key-value caches needs to be
    smaller than 16 GB times the tensor-parallelism degree.
 3. Currently, the Neuron runtime supports tensor-parallelism degrees 1,
-   2, 8, and 32 on Trn1 and supports tensor-parallelism degrees 1, 2, 4,
+   2, 8, 16 and 32 on Trn1 and supports tensor-parallelism degrees 1, 2, 4,
    8, and 24 on Inf2.
 
 Some examples:
@@ -417,7 +417,8 @@ for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xl
 -  [GPT2](https://huggingface.co/docs/transformers/model_doc/gpt2)
 -  [GPT-J](https://huggingface.co/docs/transformers/model_doc/gptj)
 -  [OPT](https://huggingface.co/docs/transformers/model_doc/opt)
-
+-  [GPT-Neox [Experimental]](https://huggingface.co/docs/transformers/model_doc/gpt_neox)
+-  [Bloom [Experimental]](https://huggingface.co/docs/transformers/model_doc/bloom)
 
 # Upcoming features
 
