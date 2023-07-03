@@ -6,6 +6,7 @@ Date: 2023-07-03
 
 - [Experimental] Added support for GPT-NeoX models.
 - [Experimental] Added support for BLOOM models.
+- [Experimental] Added support for LLaMA models.
 - Added support for more flexible tensor-parallel configurations to GPT2, OPT, and BLOOM. Previously, we had two constraints on `tp_degree`: 1) The attention heads needs to be evenly divisible by `tp_degree` 2) The `tp_degree` needs to satisfy the runtime topologies constraint for collective communication (i.e Allreduce). For more details on supported topologies, see: [Tensor-parallelism support](README.md#tensor-parallelism-support) and https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/collective-communication.html. We now get rid of 1) by using 1-axis padding.
 - Added multi-query / multi-group attention support for GPT2.
 
