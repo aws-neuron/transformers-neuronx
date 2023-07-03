@@ -1,3 +1,23 @@
+# Transformers Neuron 0.5.0 Release Notes
+
+Date: 2023-07-03
+
+## What's New?
+
+- [Experimental] Added support for GPT-NeoX models.
+- [Experimental] Added support for BLOOM models.
+- Added support for more flexible tensor-parallel configurations to GPT2, OPT, and BLOOM. Previously, we had two constraints on `tp_degree`: 1) The attention heads needs to be evenly divisible by `tp_degree` 2) The `tp_degree` needs to satisfy the runtime topologies constraint for collective communication (i.e Allreduce). For more details on supported topologies, see: [Tensor-parallelism support](README.md#tensor-parallelism-support) and https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/collective-communication.html. We now get rid of 1) by using 1-axis padding.
+- Added multi-query / multi-group attention support for GPT2.
+
+## Bug Fixes
+
+- Resolved accuracy issues which caused incorrect output.
+- Resolved an issue where NaN values could be produced when the context_length argument was used in GPT2/OPT.
+
+## Known Issues and Limitations
+
+- Missing cache reorder support for beam search. 
+
 # Transformers Neuron 0.4.0 Release Notes
 
 Date: 2023-06-12
