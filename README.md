@@ -419,7 +419,7 @@ for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xl
 -  [OPT](https://huggingface.co/docs/transformers/model_doc/opt)
 -  [GPT-Neox [Experimental]](https://huggingface.co/docs/transformers/model_doc/gpt_neox)
 -  [Bloom [Experimental]](https://huggingface.co/docs/transformers/model_doc/bloom)
--  [LLaMA [Experimental]](https://huggingface.co/docs/transformers/main/model_doc/llama)
+-  [LLaMA [Prototype]](https://huggingface.co/docs/transformers/main/model_doc/llama)
 
 # Upcoming features
 
