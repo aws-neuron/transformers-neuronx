@@ -21,7 +21,8 @@ def query_key_value(
     k_weight, k_scales, k_bias,
     v_weight, v_scales, v_bias,
     d_head,
-    neuron_config=None
+    neuron_config=None,
+    n_groups=0,
 ):
     """
     Self-attention input projections.
@@ -29,28 +30,38 @@ def query_key_value(
     Q = (hidden @ wQ) + bQ
     K = (hidden @ wK) + bK
     V = (hidden @ wV) + bV
+
+    groups = 0 outputs shapes [n_active_tokens, n_seqs, n_heads_tp, d_head]
+    groups != 0 outputs shapes [n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head] (query)
+    and [n_active_tokens, n_seqs, n_groups, d_head] (key/value)
     """
     dtype = hidden.dtype
     hidden_size, n_active_tokens, n_seqs = hidden.sizes
     hidden_size, d_head_tp = q_weight.sizes
     n_heads_tp = d_head_tp // d_head
-
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-    active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
 
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
 
     # Q = (hidden @ wQ) + bQ
     active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
-    active_q = dtype[active_sizes].Reshape(active_q)
-
     # K = (hidden @ wK) + bK
     active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
-    active_k = dtype[active_sizes].Reshape(active_k)
-
     # V = (hidden @ wV) + bV
     active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
-    active_v = dtype[active_sizes].Reshape(active_v)
+
+    if n_groups == 0:
+        active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+        active_q = dtype[active_sizes].Reshape(active_q)
+        active_k = dtype[active_sizes].Reshape(active_k)
+        active_v = dtype[active_sizes].Reshape(active_v)
+    else:       
+        n_heads_per_group = n_heads_tp // n_groups
+        active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
+        active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
+        active_q = dtype[active_q_sizes].Reshape(active_q)
+        active_k = dtype[active_kv_sizes].Reshape(active_k)
+        active_v = dtype[active_kv_sizes].Reshape(active_v)
 
     return active_q, active_k, active_v
 
@@ -126,16 +137,34 @@ def score(query, keys):
     scribe = query.scribe
     pred = scribe.pred
 
-    n_active_tokens, n_seqs, n_heads_tp, d_head = query.sizes
-    n_positions, n_seqs, n_heads_tp, d_head = keys.sizes
+    # Check for multi-query attention
+    if len(query.sizes) == 5:
+        n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head = query.sizes
+        n_positions, n_seqs, n_groups, d_head = keys.sizes
+        size_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, n_positions
+        size_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_positions
+        n_heads_tp = n_groups * n_heads_per_group
+        lhs_contract_dim = 4
+    else:
+        n_active_tokens, n_seqs, n_heads_tp, d_head = query.sizes
+        n_positions, n_seqs, n_heads_tp, d_head = keys.sizes
+        size_dot = n_seqs, n_heads_tp, n_active_tokens, n_positions
+        lhs_contract_dim = 3
+
     size = n_seqs, n_heads_tp, n_active_tokens, n_positions
 
     # Q @ K
-    dot_dims = dict(lhs_contracting_dimensions=[3],
+    dot_dims = dict(lhs_contracting_dimensions=[lhs_contract_dim],
                     lhs_batch_dimensions=[1, 2],
                     rhs_contracting_dimensions=[3],
                     rhs_batch_dimensions=[1, 2])
-    result = dtype[size].Dot(query, keys, dot_dimension_numbers=dot_dims)
+    result_dot = dtype[size_dot].Dot(query, keys, dot_dimension_numbers=dot_dims)
+
+    if len(query.sizes) == 5:
+        result_permute = dtype[size_permute].Transpose(result_dot, dimensions=[0, 1, 3, 2, 4])
+        result = dtype[size].Reshape(result_permute)
+    else:
+        result = result_dot
 
     return result
 
