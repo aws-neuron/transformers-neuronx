@@ -590,6 +590,14 @@ def all_reduce_sum(tensor, tp_degree):
     )
 
 
+def squeeze(tensor, dim):
+    assert tensor.sizes[dim] == 1
+    dtype = tensor.dtype
+    size = list(tensor.sizes)
+    size.pop(dim)
+    return dtype[size].Reshape(tensor)
+
+
 def unsqueeze(tensor, dim):
     size = list(tensor.sizes)
     dim %= len(size) + 1  # Handle negative sizes
@@ -751,7 +759,7 @@ def _embedding(weight, index):
     )
 
     # Reshape embedding tensor to look like the original index shape
-    return dtype[(*index.sizes, embedding_dim)].Reshape(result)
+    return dtype[(embedding_dim, *index.sizes)].Reshape(result)
 
 
 def embedding(weight, index, tp_degree=1, dim=1):
@@ -830,7 +838,7 @@ def embedding(weight, index, tp_degree=1, dim=1):
 
     # Case 3: Partitioned embedding: Concatenate embedding pieces
     if dim == 1:
-        return all_gather(result, dim, tp_degree=tp_degree)
+        return all_gather(result, 0, tp_degree=tp_degree)
 
     raise NotImplementedError(
         f'Embedding operation does not support dim={dim}'
@@ -983,16 +991,49 @@ def slice_along(tensor, dim, limit, start=0):
     )
 
 
-def _topk(tensor, dim, k):
+def pad(tensor, dim, size, value=0):
+    rank = len(tensor.sizes)
+    dtype = tensor.dtype
+
+    dimensions = [dict(edge_padding_low=0, edge_padding_high=0, interior_padding=0)] * rank
+    dimensions[dim] = dict(edge_padding_low=0, edge_padding_high=size, interior_padding=0)
+
+    sizes = list(tensor.sizes)
+    sizes[dim] += size
+
+    padding = dtype.Constant(constant_value=value)
+    return dtype[sizes].Pad(tensor, padding, padding_config=dict(dimensions=dimensions))
+
+
+def transpose(tensor, src, dst):
+    size = list(tensor.sizes)
+    size[src] = tensor.sizes[dst]
+    size[dst] = tensor.sizes[src]
+    dimensions = list(range(len(size)))
+    dimensions[src] = dst
+    dimensions[dst] = src
+    return tensor.dtype[size].Transpose(tensor, dimensions=dimensions)
+
+
+def _topk(tensor, k):
     """
-    Performs topk on a single partition.
+    Performs top-k on a single partition on the last dimension
     """
     scribe = tensor.scribe
     u32 = scribe.u32
     dtype = tensor.dtype
 
     sizes = list(tensor.sizes)
-    sizes[dim] = k
+    sizes[-1] = k
+
+    assert k <= tensor.sizes[-1], f'Cannot perform topk when k ({k}) is larger than the tensor size ({tensor.sizes[-1]})'
+
+    # Compiler requirement: Ensure input top-k dim is a factor of 8
+    size = tensor.sizes[-1]
+    padded_size = utils.round_up_to_divisor(size, 8)
+    if padded_size != size:
+        padding = padded_size - size
+        tensor = pad(tensor, -1, padding, value=dtype_minimum(tensor.dtype))
 
     results = scribe.tuple(dtype[sizes], u32.dtype[sizes]).CustomCall(
         tensor,
@@ -1002,73 +1043,138 @@ def _topk(tensor, dim, k):
 
     value = dtype[sizes].GetTupleElement(results, tuple_index=0)
     index = u32[sizes].GetTupleElement(results, tuple_index=1)
+
     return value, index
+
+
+def full_like(tensor, value):
+    dtype = tensor.dtype
+    size = tensor.sizes
+    result = dtype.Constant(constant_value=value)
+    result = dtype[size].Broadcast(result, dimensions=[])
+    return result
+
+
+def all_reduce_max(tensor, tp_degree=1):
+    size = tensor.sizes
+    dtype = tensor.dtype
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Maximum(p0, p1)
+
+    return dtype[size].AllReduce(
+        tensor,
+        replica_groups=[list(range(tp_degree))],
+        to_apply=reducer
+    )
+
+
+def all_reduce_max_with_indices(tensor, index, tp_degree=1):
+    """
+    Select the maximum value and its associated index across ranks.
+
+    NOTE: This does NOT automatically correct the index tensor to be globally
+          valid. This must be done in the calling code since we do not know
+          which dimension the index refers to here.
+    """
+    size = tensor.sizes
+    scribe = tensor.scribe
+    pred = scribe.pred
+
+    assert tensor.sizes == index.sizes
+
+    # Find maximum value across ranks
+    maximum = all_reduce_max(tensor, tp_degree)
+
+    # Zero out all rank-local indices which do not correspond global maximum
+    mask = pred[size].Compare(tensor, maximum, comparison_direction='EQ')
+    zero = full_like(tensor, 0)
+    index = index.dtype[index.sizes].Select(mask, index, zero)
+
+    # Reduce masked indices from across ranks (Note: Max instead of sum due to potential duplicate values)
+    index = all_reduce_max(index, tp_degree)
+
+    return maximum, index
 
 
 def topk(tensor, dim, k=50, tp_degree=1):
     """
-    Get the top `k` values and indices along a dimension.
+    Get the top-k values and indices along a dimension.
 
     Implementation Notes:
     ---------------------
-    - The `k` value must be a multiple of 8 for compilation correctness.
-      Correct for this by padding up to nearest multiple and then slice at the
-      end.
     - The `k` value may not be larger than tensor.shape[dim]. The dimension size
       may be smaller than anticipated with large tensor parallel degrees.
+    - Top-k instruction may only be invoked on the final dimension.
+    - The input `tensor` size along dimension `dim` must be a multiple of 8
+    - The input `tensor` may not be 1d. The compiler will fail.
     """
+    scribe = tensor.scribe
+    f32 = scribe.f32
 
-    # Output slicing helper
-    output_k = k
-    def trim(tensor):
-        if tensor.sizes[dim] == output_k:
-            return tensor
-        return slice_along(tensor, dim, output_k)
+    rank = len(tensor.sizes)
+    if dim < 0:
+        dim %= rank
 
-    # Compiler requirement: Ensure k is a factor of 8
-    k = utils.round_up_to_divisor(k, 8)
+    original = None
+    if dim != rank - 1:
+        original = dim
+        dim = rank - 1
 
-    # When tensor sizes are small, gather first
+    # Helper function to reformat outputs
+    def output(value, index):
+        if original is not None:
+            value = transpose(value, dim, original)
+            index = transpose(index, dim, original)
+        return value, index
+
+    # Compiler may only perform top-k on the last dimension
+    if original is not None:
+        tensor = transpose(tensor, dim, original)
+
+    # Heuristic: When tensor sizes are small, gather first
     if k > tensor.sizes[dim] and tp_degree > 1:
-        tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
-        # TODO: If tensor size is still smaller than k after all_gather, we may run into a compiler error
+        tensor = all_gather(tensor, dim=1, tp_degree=tp_degree)
         tp_degree = 1
 
     # Initial reduction
-    value, index = _topk(tensor, dim, k)
+    value, index = _topk(tensor, k)
 
     # Early exit if not doing a tensor parallel computation
     if tp_degree == 1:
-        return trim(value), trim(index)
+        return output(value, index)
+
+    rank_size = f32.Constant(constant_value=tensor.sizes[dim])
 
     # Combine initial reduction from all ranks
     value = all_gather(value, dim=dim, tp_degree=tp_degree)
     index = all_gather(index, dim=dim, tp_degree=tp_degree)
 
-    # Correct index so that it is global
+    # Correct index so that it is global. Note: Use f32 computation to avoid compiler issue
     dtype = index.dtype
     sizes = index.sizes
-    rank_size = dtype.Constant(constant_value=tensor.sizes[dim])
-    rank_size_br = dtype[sizes].Broadcast(rank_size, dimensions=[])
-    k_size = dtype.Constant(constant_value=k)
-    k_size_br = dtype[sizes].Broadcast(k_size, dimensions=[])
-    iota = dtype[sizes].Iota(dimensions=[dim])
-    group_id = dtype[sizes].Divide(iota, k_size_br)
+    rank_size_br = f32[sizes].Broadcast(rank_size, dimensions=[])
+    k_size = f32.Constant(constant_value=k)
+    k_size_br = f32[sizes].Broadcast(k_size, dimensions=[])
+    iota = f32[sizes].Iota(dimensions=[dim])
+    group_id = f32[sizes].Divide(iota, k_size_br)
+    group_id = dtype[sizes].Convert(group_id)
     offset = dtype[sizes].Multiply(group_id, rank_size_br)
     index = dtype[sizes].Add(index, offset)
 
     # Find the final global index
-    value, replica_index = _topk(value, dim, k)
+    value, replica_index = _topk(value, k)
 
     # Get the real indices
     index = gather(index, dim, replica_index)
-
-    return trim(value), trim(index)
+    return output(value, index)
 
 
 def multinomial(probabilities, dim):
     """
-    Single sample multinomial selection along a dimension.
+    Single sample multinomial selection along a dimension
     """
     scribe = probabilities.scribe
     dtype = probabilities.dtype
@@ -1148,4 +1254,27 @@ def literal(dtype, tensor):
             ),
         },
     )
+
+
+def select(tensor, dim, index, keepdim=False):
+    """
+    Selects a value for a single index along a dimension.
+    """
+    assert index.sizes[dim] == 1
+    assert len(tensor.sizes) == len(index.sizes)
+
+    scribe = tensor.scribe
+    pred = scribe.pred
+    size = tensor.sizes
+    dtype = tensor.dtype
+
+    iota = index.dtype[size].Iota(dimensions=[dim])
+    index_br = index.dtype[size].Broadcast(index, dimensions=list(range(len(index.sizes))))
+    mask = pred[size].Compare(iota, index_br, comparison_direction='EQ')
+    mask = cast(mask, dtype)
+
+    masked = dtype[size].Multiply(mask, tensor)
+    result = reduce_sum(masked, dim)
+    if keepdim:
+        result = unsqueeze(result, dim)
     return result
