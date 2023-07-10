@@ -27,6 +27,7 @@ from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
 from torch_neuronx.proto import metaneff_pb2
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
+from neuronxcc import __version__ as compiler_version
 
 def get_hash_module(hlo_module):
     # Hashing is pretty fast and neglegible compared to compilation time
@@ -55,12 +56,12 @@ def build_parallel_kernel(hlo_module, tp_degree):
 def compile_hlo_module(hlo_module, tag=None):
     hash = get_hash_module(hlo_module)
     # By default cache is on since hash of HLO is used to store neff and no collision can occur
-    cache = os.environ.get('NEURONX_CACHE', 'on')
+    cache = os.environ.get('NEURONX_CACHE', 'off')
     # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
     if tag is None:
-        hlo_module_name = f'{hlo_module.name}.{hash}'
+        hlo_module_name = f'{hlo_module.name}.{compiler_version}.{hash}'
     else:
-        hlo_module_name = f'{hlo_module.name}.{tag}.{hash}'
+        hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
     
     default_dump = os.path.join("/tmp", hlo_module_name)
     dump_to = os.environ.get('NEURONX_DUMP_TO', default_dump)
