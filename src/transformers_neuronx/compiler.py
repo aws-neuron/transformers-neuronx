@@ -29,10 +29,11 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from neuronxcc import __version__ as compiler_version
 
-def get_hash_module(hlo_module):
+def get_hash_module(hlo_module, flags):
     # Hashing is pretty fast and neglegible compared to compilation time
     hash_gen = hashlib.sha256()
-    hash_gen.update(str(hlo_module).encode('utf-8'))
+    text = str(hlo_module) + flags.replace(" ", "")
+    hash_gen.update(text.encode('utf-8'))
     hash = str(hash_gen.hexdigest())[:20]
     return hash
 
@@ -54,7 +55,8 @@ def build_parallel_kernel(hlo_module, tp_degree):
 
 
 def compile_hlo_module(hlo_module, tag=None):
-    hash = get_hash_module(hlo_module)
+    flags = os.environ.get('NEURON_CC_FLAGS', '')
+    hash = get_hash_module(hlo_module, flags)
     # By default cache is on since hash of HLO is used to store neff and no collision can occur
     cache = os.environ.get('NEURONX_CACHE', 'off')
     # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
@@ -76,8 +78,7 @@ def compile_hlo_module(hlo_module, tag=None):
     if not os.path.isfile(neff_path) or cache != 'on':
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
                         hlo_module_path, f'--output={neff_path}', '--verbose=35']
-        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-        flags = os.environ.get('NEURON_CC_FLAGS', '')
+        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])        
         flags = shlex.split(flags)
         command_line.extend(flags)
         subprocess.check_call(command_line, cwd=dump_to)
