@@ -54,6 +54,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.pre_layer_parameters = []
         self.pre_layer_builder = None
         self.allow_pad = allow_pad
+        self.use_executor = False
+        self.return_ranks = -1
+
+    def enable_executor(self, return_ranks=-1):
+        self.use_executor = True
+        self.return_ranks = return_ranks
+        self.program.enable_executor()
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
@@ -125,7 +132,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             unroll = self.unroll
         new = DecoderLmHeadForSamplingNoEmbedding(
             self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config
+            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad
         )
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
@@ -160,6 +167,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if sequence_length % self.n_active_tokens:
             raise ValueError(f'sequence_length={sequence_length} cannot be divided by '
                              f'n_active_tokens={self.n_active_tokens}')
+        outputs = None
         for start in range(0, sequence_length, self.n_active_tokens):
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
@@ -176,9 +184,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             if self.program.find_bucket_id(min_id) != bucket_id:
                 raise ValueError(f'given buckets {self.n_positions_list}, ids ranging from '
                                  f'{min_id} to {max_id} do not fall into the same bucket')
-            self.program.inputs_host_to_device(input_tensors)
-            self.program.run(bucket_id)
-        return self.program.logits_device_to_host()
+            if self.use_executor:
+                outputs = self.program.execute(bucket_id, *input_tensors, return_ranks=self.return_ranks)
+            else:
+                self.program.inputs_host_to_device(input_tensors)
+                self.program.run(bucket_id)
+
+        if not self.use_executor:
+            outputs = self.program.logits_device_to_host()
+        return outputs
 
     def embed_positions_ids(self, position_ids, start_ids=None):
         batch_size = self.batch_size
@@ -862,8 +876,41 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
             input_tensors.extend(ln_lm_head_params)
             memory.setup(input_tensors, output_tensors)
 
+    def enable_executor(self):
+        for kernel, memory in zip(self.kernels, self.memories):
+            input_tensors = [*self.input_buffers]
+            output_tensors = [self.logits_buffer]
+            kernel.build_executor(memory, input_tensors, output_tensors)
+
     def run(self, bucket_id):
         self.kernels[bucket_id](self.memories[bucket_id])
+
+    def execute(self, bucket_id, *inputs, return_ranks=-1):
+        """
+        Execute a kernel with using the optimized ParallelExecutor.
+
+        This is an alternative to the `run` method which requires that an
+        executor has been constructed for each of the underlying kernels.
+
+        Arguments:
+            bucket_id: The kernel bucket to execute
+            inputs: The set of CPU tensors to copy to each model
+            return_ranks: The number of ranks to copy back to CPU
+        """
+        casted = []
+        for cpu, buf in zip(inputs, self.kernels[bucket_id].inputs):
+            if cpu.dtype != buf.dtype:
+                cpu = cpu.to(buf.dtype)
+            casted.append(cpu)
+        outputs = self.kernels[bucket_id].execute(casted, return_ranks)
+        if return_ranks == 1:
+            result = tuple(shards[0] for shards in outputs)
+        else:
+            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
+        if len(result) == 1:
+            return result[0]
+        return result
+
 
 
 class DecoderProgramMultiLayer(DecoderProgram):
