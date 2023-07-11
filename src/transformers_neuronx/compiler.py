@@ -244,13 +244,17 @@ class ParallelMemory:
 
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
         self.model = None
         self.hlo_snapshot = None
         self.generate_hlo_snapshot()
+        self.g_start_device_id = g_start_device_id
+        if g_device_count is None:
+            g_device_count = tp_degree
+        self.g_device_count = g_device_count
 
 
     def generate_hlo_snapshot(self, tensors=None):
@@ -287,7 +291,7 @@ class ParallelKernel:
         self.neff_bytes = compile_hlo_module(self.hlo_module)
 
     def load(self):
-        self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree)
+        self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         self.model.load()
 
     def __call__(self, memory):
