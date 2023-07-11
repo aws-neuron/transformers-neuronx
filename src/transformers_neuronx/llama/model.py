@@ -96,21 +96,53 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
 
-        if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
-                n_positions_list=[self.context_length_estimate],
-                n_active_tokens=self.context_length_estimate,
-                unroll=self.context_unroll,
-                share_caches=True,
-            )
+        """
+        Parallel context w/ multiple buckets:        
+                
+            1. [Default] we choose context length estimates to be half of bucket sizes for output token model            
+            2. Provided a list of context_length_estimate, a separate KVcache is generated for each bucket
+            3. If context_length_estimate <= 0, then parallel context encoding is not used at all
+        """
+        if self.context_length_estimate is None:
+            self.context_length_estimate = [x//2 for x in self.n_positions_list]
+            self.context_length_estimate.append(self.n_positions_list[-1])
+        elif isinstance(self.context_length_estimate, (list, tuple)):            
+            self.context_length_estimate = list(self.context_length_estimate)
+        elif self.context_length_estimate > 0:
+            self.context_length_estimate = [self.context_length_estimate]
+        else:
+            self.context_length_estimate = None
+
+        if self.context_length_estimate is not None:                        
+            self.decoder_lm_head_for_context = {
+                context_length_estimate: self.decoder_lm_head.build_weight_shared(
+                    n_positions_list=[context_length_estimate],
+                    n_active_tokens=context_length_estimate,
+                    unroll=self.context_unroll,
+                    share_caches=True,
+                ) 
+                for context_length_estimate in self.context_length_estimate}
 
     def reset(self):
         self.decoder_lm_head.reset()
 
+    def find_context_length_estimate(self, context_length):
+        if isinstance(self.context_length_estimate, list):
+            for context_length_estimate in self.context_length_estimate:
+                context_length = context_length_estimate
+                if context_length_estimate >= context_length:
+                    break
+            else:
+                context_length = self.context_length_estimate[-1]
+        else:
+            context_length = self.context_length_estimate
+        return context_length
+    
     def context(self, hidden, pos_embd, cache_ids, start_ids):
         context_length = hidden.shape[1]
         current = 0
-        estimate = self.context_length_estimate
+        estimate = self.find_context_length_estimate(context_length)
+
         if estimate is not None:
             hidden_context = hidden
             cache_context = cache_ids
@@ -134,7 +166,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
                 current = estimate
 
             if current == estimate:
-                logits = self.decoder_lm_head_for_context(hidden_context, pos_embd_context, cache_context, start_ids)
+                decoder_lm_head_for_context = self.decoder_lm_head_for_context[estimate]
+                logits = decoder_lm_head_for_context(hidden_context, pos_embd_context, cache_context, start_ids)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
@@ -176,10 +209,10 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         # This also means we need to shift the start_ids over to correct
         # for padding.
         offset = 0
-        if self.context_length_estimate:
-            batch_size, context_length = input_ids.shape
-            estimate = self.context_length_estimate
-            if context_length < self.context_length_estimate:
+        batch_size, context_length = input_ids.shape
+        estimate = self.find_context_length_estimate(context_length)
+        if estimate:
+            if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=True)
                 offset = estimate - context_length
                 if start_ids is None:
