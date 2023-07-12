@@ -34,7 +34,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        pos_embed = hidden_dtype[n_active_tokens, head_dim, head_dim].Parameter(parameter_number=1)
+        pos_embed = hidden_dtype[n_active_tokens, head_dim].Parameter(parameter_number=1)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=2)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=3)
 
@@ -119,8 +119,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             neuron_config=neuron_config,
         )
 
-        # Q = Q @ E
-        # K = K @ E
+        # Q = Rotate(Q)
+        # K = Rotate(K)
         query, key = attention.query_key_projection(query, key, pos_embed)
 
         # Q = Q / sqrt(d_head)
