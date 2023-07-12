@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer
+from transformers_neuronx.layers import attention, transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 
@@ -121,7 +121,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # Q = Rotate(Q)
         # K = Rotate(K)
-        query, key = attention.rotate_half(query, key, pos_embed)
+        query, key = rotary.rotate_half(query, key, pos_embed)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
