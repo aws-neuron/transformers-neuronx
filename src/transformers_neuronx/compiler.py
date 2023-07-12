@@ -65,8 +65,8 @@ def compile_hlo_module(hlo_module, tag=None):
     else:
         hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
     
-    default_dump = os.path.join("/tmp", hlo_module_name)
-    dump_to = os.environ.get('NEURONX_DUMP_TO', default_dump)
+    dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+    dump_to = os.path.join(dump_to, hlo_module_name)
     os.makedirs(dump_to, exist_ok=True)
 
     hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
