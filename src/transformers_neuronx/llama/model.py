@@ -55,9 +55,9 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head_for_context = None
         head_dim = config.hidden_size // config.num_attention_heads
         position_ids = torch.arange(n_positions)
-        positional_embedding = rotary_embedding(head_dim, head_dim, position_ids)
+        positional_embedding = rotary_embedding(head_dim, position_ids)
         self.head_dim = head_dim
-        self.positional_embedding = positional_embedding.reshape([-1, head_dim * head_dim])
+        self.positional_embedding = positional_embedding.reshape([-1, head_dim])
 
     def to_neuron(self):
 
@@ -230,33 +230,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         return result
 
 
-def rotary_embedding(dim, head_dim, cache_ids, base=10000):
-
-    embs = []
-
-    for offset in cache_ids:
-        seq_len = offset + 1
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
-        sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
-        sin = torch.sin(sinusoid_inp)
-        cos = torch.cos(sinusoid_inp)
-
-        # Stack sin and cos
-        sin = torch.cat((sin[None, offset:seq_len, None, :], sin[None, offset:seq_len, None, :]), dim=-1)
-        sin[..., : sin.shape[-1] // 2] *= -1 # multiply second half by -1
-        cos = torch.cat((cos[None, offset:seq_len, None, :], cos[None, offset:seq_len, None, :]), dim=-1)
-
-        sin_diag = torch.diagflat(sin)
-        cos_diag = torch.diagflat(cos)
-
-        # Swap halves
-        rotate = torch.eye(sin.shape[-1])
-        rotate[: sin.shape[-1] // 2, :], rotate[sin.shape[-1] // 2 :, :] = rotate[sin.shape[-1] // 2 :, :].clone(), rotate[: sin.shape[-1] // 2, :].clone()
-        sincos = torch.matmul(rotate, sin_diag) + cos_diag
-
-        # Only rotary_pct of this is used - we can optimize if necessary
-        pos_embd = torch.eye(head_dim)
-        pos_embd[:dim, :dim] = sincos
-        embs.append(pos_embd)
-
-    return torch.stack(embs, dim=0)
+def rotary_embedding(head_dim, cache_ids, base=10000):
+    seq_len = cache_ids.shape[0]
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))
+    sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
+    sin = torch.sin(sinusoid_inp)
+    cos = torch.cos(sinusoid_inp)
+    pos_embd = torch.cat((sin, cos), dim=-1)
+    return pos_embd

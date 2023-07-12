@@ -54,38 +54,87 @@ def query_key_value(
 
     return active_q, active_k, active_v
 
+def slice_along(tensor, dim, limit, start=0):
+    """
+    Slice a tensor along a dimension from start to limit
+    """
+    dimensions = [dict(start=0, limit=size, stride=1) for size in tensor.sizes]
+    dimensions[dim] = dict(start=start, limit=limit, stride=1)
+    sizes = list(tensor.sizes)
+    sizes[dim] = limit - start
+    return tensor.dtype[sizes].Slice(
+        tensor,
+        slice_dimensions=dimensions
+    )
 
-def query_key_projection(query, key, qk_weight):
+def get_up_down(q):
+    """
+    Given a tensor, returns its upper and lower halves (divided in the last dimension)
+    """
+    head_dim = q.sizes[-1]
+    q_up = slice_along(q, -1, head_dim//2)
+    q_down = slice_along(q, -1, head_dim, head_dim//2)
+    return q_up, q_down
+
+def ax_plus_by(a, x, b, y):
+    """
+    Calculates a * x + b * y
+    """
+    ax = a.dtype[a.sizes].Multiply(a, x)
+    by = b.dtype[b.sizes].Multiply(b, y)
+    ax_by = ax.dtype[ax.sizes].Add(ax, by)
+    return ax_by
+
+def ax_minus_by(a, x, b, y):
+    """
+    Calculates a * x - b * y
+    """
+    ax = a.dtype[a.sizes].Multiply(a, x)
+    by = b.dtype[b.sizes].Multiply(b, y)
+    ax_by = ax.dtype[ax.sizes].Subtract(ax, by)
+    return ax_by
+
+def rotate_vec(q, sin_r, cos_r):
+    """
+    Given vectors q, sin, and cos tables, apply rotation to vectors
+    """
+    q_up, q_down = get_up_down(q)
+    q_rot_up = ax_minus_by(cos_r, q_up, sin_r, q_down)
+    q_rot_down = ax_plus_by(cos_r, q_down, sin_r, q_up)
+    q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
+    return q_rot
+
+def query_key_projection(query, key, sin_cos):
     """
     A secondary projection to apply to input query/key projections (used in
     specific models: GPT-J/GPT-NeoX/Llama).
 
-    Q = Q @ W
-    K = K @ W
     """
     dtype = key.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = active_sizes = key.sizes
     active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
 
-    dot_dims = dict(
-        lhs_batch_dimensions=[0],
-        lhs_contracting_dimensions=[2],
-        rhs_batch_dimensions=[0],
-        rhs_contracting_dimensions=[1]
-    )
+    """
+        Vector approach:
+        | q_up cos - q_down sin |
+        | q_up sin + q_down cos |
+    """
+    # Rotate query and key
+    n_active_tokens, head_dim = sin_cos.sizes
+    sin_sizes = n_active_tokens, head_dim // 2        
+    broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head // 2
+    
+    # Get sin and cos as upper and lower half of input embedding
+    sin, cos = get_up_down(sin_cos)        
+    sin_r = dtype[broadcast_sizes].Broadcast(sin, dimensions=[0,3])
+    cos_r = dtype[broadcast_sizes].Broadcast(cos, dimensions=[0,3])
 
-    # Q = Q @ W
-    query = dtype[active_r_sizes].Reshape(query)
-    query = dtype[active_r_sizes].Dot(query, qk_weight, dot_dimension_numbers=dot_dims)
-    query = dtype[active_sizes].Reshape(query)
-
-    # K = K @ W
-    key = dtype[active_r_sizes].Reshape(key)
-    key = dtype[active_r_sizes].Dot(key, qk_weight, dot_dimension_numbers=dot_dims)
-    key = dtype[active_sizes].Reshape(key)
-
+    # Rotate query
+    query = rotate_vec(query, sin_r, cos_r)        
+    
+    # Rotate key
+    key = rotate_vec(key, sin_r, cos_r)
     return query, key
-
 
 def update_cache(cache, cache_ids, values):
     """
