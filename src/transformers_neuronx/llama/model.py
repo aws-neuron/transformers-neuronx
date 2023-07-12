@@ -22,6 +22,7 @@ from transformers_neuronx import utils
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
+from transformers_neuronx.layers.rotary import rotary_embedding
 
 
 class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
@@ -229,12 +230,3 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             result = result[:, offset:]
         return result
 
-
-def rotary_embedding(head_dim, cache_ids, base=10000):
-    seq_len = cache_ids.shape[0]
-    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))
-    sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
-    sin = torch.sin(sinusoid_inp)
-    cos = torch.cos(sinusoid_inp)
-    pos_embd = torch.cat((sin, cos), dim=-1)
-    return pos_embd

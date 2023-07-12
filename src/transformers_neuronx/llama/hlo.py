@@ -121,7 +121,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # Q = Rotate(Q)
         # K = Rotate(K)
-        query, key = attention.query_key_projection(query, key, pos_embed)
+        query, key = attention.rotate_half(query, key, pos_embed)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)

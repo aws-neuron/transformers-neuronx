@@ -19,6 +19,23 @@ from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx import utils
 
+def ax_plus_by(a, x, b, y):
+    """
+    Calculates a * x + b * y
+    """
+    ax = a.dtype[a.sizes].Multiply(a, x)
+    by = b.dtype[b.sizes].Multiply(b, y)
+    ax_by = ax.dtype[ax.sizes].Add(ax, by)
+    return ax_by
+
+def ax_minus_by(a, x, b, y):
+    """
+    Calculates a * x - b * y
+    """
+    ax = a.dtype[a.sizes].Multiply(a, x)
+    by = b.dtype[b.sizes].Multiply(b, y)
+    ax_by = ax.dtype[ax.sizes].Subtract(ax, by)
+    return ax_by
 
 def layer_norm(hidden, weight, bias):
     scribe = hidden.scribe
