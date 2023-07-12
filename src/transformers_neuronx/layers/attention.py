@@ -54,57 +54,58 @@ def query_key_value(
 
     return active_q, active_k, active_v
 
-def slice_along(tensor, dim, limit, start=0):
-    """
-    Slice a tensor along a dimension from start to limit
-    """
-    dimensions = [dict(start=0, limit=size, stride=1) for size in tensor.sizes]
-    dimensions[dim] = dict(start=start, limit=limit, stride=1)
-    sizes = list(tensor.sizes)
-    sizes[dim] = limit - start
-    return tensor.dtype[sizes].Slice(
-        tensor,
-        slice_dimensions=dimensions
-    )
-
 def get_up_down(q):
     """
     Given a tensor, returns its upper and lower halves (divided in the last dimension)
     """
     head_dim = q.sizes[-1]
-    q_up = slice_along(q, -1, head_dim//2)
-    q_down = slice_along(q, -1, head_dim, head_dim//2)
+    q_up = hlo.slice_along(q, -1, head_dim//2)
+    q_down = hlo.slice_along(q, -1, head_dim, head_dim//2)
     return q_up, q_down
-
-def ax_plus_by(a, x, b, y):
-    """
-    Calculates a * x + b * y
-    """
-    ax = a.dtype[a.sizes].Multiply(a, x)
-    by = b.dtype[b.sizes].Multiply(b, y)
-    ax_by = ax.dtype[ax.sizes].Add(ax, by)
-    return ax_by
-
-def ax_minus_by(a, x, b, y):
-    """
-    Calculates a * x - b * y
-    """
-    ax = a.dtype[a.sizes].Multiply(a, x)
-    by = b.dtype[b.sizes].Multiply(b, y)
-    ax_by = ax.dtype[ax.sizes].Subtract(ax, by)
-    return ax_by
 
 def rotate_vec(q, sin_r, cos_r):
     """
     Given vectors q, sin, and cos tables, apply rotation to vectors
     """
     q_up, q_down = get_up_down(q)
-    q_rot_up = ax_minus_by(cos_r, q_up, sin_r, q_down)
-    q_rot_down = ax_plus_by(cos_r, q_down, sin_r, q_up)
+    q_rot_up = hlo.ax_minus_by(cos_r, q_up, sin_r, q_down)
+    q_rot_down = hlo.ax_plus_by(cos_r, q_down, sin_r, q_up)
     q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
     return q_rot
 
-def query_key_projection(query, key, sin_cos):
+# TODO: This should be removed and rotate_half should be used instead after GPTNeoX changes.
+def query_key_projection(query, key, qk_weight):
+    """
+    A secondary projection to apply to input query/key projections (used in
+    specific models: GPT-J/GPT-NeoX).
+
+    Q = Q @ W
+    K = K @ W
+    """
+    dtype = key.dtype
+    n_active_tokens, n_seqs, n_heads_tp, d_head = active_sizes = key.sizes
+    active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
+
+    dot_dims = dict(
+        lhs_batch_dimensions=[0],
+        lhs_contracting_dimensions=[2],
+        rhs_batch_dimensions=[0],
+        rhs_contracting_dimensions=[1]
+    )
+
+    # Q = Q @ W
+    query = dtype[active_r_sizes].Reshape(query)
+    query = dtype[active_r_sizes].Dot(query, qk_weight, dot_dimension_numbers=dot_dims)
+    query = dtype[active_sizes].Reshape(query)
+
+    # K = K @ W
+    key = dtype[active_r_sizes].Reshape(key)
+    key = dtype[active_r_sizes].Dot(key, qk_weight, dot_dimension_numbers=dot_dims)
+    key = dtype[active_sizes].Reshape(key)
+
+    return query, key
+
+def rotate_half(query, key, sin_cos):
     """
     A secondary projection to apply to input query/key projections (used in
     specific models: GPT-J/GPT-NeoX/Llama).
