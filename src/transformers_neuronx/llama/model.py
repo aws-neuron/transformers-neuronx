@@ -189,7 +189,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         hidden = hidden.transpose(0, -1)
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         pos_embd = torch.nn.functional.embedding(position_ids, self.positional_embedding)
-        pos_embd = pos_embd.view([-1, self.head_dim, self.head_dim])
+        pos_embd = pos_embd.view([-1, self.head_dim])
 
         if context_length > 1:
             logits = self.context(hidden, pos_embd, cache_ids, start_ids)
