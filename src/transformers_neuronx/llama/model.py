@@ -130,14 +130,14 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
     def find_context_length_estimate(self, context_length):
         if isinstance(self.context_length_estimate, list):
             for context_length_estimate in self.context_length_estimate:
-                context_length = context_length_estimate
+                best_context_length_estimate = context_length_estimate
                 if context_length_estimate >= context_length:
                     break
             else:
-                context_length = self.context_length_estimate[-1]
+                best_context_length_estimate = self.context_length_estimate[-1]
         else:
-            context_length = self.context_length_estimate
-        return context_length
+            best_context_length_estimate = self.context_length_estimate
+        return best_context_length_estimate
     
     def context(self, hidden, pos_embd, cache_ids, start_ids):
         context_length = hidden.shape[1]
