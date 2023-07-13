@@ -98,30 +98,30 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.to_neuron()
 
         """
-        Parallel context w/ multiple buckets:        
-                
-            1. [Default] we choose context length estimates to be half of bucket sizes for output token model            
+        Parallel context w/ multiple buckets:
+
+            1. [Default] we choose context length estimates to be half of bucket sizes for output token model
             2. Provided a list of context_length_estimate, a separate KVcache is generated for each bucket
             3. If context_length_estimate <= 0, then parallel context encoding is not used at all
         """
         if self.context_length_estimate is None:
             self.context_length_estimate = [x//2 for x in self.n_positions_list]
             self.context_length_estimate.append(self.n_positions_list[-1])
-        elif isinstance(self.context_length_estimate, (list, tuple)):            
+        elif isinstance(self.context_length_estimate, (list, tuple)):
             self.context_length_estimate = list(self.context_length_estimate)
         elif self.context_length_estimate > 0:
             self.context_length_estimate = [self.context_length_estimate]
         else:
             self.context_length_estimate = None
 
-        if self.context_length_estimate is not None:                        
+        if self.context_length_estimate is not None:
             self.decoder_lm_head_for_context = {
                 context_length_estimate: self.decoder_lm_head.build_weight_shared(
                     n_positions_list=[context_length_estimate],
                     n_active_tokens=context_length_estimate,
                     unroll=self.context_unroll,
                     share_caches=True,
-                ) 
+                )
                 for context_length_estimate in self.context_length_estimate}
 
     def reset(self):
@@ -138,8 +138,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         else:
             best_context_length_estimate = self.context_length_estimate
         return best_context_length_estimate
-    
-    def context(self, hidden, pos_embd, cache_ids, start_ids):
+
+    def context(self, hidden, cache_ids, start_ids, pos_embd):
         context_length = hidden.shape[1]
         current = 0
         estimate = self.find_context_length_estimate(context_length)
@@ -168,11 +168,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 decoder_lm_head_for_context = self.decoder_lm_head_for_context[estimate]
-                logits = decoder_lm_head_for_context(hidden_context, pos_embd_context, cache_context, start_ids)
+                logits = decoder_lm_head_for_context(hidden_context, cache_context, start_ids, pos_embd_context)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i+1], pos_embd[i:i+1], cache_ids, start_ids)
+            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids, pos_embd[i:i+1])
 
         return logits
 
@@ -192,9 +192,9 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         pos_embd = pos_embd.view([-1, self.head_dim])
 
         if context_length > 1:
-            logits = self.context(hidden, pos_embd, cache_ids, start_ids)
+            logits = self.context(hidden, cache_ids, start_ids, pos_embd)
         else:
-            logits = self.decoder_lm_head(hidden, pos_embd, cache_ids, start_ids)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, pos_embd)
 
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
