@@ -141,6 +141,24 @@ def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
     bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
+def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    dtype = bias.dtype if bias is not None else rhs.dtype
+    enable_quantize = neuron_config and neuron_config.quant
+    if enable_quantize:
+        if rhs.dtype != dtype:
+            rhs = dtype[rhs.sizes].Convert(rhs)
+        if lhs.dtype != dtype:
+            lhs = dtype[lhs.sizes].Convert(lhs)
+    lhs_size, _ = lhs.sizes
+    _, rhs_size = rhs.sizes
+    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
+    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    if enable_quantize:
+        dot = dequantize(dot, scales, neuron_config, 1)
+    if bias is None:
+        return dot
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
+    return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 def gen_add_func(dtype):
 
@@ -195,9 +213,10 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-    hidden = dot00_add0(in_weight, hidden, in_bias, in_scales, neuron_config)
+    hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
     hidden = getattr(activations, activation_function)(hidden)
-    hidden = dot00_add0(out_weight, hidden, out_bias, out_scales, neuron_config)
+    hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+    hidden = dtype[hidden_r_sizes].Transpose(hidden, dimensions=[1, 0])
     hidden = dtype[hidden_sizes].Reshape(hidden)
     if tp_degree == 1:
         return hidden
