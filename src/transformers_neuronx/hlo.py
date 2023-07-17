@@ -15,9 +15,13 @@
 import functools
 import operator
 
+import torch
+
 from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx import utils
+from transformers_neuronx import compiler
+
 
 def ax_plus_by(a, x, b, y):
     """
@@ -1018,3 +1022,61 @@ def multinomial(probabilities, dim):
     result = cast(cmp, u32)
     summation = reduce_sum(result, dim, keepdim=True)
     return summation
+
+
+def full(value, dtype, sizes):
+    result = dtype.Constant(constant_value=value)
+    result = dtype[sizes].Broadcast(result, dimensions=[])
+    return result
+
+
+def literal(dtype, tensor):
+
+    accessors = {
+        # https://github.com/tensorflow/tensorflow/blob/v2.8.0/tensorflow/compiler/xla/xla_data.proto#L401
+        torch.bool: "preds",
+        torch.int8: "s8s",
+        torch.uint8: "u8s",
+        torch.int32: "s32s",
+        torch.int64: "s64s",
+        torch.float32: "f32s",
+        torch.float64: "f64s",
+
+        torch.complex64: "c64s", # Stored as interleaved real, imag floats.
+        torch.complex128: "c128s", # Stored as interleaved real, imag doubles.
+
+        # The F16s, BF16s, U16s and S16s are encoded in little endian byte order
+        torch.float16: "f16s",     # Stored as bytes
+        torch.bfloat16: "bf16s",   # Stored as bytes
+        torch.int16: "s16s",       # Stored as bytes
+    }
+
+    converter = compiler.DataTypeConverter()
+
+    # Convert tensor data to expected HLO data type
+    torch_dtype = converter.hlo2torch(dtype.shape_proto.element_type)
+    if tensor.dtype != torch_dtype:
+        tensor = tensor.to(torch_dtype)
+
+    data = tensor.data.numpy().ravel()
+    if tensor.dtype in [torch.float16, torch.bfloat16, torch.int16]:
+        data = data.tobytes()
+
+    accessor = accessors[tensor.dtype]
+    element_type = converter.torch2hlo(tensor.dtype)
+    sizes = list(tensor.shape)
+    result = dtype[sizes].Constant(
+        literal={
+            accessor: data,
+            'shape': dict(
+                dimensions=sizes,
+                element_type=element_type,
+                is_dynamic_dimension=[False] * len(sizes),
+                layout=dict(
+                    minor_to_major=reversed(range(len(sizes))),
+                    memory_space=1,
+                ),
+            ),
+        },
+    )
+    return result
