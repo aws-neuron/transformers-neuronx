@@ -227,3 +227,55 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         if offset != 0:
             result = result[:, offset:]
         return result
+
+class FIDLlamaForSampling(LlamaForSampling):
+
+    def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
+                 context_length_estimate=None, context_unroll=None, unroll=None,
+                 neuron_config=None, **kwargs):
+        # Force batch_size=1 in NEFF
+        super().__init__(config, n_positions=n_positions, batch_size=1, amp=amp,
+                        tp_degree=tp_degree, context_length_estimate=context_length_estimate,
+                        context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
+                        **kwargs)
+
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+        """ Sample function
+        input_ids: shape [batch_size, context_length]
+
+        input_ids of different batch index represent single (context + query).
+        They will be mixed and generate a single output sequence.
+        """ 
+
+        # In FID-Llama, first, context encoding is done w/ generating any output token for context
+        # Here batch-size are different context+queries of single run
+
+        offset = 0
+        batch_size, context_length = input_ids.shape
+
+        # The context length estimate is chosen based on single (context+query)
+        estimate = self.find_context_length_estimate(context_length)
+
+        if estimate:
+            if context_length < estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=True)
+                offset = estimate - context_length
+                if start_ids is None:
+                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                start_ids += offset
+                sequence_length += offset
+                # Sequence length cannot be greater than n_positions
+                sequence_length = min(sequence_length, self.config.n_positions)
+
+        # Flatten input_ids
+        context_length = batch_size * context_length
+        input_ids = input_ids.reshape(context_length, 1)
+
+        # Run the model
+        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+
+        if offset != 0:
+            # Offset by offset * batch_size
+            result = result[:, offset * batch_size:]
+        return result
