@@ -36,7 +36,8 @@ class LlamaForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, head_dim, cache_ids)
+        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, head_dim, cache_ids,
+                                                interpolation_factor=self.config.position_interpolation_factor)
 
         # NOTE: When using token generation network, we generate a mask for the
         #       past tokens and the current tokens separately. This allows us

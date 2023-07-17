@@ -16,17 +16,20 @@ import torch
 from transformers_neuronx import hlo
 
 
-def rotary_embedding(head_dim, cache_ids, base=10000):
+def rotary_embedding(head_dim, cache_ids, base=10000, interpolation_factor=None):
     seq_len = cache_ids.shape[0]
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))
-    sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
+    t = torch.arange(seq_len, dtype=inv_freq.dtype)
+    if interpolation_factor:
+        t /= interpolation_factor
+    sinusoid_inp = torch.einsum("i , j -> i j", t, inv_freq).float()
     sin = torch.sin(sinusoid_inp)
     cos = torch.cos(sinusoid_inp)
     pos_embd = torch.cat((sin, cos), dim=-1)
     return pos_embd
 
 
-def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000):
+def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_factor=None):
 
     scribe = cache_ids.scribe
     # Using f16 during compute causes relatively high error
@@ -41,6 +44,12 @@ def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000):
     cache_ids = hlo.cast(cache_ids, mtype)
 
     cache_ids = mtype[n_active_tokens, 1].Reshape(cache_ids)
+
+    if interpolation_factor:
+        scale = mtype.Constant(constant_value=interpolation_factor)
+        scale_br = mtype[cache_ids.sizes].Broadcast(scale, dimensions=[])
+        cache_ids = mtype[cache_ids.sizes].Divide(cache_ids, scale_br)
+
     inv_freq = mtype[1, size].Reshape(inv_freq)
     dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
     sinusoid_inp = mtype[n_active_tokens, size].Dot(cache_ids, inv_freq, dot_dimension_numbers=dot_dims)

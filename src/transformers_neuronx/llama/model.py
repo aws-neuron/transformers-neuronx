@@ -33,7 +33,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.config = config
-        self.neuron_config =  neuron_config
+        self.neuron_config = neuron_config
 
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:
@@ -56,7 +56,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head_for_context = None
         head_dim = config.hidden_size // config.num_attention_heads
         position_ids = torch.arange(n_positions)
-        positional_embedding = rotary_embedding(head_dim, position_ids)
+        positional_embedding = rotary_embedding(head_dim, position_ids,
+                                                interpolation_factor=config.position_interpolation_factor)
         self.head_dim = head_dim
         self.positional_embedding = positional_embedding.reshape([-1, head_dim])
 
@@ -107,7 +108,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             3. If context_length_estimate <= 0, then parallel context encoding is not used at all
         """
         if self.context_length_estimate is None:
-            self.context_length_estimate = [x//2 for x in self.n_positions_list]
+            self.context_length_estimate = [x // 2 for x in self.n_positions_list]
             self.context_length_estimate.append(self.n_positions_list[-1])
         elif isinstance(self.context_length_estimate, (list, tuple)):
             self.context_length_estimate = list(self.context_length_estimate)
@@ -174,7 +175,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids)
+            logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
 
         return logits
 
@@ -222,7 +223,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
                 sequence_length = min(sequence_length, self.config.n_positions)
 
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                        eos_token_id=self.config.eos_token_id, top_k=top_k)
 
         if offset != 0:
             result = result[:, offset:]
