@@ -61,6 +61,7 @@ def get_up_down(q):
     q_down = hlo.slice_along(q, -1, head_dim, head_dim//2)
     return q_up, q_down
 
+
 def rotate_vec(q, sin_r, cos_r):
     """
     Given vectors q, sin, and cos tables, apply rotation to vectors
@@ -70,6 +71,7 @@ def rotate_vec(q, sin_r, cos_r):
     q_rot_down = hlo.ax_plus_by(cos_r, q_down, sin_r, q_up)
     q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
     return q_rot
+
 
 def rotate_half(query, key, sin_cos):
     """
@@ -87,12 +89,10 @@ def rotate_half(query, key, sin_cos):
         | q_up sin + q_down cos |
     """
     # Rotate query and key
-    n_active_tokens, head_dim = sin_cos.sizes
-    sin_sizes = n_active_tokens, head_dim // 2
     broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head // 2
 
     # Get sin and cos as upper and lower half of input embedding
-    sin, cos = get_up_down(sin_cos)
+    sin, cos = sin_cos
     sin_r = dtype[broadcast_sizes].Broadcast(sin, dimensions=[0,3])
     cos_r = dtype[broadcast_sizes].Broadcast(cos, dimensions=[0,3])
 
