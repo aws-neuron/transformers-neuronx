@@ -25,6 +25,33 @@ def rotary_embedding(head_dim, cache_ids, base=10000):
     pos_embd = torch.cat((sin, cos), dim=-1)
     return pos_embd
 
+
+def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000):
+
+    scribe = cache_ids.scribe
+    # Using f16 during compute causes relatively high error
+    mtype = scribe.f32
+
+    n_active_tokens, = cache_ids.sizes
+    size = head_dim // 2
+
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))
+    inv_freq = hlo.literal(mtype, inv_freq)
+
+    cache_ids = hlo.cast(cache_ids, mtype)
+
+    cache_ids = mtype[n_active_tokens, 1].Reshape(cache_ids)
+    inv_freq = mtype[1, size].Reshape(inv_freq)
+    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
+    sinusoid_inp = mtype[n_active_tokens, size].Dot(cache_ids, inv_freq, dot_dimension_numbers=dot_dims)
+
+    sin = mtype[n_active_tokens, size].Sin(sinusoid_inp)
+    cos = mtype[n_active_tokens, size].Cos(sinusoid_inp)
+    sin = hlo.cast(sin, dtype)
+    cos = hlo.cast(cos, dtype)
+    return sin, cos
+
+
 def get_up_down(q):
     """
     Given a tensor, returns its upper and lower halves (divided in the last dimension)
@@ -61,17 +88,17 @@ def rotate_half(query, key, sin_cos):
     """
     # Rotate query and key
     n_active_tokens, head_dim = sin_cos.sizes
-    sin_sizes = n_active_tokens, head_dim // 2        
+    sin_sizes = n_active_tokens, head_dim // 2
     broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head // 2
-    
+
     # Get sin and cos as upper and lower half of input embedding
-    sin, cos = get_up_down(sin_cos)        
+    sin, cos = get_up_down(sin_cos)
     sin_r = dtype[broadcast_sizes].Broadcast(sin, dimensions=[0,3])
     cos_r = dtype[broadcast_sizes].Broadcast(cos, dimensions=[0,3])
 
     # Rotate query
-    query = rotate_vec(query, sin_r, cos_r)        
-    
+    query = rotate_vec(query, sin_r, cos_r)
+
     # Rotate key
     key = rotate_vec(key, sin_r, cos_r)
     return query, key

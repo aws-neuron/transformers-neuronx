@@ -64,7 +64,7 @@ def compile_hlo_module(hlo_module, tag=None):
         hlo_module_name = f'{hlo_module.name}.{compiler_version}.{hash}'
     else:
         hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
-    
+
     dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
     dump_to = os.path.join(dump_to, hlo_module_name)
     os.makedirs(dump_to, exist_ok=True)
@@ -78,7 +78,7 @@ def compile_hlo_module(hlo_module, tag=None):
     if not os.path.isfile(neff_path) or cache != 'on':
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
                         hlo_module_path, f'--output={neff_path}', '--verbose=35']
-        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])        
+        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
         flags = shlex.split(flags)
         command_line.extend(flags)
         subprocess.check_call(command_line, cwd=dump_to)
@@ -164,6 +164,7 @@ class DataTypeConverter:
         self.hlo2metaneff_mapping = {}
         self.hlo2torch_mapping = {}
         self.torch2name_mapping = {}
+        self.torch2hlo_mapping = {}
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
             pname, dname, tname = line.split()
@@ -173,6 +174,7 @@ class DataTypeConverter:
             self.hlo2metaneff_mapping[primitive_type] = metaneff_dtype
             self.hlo2torch_mapping[primitive_type] = torch_dtype
             self.torch2name_mapping[torch_dtype] = pname.lower()
+            self.torch2hlo_mapping[torch_dtype] = primitive_type
 
     def hlo2metaneff(self, primitive_type):
         return self.hlo2metaneff_mapping[primitive_type]
@@ -182,6 +184,9 @@ class DataTypeConverter:
 
     def torch2name(self, torch_dtype):
         return self.torch2name_mapping[torch_dtype]
+
+    def torch2hlo(self, torch_dtype):
+        return self.torch2hlo_mapping[torch_dtype]
 
 
 class Kernel:
@@ -353,7 +358,7 @@ def gen_zero_output_from_shape(input):
     shape = tuple(shape_proto.dimensions)
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
     return torch.zeros(shape, dtype=dtype)
-    
+
 def get_debug_outputs(program, bucket_id=0):
     debug_tensors = program.memories[bucket_id].get_debug_tensors()
     debug_tensors = [ops.parallel_cpu(x) for x in debug_tensors]
