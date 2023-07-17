@@ -363,7 +363,7 @@ class ParallelKernel:
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)
             casted.append(cpu)
-        outputs = torch.ops.neuron._parallel_executor_run(self.executor, inputs, return_ranks)
+        outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
         if return_ranks == 1:
             result = tuple(shards[0] for shards in outputs)
         else:
