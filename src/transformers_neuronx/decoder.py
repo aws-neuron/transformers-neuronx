@@ -897,19 +897,7 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
             inputs: The set of CPU tensors to copy to each model
             return_ranks: The number of ranks to copy back to CPU
         """
-        casted = []
-        for cpu, buf in zip(inputs, self.kernels[bucket_id].inputs):
-            if cpu.dtype != buf.dtype:
-                cpu = cpu.to(buf.dtype)
-            casted.append(cpu)
-        outputs = self.kernels[bucket_id].execute(casted, return_ranks)
-        if return_ranks == 1:
-            result = tuple(shards[0] for shards in outputs)
-        else:
-            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
-        if len(result) == 1:
-            return result[0]
-        return result
+        return self.kernels[bucket_id].execute(inputs, return_ranks)
 
 
 

@@ -274,7 +274,8 @@ class ParallelKernel:
         if g_device_count is None:
             g_device_count = tp_degree
         self.g_device_count = g_device_count
-
+        self.inputs = None
+        self.outputs = None
 
     def generate_hlo_snapshot(self, tensors=None):
         if tensors is None:
@@ -322,6 +323,8 @@ class ParallelKernel:
         """
         Build an optimized executor class to enable `execute` method.
         """
+        self.inputs = inputs
+        self.outputs = outputs
         self.executor = torch.classes.neuron.ParallelExecutor(
             self.model,
             memory.inputs,  # All inputs (inputs, caches, weights)
@@ -353,10 +356,21 @@ class ParallelKernel:
                     * -1: Return data form all ranks.
 
         Returns:
-            results: A list of outputs where each output is a list of tensors
-                from each rank.
+            result: The output tensors from each rank concatenated along dim 0.
         """
-        return torch.ops.neuron._parallel_executor_run(self.executor, inputs, return_ranks)
+        casted = []
+        for cpu, buf in zip(inputs, self.inputs):
+            if cpu.dtype != buf.dtype:
+                cpu = cpu.to(buf.dtype)
+            casted.append(cpu)
+        outputs = torch.ops.neuron._parallel_executor_run(self.executor, inputs, return_ranks)
+        if return_ranks == 1:
+            result = tuple(shards[0] for shards in outputs)
+        else:
+            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
+        if len(result) == 1:
+            return result[0]
+        return result
 
 
 def gen_zero_input(hlo_module, index):
