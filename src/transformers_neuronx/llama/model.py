@@ -139,7 +139,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             best_context_length_estimate = self.context_length_estimate
         return best_context_length_estimate
 
-    def context(self, hidden, cache_ids, start_ids, pos_embd):
+    def context(self, hidden, cache_ids, start_ids):
         context_length = hidden.shape[1]
         current = 0
         estimate = self.find_context_length_estimate(context_length)
@@ -147,14 +147,12 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         if estimate is not None:
             hidden_context = hidden
             cache_context = cache_ids
-            pos_embd_context = pos_embd
 
             # Slice context that when it is too large
             if context_length > estimate:
                 current = estimate
                 hidden_context = hidden[:, :estimate]
                 cache_context = cache_ids[:estimate]
-                pos_embd_context = pos_embd[:estimate]
 
             # Cannot use context encoding for a context that is too small. This
             # is because the caller must be aware of the cache-ids/start-ids
@@ -168,11 +166,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 decoder_lm_head_for_context = self.decoder_lm_head_for_context[estimate]
-                logits = decoder_lm_head_for_context(hidden_context, cache_context, start_ids, pos_embd_context)
+                logits = decoder_lm_head_for_context(hidden_context, cache_context, start_ids)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids, pos_embd[i:i+1])
+            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids)
 
         return logits
 
@@ -184,17 +182,13 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
-        # TODO: Move embedding and rotary embedding to Neuron
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
         hidden = hidden.transpose(0, -1)
-        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
-        pos_embd = torch.nn.functional.embedding(position_ids, self.positional_embedding)
-        pos_embd = pos_embd.view([-1, self.head_dim])
 
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids, pos_embd)
+            logits = self.context(hidden, cache_ids, start_ids)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, pos_embd)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
 
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
@@ -229,4 +223,3 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         if offset != 0:
             result = result[:, offset:]
         return result
-
