@@ -20,6 +20,7 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
@@ -123,7 +124,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
-        slopes = build_alibi_slopes(self.config.n_head)
+        slopes = alibi.build_slopes(self.config.n_head)
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
         self.decoder_lm_head.to_neuron()
 
@@ -217,22 +218,3 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
 
         return result[:, offset:]
-
-
-def build_alibi_slopes(num_heads):
-    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/bloom/modeling_bloom.py#L86
-
-    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
-    base = 2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3)))
-    powers = range(1, 1 + closest_power_of_2)
-    slopes = list(map(lambda x: math.pow(base, x), powers))
-
-    if closest_power_of_2 != num_heads:
-        extra_base = 2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3)))
-        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
-        extra_powers = range(1, 1 + 2 * num_remaining_heads, 2)
-        extra_slopes = list(map(lambda x: math.pow(extra_base, x), extra_powers))
-        slopes.extend(extra_slopes)
-
-    assert len(slopes) == num_heads
-    return torch.tensor(slopes).view(num_heads, 1)
