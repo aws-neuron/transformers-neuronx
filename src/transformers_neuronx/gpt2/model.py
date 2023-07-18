@@ -127,12 +127,10 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -277,11 +275,10 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         return logits
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
@@ -437,7 +434,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         if is_context_encode:
             self.tensor_pool.push([inputs_embeds, position_embeds])
         return hidden, start_ids
@@ -451,9 +447,8 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             task = self.tensor_pool.async_clear()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
             self.tensor_pool.push(hidden)
