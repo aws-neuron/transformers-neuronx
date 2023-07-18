@@ -41,6 +41,7 @@ def ax_minus_by(a, x, b, y):
     ax_by = ax.dtype[ax.sizes].Subtract(ax, by)
     return ax_by
 
+
 def layer_norm(hidden, weight, bias):
     scribe = hidden.scribe
     dtype = hidden.dtype
@@ -60,6 +61,31 @@ def layer_norm(hidden, weight, bias):
     weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
     output = f32[sizes].Multiply(bn_output, weight_br)
     bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
+    output = f32[sizes].Add(output, bias_br)
+    output = dtype[sizes].Convert(output)
+    output = dtype[input_sizes].Reshape(output)
+    return output
+
+
+def layer_norm_bsh(hidden, weight, bias):
+    scribe = hidden.scribe
+    dtype = hidden.dtype
+    f32 = scribe.f32
+    batch_size, n_active_tokens, hidden_size = input_sizes = hidden.sizes
+    norm_size = n_active_tokens * batch_size
+    sizes = norm_size, hidden_size
+    hidden = dtype[sizes].Reshape(hidden)
+    hidden = f32[sizes].Convert(hidden)
+    one = f32.Constant(constant_value=1)
+    scale = f32[norm_size].Broadcast(one, dimensions=[])
+    zero = f32.Constant(constant_value=0)
+    offset = f32[norm_size].Broadcast(zero, dimensions=[])
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=0)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
+    output = f32[sizes].Multiply(bn_output, weight_br)
+    bias_br = f32[sizes].Broadcast(bias, dimensions=[1])
     output = f32[sizes].Add(output, bias_br)
     output = dtype[sizes].Convert(output)
     output = dtype[input_sizes].Reshape(output)
@@ -103,6 +129,14 @@ def dot00(lhs, rhs):
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
+    return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+
+
+def dot01(lhs, rhs):
+    dtype = lhs.dtype
+    _, lhs_size = lhs.sizes
+    rhs_size, _ = rhs.sizes
+    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
     return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
 
 
@@ -221,6 +255,41 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden = getattr(activations, activation_function)(hidden)
     hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
     hidden = dtype[hidden_r_sizes].Transpose(hidden, dimensions=[1, 0])
+    hidden = dtype[hidden_sizes].Reshape(hidden)
+    if tp_degree == 1:
+        return hidden
+    replica_groups = [list(range(tp_degree))]
+    add_func = gen_add_func(dtype)
+    hidden = dtype[hidden_sizes].AllReduce(hidden, replica_groups=replica_groups, to_apply=add_func)
+    return hidden
+
+
+def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
+            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None):
+    # single:
+    #   hidden: [b, a, h]
+    #   in_weight: [h, 4h]
+    #   in_bias: [4h]
+    #   out_weight: [4h, h]
+    #   out_bias: [h]
+    # t-way tp:
+    #   hidden: [b, a, h]
+    #   in_weight: [h, 4h/t]
+    #   in_bias: [4h/t]
+    #   out_weight: [4h/t, h]
+    #   out_bias: [h]
+    dtype = hidden.dtype
+    if u8_bounds is not None:
+        f32 = hidden.scribe.f32
+        *_, in_min, in_max, out_min, out_max = u8_bounds
+        in_weight = u8_decode(dtype, dequant_dtype, in_weight, in_min, in_max)
+        out_weight = u8_decode(dtype, dequant_dtype, out_weight, out_min, out_max)
+    batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
+    hidden_r_sizes = batch_size * n_active_tokens, hidden_size
+    hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
+    hidden = dot10_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+    hidden = getattr(activations, activation_function)(hidden)
+    hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
     hidden = dtype[hidden_sizes].Reshape(hidden)
     if tp_degree == 1:
         return hidden
