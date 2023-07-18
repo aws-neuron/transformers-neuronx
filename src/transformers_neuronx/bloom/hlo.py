@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer
+from transformers_neuronx.layers import attention, transformer, alibi
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -44,7 +44,7 @@ class BloomForSamplingNoEmbeddingHlo:
         return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
     def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
-        prior_alibi, active_alibi = build_alibi_from_slopes(slopes, mask, active_mask)
+        prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
         return hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
     def layer(self, hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
@@ -153,7 +153,7 @@ class BloomForSamplingNoEmbeddingHlo:
             # S = Q @ K + A
             score = attention.score(query, key)
             score = f32[score.sizes].Convert(score)
-            score = f32[score.sizes].Add(score, active_alibi)
+            score = f32[score.sizes].Add(score, prior_alibi)
             score = attention.mask(score, mask)
             score = hlo.cast(score, dtype)
 
@@ -169,56 +169,3 @@ class BloomForSamplingNoEmbeddingHlo:
         updated_values = attention.update_cache(cached_values, cache_ids, value)
 
         return output, updated_keys, updated_values
-
-
-def build_alibi_from_slopes(slopes, attention_mask, active_mask):
-
-    num_heads_tp, *_ = slopes.sizes
-    scribe = attention_mask.scribe
-    dtype = scribe.f32
-
-    def _alibi(summation, mask):
-
-        size = mask.sizes
-        batch_size, n_active_tokens, seq_length = mask.sizes
-
-        one = dtype.Constant(constant_value=1)
-        one_br = dtype[size].Broadcast(one, dimensions=[])
-        summation_sub = dtype[size].Subtract(summation, one_br)
-        sum_mul = dtype[size].Multiply(summation_sub, mask)
-
-        slopes_sh = dtype[batch_size, n_active_tokens, num_heads_tp, 1].Broadcast(slopes, dimensions=[2, 3])
-        sum_sh = dtype[batch_size, n_active_tokens, 1, seq_length].Reshape(sum_mul)
-        dot_dims = dict(
-            lhs_contracting_dimensions=[3],
-            lhs_batch_dimensions=[0, 1],
-            rhs_contracting_dimensions=[2],
-            rhs_batch_dimensions=[0, 1]
-        )
-        product = dtype[batch_size, n_active_tokens, num_heads_tp, seq_length].Dot(slopes_sh, sum_sh, dot_dimension_numbers=dot_dims)
-        result = dtype[batch_size, num_heads_tp, n_active_tokens, seq_length].Transpose(product, dimensions=[0, 2, 1, 3])
-        return result
-
-    scribe = attention_mask.scribe
-    fp32 = scribe.f32
-
-    # Create alibi for the `attention_mask` tokens
-    mask_cast = hlo.cast(attention_mask, fp32)
-    summation = hlo.cumsum(mask_cast, -1)
-    alibi = _alibi(summation, mask_cast)
-
-    # Create alibi for the `active_mask` tokens:
-    #    Since the prior token mask is the `attention_mask` and the
-    #    active token mask is the `active_mask`, we need to combine both masks to
-    #    find the true cumulative sum.
-    if active_mask is not None:
-        total = hlo.reduce_sum(mask_cast, 2)
-        active_cast = hlo.cast(active_mask, fp32)
-        total = fp32[total.sizes].Add(total, active_cast)
-        total_sh = hlo.unsqueeze(total, 1)
-        active_cast_sh = hlo.unsqueeze(active_cast, 1)
-        active_alibi = _alibi(total_sh, active_cast_sh)
-        return alibi, active_alibi
-
-    # When no active mask, we do not have a "prior" alibi
-    return None, alibi
