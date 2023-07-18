@@ -96,6 +96,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.decoder_lm_head.enable_executor()
+
 
         """
         Parallel context w/ multiple buckets:
@@ -115,14 +117,16 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             self.context_length_estimate = None
 
         if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = {
-                context_length_estimate: self.decoder_lm_head.build_weight_shared(
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_length_estimate:
+                model = self.decoder_lm_head.build_weight_shared(
                     n_positions_list=[context_length_estimate],
                     n_active_tokens=context_length_estimate,
                     unroll=self.context_unroll,
                     share_caches=True,
                 )
-                for context_length_estimate in self.context_length_estimate}
+                model.enable_executor()
+                self.decoder_lm_head_for_context[context_length_estimate] = model
 
     def reset(self):
         self.decoder_lm_head.reset()
