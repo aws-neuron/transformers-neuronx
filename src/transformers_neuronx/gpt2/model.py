@@ -387,11 +387,14 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # Only share caches when we don't generate multiple suggestions.
+        share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size
         self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
             n_positions_list=[self.context_length_estimate],
             n_active_tokens=self.context_length_estimate,
             batch_size=self.prompt_batch_size,
             unroll=self.context_unroll,
+            share_caches=share_caches
         )
         config = self.config
         n_heads_tp = config.n_head // config.tp_degree
