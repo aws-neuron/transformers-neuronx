@@ -31,7 +31,8 @@ def query_key_value(
     V = (hidden @ wV) + bV
     """
     dtype = hidden.dtype
-    hidden_size, n_active_tokens, n_seqs = hidden.sizes
+    n_seqs, n_active_tokens, hidden_size = hidden.sizes
+    hidden = dtype[hidden_size,n_active_tokens,n_seqs].Transpose(hidden, dimensions=[2, 1, 0])
     hidden_size, d_head_tp = q_weight.sizes
     n_heads_tp = d_head_tp // d_head
 
@@ -223,8 +224,8 @@ def context(past_scores, active_score, past_values, active_values):
     output = dtype[sizes].Add(output, active_output)
     denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
     output = dtype[sizes].Divide(output, denom_br)
-    sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-    output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+    sizes = n_seqs, n_active_tokens, n_heads_tp, d_head
+    output = dtype[sizes].Transpose(output, dimensions=[0, 2, 1, 3])
     return output
 
 
@@ -258,8 +259,8 @@ def context_combined(score, values):
     )
     sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
     result = dtype[sizes].Dot(probs, values, dot_dimension_numbers=dot_dims)
-    sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-    result = dtype[sizes].Transpose(result, dimensions=[2, 0, 1, 3])
+    sizes = n_seqs, n_active_tokens, n_heads_tp, d_head
+    result = dtype[sizes].Transpose(result, dimensions=[0, 2, 1, 3])
     return result
 
 
@@ -276,24 +277,23 @@ def output(
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
-    attn_size, hidden_size = out_weight.sizes
-    hidden_sizes = hidden_size, n_active_tokens, n_seqs
-    hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
-    attn_size = hidden_size // tp_degree
+    _, hidden_size = out_weight.sizes
+    hidden_sizes = n_seqs, n_active_tokens, hidden_size
+    hidden_r_sizes = n_seqs * n_active_tokens, hidden_size
 
     enable_quantize = neuron_config and neuron_config.quant
     if enable_quantize:
         out_weight = dtype[out_weight.sizes].Convert(out_weight)
 
-    result_sizes_2d = n_active_tokens * n_seqs, n_heads_tp * d_head
+    result_sizes_2d = n_seqs * n_active_tokens, n_heads_tp * d_head
     result = dtype[result_sizes_2d].Reshape(context)
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
-    result = dtype[hidden_r_sizes].Dot(out_weight, result, dot_dimension_numbers=dot_dims)
+    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
+    result = dtype[hidden_r_sizes].Dot(result, out_weight, dot_dimension_numbers=dot_dims)
     if enable_quantize:
-        result = hlo.dequantize(result, out_scales, neuron_config, 0)
+        result = hlo.dequantize(result, out_scales, neuron_config, 1)
 
     if out_bias is not None:
-        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
+        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[1])
         result = dtype[hidden_r_sizes].Add(result, out_bias)
 
     result = dtype[hidden_sizes].Reshape(result)

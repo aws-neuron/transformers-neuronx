@@ -182,7 +182,6 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        hidden = hidden.transpose(0, -1)
 
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
@@ -190,9 +189,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
 
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):

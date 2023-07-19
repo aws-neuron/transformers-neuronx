@@ -30,7 +30,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
+        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
