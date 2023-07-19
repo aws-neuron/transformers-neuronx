@@ -95,7 +95,7 @@ def layer_norm_bsh(hidden, weight, bias):
 def rms_norm(hidden, weight, eps=1e-6):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
-    hidden_size, n_active_tokens, batch_size = size = hidden.sizes
+    batch_size, n_active_tokens, hidden_size = size = hidden.sizes
     dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
@@ -104,12 +104,12 @@ def rms_norm(hidden, weight, eps=1e-6):
 
     # PERF: Is it better to use BatchNormTraining operation here?
     square = f32[hidden.sizes].Multiply(hidden, hidden)
-    variance = reduce_mean(square, 0)
+    variance = reduce_mean(square, 2)
     eps = f32.Constant(constant_value=eps)
     eps_br = f32[variance.sizes].Broadcast(eps, dimensions=[])
     mean_eps = f32[variance.sizes].Add(variance, eps_br)
     rsqrt = f32[variance.sizes].Rsqrt(mean_eps)
-    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=[1, 2])
+    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=[0, 1])
     scaled = f32[size].Multiply(hidden, rsqrt_br)
 
     if weight is None:
@@ -117,7 +117,7 @@ def rms_norm(hidden, weight, eps=1e-6):
         return scaled
 
     weight = cast(weight, f32)
-    weight_br = f32[size].Broadcast(weight, dimensions=[0])
+    weight_br = f32[size].Broadcast(weight, dimensions=[2])
     result = f32[size].Multiply(scaled, weight_br)
     result = cast(result, dtype)
 
@@ -318,28 +318,28 @@ def gated_mlp(
     TODO: Support quantization
 
     Sizes:
-        hidden:     [h, a, b]
+        hidden:     [b, a, h]
         in0_weight: [h, n / tp]
         in1_weight: [h, n / tp]
         out_weight: [n / tp, h]
         in0_bias:   [n / tp]
         in1_bias:   [n / tp]
         out_bias:   [h]
-        result:     [h, a, b]
+        result:     [b, a, h]
     """
 
     dtype = hidden.dtype
-    hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
-    hidden_r_sizes = hidden_size, n_active_tokens * batch_size
+    batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
+    hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    hidden_active = dot00_add0(in0_weight, hidden, in0_bias)
+    hidden_active = dot10_add1(hidden, in0_weight, in0_bias)
     hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias)
+    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
 
-    result = dot00_add0(out_weight, hidden_states, out_bias)
+    result = dot10_add1(hidden_states, out_weight, out_bias)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
