@@ -277,8 +277,8 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         hidden = inputs_embeds + position_embeds
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
-        logits = logits.transpose(0, 1)
+        logits = logits[:self.config.vocab_size]
+        logits = logits.permute([1, 2, 0])
         return logits
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
