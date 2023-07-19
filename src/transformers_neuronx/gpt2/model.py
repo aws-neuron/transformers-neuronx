@@ -335,7 +335,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         context_length_estimate = utils.get_closest_pow2_bucket_size(context_length_estimate)
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
-        n_positions_list = [config.n_positions]
+        n_positions_list = utils.power_of_two_bucket_sizes(context_length_estimate * 2, config.n_positions)
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
