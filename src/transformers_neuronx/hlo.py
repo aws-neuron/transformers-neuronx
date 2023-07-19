@@ -1254,6 +1254,7 @@ def literal(dtype, tensor):
             ),
         },
     )
+    return result
 
 
 def select(tensor, dim, index, keepdim=False):
