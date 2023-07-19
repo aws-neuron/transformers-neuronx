@@ -19,10 +19,10 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import bucket
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
-from transformers_neuronx.layers.rotary import rotary_embedding
 
 
 class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
@@ -35,18 +35,19 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.config = config
         self.neuron_config = neuron_config
 
-        self.context_length_estimate = context_length_estimate
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
 
         if unroll is None:
             unroll = config.num_hidden_layers
-        # Bucket sizes below 128 do not provide significant latency benefit and add bucket switching overhead
-        self.n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+
+        self.token_buckets = bucket.token_sizes(n_positions)
+        self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
+            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
             config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
         )
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
@@ -54,12 +55,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
-        head_dim = config.hidden_size // config.num_attention_heads
-        position_ids = torch.arange(n_positions)
-        positional_embedding = rotary_embedding(head_dim, position_ids,
-                                                interpolation_factor=config.position_interpolation_factor)
-        self.head_dim = head_dim
-        self.positional_embedding = positional_embedding.reshape([-1, head_dim])
 
     def to_neuron(self):
 
@@ -99,27 +94,9 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.to_neuron()
         self.decoder_lm_head.enable_executor()
 
-
-        """
-        Parallel context w/ multiple buckets:
-
-            1. [Default] we choose context length estimates to be half of bucket sizes for output token model
-            2. Provided a list of context_length_estimate, a separate KVcache is generated for each bucket
-            3. If context_length_estimate <= 0, then parallel context encoding is not used at all
-        """
-        if self.context_length_estimate is None:
-            self.context_length_estimate = [x // 2 for x in self.n_positions_list]
-            self.context_length_estimate.append(self.n_positions_list[-1])
-        elif isinstance(self.context_length_estimate, (list, tuple)):
-            self.context_length_estimate = list(self.context_length_estimate)
-        elif self.context_length_estimate > 0:
-            self.context_length_estimate = [self.context_length_estimate]
-        else:
-            self.context_length_estimate = None
-
-        if self.context_length_estimate is not None:
+        if self.context_buckets:
             self.decoder_lm_head_for_context = {}
-            for context_length_estimate in self.context_length_estimate:
+            for context_length_estimate in self.context_buckets:
                 model = self.decoder_lm_head.build_weight_shared(
                     n_positions_list=[context_length_estimate],
                     n_active_tokens=context_length_estimate,
@@ -132,22 +109,10 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def find_context_length_estimate(self, context_length):
-        if isinstance(self.context_length_estimate, list):
-            for context_length_estimate in self.context_length_estimate:
-                best_context_length_estimate = context_length_estimate
-                if context_length_estimate >= context_length:
-                    break
-            else:
-                best_context_length_estimate = self.context_length_estimate[-1]
-        else:
-            best_context_length_estimate = self.context_length_estimate
-        return best_context_length_estimate
-
     def context(self, hidden, cache_ids, start_ids):
         context_length = hidden.shape[1]
         current = 0
-        estimate = self.find_context_length_estimate(context_length)
+        estimate = bucket.find(self.context_buckets, context_length)
 
         if estimate is not None:
             hidden_context = hidden
@@ -170,8 +135,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
                 current = estimate
 
             if current == estimate:
-                decoder_lm_head_for_context = self.decoder_lm_head_for_context[estimate]
-                logits = decoder_lm_head_for_context(hidden_context, cache_context, start_ids)
+                model = self.decoder_lm_head_for_context[estimate]
+                logits = model(hidden_context, cache_context, start_ids)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
@@ -210,7 +175,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         # for padding.
         offset = 0
         batch_size, context_length = input_ids.shape
-        estimate = self.find_context_length_estimate(context_length)
+        estimate = bucket.find(self.context_buckets, context_length)
         if estimate:
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=True)
@@ -220,7 +185,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
                 start_ids += offset
                 sequence_length += offset
                 # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.config.n_positions)
+                sequence_length = min(sequence_length, self.max_positions)
 
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                         eos_token_id=self.config.eos_token_id, top_k=top_k)
@@ -246,7 +211,7 @@ class FIDLlamaForSampling(LlamaForSampling):
 
         input_ids of different batch index represent single (context + query).
         They will be mixed and generate a single output sequence.
-        """ 
+        """
 
         # In FID-Llama, first, context encoding is done w/ generating any output token for context
         # Here batch-size are different context+queries of single run
@@ -255,7 +220,7 @@ class FIDLlamaForSampling(LlamaForSampling):
         batch_size, context_length = input_ids.shape
 
         # The context length estimate is chosen based on single (context+query)
-        estimate = self.find_context_length_estimate(context_length)
+        estimate = bucket.find(self.context_buckets, context_length)
 
         if estimate:
             if context_length < estimate:
@@ -266,7 +231,7 @@ class FIDLlamaForSampling(LlamaForSampling):
                 start_ids += offset
                 sequence_length += offset
                 # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.config.n_positions)
+                sequence_length = min(sequence_length, self.max_positions)
 
         # Flatten input_ids
         context_length = batch_size * context_length
