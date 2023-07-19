@@ -412,7 +412,7 @@ The `examples` folder contains tutorials for running autoregressive sampling usi
 transformers checkpoints. For example, `examples/facebook-opt-13b-sampling.md` contains instructions
 for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xlarge instance.
 
-# Currently supported models
+# Currently supported models and features
 
 -  [GPT2](https://huggingface.co/docs/transformers/model_doc/gpt2)
 -  [GPT-J](https://huggingface.co/docs/transformers/model_doc/gptj)
@@ -420,6 +420,28 @@ for running HuggingFace `facebook/opt-13b` autoregressive sampling on a trn1.2xl
 -  [GPT-Neox [Experimental]](https://huggingface.co/docs/transformers/model_doc/gpt_neox)
 -  [Bloom [Experimental]](https://huggingface.co/docs/transformers/model_doc/bloom)
 -  [LLaMA [Prototype]](https://huggingface.co/docs/transformers/main/model_doc/llama)
+
+**Model status**
+- Prototype (Alpha): An initial in-development version of a model that should be considered a preview of future functionality. A prototype may not be fully functional. A prototype model is not expected to perform well and may also have known accuracy issues. Prototype models may not maintain compatibility across versions.
+- Experimental (Beta): A functional model which may still need performance & accuracy tuning. An experimental model should produce accurate results in most cases but is not yet considered stable. Prototype models may not maintain compatibility across versions.
+- Stable: A model which has been validated for both accuracy and performance. Breaking changes to a stable models will occur with a deprecation notice in advance. 
+
+| Model Support | Functional | Performance Tuned | Backwards Compatibility |
+|---------------|------------|-------------------|-------------------------|
+| Prototype     | No         | No                | No                      |
+| Experimental  | Yes        | No                | No                      |
+| Stable        | Yes        | Yes               | Yes                     |
+
+**Model features**
+
+| Model   | Flexible Tensor Parallelism | Prompt Estimate Support | Serialization Support |
+|---------|-----------------------------|-------------------------|-----------------------|
+| GPT2    | Yes                         | Partial                 | Partial               |
+| GPT-J   | No                          | No                      | No                    |
+| LLaMa   | Yes                         | Yes                     | No                    |
+| BLOOM   | Yes                         | Yes                     | No                    |
+| GPTNeoX | No                          | No                      | No                    |
+| OPT     | Yes                         | No                      | No                    |
 
 # Upcoming features
 
