@@ -103,7 +103,9 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
                     unroll=self.context_unroll,
                     share_caches=True,
                 )
-                model.enable_executor()
+                # PERF: No latency improvement seen in multi-layer models from executor
+                if self.context_unroll == self.config.num_hidden_layers:
+                    model.enable_executor()
                 self.decoder_lm_head_for_context[context_length_estimate] = model
 
     def reset(self):
