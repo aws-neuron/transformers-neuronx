@@ -260,6 +260,67 @@ class ParallelMemory:
             return []
 
 
+class Executor:
+
+    def __init__(self, model, memory, inputs, outputs):
+        """
+        An optimized executor class that allocates a thread for each model rank.
+
+        This implements a number of optimizations to speed up execution time:
+        - The primary optimization is that this class creates set of fixed
+          threads that are always blocking on a barrier waiting to execute.
+          In practice, this can significantly speed up the thread startup
+          time for model executions compared to other threadpool
+          implementations.
+        - A second optimization is that each thread is responsible for
+          both the I/O and the execution of the model rank. This means that
+          fewer `libtorchneuron` API calls are made an fewer threadpool starts
+          are being triggered.
+        The combination of the above optimization can have a huge effect
+        especially on small/fast models.
+        """
+        self.inputs = inputs
+        self.outputs = outputs
+        self.executor = torch.classes.neuron.ParallelExecutor(
+            model,
+            memory.inputs,  # All inputs (inputs, caches, weights)
+            memory.outputs, # All outputs (outputs, caches)
+            inputs,         # User provided inputs
+            outputs,        # Returned outputs
+        )
+
+    def __call__(self, inputs, return_ranks: int = -1):
+        """
+        Execute the kernel with the given inputs.
+
+        Arguments:
+            inputs: A set of input tensors to copy to each model rank.
+            return_ranks: Specifies which ranks to return to python. This is
+                useful if data is only required from a specific number of
+                NeuronCores. For example:
+                    * 0: Do not return any data.
+                    * 1: Return data only from the first rank. This is useful
+                         when the data is synchronized across ranks.
+                    * -1: Return data form all ranks.
+
+        Returns:
+            result: The output tensors from each rank concatenated along dim 0.
+        """
+        casted = []
+        for cpu, buf in zip(inputs, self.inputs):
+            if cpu.dtype != buf.dtype:
+                cpu = cpu.to(buf.dtype)
+            casted.append(cpu)
+        outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+        if return_ranks == 1:
+            result = tuple(shards[0] for shards in outputs)
+        else:
+            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
+        if len(result) == 1:
+            return result[0]
+        return result
+
+
 class ParallelKernel:
     hlo_snapshot_iter = 0
     def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
@@ -268,14 +329,11 @@ class ParallelKernel:
         self.neff_bytes = None
         self.model = None
         self.hlo_snapshot = None
-        self.executor = None
         self.generate_hlo_snapshot()
         self.g_start_device_id = g_start_device_id
         if g_device_count is None:
             g_device_count = tp_degree
         self.g_device_count = g_device_count
-        self.inputs = None
-        self.outputs = None
 
     def generate_hlo_snapshot(self, tensors=None):
         if tensors is None:
@@ -320,57 +378,7 @@ class ParallelKernel:
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
     def build_executor(self, memory, inputs, outputs):
-        """
-        Build an optimized executor class to enable `execute` method.
-        """
-        self.inputs = inputs
-        self.outputs = outputs
-        self.executor = torch.classes.neuron.ParallelExecutor(
-            self.model,
-            memory.inputs,  # All inputs (inputs, caches, weights)
-            memory.outputs, # All outputs (outputs, caches)
-            inputs,         # User provided inputs
-            outputs,        # Returned outputs
-        )
-
-    def execute(self, inputs, return_ranks: int = -1):
-        """
-        Execute the kernel with the given inputs.
-
-        This is an alternative to `__call__` which uses the ParallelExecutor.
-        It is assumed that the executor was previously constructed using the
-        `build_executor` method call.
-
-        This allocates a fixed set of threads per NeuronCore per kernel which
-        are always waiting to execute. This can prevent uncessarily long wait
-        times for tensor parallel threads to begin executing.
-
-        Arguments:
-            inputs: A set of input tensors to copy to each model rank.
-            return_ranks: Specifies which ranks to return to python. This is
-                useful if data is only required from a specific number of
-                NeuronCores. For example:
-                    * 0: Do not return any data.
-                    * 1: Return data only from the first rank. This is useful
-                         when the data is synchronized across ranks.
-                    * -1: Return data form all ranks.
-
-        Returns:
-            result: The output tensors from each rank concatenated along dim 0.
-        """
-        casted = []
-        for cpu, buf in zip(inputs, self.inputs):
-            if cpu.dtype != buf.dtype:
-                cpu = cpu.to(buf.dtype)
-            casted.append(cpu)
-        outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
-        if return_ranks == 1:
-            result = tuple(shards[0] for shards in outputs)
-        else:
-            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
-        if len(result) == 1:
-            return result[0]
-        return result
+        return Executor(self.model, memory, inputs, outputs)
 
 
 def gen_zero_input(hlo_module, index):
