@@ -866,6 +866,7 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         first_hlo, *_ = hlo_modules
         self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
         self.memories = [kernel.build_memory() for kernel in self.kernels]
+        self.executors = list()
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params)
@@ -876,14 +877,15 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
             input_tensors.extend(ln_lm_head_params)
             memory.setup(input_tensors, output_tensors)
 
+    def run(self, bucket_id):
+        self.kernels[bucket_id](self.memories[bucket_id])
+
     def enable_executor(self):
         for kernel, memory in zip(self.kernels, self.memories):
             input_tensors = [*self.input_buffers]
             output_tensors = [self.logits_buffer]
-            kernel.build_executor(memory, input_tensors, output_tensors)
-
-    def run(self, bucket_id):
-        self.kernels[bucket_id](self.memories[bucket_id])
+            executor = kernel.build_executor(memory, input_tensors, output_tensors)
+            self.executors.append(executor)
 
     def execute(self, bucket_id, *inputs, return_ranks=-1):
         """
@@ -897,7 +899,7 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
             inputs: The set of CPU tensors to copy to each model
             return_ranks: The number of ranks to copy back to CPU
         """
-        return self.kernels[bucket_id].execute(inputs, return_ranks)
+        return self.executors[bucket_id](inputs, return_ranks)
 
 
 
@@ -915,6 +917,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
             self.multi_layers_memories.append(memories)
         self.ln_lm_head_kernel = compiler.ParallelKernel(ln_lm_head_hlo_module, tp_degree)
         self.ln_lm_head_memory = self.ln_lm_head_kernel.build_memory()
+        self.layer_executors = list()
+        self.lm_head_executor = None
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params)
@@ -935,6 +939,24 @@ class DecoderProgramMultiLayer(DecoderProgram):
         for memories in self.multi_layers_memories:
             self.kernels[bucket_id](memories[bucket_id])
         self.ln_lm_head_kernel(self.ln_lm_head_memory)
+
+    def enable_executor(self):
+        for kernel, memories in zip(self.kernels, self.multi_layers_memories):
+            executors = list()
+            self.layer_executors.append(executors)
+            for memory in memories:
+                # NOTE: No input/output returns from layers. Do one-time copy
+                executor = kernel.build_executor(memory, [], [])
+                executors.append(executor)
+        output_tensors = [self.logits_buffer]
+        executor = self.ln_lm_head_kernel.build_executor(self.ln_lm_head_memory, [], output_tensors)
+        self.lm_head_executor = executor
+
+    def execute(self, bucket_id, *inputs, return_ranks=-1):
+        self.inputs_host_to_device(inputs) # One-time input copy
+        for executor in self.layer_executors[bucket_id]:
+            executor([], return_ranks=0) # No returns from intermediate layers
+        return self.lm_head_executor([], return_ranks=return_ranks)
 
 
 class FastCacheBroadcaster:
