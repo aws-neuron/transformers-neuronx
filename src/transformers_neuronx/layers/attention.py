@@ -276,7 +276,7 @@ def output(
     O = (C @ wO) + bO
     """
     dtype = context.dtype
-    n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
+    n_seqs, n_active_tokens, n_heads_tp, d_head = context.sizes
     _, hidden_size = out_weight.sizes
     hidden_sizes = n_seqs, n_active_tokens, hidden_size
     hidden_r_sizes = n_seqs * n_active_tokens, hidden_size
