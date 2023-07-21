@@ -65,6 +65,7 @@ def compile_hlo_module(hlo_module, tag=None):
     else:
         hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
 
+    dump = "NEURONX_DUMP_TO" in os.environ
     dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
     dump_to = os.path.join(dump_to, hlo_module_name)
     os.makedirs(dump_to, exist_ok=True)
@@ -77,8 +78,11 @@ def compile_hlo_module(hlo_module, tag=None):
     neff_path = os.path.realpath(neff_path)
     if not os.path.isfile(neff_path) or cache != 'on':
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        hlo_module_path, f'--output={neff_path}', '--verbose=35']
-        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
+                        hlo_module_path, f'--output={neff_path}']
+        if dump:
+            command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
+        else:
+            command_line.extend(['--verbose=35'])
         flags = shlex.split(flags)
         command_line.extend(flags)
         subprocess.check_call(command_line, cwd=dump_to)
