@@ -28,6 +28,7 @@ from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
 from torch_neuronx.proto import metaneff_pb2
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
+from libneuronxla import neuron_xla_compile
 from neuronxcc import __version__ as compiler_version
 
 def get_hash_module(hlo_module, flags):
@@ -54,51 +55,39 @@ def build_parallel_kernel(hlo_module, tp_degree):
     kernel.build()
     return kernel
 
-
 def compile_hlo_module(hlo_module, tag=None):
     flags = os.environ.get('NEURON_CC_FLAGS', '')
-    hash = get_hash_module(hlo_module, flags)
-    # By default cache is on since hash of HLO is used to store neff and no collision can occur
-    cache = os.environ.get('NEURONX_CACHE', 'off')
-    # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
-    if tag is None:
-        hlo_module_name = f'{hlo_module.name}.{compiler_version}.{hash}'
-    else:
-        hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
+    module_hash = get_hash_module(hlo_module, flags)
 
     dump = "NEURONX_DUMP_TO" in os.environ
-    dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
-    dump_to = os.path.join(dump_to, hlo_module_name)
-    os.makedirs(dump_to, exist_ok=True)
 
-    hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
-    hlo_module_path = os.path.realpath(hlo_module_path)
-    if not os.path.isfile(hlo_module_path) or cache != 'on':
-        dump_proto(hlo_module, hlo_module_path)
-    neff_path = f'{hlo_module_path}.neff'
-    neff_path = os.path.realpath(neff_path)
-    if not os.path.isfile(neff_path) or cache != 'on':
+    if dump:
+        # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
+        if tag is None:
+            hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_hash}'
+        else:
+            hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{module_hash}'
+
+        dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+        dump_to = os.path.join(dump_to, hlo_module_name)
+        os.makedirs(dump_to, exist_ok=True)
+        hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
+        hlo_module_path = os.path.realpath(hlo_module_path)
+        if not os.path.isfile(hlo_module_path):
+            dump_proto(hlo_module, hlo_module_path)
+        neff_path = f'{hlo_module_path}.neff'
+        neff_path = os.path.realpath(neff_path)
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
                         hlo_module_path, f'--output={neff_path}']
-        if dump:
-            command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-        else:
-            command_line.extend(['--verbose=35'])
-        flags = shlex.split(flags)
-        command_line.extend(flags)
+        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
         subprocess.check_call(command_line, cwd=dump_to)
-    with open(neff_path, 'rb') as f:
-        neff_bytes = f.read()
+        with open(neff_path, 'rb') as f:
+            neff_bytes = f.read()
+    else:
+        module_bytes = hlo_module.SerializeToString()
+        neff_bytes = neuron_xla_compile(module_bytes, (flags + ' --verbose=35').split(), input_format="hlo", platform_target="trn1",
+            cache_key=module_hash, retry_failed_compilation=False, lazy=True, use_cache=True, cache_dir=None)
     return neff_bytes
-
-
-class GlobalCounter:
-
-    _counter = 0
-
-    def __call__(self):
-        GlobalCounter._counter += 1
-        return GlobalCounter._counter
 
 
 def dump_proto(proto, path):
