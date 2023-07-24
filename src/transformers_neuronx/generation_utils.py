@@ -33,9 +33,15 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         out_logits = out_logits[:, None, :]
         if return_dict:
             return ModelOutput(
-                [("logits", out_logits)]
+                [("logits", out_logits), ("past_key_values", tuple())],
             )
         return (out_logits,)
+
+    # implemented for beam search
+    # we ignore past as we don't expose k/v_cache
+    def _reorder_cache(self, past, beam_idx):
+        assert hasattr(self.model, 'reorder_cache') and callable(self.model.reorder_cache), "{self.model.__class__.__name__} doesn't have reorder_cache implemented for beam searchc"
+        self.model.reorder_cache(beam_idx)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         # convert attention_mask to start_ids

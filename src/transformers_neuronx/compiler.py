@@ -21,6 +21,7 @@ import tempfile
 import numpy as np
 from textwrap import dedent
 import torch
+import logging
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -431,3 +432,44 @@ def get_debug_outputs(program, bucket_id=0):
     debug_tensors = [ops.parallel_cpu(x) for x in debug_tensors]
     debug_names = program.debugger.get_names() if hasattr(program, "debugger") else []
     return debug_tensors, debug_names
+
+class HLOKernel:
+    def __init__(self, hlo_program, tp, start_g_nc_id=0, g_nc_count=None):
+        self.hlo_program = hlo_program
+        self.tp = tp
+        self.start_g_nc_id = start_g_nc_id
+        if g_nc_count is None:
+            g_nc_count = tp
+        self.g_nc_count = g_nc_count
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree=self.tp)
+
+    def compile(self):
+        self.hlo_module = compiler.compile_py_func(self.hlo_program)
+        self.build()
+
+    def build(self):
+        # wrap HLO with kernel and compile{
+        logging.debug(f"Build hlo module with tp {self.tp} g_start_device_id {self.start_g_nc_id} g_device_count {self.g_nc_count}")
+        self.kernel = compiler.ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
+        # load NEFF
+        self.kernel.build()
+
+    def load(self):
+        logging.debug(f"loading {self.hlo_module.name}")
+        self.kernel.load()
+
+    def setup(self, nc_input_buffers, nc_output_buffers, output_count=None):
+        self.memories = self.kernel.build_memory()
+        if len(nc_output_buffers) == 0:
+            if output_count is None:
+                cpu_output_buffers = [compiler.gen_zero_output(self.hlo_module, None)] # index is only needed when indexing output tuple
+            else:
+                cpu_output_buffers = [compiler.gen_zero_output(self.hlo_module, i) for i in range(output_count)]
+            nc_output_buffers = []
+            for o in cpu_output_buffers:
+                nc_output_buffers.append(self.manipulator.duplicate(o)) 
+        self.memories.setup(nc_input_buffers, nc_output_buffers) # Segmentation fault (core dumped)
+
+    def run(self):
+        logging.debug(f"running {self.hlo_module.name}")
+        self.kernel(self.memories)

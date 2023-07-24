@@ -74,6 +74,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         if os.path.exists(program_filename):
             self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
+    def reorder_cache(self, reorder_ids):
+        self.decoder_lm_head.reorder_cache(reorder_ids)
+
     def to_neuron(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()

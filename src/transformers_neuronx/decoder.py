@@ -336,6 +336,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
         return compiler.compile_py_func(ln_lm_head)
 
+    def reorder_cache(self, reorder_ids):
+        self.program.reorder_cache(self.layers, reorder_ids)
+
 
 def read_n_position(hlo_module, num_inputs):
     return hlo_module.host_program_shape.parameters[num_inputs].dimensions[0]
@@ -573,6 +576,7 @@ class DecoderLayer(torch.nn.Module):
         n_heads_kv_cache = n_heads * self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1]
         cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache, self.attention_head_size]
         cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+        self.cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
         self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=2)
         self.attn_v_cache = manipulator.shard_along(cpu_cache, dim=2)
@@ -803,7 +807,6 @@ class DecoderParameterBuilder:
         self.parameter_number += 1
         return param
 
-
 class DecoderProgram:
 
     def __init__(self, hlo_modules, num_inputs, tp_degree):
@@ -813,10 +816,12 @@ class DecoderProgram:
         self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+        self.tp_degree = tp_degree
 
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
+        self.layers = layers
 
         # Compile modules in parallel
         with ThreadPoolExecutor(max_workers=None) as executor:
@@ -825,6 +830,8 @@ class DecoderProgram:
 
         for kernel in self.kernels:
             kernel.load()
+
+        self.setup_reorder_cache_kernel()
 
     def get_neff_bytes(self):
         return [kernel.neff_bytes for kernel in self.kernels]
@@ -858,6 +865,52 @@ class DecoderProgram:
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
 
+    def setup_reorder_cache_kernel(self):
+        # assume each layer have same size of cache
+        def reorder_cache(scribe):
+            reorder_ids = scribe.s64[self.layers[0].cache_shape].Parameter(parameter_number=0)
+            caches = []
+            param_builder = DecoderParameterBuilder(scribe, 1)
+            for layer in self.layers:
+                for cache in layer.attn_k_cache, layer.attn_v_cache:
+                    cache = param_builder.from_tensor(cache)
+                    caches.append(cache)
+            outputs = []
+            # TODO: concat -> reorder -> indexing?
+            # cache of shape [self.n_positions, self.batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+            # we want to reorder on batch dimension
+            for cache in caches:
+                new_cache = hlo.gather(cache, 1, reorder_ids) 
+                outputs.append(new_cache)
+            root_shapes = [tensor.dtype[tensor.sizes] for tensor in outputs]
+            return scribe.tuple(*root_shapes).Tuple(*outputs)
+
+        self.reorder_cache_hlo_kernel = compiler.HLOKernel(reorder_cache, self.tp_degree)
+        self.reorder_cache_hlo_kernel.compile()
+        self.reorder_cache_hlo_kernel.load()
+
+        # setup memory buffer
+        reorder_ids = torch.zeros(self.layers[0].cache_shape, dtype=torch.int64)
+        self.reorder_ids_buffers = self.reorder_cache_hlo_kernel.manipulator.duplicate(reorder_ids)
+        input_tensors = [self.reorder_ids_buffers]
+        output_tensors = []
+        for layer in self.layers:
+            for cache in layer.attn_k_cache, layer.attn_v_cache:
+                input_tensors.append(cache)
+                output_tensors.append(cache) # aliasing
+        self.reorder_cache_hlo_kernel.setup(input_tensors, output_tensors)
+
+    def reorder_cache(self, layers, reorder_ids):
+        # convert reorder_ids to in tensor 
+        reorder_ids_tensor = torch.zeros(1, len(reorder_ids), 1, 1, dtype=torch.int64)
+        reorder_ids_tensor[0, :, 0, 0] = torch.tensor(reorder_ids, dtype=torch.int64)
+        # TODO: do this broadcast in HLO to avoid data copy overhead
+        reorder_ids_tensor = reorder_ids_tensor.broadcast_to(layers[0].cache_shape).contiguous()
+        # TODO: if reorder_ids == range(batch_size), don't do anything
+        reorder_ids_tensors_cpu = self.reorder_cache_hlo_kernel.manipulator.duplicate_on_cpu(reorder_ids_tensor)
+        ops.parallel_write(self.reorder_ids_buffers, reorder_ids_tensors_cpu)
+        self.reorder_cache_hlo_kernel.run()
+    
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
