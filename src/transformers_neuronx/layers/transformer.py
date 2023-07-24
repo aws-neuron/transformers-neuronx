@@ -61,7 +61,7 @@ def rms_lm_head(hidden, rms_weight, lm_head_weight, lm_head_bias, eps=1e-6):
 
     logits = (rms_norm(H) @ W) + B
     """
-    hidden_size, n_active_tokens, batch_size = hidden.sizes
+    batch_size, n_active_tokens, hidden_size = hidden.sizes
     dtype = hidden.dtype
     if n_active_tokens > 1:
         slice_dimensions = [
