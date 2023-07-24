@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer
+from transformers_neuronx.layers import attention, transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 
@@ -30,12 +30,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
+        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
         head_dim = self.config.attention_head_size
+
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        pos_embed = hidden_dtype[n_active_tokens, head_dim, head_dim].Parameter(parameter_number=1)
-        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=2)
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=3)
+        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
+        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, head_dim, cache_ids,
+                                                interpolation_factor=self.config.position_interpolation_factor)
 
         # NOTE: When using token generation network, we generate a mask for the
         #       past tokens and the current tokens separately. This allows us
@@ -50,7 +52,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=token_generation,
             start_mask=True,
         )
-        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, 0, 0, None)
+        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, 0, None)
 
     def layer(
             self, hidden, pos_embed, cache_ids, mask, active_mask,
@@ -104,6 +106,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         neuron_config=None
     ):
         d_head = self.config.attention_head_size
+        tp_degree = self.config.tp_degree
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -117,9 +120,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             neuron_config=neuron_config,
         )
 
-        # Q = Q @ E
-        # K = K @ E
-        query, key = attention.query_key_projection(query, key, pos_embed)
+        # Q = Rotate(Q)
+        # K = Rotate(K)
+        query, key = rotary.rotate_half(query, key, pos_embed)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
@@ -148,7 +151,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
 
         # O = (C @ wO) + bO
-        output = attention.output(context, out_weight, out_scales, out_bias, self.config.tp_degree, neuron_config)
+        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, neuron_config)
 
         # KCache[I] = K
         # VCache[I] = V
