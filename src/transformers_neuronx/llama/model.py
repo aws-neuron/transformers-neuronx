@@ -19,6 +19,7 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import bucket
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
@@ -32,20 +33,22 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.config = config
-        self.neuron_config =  neuron_config
+        self.neuron_config = neuron_config
 
-        self.context_length_estimate = context_length_estimate
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
 
         if unroll is None:
             unroll = config.num_hidden_layers
-        self.n_positions_list = utils.power_of_two_bucket_sizes(32, n_positions)
+
+        self.token_buckets = bucket.token_sizes(n_positions)
+        self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
-            config.num_hidden_layers, unroll, neuron_config=neuron_config
+            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
+            config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
         )
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
@@ -89,91 +92,160 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.decoder_lm_head.enable_executor()
 
-        if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
-                n_positions_list=[self.context_length_estimate],
-                n_active_tokens=self.context_length_estimate,
-                unroll=self.context_unroll,
-                share_caches=True,
-            )
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                model = self.decoder_lm_head.build_weight_shared(
+                    n_positions_list=[context_length_estimate],
+                    n_active_tokens=context_length_estimate,
+                    unroll=self.context_unroll,
+                    share_caches=True,
+                )
+                # PERF: No latency improvement seen in multi-layer models from executor
+                if self.context_unroll == self.config.num_hidden_layers:
+                    model.enable_executor()
+                self.decoder_lm_head_for_context[context_length_estimate] = model
 
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids=None):
+    def context(self, hidden, cache_ids, start_ids):
+        context_length = hidden.shape[1]
+        current = 0
+        estimate = bucket.find(self.context_buckets, context_length)
 
-        # TODO: Move embedding and rotary embedding to Neuron
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-        pos_embd = rotary_embedding(head_dim, head_dim, cache_ids)
+        if estimate is not None:
+            hidden_context = hidden
+            cache_context = cache_ids
 
-        start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
-        hidden = hidden.transpose(0, -1)
-        logits = decoder_lm_head(hidden, pos_embd, cache_ids, start_ids)
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+            # Slice context that when it is too large
+            if context_length > estimate:
+                current = estimate
+                hidden_context = hidden[:, :estimate]
+                cache_context = cache_ids[:estimate]
+
+            # Cannot use context encoding for a context that is too small. This
+            # is because the caller must be aware of the cache-ids/start-ids
+            # used.
+            elif context_length < estimate:
+                current = 0
+
+            # Directly pass input to the context network when exactly sized
+            else:
+                current = estimate
+
+            if current == estimate:
+                model = self.decoder_lm_head_for_context[estimate]
+                logits = model(hidden_context, cache_context, start_ids)
+
+        for i in range(current, context_length):
+            cache_ids = torch.as_tensor([i], dtype=torch.int32)
+            logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
+
         return logits
 
-    def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
 
-    def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+        batch_size, context_length = input_ids.shape
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
+        hidden = self.chkpt_model.model.embed_tokens(input_ids)
+
+        if context_length > 1:
+            logits = self.context(hidden, cache_ids, start_ids)
+        else:
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
+        return logits
+
+    def sample(self, input_ids, sequence_length, start_ids=None,
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0):
+
+        # To enable optimized context encoding network, we must pad
+        # up to the context length estimate or we will not correctly
+        # select the final context logits (See: layers/transformer.py).
+        # This also means we need to shift the start_ids over to correct
+        # for padding.
+        offset = 0
+        batch_size, context_length = input_ids.shape
+        estimate = bucket.find(self.context_buckets, context_length)
+        if estimate:
+            if context_length < estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=True)
+                offset = estimate - context_length
+                if start_ids is None:
+                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                start_ids += offset
+                sequence_length += offset
+                # Sequence length cannot be greater than n_positions
+                sequence_length = min(sequence_length, self.max_positions)
+
+        result = sampling.sample_llama(
+            self, input_ids, start_ids, sequence_length,
+            eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
+            top_k=top_k, top_p=top_p, temperature=temperature
+        )
+
+        if offset != 0:
+            result = result[:, offset:]
+        return result
+
+class FIDLlamaForSampling(LlamaForSampling):
+
+    def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
+                 context_length_estimate=None, context_unroll=None, unroll=None,
+                 neuron_config=None, **kwargs):
+        # Force batch_size=1 in NEFF
+        super().__init__(config, n_positions=n_positions, batch_size=1, amp=amp,
+                        tp_degree=tp_degree, context_length_estimate=context_length_estimate,
+                        context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
+                        **kwargs)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        if self.context_length_estimate is None:
-            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+        """ Sample function
+        input_ids: shape [batch_size, context_length]
+
+        input_ids of different batch index represent single (context + query).
+        They will be mixed and generate a single output sequence.
+        """
+
+        # In FID-Llama, first, context encoding is done w/ generating any output token for context
+        # Here batch-size are different context+queries of single run
+
+        offset = 0
+        batch_size, context_length = input_ids.shape
+
+        # The context length estimate is chosen based on single (context+query)
+        estimate = bucket.find(self.context_buckets, context_length)
+
+        if estimate:
+            if context_length < estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=True)
+                offset = estimate - context_length
+                if start_ids is None:
+                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                start_ids += offset
+                sequence_length += offset
+                # Sequence length cannot be greater than n_positions
+                sequence_length = min(sequence_length, self.max_positions)
+
+        # Flatten input_ids
+        context_length = batch_size * context_length
+        input_ids = input_ids.reshape(context_length, 1)
+
+        # Run the model
+        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
 
-        _, start = input_ids.shape
-        context_length = self.context_length_estimate
-        cache_ids = torch.arange(context_length, dtype=torch.int32)
-        input_context = input_ids[:, :context_length]
-        if start < context_length:
-            input_pad = context_length - start
-            input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
-        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
-        for cur_len in range(context_length, start):
-            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-            next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
-        return sampling.sample_loop(
-            self, input_ids, start_ids, next_token_scores, sequence_length,
-            eos_token_id=self.config.eos_token_id, top_k=top_k)
-
-
-
-def rotary_embedding(dim, head_dim, cache_ids, base=10000):
-
-    # TODO: Support start_id masking for left padded sequences
-
-    embs = []
-
-    for offset in cache_ids:
-        seq_len = offset + 1
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
-        sinusoid_inp = torch.einsum("i , j -> i j", torch.arange(seq_len), inv_freq).float()
-        sin = torch.sin(sinusoid_inp)
-        cos = torch.cos(sinusoid_inp)
-
-        # Stack sin and cos
-        sin = torch.cat((sin[None, offset:seq_len, None, :], sin[None, offset:seq_len, None, :]), dim=-1)
-        sin[..., : sin.shape[-1] // 2] *= -1 # multiply second half by -1
-        cos = torch.cat((cos[None, offset:seq_len, None, :], cos[None, offset:seq_len, None, :]), dim=-1)
-
-        sin_diag = torch.diagflat(sin)
-        cos_diag = torch.diagflat(cos)
-
-        # Swap halves
-        rotate = torch.eye(sin.shape[-1])
-        rotate[: sin.shape[-1] // 2, :], rotate[sin.shape[-1] // 2 :, :] = rotate[sin.shape[-1] // 2 :, :].clone(), rotate[: sin.shape[-1] // 2, :].clone()
-        sincos = torch.matmul(rotate, sin_diag) + cos_diag
-
-        # Only rotary_pct of this is used - we can optimize if necessary
-        pos_embd = torch.eye(head_dim)
-        pos_embd[:dim, :dim] = sincos
-        embs.append(pos_embd)
-
-    return torch.stack(embs, dim=0)
+        if offset != 0:
+            # Offset by offset * batch_size
+            result = result[:, offset * batch_size:]
+        return result

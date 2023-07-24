@@ -127,12 +127,10 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -277,11 +275,10 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
+        logits = logits.permute([1, 2, 0])
         return logits
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
@@ -290,20 +287,6 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
-        # TODO (bowencc): Need to further verify the behavior of attention_mask and position_ids under beam search, comment out for now
-        # batch_dim = input_ids.shape[0]
-        # batch_size = self.config.batch_size
-        # if batch_dim != batch_size:
-        #     if batch_dim < batch_size or batch_dim % batch_size != 0:
-        #         raise ValueError(f"batch dimension on input_ids ({batch_dim}) is not compatible with model's compiled batch_size ({batch_size})")
-        #     input_ids_splits = input_ids.reshape(batch_size, batch_dim//batch_size, -1).transpose(1, 0).split(1, dim=0)
-        #     out_logits = []
-        #     # iterate per beam
-        #     for split in input_ids_splits:
-        #         out = self._forward(split.squeeze(0), cache_ids, start_ids)
-        #         out_logits.append(out)
-        #     out_logits = torch.cat(out_logits, dim=1).reshape(batch_dim, 1, -1)
-        # else:
         out_logits = self._forward(input_ids, cache_ids, start_ids)
         if return_dict:
             return ModelOutput(
@@ -352,7 +335,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         context_length_estimate = utils.get_closest_pow2_bucket_size(context_length_estimate)
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
-        n_positions_list = [config.n_positions]
+        n_positions_list = utils.power_of_two_bucket_sizes(context_length_estimate * 2, config.n_positions)
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
@@ -401,26 +384,32 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        # Only share caches when we don't generate multiple suggestions.
+        share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size
         self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
             n_positions_list=[self.context_length_estimate],
             n_active_tokens=self.context_length_estimate,
             batch_size=self.prompt_batch_size,
             unroll=self.context_unroll,
+            share_caches=share_caches
         )
         config = self.config
         n_heads_tp = config.n_head // config.tp_degree
         d_head = n_embd // config.n_head
         self.broadcaster = decoder.FastCacheBroadcaster(
-            config.n_positions, self.prompt_batch_size, self.decoder_lm_head.batch_size,
+            self.context_length_estimate, self.prompt_batch_size, self.decoder_lm_head.batch_size,
             n_heads_tp, d_head, config.amp, config.tp_degree, config.n_layer)
         source_caches = []
         for layer in self.decoder_lm_head_for_context.layers:
             source_caches.append(layer.attn_k_cache)
             source_caches.append(layer.attn_v_cache)
+        manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
         target_caches = []
         for layer in self.decoder_lm_head.layers:
-            target_caches.append(layer.attn_k_cache)
-            target_caches.append(layer.attn_v_cache)
+            attn_k_cache = manipulator.slice_on_nc(layer.attn_k_cache, 0, start=0, end=self.context_length_estimate, step=1)
+            attn_v_cache = manipulator.slice_on_nc(layer.attn_v_cache, 0, start=0, end=self.context_length_estimate, step=1)
+            target_caches.append(attn_k_cache)
+            target_caches.append(attn_v_cache)
         self.broadcaster.setup(source_caches, target_caches)
         self.tensor_pool = tensor_pool.TensorPool()
         # We need to reset once, since there might be NaN initially in KVcache.
@@ -445,7 +434,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, -1)
         if is_context_encode:
             self.tensor_pool.push([inputs_embeds, position_embeds])
         return hidden, start_ids
@@ -459,9 +447,8 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             task = self.tensor_pool.async_clear()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.transpose(0, -1)
-        logits = logits[:, -1, :]
+        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
             self.tensor_pool.push(hidden)

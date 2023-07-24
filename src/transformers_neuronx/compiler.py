@@ -15,6 +15,7 @@
 import os
 import shlex
 import subprocess
+import hashlib
 import tarfile
 import tempfile
 import numpy as np
@@ -26,7 +27,15 @@ from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
 from torch_neuronx.proto import metaneff_pb2
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
+from neuronxcc import __version__ as compiler_version
 
+def get_hash_module(hlo_module, flags):
+    # Hashing is pretty fast and neglegible compared to compilation time
+    hash_gen = hashlib.sha256()
+    text = str(hlo_module) + flags.replace(" ", "")
+    hash_gen.update(text.encode('utf-8'))
+    hash = str(hash_gen.hexdigest())[:20]
+    return hash
 
 def compile_py_func(py_func):
     return HloScribe(serialize_torch)(py_func).module_proto
@@ -45,32 +54,40 @@ def build_parallel_kernel(hlo_module, tp_degree):
     return kernel
 
 
-def compile_hlo_module(hlo_module):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dump_to = os.environ.get('NEURONX_DUMP_TO', None)
-        cache = os.environ.get('NEURONX_CACHE', 'off')
-        hlo_module_name = f'{hlo_module.name}.{GlobalCounter()()}'
-        if dump_to is not None:
-            dump_to = os.path.join(dump_to, hlo_module_name)
-            os.makedirs(dump_to, exist_ok=True)
-            tmpdir = dump_to
-        hlo_module_path = os.path.join(tmpdir, f'{hlo_module_name}.pb')
-        hlo_module_path = os.path.realpath(hlo_module_path)
-        if not os.path.isfile(hlo_module_path) or cache != 'on':
-            dump_proto(hlo_module, hlo_module_path)
-        neff_path = f'{hlo_module_path}.neff'
-        neff_path = os.path.realpath(neff_path)
-        if not os.path.isfile(neff_path) or cache != 'on':
-            command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                            hlo_module_path, f'--output={neff_path}', '--verbose=35']
-            if dump_to is not None:
-                command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-            flags = os.environ.get('NEURON_CC_FLAGS', '')
-            flags = shlex.split(flags)
-            command_line.extend(flags)
-            subprocess.check_call(command_line, cwd=tmpdir)
-        with open(neff_path, 'rb') as f:
-            neff_bytes = f.read()
+def compile_hlo_module(hlo_module, tag=None):
+    flags = os.environ.get('NEURON_CC_FLAGS', '')
+    hash = get_hash_module(hlo_module, flags)
+    # By default cache is on since hash of HLO is used to store neff and no collision can occur
+    cache = os.environ.get('NEURONX_CACHE', 'off')
+    # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
+    if tag is None:
+        hlo_module_name = f'{hlo_module.name}.{compiler_version}.{hash}'
+    else:
+        hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{hash}'
+
+    dump = "NEURONX_DUMP_TO" in os.environ
+    dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+    dump_to = os.path.join(dump_to, hlo_module_name)
+    os.makedirs(dump_to, exist_ok=True)
+
+    hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
+    hlo_module_path = os.path.realpath(hlo_module_path)
+    if not os.path.isfile(hlo_module_path) or cache != 'on':
+        dump_proto(hlo_module, hlo_module_path)
+    neff_path = f'{hlo_module_path}.neff'
+    neff_path = os.path.realpath(neff_path)
+    if not os.path.isfile(neff_path) or cache != 'on':
+        command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
+                        hlo_module_path, f'--output={neff_path}']
+        if dump:
+            command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
+        else:
+            command_line.extend(['--verbose=35'])
+        flags = shlex.split(flags)
+        command_line.extend(flags)
+        subprocess.check_call(command_line, cwd=dump_to)
+    with open(neff_path, 'rb') as f:
+        neff_bytes = f.read()
     return neff_bytes
 
 
@@ -151,6 +168,7 @@ class DataTypeConverter:
         self.hlo2metaneff_mapping = {}
         self.hlo2torch_mapping = {}
         self.torch2name_mapping = {}
+        self.torch2hlo_mapping = {}
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
             pname, dname, tname = line.split()
@@ -160,6 +178,7 @@ class DataTypeConverter:
             self.hlo2metaneff_mapping[primitive_type] = metaneff_dtype
             self.hlo2torch_mapping[primitive_type] = torch_dtype
             self.torch2name_mapping[torch_dtype] = pname.lower()
+            self.torch2hlo_mapping[torch_dtype] = primitive_type
 
     def hlo2metaneff(self, primitive_type):
         return self.hlo2metaneff_mapping[primitive_type]
@@ -169,6 +188,9 @@ class DataTypeConverter:
 
     def torch2name(self, torch_dtype):
         return self.torch2name_mapping[torch_dtype]
+
+    def torch2hlo(self, torch_dtype):
+        return self.torch2hlo_mapping[torch_dtype]
 
 
 class Kernel:
@@ -242,16 +264,80 @@ class ParallelMemory:
             return []
 
 
+class Executor:
+
+    def __init__(self, model, memory, inputs, outputs):
+        """
+        An optimized executor class that allocates a thread for each model rank.
+
+        This implements a number of optimizations to speed up execution time:
+        - The primary optimization is that this class creates set of fixed
+          threads that are always blocking on a barrier waiting to execute.
+          In practice, this can significantly speed up the thread startup
+          time for model executions compared to other threadpool
+          implementations.
+        - A second optimization is that each thread is responsible for
+          both the I/O and the execution of the model rank. This means that
+          fewer `libtorchneuron` API calls are made an fewer threadpool starts
+          are being triggered.
+        The combination of the above optimization can have a huge effect
+        especially on small/fast models.
+        """
+        self.inputs = inputs
+        self.outputs = outputs
+        self.executor = torch.classes.neuron.ParallelExecutor(
+            model,
+            memory.inputs,  # All inputs (inputs, caches, weights)
+            memory.outputs, # All outputs (outputs, caches)
+            inputs,         # User provided inputs
+            outputs,        # Returned outputs
+        )
+
+    def __call__(self, inputs, return_ranks: int = -1):
+        """
+        Execute the kernel with the given inputs.
+
+        Arguments:
+            inputs: A set of input tensors to copy to each model rank.
+            return_ranks: Specifies which ranks to return to python. This is
+                useful if data is only required from a specific number of
+                NeuronCores. For example:
+                    * 0: Do not return any data.
+                    * 1: Return data only from the first rank. This is useful
+                         when the data is synchronized across ranks.
+                    * -1: Return data form all ranks.
+
+        Returns:
+            result: The output tensors from each rank concatenated along dim 0.
+        """
+        casted = []
+        for cpu, buf in zip(inputs, self.inputs):
+            if cpu.dtype != buf.dtype:
+                cpu = cpu.to(buf.dtype)
+            casted.append(cpu)
+        outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+        if return_ranks == 1:
+            result = tuple(shards[0] for shards in outputs)
+        else:
+            result = tuple(torch.cat(shards, dim=0) for shards in outputs)
+        if len(result) == 1:
+            return result[0]
+        return result
+
+
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
         self.model = None
         self.hlo_snapshot = None
         self.generate_hlo_snapshot()
-
+        self.g_start_device_id = g_start_device_id
+        if g_device_count is None:
+            g_device_count = tp_degree
+        self.g_device_count = g_device_count
 
     def generate_hlo_snapshot(self, tensors=None):
         if tensors is None:
@@ -280,20 +366,23 @@ class ParallelKernel:
     def build_memory(self):
         return ParallelMemory(self.hlo_module, self.tp_degree)
 
-    def build(self):
+    def build(self, tag=None):
         # Avoid rebuilding NEFF. This path occurs during deserialization
         if self.neff_bytes is not None:
             return
-        self.neff_bytes = compile_hlo_module(self.hlo_module)
+        self.neff_bytes = compile_hlo_module(self.hlo_module, tag)
 
     def load(self):
-        self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree)
+        self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         self.model.load()
 
     def __call__(self, memory):
         if self.hlo_snapshot:
             self.generate_hlo_snapshot(memory.input_tensors)
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
+
+    def build_executor(self, memory, inputs, outputs):
+        return Executor(self.model, memory, inputs, outputs)
 
 
 def gen_zero_input(hlo_module, index):
@@ -336,7 +425,7 @@ def gen_zero_output_from_shape(input):
     shape = tuple(shape_proto.dimensions)
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
     return torch.zeros(shape, dtype=dtype)
-    
+
 def get_debug_outputs(program, bucket_id=0):
     debug_tensors = program.memories[bucket_id].get_debug_tensors()
     debug_tensors = [ops.parallel_cpu(x) for x in debug_tensors]
