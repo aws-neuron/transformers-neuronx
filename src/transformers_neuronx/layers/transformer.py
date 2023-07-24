@@ -27,7 +27,7 @@ def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
 
     logits = (layer_norm(H) @ W) + B
     """
-    hidden_size, n_active_tokens, batch_size = hidden.sizes
+    batch_size, n_active_tokens, hidden_size = hidden.sizes
     dtype = hidden.dtype
     if n_active_tokens > 1:
         slice_dimensions = [
@@ -38,7 +38,7 @@ def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
         n_active_tokens = 1
         sizes = batch_size, n_active_tokens, hidden_size
         hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
-    ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+    ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias)
     ln_hidden = dtype[batch_size*n_active_tokens,hidden_size].Reshape(ln_hidden)
     logits = hlo.dot01(lm_head_weight, ln_hidden)
     if lm_head_bias is not None:
