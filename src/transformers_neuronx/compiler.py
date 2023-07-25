@@ -444,13 +444,13 @@ class HLOKernel:
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree=self.tp)
 
     def compile(self):
-        self.hlo_module = compiler.compile_py_func(self.hlo_program)
+        self.hlo_module = compile_py_func(self.hlo_program)
         self.build()
 
     def build(self):
         # wrap HLO with kernel and compile{
         logging.debug(f"Build hlo module with tp {self.tp} g_start_device_id {self.start_g_nc_id} g_device_count {self.g_nc_count}")
-        self.kernel = compiler.ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
+        self.kernel = ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
         # load NEFF
         self.kernel.build()
 
@@ -462,9 +462,9 @@ class HLOKernel:
         self.memories = self.kernel.build_memory()
         if len(nc_output_buffers) == 0:
             if output_count is None:
-                cpu_output_buffers = [compiler.gen_zero_output(self.hlo_module, None)] # index is only needed when indexing output tuple
+                cpu_output_buffers = [gen_zero_output(self.hlo_module, None)] # index is only needed when indexing output tuple
             else:
-                cpu_output_buffers = [compiler.gen_zero_output(self.hlo_module, i) for i in range(output_count)]
+                cpu_output_buffers = [gen_zero_output(self.hlo_module, i) for i in range(output_count)]
             nc_output_buffers = []
             for o in cpu_output_buffers:
                 nc_output_buffers.append(self.manipulator.duplicate(o)) 

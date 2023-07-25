@@ -868,7 +868,7 @@ class DecoderProgram:
     def setup_reorder_cache_kernel(self):
         # assume each layer have same size of cache
         def reorder_cache(scribe):
-            reorder_ids = scribe.s64[self.layers[0].cache_shape].Parameter(parameter_number=0)
+            reorder_ids = scribe.s64[self.layers[0].batch_size].Parameter(parameter_number=0)
             caches = []
             param_builder = DecoderParameterBuilder(scribe, 1)
             for layer in self.layers:
@@ -880,7 +880,7 @@ class DecoderProgram:
             # cache of shape [self.n_positions, self.batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
             # we want to reorder on batch dimension
             for cache in caches:
-                new_cache = hlo.gather(cache, 1, reorder_ids) 
+                new_cache = hlo.index_select(cache, 1, reorder_ids)
                 outputs.append(new_cache)
             root_shapes = [tensor.dtype[tensor.sizes] for tensor in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
@@ -901,11 +901,7 @@ class DecoderProgram:
         self.reorder_cache_hlo_kernel.setup(input_tensors, output_tensors)
 
     def reorder_cache(self, layers, reorder_ids):
-        # convert reorder_ids to in tensor 
-        reorder_ids_tensor = torch.zeros(1, len(reorder_ids), 1, 1, dtype=torch.int64)
-        reorder_ids_tensor[0, :, 0, 0] = torch.tensor(reorder_ids, dtype=torch.int64)
-        # TODO: do this broadcast in HLO to avoid data copy overhead
-        reorder_ids_tensor = reorder_ids_tensor.broadcast_to(layers[0].cache_shape).contiguous()
+        reorder_ids_tensor = torch.tensor(reorder_ids, dtype=torch.int64)
         # TODO: if reorder_ids == range(batch_size), don't do anything
         reorder_ids_tensors_cpu = self.reorder_cache_hlo_kernel.manipulator.duplicate_on_cpu(reorder_ids_tensor)
         ops.parallel_write(self.reorder_ids_buffers, reorder_ids_tensors_cpu)
