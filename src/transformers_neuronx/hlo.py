@@ -1279,3 +1279,27 @@ def select(tensor, dim, index, keepdim=False):
     if keepdim:
         result = unsqueeze(result, dim)
     return result
+
+def index_select(tensor, dim, index):
+    dtype = tensor.dtype
+    n_index, = index.sizes
+
+    sizes = list(tensor.sizes)
+    sizes[dim] = n_index
+    offset_dims = list(range(len(tensor.sizes)))
+    offset_dims.pop(dim)
+    gather_slice_sizes = list(tensor.sizes)
+    gather_slice_sizes[dim] = 1
+
+    result = dtype[sizes].Gather(
+        tensor,
+        index,
+        gather_dimension_numbers=dict(
+            offset_dims=offset_dims,
+            collapsed_slice_dims=[dim],
+            start_index_map=[dim],
+            index_vector_dim=1,
+        ),
+        gather_slice_sizes=gather_slice_sizes,
+    )
+    return result
