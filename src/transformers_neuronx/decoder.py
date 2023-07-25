@@ -23,7 +23,6 @@ from transformers_neuronx import parallel
 from transformers_neuronx import utils
 from transformers_neuronx import quantize
 from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import Manager
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
@@ -825,18 +824,13 @@ class DecoderProgram:
         self.layers = layers
 
         # Compile modules in parallel
-        with Manager() as manager:
-            neff_dict = manager.dict()
-            with ProcessPoolExecutor(max_workers=len(self.n_positions_list)) as executor:
-                features = []
-                for kernel, bucket_size in zip(self.kernels, self.n_positions_list):
-                    feature = executor.submit(multi_process_compile_helper, kernel, bucket_size, neff_dict)
-                    features.append(feature)
-                for feature in features:
-                    result = feature.result()
-
+        with ProcessPoolExecutor(max_workers=len(self.n_positions_list)) as executor:
+            neff_bytes_futures = []
             for kernel, bucket_size in zip(self.kernels, self.n_positions_list):
-                kernel.neff_bytes = neff_dict[bucket_size]
+                future = executor.submit(kernel.compile, bucket_size)
+                neff_bytes_futures.append(future)
+            for kernel, future in zip(self.kernels, neff_bytes_futures):
+                kernel.neff_bytes = future.result()
 
         for kernel in self.kernels:
             kernel.load()

@@ -66,7 +66,7 @@ def compile_hlo_module(hlo_module, tag=None):
         if tag is None:
             hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_hash}'
         else:
-            hlo_module_name = f'{hlo_module.name}.{tag}.{compiler_version}.{module_hash}'
+            hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_hash}'
 
         dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
         dump_to = os.path.join(dump_to, hlo_module_name)
@@ -355,6 +355,10 @@ class ParallelKernel:
 
     def build_memory(self):
         return ParallelMemory(self.hlo_module, self.tp_degree)
+
+    def compile(self, tag=None):
+        self.build(tag=tag)
+        return self.neff_bytes
 
     def build(self, tag=None):
         # Avoid rebuilding NEFF. This path occurs during deserialization
