@@ -85,7 +85,7 @@ def compile_hlo_module(hlo_module, tag=None):
             neff_bytes = f.read()
     else:
         module_bytes = hlo_module.SerializeToString()
-        neff_bytes = neuron_xla_compile(module_bytes, (flags + ' --verbose=35').split(), input_format="hlo", platform_target="trn1",
+        neff_bytes = neuron_xla_compile(module_bytes, shlex.split(flags), input_format="hlo", platform_target="trn1",
             cache_key=module_hash, retry_failed_compilation=False, lazy=True, use_cache=True, cache_dir=None)
     return neff_bytes
 
