@@ -178,8 +178,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
                     tensor = tensor[tuple(slices)].contiguous()
                 input_tensors.append(tensor)
             _, cache_ids, *_ = input_tensors
-            min_id = cache_ids.max().item()
-            max_id = cache_ids.min().item()
+            max_id = cache_ids.max().item()
+            min_id = cache_ids.min().item()
+            # When context_length == m * n_active_tokens, bucket-size of n_active_tokens should be chosen.
+            # This is useful for Fusion-In-Decoder case, where 2nd n_active_tokens don't need to attend to
+            # 1st n_active_tokens.
+            if max_id - min_id > 1:
+                max_id -= min_id
+                min_id = 0
             bucket_id = self.program.find_bucket_id(max_id)
             if self.program.find_bucket_id(min_id) != bucket_id:
                 raise ValueError(f'given buckets {self.n_positions_list}, ids ranging from '
