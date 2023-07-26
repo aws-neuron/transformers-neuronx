@@ -103,13 +103,13 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
 
 def validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep):
     if top_k is not None and (not isinstance(top_k, int) or not (top_k > 0)):
-        raise ValueError('top_k` has to be a strictly positive int.')
+        raise ValueError('top_k has to be a strictly positive int.')
 
     if top_p is not None and (not isinstance(top_p, float) or not (0.0 < top_p <= 1.0)):
-        raise ValueError('top_p` has to be a strictly positive float that less than or equal to 1.0.')
+        raise ValueError('top_p has to be a strictly positive float that less than or equal to 1.0.')
 
     if min_tokens_to_keep is not None and (not isinstance(min_tokens_to_keep, int) or min_tokens_to_keep < 0):
-        raise ValueError('min_tokens_to_keep` has to be a non-negative int.')
+        raise ValueError('min_tokens_to_keep has to be a non-negative int.')
 
 
 def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
@@ -132,25 +132,29 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
         Otherwise, performs top_p filtering on the result of top_k filtering, and calculating cumulative probabilities
         only on the filtered result from top_k filtering.
         """
-        scores_to_filter = scores if indices is None else torch.index_select(scores, dim=-1, index=indices[0])
-        sorted_scores, sorted_indices = torch.sort(scores_to_filter, descending=True)
-        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1), dim=-1)
-        n_to_keep = (cumulative_probs <= top_p).int().sum(dim=-1).apply_(safe_size)
-        scores_to_keep, indices_to_keep = sorted_scores[:, 0:max(n_to_keep)], sorted_indices[:, 0:max(n_to_keep)]
+        def filter_sorted(sorted_scores):
+            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1), dim=-1)
+            mask = cumulative_probs <= top_p
+            mask[:, :min_tokens_to_keep] = True
+            n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
+            sorted_scores = sorted_scores[:, :n_to_keep]
+            mask = mask[:, :n_to_keep]
 
-        # the to_keep tensors kept max(n_to_keep). n_to_keep is an array of ints, each indicates the number of
-        # scores to keep for the respective sequence in a batch. since indices_to_keep need to be returned as a
-        # whole matrix, we need to set the values that correspond to unwanted indices, those that are exceeds n_to_keep
-        # for their respective sequences, to -inf. This way subsequent sampling logic will not pick up these unwanted
-        # token indices.
-        for i, seq in enumerate(scores_to_keep):
-            scores_to_keep[i, n_to_keep[i].item():] = -float('inf')
+            # Performed top_p on all batches. Need to return all batches' filtered values in one matrix. Therefore,
+            # we need to set the values that correspond to unwanted indices -- those that where mask has value False
+            # -- to -inf. This way subsequent sampling logic will not pick up these unwanted token indices.
+            sorted_scores[~mask] = -float('inf')
+            return sorted_scores
 
-        if indices is not None:
-            # Map to original indices
-            indices_to_keep = torch.index_select(indices, dim=-1, index=indices_to_keep[0])
+        if indices is None:
+            # Not filtered by filter_by_top_k
+            ret_scores, ret_indices = torch.sort(scores, descending=True)
+            ret_scores = filter_sorted(ret_scores)
+            return ret_scores, ret_indices[:, :ret_scores.size(dim=-1)]
 
-        return scores_to_keep, indices_to_keep
+        # Already filtered by filter_by_top_k, the value sequences represented by indices are already sorted.
+        ret_scores = filter_sorted(torch.gather(scores, 1, indices))
+        return ret_scores, indices[:, :ret_scores.size(dim=-1)]
 
     if (top_k is None and top_p is None) or min_tokens_to_keep > input_size:
         # Nothing to filter
@@ -173,7 +177,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     if not isinstance(temperature, float) or not (temperature > 0):
-        raise ValueError('temperature` has to be a strictly positive float.')
+        raise ValueError('temperature has to be a strictly positive float.')
 
     # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
@@ -199,9 +203,9 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # this means that, while every sequence in the batch has the same length, a sequence that
         # encounters eos_token_id earlier will be filled with eos_token_ids post the first appearance
         # of eos_token_id.
-        tokens.append(torch.where(done_flags == True, eos_token_id, inputs))
+        tokens.append(torch.where(done_flags.eq(True), eos_token_id, inputs))
 
-        if next_len >= sequence_length or torch.all(done_flags == True):
+        if next_len >= sequence_length or done_flags.all():
             break
 
         # forward pass to get next token
