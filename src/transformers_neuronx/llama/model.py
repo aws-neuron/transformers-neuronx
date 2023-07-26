@@ -209,6 +209,50 @@ class FIDLlamaForSampling(LlamaForSampling):
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
                         **kwargs)
 
+    def context(self, hidden, cache_ids, start_ids):
+        # Fusion-In-Decoder context encoding
+        fused_context_length = hidden.shape[1]
+        context_length = fused_context_length // self.batch_size
+
+        current = 0
+        estimate = bucket.find(self.context_buckets, context_length)
+
+        if estimate is not None:
+            hidden_context = hidden
+            cache_context = cache_ids
+
+            # Slice context when it is too large
+            if context_length > estimate:
+                current = estimate
+                hidden_context = hidden[:, :estimate]
+                cache_context = cache_ids[:estimate]
+
+            # Cannot use context encoding for a context that is too small. This
+            # is because the caller must be aware of the cache-ids/start-ids
+            # used.
+            elif context_length < estimate:
+                current = 0
+
+            # Directly pass input to the context network when exactly sized
+            else:
+                current = estimate
+
+            if current == estimate:
+                model = self.decoder_lm_head_for_context[estimate]
+
+                # Run each context separately in-place
+                for j in range(self.batch_size):
+                    single_context_slice = slice(j * context_length, (j+1) * context_length)
+                    logits = model(hidden_context[:, single_context_slice, :], cache_context[single_context_slice], start_ids)
+
+        # Todo: Verify we need reduce pointer by one
+        current -= 1
+        for i in range(current, context_length):
+            cache_ids = torch.as_tensor([i], dtype=torch.int32)
+            logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
+
+        return logits
+
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         """ Sample function
         input_ids: shape [batch_size, context_length]
@@ -221,6 +265,7 @@ class FIDLlamaForSampling(LlamaForSampling):
         # Here batch-size are different context+queries of single run
 
         offset = 0
+        fused_batch_size = 1
         batch_size, context_length = input_ids.shape
 
         # The context length estimate is chosen based on single (context+query)
@@ -231,15 +276,16 @@ class FIDLlamaForSampling(LlamaForSampling):
                 input_ids = utils.pad(input_ids, 1, estimate, left=True)
                 offset = estimate - context_length
                 if start_ids is None:
-                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                    start_ids = torch.zeros(fused_batch_size, dtype=torch.int32)
                 start_ids += offset
                 sequence_length += offset
                 # Sequence length cannot be greater than n_positions
                 sequence_length = min(sequence_length, self.max_positions)
+                context_length = estimate
 
         # Flatten input_ids
         context_length = batch_size * context_length
-        input_ids = input_ids.reshape(context_length, 1)
+        input_ids = input_ids.reshape(fused_batch_size, context_length)
 
         # Run the model
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
@@ -247,5 +293,5 @@ class FIDLlamaForSampling(LlamaForSampling):
 
         if offset != 0:
             # Offset by offset * batch_size
-            result = result[:, offset * batch_size:]
+            result = result[:, context_length:]
         return result
