@@ -208,6 +208,7 @@ class FIDLlamaForSampling(LlamaForSampling):
                         tp_degree=tp_degree, context_length_estimate=context_length_estimate,
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
                         **kwargs)
+        self.batch_size = batch_size
 
     def context(self, hidden, cache_ids, start_ids):
         # Fusion-In-Decoder context encoding
