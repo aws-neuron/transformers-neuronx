@@ -220,14 +220,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.unroll == self.num_layers:
             hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramFullyUnrolled(hlo_modules, num_inputs, self.tp_degree)
+            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
             hlo_modules = [self._hlo_multi_layer(npos) for npos in self.n_positions_list]
             ln_lm_head_hlo_module = self._hlo_ln_lm_head()
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramMultiLayer(hlo_modules, ln_lm_head_hlo_module, num_inputs,
+            program = DecoderProgramMultiLayer(self.layers, hlo_modules, ln_lm_head_hlo_module, num_inputs,
                                                self.num_layers, self.unroll, self.tp_degree)
         if self.compiler_artifacts_path is not None:
             with open(self.compiler_artifacts_path, 'rb') as f:
@@ -815,7 +815,8 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, hlo_modules, num_inputs, tp_degree):
+    def __init__(self, layers, hlo_modules, num_inputs, tp_degree):
+        self.layers = layers
         first_hlo, *_ = hlo_modules
         self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(num_inputs)]
         self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
@@ -823,6 +824,7 @@ class DecoderProgram:
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
         self.tp_degree = tp_degree
+        self.reorder_cache_hlo_kernel = self.create_reoder_cache_kernel()
 
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
@@ -844,11 +846,12 @@ class DecoderProgram:
         self.setup_reorder_cache_kernel()
 
     def get_neff_bytes(self):
-        return [kernel.neff_bytes for kernel in self.kernels]
+        return [kernel.neff_bytes for kernel in self.kernels] + [self.reorder_cache_hlo_kernel.kernel.neff_bytes]
 
     def set_neff_bytes(self, kernels_neff_bytes):
-        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes):
+        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes[:-1]):
             kernel.neff_bytes = neff_bytes
+        self.reorder_cache_hlo_kernel.kernel.neff_bytes = kernels_neff_bytes[-1]
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -875,9 +878,9 @@ class DecoderProgram:
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
 
-    def setup_reorder_cache_kernel(self):
+    def create_reoder_cache_kernel(self):
         # assume each layer have same size of cache
-        def reorder_cache(scribe):
+        def _reorder_cache(scribe):
             reorder_ids = scribe.s64[self.layers[0].batch_size].Parameter(parameter_number=0)
             caches = []
             param_builder = DecoderParameterBuilder(scribe, 1)
@@ -895,8 +898,10 @@ class DecoderProgram:
             root_shapes = [tensor.dtype[tensor.sizes] for tensor in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
-        self.reorder_cache_hlo_kernel = compiler.HLOKernel(reorder_cache, self.tp_degree)
-        self.reorder_cache_hlo_kernel.compile()
+        return compiler.HLOKernel(_reorder_cache, self.tp_degree)
+
+    def setup_reorder_cache_kernel(self):
+        self.reorder_cache_hlo_kernel.build()
         self.reorder_cache_hlo_kernel.load()
 
         # setup memory buffer
@@ -920,8 +925,8 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, hlo_modules, num_inputs, tp_degree):
-        super().__init__(hlo_modules, num_inputs, tp_degree)
+    def __init__(self, layers, hlo_modules, num_inputs, tp_degree):
+        super().__init__(layers, hlo_modules, num_inputs, tp_degree)
         first_hlo, *_ = hlo_modules
         self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
         self.memories = [kernel.build_memory() for kernel in self.kernels]
@@ -964,8 +969,8 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree):
-        super().__init__(hlo_modules, num_inputs, tp_degree)
+    def __init__(self, layers, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree):
+        super().__init__(layers, hlo_modules, num_inputs, tp_degree)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
         self.logits_buffer = compiler.gen_zero_output(ln_lm_head_hlo_module)
