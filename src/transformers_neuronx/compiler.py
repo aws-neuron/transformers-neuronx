@@ -435,15 +435,12 @@ class HLOKernel:
             g_nc_count = tp
         self.g_nc_count = g_nc_count
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree=self.tp)
-
-    def compile(self):
         self.hlo_module = compile_py_func(self.hlo_program)
-        self.build()
+        self.kernel = ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
 
     def build(self):
         # wrap HLO with kernel and compile{
         logging.debug(f"Build hlo module with tp {self.tp} g_start_device_id {self.start_g_nc_id} g_device_count {self.g_nc_count}")
-        self.kernel = ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
         # load NEFF
         self.kernel.build()
 
