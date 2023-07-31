@@ -765,6 +765,7 @@ class DecoderLayer(torch.nn.Module):
     def assign_caches(self, layer):
         self.attn_k_cache = layer.attn_k_cache
         self.attn_v_cache = layer.attn_v_cache
+        self.cache_shape = layer.cache_shape
 
 
 class MaybeParallelTensorManipulator:
