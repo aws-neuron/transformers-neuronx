@@ -209,6 +209,7 @@ class FIDLlamaForSampling(LlamaForSampling):
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
                         **kwargs)
         self.batch_size = batch_size
+        self.bos_token_id = self.config.bos_token_id
 
     def context(self, hidden, cache_ids, start_ids):
         # Fusion-In-Decoder context encoding
@@ -246,12 +247,12 @@ class FIDLlamaForSampling(LlamaForSampling):
                     single_context_slice = slice(j * context_length, (j+1) * context_length)
                     logits = model(hidden_context[:, single_context_slice, :], cache_context[single_context_slice], start_ids)
 
-        # Todo: Verify we need reduce pointer by one
-        current -= 1
+
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
             logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
 
+        logits[:] = self.bos_token_id
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
