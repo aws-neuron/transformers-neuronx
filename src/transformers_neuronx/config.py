@@ -45,3 +45,22 @@ class NeuronConfig():
     def __init__(self, **kargs):
         # Quantization related configurations
         self.quant = kargs.pop('quant', None)
+
+
+class GenerationConfig:
+
+    def __init__(self, *,
+        max_length = None,      # Default: Infer max sequence length from model
+        do_sample = False,      # Default: Greedy
+        top_k = 50,             # Default: Top 50 (when sampling)
+        eos_token_id = None,    # Default: Ignore EOS token
+        early_stopping = None,  # Default: Open-ended generation
+        temperature = None,     # Default: No temperature application
+    ):
+        self.max_length = max_length
+        self.do_sample = do_sample
+        self.top_k = top_k
+        self.eos_token_id = eos_token_id
+        self.early_stopping = early_stopping
+        self.temperature = temperature
+
