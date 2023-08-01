@@ -252,7 +252,8 @@ class FIDLlamaForSampling(LlamaForSampling):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
             logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
 
-        logits[:] = self.bos_token_id
+        logits[:] = float('-inf')
+        logits[self.bos_token_id] = 1.0
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -272,6 +273,11 @@ class FIDLlamaForSampling(LlamaForSampling):
 
         # The context length estimate is chosen based on single (context+query)
         estimate = bucket.find(self.context_buckets, context_length)
+
+        if batch_size * context_length >= sequence_length:
+            raise ValueError(f"sequence_length [{sequence_length}] should be larger than fused input contexts [{context_length} x {batch_size}]")
+        if batch_size * estimate >= sequence_length:
+            raise ValueError(f"sequence_length [{sequence_length}] should be larger than fused input context estimates [{estimate} x {batch_size}]")
 
         if estimate:
             if context_length < estimate:
