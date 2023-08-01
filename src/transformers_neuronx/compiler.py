@@ -57,6 +57,7 @@ def build_parallel_kernel(hlo_module, tp_degree):
 
 def compile_hlo_module(hlo_module, tag=None):
     flags = os.environ.get('NEURON_CC_FLAGS', '')
+
     module_hash = get_hash_module(hlo_module, flags)
 
     dump = "NEURONX_DUMP_TO" in os.environ
@@ -78,14 +79,14 @@ def compile_hlo_module(hlo_module, tag=None):
         neff_path = f'{hlo_module_path}.neff'
         neff_path = os.path.realpath(neff_path)
         command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        hlo_module_path, f'--output={neff_path}']
+                        hlo_module_path, f'--output={neff_path}', *shlex.split(flags)]
         command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
         subprocess.check_call(command_line, cwd=dump_to)
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
     else:
         module_bytes = hlo_module.SerializeToString()
-        neff_bytes = neuron_xla_compile(module_bytes, shlex.split(flags), input_format="hlo", platform_target="trn1",
+        neff_bytes = neuron_xla_compile(module_bytes, flags, input_format="hlo", platform_target="trn1",
             cache_key=module_hash, retry_failed_compilation=False, lazy=True, use_cache=True, cache_dir=None)
     return neff_bytes
 
