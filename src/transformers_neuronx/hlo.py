@@ -662,7 +662,7 @@ def gather(tensor, dim, index):
     return result
 
 
-def _argmax(tensor, dim, keepdim=False):
+def _argmax(tensor, dim, keepdim=False, return_values=False):
     """
     Performs argmax on a single partition
     """
@@ -682,13 +682,15 @@ def _argmax(tensor, dim, keepdim=False):
         keepdim_shape[dim] = 1
         index = u32[keepdim_shape].Reshape(index)
 
+    if return_values:
+        return reduce_max(tensor, dim, keepdim), index
     return index
 
 
-def argmax(tensor, dim, keepdim=False, tp_degree=1):
+def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
 
     if tp_degree == 1:
-        return _argmax(tensor, dim, keepdim)
+        return _argmax(tensor, dim, keepdim, return_values=return_values)
 
     scribe = tensor.scribe
 
@@ -725,10 +727,14 @@ def argmax(tensor, dim, keepdim=False, tp_degree=1):
     replica_index = dtype[rs_size].Reshape(replica_index)
 
     mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
-    mask = index.dtype[mask.sizes].Convert(mask)
-    masked = dtype[sizes].Multiply(mask, index)
-    return reduce_sum(masked, dim=dim, keepdim=keepdim)
+    mask_index = index.dtype[mask.sizes].Convert(mask)
+    masked = dtype[sizes].Multiply(mask, mask_index)
+    index = reduce_sum(masked, dim=dim, keepdim=keepdim)
 
+    if return_values:
+        value = reduce_max(value, dim=dim, keepdim=keepdim)
+        return value, index
+    return index
 
 def _embedding(weight, index):
     """
@@ -759,7 +765,7 @@ def _embedding(weight, index):
     )
 
     # Reshape embedding tensor to look like the original index shape
-    return dtype[(embedding_dim, *index.sizes)].Reshape(result)
+    return dtype[(*index.sizes, embedding_dim)].Reshape(result)
 
 
 def embedding(weight, index, tp_degree=1, dim=1):
@@ -838,7 +844,8 @@ def embedding(weight, index, tp_degree=1, dim=1):
 
     # Case 3: Partitioned embedding: Concatenate embedding pieces
     if dim == 1:
-        return all_gather(result, 0, tp_degree=tp_degree)
+        # Using BSH, concatenate along the last dim
+        return all_gather(result, 2, tp_degree=tp_degree)
 
     raise NotImplementedError(
         f'Embedding operation does not support dim={dim}'
@@ -1111,6 +1118,10 @@ def topk(tensor, dim, k=50, tp_degree=1):
     - The input `tensor` size along dimension `dim` must be a multiple of 8
     - The input `tensor` may not be 1d. The compiler will fail.
     """
+
+    if k == 1:
+        return argmax(tensor, dim, return_values=True, keepdim=True, tp_degree=tp_degree)
+
     scribe = tensor.scribe
     f32 = scribe.f32
 
@@ -1160,8 +1171,8 @@ def topk(tensor, dim, k=50, tp_degree=1):
     k_size_br = f32[sizes].Broadcast(k_size, dimensions=[])
     iota = f32[sizes].Iota(dimensions=[dim])
     group_id = f32[sizes].Divide(iota, k_size_br)
-    group_id = dtype[sizes].Convert(group_id)
-    offset = dtype[sizes].Multiply(group_id, rank_size_br)
+    offset = f32[sizes].Multiply(group_id, rank_size_br)
+    offset = dtype[sizes].Convert(offset)
     index = dtype[sizes].Add(index, offset)
 
     # Find the final global index
@@ -1280,6 +1291,7 @@ def select(tensor, dim, index, keepdim=False):
         result = unsqueeze(result, dim)
     return result
 
+
 def index_select(tensor, dim, index):
     dtype = tensor.dtype
     n_index, = index.sizes
@@ -1303,3 +1315,24 @@ def index_select(tensor, dim, index):
         gather_slice_sizes=gather_slice_sizes,
     )
     return result
+
+
+def add(a, b):
+    assert a.sizes == b.sizes
+    assert a.dtype == b.dtype
+    return a.dtype[a.sizes].Add(a, b)
+
+
+def divide(a, b):
+    assert a.sizes == b.sizes
+    assert a.dtype == b.dtype
+    return a.dtype[a.sizes].Divide(a, b)
+
+
+def reshape(tensor, shape):
+    if shape == tensor.sizes:
+        return tensor
+    dst_numel = functools.reduce(operator.mul, shape)
+    src_numel = functools.reduce(operator.mul, tensor.sizes)
+    assert dst_numel == src_numel
+    return tensor.dtype[shape].Reshape(tensor)
