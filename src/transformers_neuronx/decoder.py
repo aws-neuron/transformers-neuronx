@@ -343,7 +343,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         return compiler.compile_py_func(ln_lm_head)
 
     def reorder_cache(self, reorder_ids):
-        self.program.reorder_cache(self.layers, reorder_ids)
+        self.program.reorder_cache(reorder_ids)
+
+
+    def setup_reorder_cache(self):
+        self.program.setup_reorder_cache()
 
 
 def read_n_position(hlo_module, num_inputs):
@@ -825,12 +829,11 @@ class DecoderProgram:
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
         self.tp_degree = tp_degree
-        self.reorder_cache_hlo_kernel = self.create_reoder_cache_kernel()
+        self.need_reorder_cache = False
 
     def setup(self, layers, ln_lm_head_params):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
-        self.layers = layers
 
         # Compile modules in parallel
         with ProcessPoolExecutor(max_workers=len(self.n_positions_list)) as executor:
@@ -844,15 +847,26 @@ class DecoderProgram:
         for kernel in self.kernels:
             kernel.load()
 
-        self.setup_reorder_cache_kernel()
+    def setup_reorder_cache(self):
+        self.need_reorder_cache = True
+        self.reorder_cache_hlo_kernel = self._create_reoder_cache_kernel()
+        self._setup_reorder_cache_kernel()
+
 
     def get_neff_bytes(self):
-        return [kernel.neff_bytes for kernel in self.kernels] + [self.reorder_cache_hlo_kernel.kernel.neff_bytes]
+        neff_bytes_arr = [kernel.neff_bytes for kernel in self.kernels] 
+        if self.need_reorder_cache:
+            neff_bytes_arr += [self.reorder_cache_hlo_kernel.kernel.neff_bytes]
+        return neff_bytes_arr
 
     def set_neff_bytes(self, kernels_neff_bytes):
-        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes[:-1]):
+        if self.need_reorder_cache:
+            kernels_neff_bytes, reorder_cache_kernel_bytes = kernels_neff_bytes[:-1], kernels_neff_bytes[-1]
+            self.reorder_cache_hlo_kernel.kernel.neff_bytes = reorder_cache_kernel_bytes
+        
+        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes):
             kernel.neff_bytes = neff_bytes
-        self.reorder_cache_hlo_kernel.kernel.neff_bytes = kernels_neff_bytes[-1]
+        
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -879,7 +893,7 @@ class DecoderProgram:
         for layer in layers:
             input_tensors.extend(layer.valid_parameters())
 
-    def create_reoder_cache_kernel(self):
+    def _create_reoder_cache_kernel(self):
         # assume each layer have same size of cache
         def _reorder_cache(scribe):
             reorder_ids = scribe.s64[self.layers[0].batch_size].Parameter(parameter_number=0)
@@ -901,7 +915,7 @@ class DecoderProgram:
 
         return compiler.HLOKernel(_reorder_cache, self.tp_degree)
 
-    def setup_reorder_cache_kernel(self):
+    def _setup_reorder_cache_kernel(self):
         self.reorder_cache_hlo_kernel.build()
         self.reorder_cache_hlo_kernel.load()
 
@@ -916,7 +930,8 @@ class DecoderProgram:
                 output_tensors.append(cache) # aliasing
         self.reorder_cache_hlo_kernel.setup(input_tensors, output_tensors)
 
-    def reorder_cache(self, layers, reorder_ids):
+    def reorder_cache(self, reorder_ids):
+        assert self.need_reorder_cache, "DecoderProgram is not built with reorder_cache"
         reorder_ids_tensor = torch.tensor(reorder_ids, dtype=torch.int64)
         # TODO: if reorder_ids == range(batch_size), don't do anything
         reorder_ids_tensors_cpu = self.reorder_cache_hlo_kernel.manipulator.duplicate_on_cpu(reorder_ids_tensor)
