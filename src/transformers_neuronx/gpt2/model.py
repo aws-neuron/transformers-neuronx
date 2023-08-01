@@ -77,6 +77,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.reorder_cache(reorder_ids)
 
+    def setup_reorder_cache(self):
+        self.decoder_lm_head.setup_reorder_cache()
+
     def to_neuron(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()
