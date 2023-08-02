@@ -25,6 +25,7 @@ def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, 
                        eos_token_id, top_k)
 
 
+@torch.no_grad()
 def sample_tokens(model, input_ids, start_ids=None, sequence_length=128):
     """
     A sampling loop for a model that emits selected tokens.
@@ -33,18 +34,20 @@ def sample_tokens(model, input_ids, start_ids=None, sequence_length=128):
     the model itself.
     """
     _, start = input_ids.shape
+
     cache_ids = torch.arange(start, dtype=torch.int32)
     next_tokens = model(input_ids, cache_ids, start_ids)
 
+    cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
-    for cur_len in range(start, sequence_length):
 
-        next_tokens = next_tokens[..., -1:]
+    for current, cache_id in zip(range(start + 1, sequence_length + 1), cache_ids):
+
         tokens.append(next_tokens)
+        if current >= sequence_length:
+            break
 
-        # forward pass to get next token
-        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-        next_tokens = model(next_tokens, cache_ids, start_ids)
+        next_tokens = model(next_tokens, cache_id, start_ids)
 
     return torch.cat(tokens, dim=-1)
 
