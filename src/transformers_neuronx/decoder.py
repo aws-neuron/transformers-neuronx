@@ -161,9 +161,29 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         for layer in self.layers:
             layer.reset()
 
+    def forward_single(self, *inputs):
+        """
+        Fast-path forward function which avoids as much overhead as possible.
+
+        This path makes the assumption that inputs are correctly sized for a
+        sequence length of 1. This allows us to avoid checking buckets, slicing,
+        etc.
+        """
+        _, cache_ids, *_ = inputs
+        bucket_id = self.program.find_bucket_id(cache_ids.item())
+        if self.use_executor:
+            return self.program.execute(bucket_id, *inputs, return_ranks=self.return_ranks)
+        else:
+            self.program.inputs_host_to_device(inputs)
+            self.program.run(bucket_id)
+            return self.program.logits_device_to_host()
+
     def forward(self, *inputs):
         hidden, *_ = inputs
-        _, sequence_length, _ = hidden.shape
+        sequence_dim, *_ = self.inputs_sdim
+        sequence_length = hidden.shape[sequence_dim]
+        if sequence_length == 1:
+            return self.forward_single(*inputs)
         if sequence_length % self.n_active_tokens:
             raise ValueError(f'sequence_length={sequence_length} cannot be divided by '
                              f'n_active_tokens={self.n_active_tokens}')
