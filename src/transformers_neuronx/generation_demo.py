@@ -80,6 +80,7 @@ def main():
     run_parser.add_argument('--top_p', type=float, default=1.0)
     run_parser.add_argument('--temperature', type=float, default=1.0)
     run_parser.add_argument('--no_repeat_ngram_size', type=int, default=0)
+    run_parser.add_argument('--num_return_sequences', type=int, default=1)
     # input prompt
     run_parser.add_argument('--various', action='store_true', help="Generated batched sequence with different length if set; otherwise using same length")
     run_parser.add_argument('--prompt', type=str, default= "Hello, I'm a language model, not a programming language. " \
@@ -173,6 +174,8 @@ def run(args, hf_model_name, model_cls):
                                         tp_degree=args.tp_degree, n_positions=args.n_positions,
                                         unroll=args.unroll)
         neuron_model.to_neuron()
+        if args.beam > 1:
+            neuron_model.setup_reorder_cache()
         model = HuggingFaceGenerationModelAdapter(config, neuron_model)
         print('running model.to_neuron')
     else:
@@ -190,6 +193,7 @@ def run(args, hf_model_name, model_cls):
             top_k=args.top_k,
             top_p=args.top_p,
             temperature=args.temperature,
+            num_return_sequences=args.num_return_sequences,
         )
 
     print('generated_sequence=', generated_sequence)
