@@ -23,7 +23,7 @@ class BloomForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
@@ -60,6 +60,7 @@ class BloomForSamplingNoEmbeddingHlo:
               post_mlp_ln_weight, post_mlp_ln_bias):
 
         dtype = hidden.dtype
+        hidden = hlo.transpose210(hidden)
         ln_hidden = hlo.layer_norm_bsh(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
@@ -82,6 +83,7 @@ class BloomForSamplingNoEmbeddingHlo:
         )
 
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        hidden = hlo.transpose210(hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):

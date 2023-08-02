@@ -134,9 +134,10 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, 2)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
@@ -282,10 +283,11 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, 2)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
-        logits = logits.permute([1, 2, 0])
+        logits = logits.permute([2, 1, 0])
         return logits
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
@@ -523,12 +525,13 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             # The big tensor destruction is slow in CPU. Use asynchronous clear 
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
+        hidden = hidden.transpose(0, 2)
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
         else:
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[: self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
