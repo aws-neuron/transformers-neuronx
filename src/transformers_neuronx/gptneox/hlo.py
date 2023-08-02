@@ -98,6 +98,7 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
     # Parallel Attention + FF Layers pseudocode:
     #   x = x + attn(ln1(x)) + mlp(ln2(x))
+    hidden = hlo.transpose210(hidden)
     ln_hidden = hlo.layer_norm_bsh(hidden, ln_1_weight, ln_1_bias)  # input_layernorm
     attn_output, out_key_cache, out_value_cache = gptneox_attention(
         debugger,
@@ -117,6 +118,7 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     mlp_hidden = hlo.mlp_bsh(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                              activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
+    out_hidden = hlo.transpose210(out_hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
     out_value_cache.set_alias_to(value_cache, must=True)
     return out_hidden, out_key_cache, out_value_cache
@@ -176,7 +178,7 @@ def gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions):
 
     def scribable(scribe):
         pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
-        hidden = pbuilder([batch_size, n_active_tokens, embed_dim])
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
         start_ids = pbuilder([batch_size], dtype=scribe.s32)

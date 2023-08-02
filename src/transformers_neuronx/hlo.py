@@ -92,7 +92,7 @@ def layer_norm_bsh(hidden, weight, bias):
     return output
 
 
-def rms_norm(hidden, weight, eps=1e-6):
+def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     batch_size, n_active_tokens, hidden_size = size = hidden.sizes
@@ -104,12 +104,13 @@ def rms_norm(hidden, weight, eps=1e-6):
 
     # PERF: Is it better to use BatchNormTraining operation here?
     square = f32[hidden.sizes].Multiply(hidden, hidden)
-    variance = reduce_mean(square, 2)
+    variance = reduce_mean(square, dim)
     eps = f32.Constant(constant_value=eps)
     eps_br = f32[variance.sizes].Broadcast(eps, dimensions=[])
     mean_eps = f32[variance.sizes].Add(variance, eps_br)
     rsqrt = f32[variance.sizes].Rsqrt(mean_eps)
-    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=[0, 1])
+    dims = [idx for idx in range(len(hidden.sizes)) if idx != dim]
+    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=dims)
     scaled = f32[size].Multiply(hidden, rsqrt_br)
 
     if weight is None:
@@ -117,7 +118,7 @@ def rms_norm(hidden, weight, eps=1e-6):
         return scaled
 
     weight = cast(weight, f32)
-    weight_br = f32[size].Broadcast(weight, dimensions=[2])
+    weight_br = f32[size].Broadcast(weight, dimensions=[dim])
     result = f32[size].Multiply(scaled, weight_br)
     result = cast(result, dtype)
 
@@ -1336,3 +1337,9 @@ def reshape(tensor, shape):
     src_numel = functools.reduce(operator.mul, tensor.sizes)
     assert dst_numel == src_numel
     return tensor.dtype[shape].Reshape(tensor)
+
+
+def transpose210(tensor):
+    dtype = tensor.dtype
+    size0, size1, size2 = tensor.sizes
+    return dtype[size2,size1,size0].Transpose(tensor, dimensions=[2, 1, 0])

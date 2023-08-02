@@ -30,7 +30,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
@@ -70,6 +70,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             in0_weight, in1_weight, out_weight,
         ):
         dtype = hidden.dtype
+        hidden = hlo.transpose210(hidden)
         eps = self.config.rms_norm_eps
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
@@ -90,6 +91,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             tp_degree=self.config.tp_degree,
         )
         res_hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        res_hidden = hlo.transpose210(res_hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
