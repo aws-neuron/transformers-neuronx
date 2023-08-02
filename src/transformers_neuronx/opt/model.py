@@ -116,9 +116,10 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, 2)
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
@@ -225,7 +226,7 @@ class OPTForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = batch_size, n_active_tokens, self.hidden_size
+        hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
@@ -249,6 +250,7 @@ class OPTForSamplingNoEmbeddingHlo:
               mlp_out_weight, mlp_out_scales, mlp_out_bias,
               post_mlp_ln_weight, post_mlp_ln_bias):
         dtype = hidden.dtype
+        hidden = hlo.transpose210(hidden)
         ln_hidden = hlo.layer_norm_bsh(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == attn_k_weight.sizes[-1], \
             f"kv cache shape ({attn_k_cache.sizes}) doesn't match kv weight shape ({attn_k_weight.sizes})"
@@ -268,29 +270,30 @@ class OPTForSamplingNoEmbeddingHlo:
             in_scales=mlp_in_scales, out_scales=mlp_out_scales, neuron_config=self.neuron_config,
         )
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        hidden = hlo.transpose210(hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
-        batch_size, n_active_tokens, hidden_size = hidden.sizes
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
         dtype = hidden.dtype
         slice_threshold = 2  # 1 doesn't work for now; see P86509517
         if n_active_tokens > slice_threshold:
             slice_dimensions = [
-                dict(start=0, limit=batch_size, stride=1),
-                dict(start=n_active_tokens-slice_threshold, limit=n_active_tokens, stride=1),
                 dict(start=0, limit=hidden_size, stride=1),
+                dict(start=n_active_tokens-slice_threshold, limit=n_active_tokens, stride=1),
+                dict(start=0, limit=batch_size, stride=1),
             ]
             n_active_tokens = slice_threshold
-            sizes = batch_size, n_active_tokens, hidden_size
+            sizes = hidden_size, n_active_tokens, batch_size
             hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
-        ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias)
-        ln_hidden = dtype[batch_size*n_active_tokens,hidden_size].Reshape(ln_hidden)
-        logits = hlo.dot01(lm_head_weight, ln_hidden)
+        ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+        ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
+        logits = hlo.dot00(lm_head_weight, ln_hidden)
         if lm_head_bias is not None:
             lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
             logits = dtype[logits.sizes].Add(logits, lm_head_bias)
         vocab_size, _ = logits.sizes
-        return dtype[vocab_size,batch_size,n_active_tokens].Reshape(logits)
+        return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
 
     def attention(self, hidden, cache_ids, mask, active_mask, 
@@ -421,8 +424,9 @@ class OPTForGreedySearch(OPTForSampling):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
+        hidden = hidden.transpose(0, 2)
         tokens = self.decoder_lm_head(hidden, cache_ids, start_ids)
-        tokens = tokens[:, :, -1]
+        tokens = tokens[:, -1, :]
         tokens = tokens.transpose(0, 1)
         return tokens
 

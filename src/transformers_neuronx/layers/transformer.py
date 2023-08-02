@@ -27,25 +27,25 @@ def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
 
     logits = (layer_norm(H) @ W) + B
     """
-    batch_size, n_active_tokens, hidden_size = hidden.sizes
+    hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
     if n_active_tokens > 1:
         slice_dimensions = [
-            dict(start=0, limit=batch_size, stride=1),
-            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
             dict(start=0, limit=hidden_size, stride=1),
+            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
+            dict(start=0, limit=batch_size, stride=1),
         ]
         n_active_tokens = 1
-        sizes = batch_size, n_active_tokens, hidden_size
+        sizes = hidden_size, n_active_tokens, batch_size
         hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
-    ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias)
-    ln_hidden = dtype[batch_size*n_active_tokens,hidden_size].Reshape(ln_hidden)
-    logits = hlo.dot01(lm_head_weight, ln_hidden)
+    ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+    ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
+    logits = hlo.dot00(lm_head_weight, ln_hidden)
     if lm_head_bias is not None:
         lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
         logits = dtype[logits.sizes].Add(logits, lm_head_bias)
     vocab_size, _ = logits.sizes
-    result = dtype[vocab_size,batch_size,n_active_tokens].Reshape(logits)
+    result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
     return result
 
 
@@ -61,23 +61,23 @@ def rms_lm_head(hidden, rms_weight, lm_head_weight, lm_head_bias, eps=1e-6):
 
     logits = (rms_norm(H) @ W) + B
     """
-    batch_size, n_active_tokens, hidden_size = hidden.sizes
+    hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
     if n_active_tokens > 1:
         slice_dimensions = [
-            dict(start=0, limit=batch_size, stride=1),
-            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
             dict(start=0, limit=hidden_size, stride=1),
+            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
+            dict(start=0, limit=batch_size, stride=1),
         ]
         n_active_tokens = 1
-        sizes = batch_size, n_active_tokens, hidden_size
+        sizes = hidden_size, n_active_tokens, batch_size
         hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
-    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps)
-    rms_hidden = dtype[batch_size * n_active_tokens, hidden_size].Reshape(rms_hidden)
-    logits = hlo.dot01(lm_head_weight, rms_hidden)
+    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, dim=0)
+    rms_hidden = dtype[hidden_size, n_active_tokens*batch_size].Reshape(rms_hidden)
+    logits = hlo.dot00(lm_head_weight, rms_hidden)
     if lm_head_bias is not None:
         lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
         logits = dtype[logits.sizes].Add(logits, lm_head_bias)
     vocab_size, _ = logits.sizes
-    result = dtype[vocab_size,batch_size,n_active_tokens].Reshape(logits)
+    result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
     return result
