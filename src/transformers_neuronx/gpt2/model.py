@@ -134,7 +134,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2)
+        hidden = hidden.transpose(0, 2).contiguous()
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
@@ -283,7 +283,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2)
+        hidden = hidden.transpose(0, 2).contiguous()
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
@@ -525,7 +525,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             # The big tensor destruction is slow in CPU. Use asynchronous clear 
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
-        hidden = hidden.transpose(0, 2)
+        hidden = hidden.transpose(0, 2).contiguous()
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
         else:

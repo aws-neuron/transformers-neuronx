@@ -155,7 +155,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel):
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        hidden = hidden.transpose(0, -1)
+        hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
