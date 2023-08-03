@@ -116,7 +116,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel):
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2)
+        hidden = hidden.transpose(0, 2).contiguous()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
@@ -424,7 +424,7 @@ class OPTForGreedySearch(OPTForSampling):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2)
+        hidden = hidden.transpose(0, 2).contiguous()
         tokens = self.decoder_lm_head(hidden, cache_ids, start_ids)
         tokens = tokens[:, -1, :]
         tokens = tokens.transpose(0, 1)
