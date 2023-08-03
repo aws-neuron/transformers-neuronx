@@ -110,7 +110,7 @@ class GPTNeoXForSampling(module.PretrainedModel):
     def _run_program(self, program, bucket_id, input_ids, cache_offset, start_ids):
         active_n_positions = self.n_positions_list[bucket_id]
         hidden = self.gpt_neox.embed_in(input_ids)
-        hidden = hidden.transpose(0, -1)
+        hidden = hidden.transpose(0, -1).contiguous()
         input_buffers = program.buffers.get_input_buffers(bucket_id)
         hidden_buffer, pos_embd_buffer, *_ = input_buffers
         hidden = hidden.to(hidden_buffer.dtype)

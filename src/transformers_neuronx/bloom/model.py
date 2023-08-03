@@ -182,7 +182,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        hidden = hidden.transpose(0, -1)
+        hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
