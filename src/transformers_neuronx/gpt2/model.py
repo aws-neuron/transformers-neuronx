@@ -453,9 +453,10 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             # The big tensor destruction is slow in CPU. Use asynchronous clear 
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
+        hidden=hidden.transpose(0,2).contiguous()
         logits = decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
