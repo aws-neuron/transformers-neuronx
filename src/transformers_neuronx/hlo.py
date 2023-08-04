@@ -729,7 +729,7 @@ def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
 
     mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
     mask_index = index.dtype[mask.sizes].Convert(mask)
-    masked = dtype[sizes].Multiply(mask, mask_index)
+    masked = dtype[sizes].Multiply(index, mask_index)
     index = reduce_sum(masked, dim=dim, keepdim=keepdim)
 
     if return_values:

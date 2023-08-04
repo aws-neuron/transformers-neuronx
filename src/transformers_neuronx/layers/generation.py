@@ -29,14 +29,14 @@ def generate(logits, config: config.GenerationConfig, tp_degree=1):
 
 
 def greedy_search(logits, *, tp_degree=1):
-    vocab_size, batch_size, n_active_tokens = logits.sizes
+    vocab_size, n_active_tokens, batch_size = logits.sizes
     assert n_active_tokens == 1
     result = hlo.argmax(logits, 0, tp_degree=tp_degree)
     return result.dtype[batch_size, 1].Reshape(result)
 
 
 def sample(logits, *, k=50, temperature=None, tp_degree=1):
-    vocab_size, batch_size, n_active_tokens = logits.sizes
+    vocab_size, n_active_tokens, batch_size = logits.sizes
     assert n_active_tokens == 1
 
     if k == 1:
