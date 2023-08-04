@@ -16,13 +16,13 @@ import torch
 
 
 @torch.no_grad()
-def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50):
+def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None):
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
     cache_ids = torch.arange(start, dtype=torch.int32)
     next_token_scores = model(input_ids, cache_ids, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
-                       eos_token_id, top_k)
+                       eos_token_id, top_k, streamer)
 
 
 @torch.no_grad()
@@ -77,7 +77,7 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50):
+                top_k=50, streamer=None):
     tokens = [input_ids]
     _, start = input_ids.shape
     for cur_len in range(start, sequence_length):
@@ -95,12 +95,19 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         inputs = torch.gather(topk_indices, 1, inputs_in_topk)
         tokens.append(inputs)
 
+        if streamer:
+            streamer.put(inputs)
+
         if next_len >= sequence_length:
             break
 
         # forward pass to get next token
         cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
+
+    if streamer:
+        streamer.end()
+
     return torch.cat(tokens, dim=-1)
 
 
@@ -176,7 +183,7 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
 
 
 def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                      top_k=50, top_p=1.0, temperature=1.0):
+                      top_k=50, top_p=1.0, temperature=1.0, streamer=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     if not isinstance(temperature, float) or not (temperature > 0):
@@ -206,7 +213,12 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # this means that, while every sequence in the batch has the same length, a sequence that
         # encounters eos_token_id earlier will be filled with eos_token_ids post the first appearance
         # of eos_token_id.
-        tokens.append(torch.where(done_flags.eq(True), eos_token_id, inputs))
+
+        token = torch.where(done_flags.eq(True), eos_token_id, inputs)
+        tokens.append(token)
+
+        if streamer:
+            streamer.put(token)
 
         if next_len >= sequence_length or done_flags.all():
             break
@@ -214,11 +226,15 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # forward pass to get next token
         cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
+
+    if streamer:
+        streamer.end()
+
     return torch.cat(tokens, dim=-1)
 
 
 @torch.no_grad()
-def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0):
+def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0, streamer=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     # populate key/value caches according to the prompt text
@@ -226,5 +242,5 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     cache_ids = torch.arange(start, dtype=torch.int32)
     next_token_scores = model(input_ids, cache_ids, start_ids)
     return sample_loop_llama(
-        model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature
+        model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )
