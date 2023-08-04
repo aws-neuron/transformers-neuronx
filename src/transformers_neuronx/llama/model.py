@@ -169,7 +169,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0):
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):
 
         # To enable optimized context encoding network, we must pad
         # up to the context length estimate or we will not correctly
@@ -193,7 +193,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
-            top_k=top_k, top_p=top_p, temperature=temperature
+            top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer
         )
 
         if offset != 0:
@@ -258,7 +258,7 @@ class FIDLlamaForSampling(LlamaForSampling):
         logits[self.bos_token_id] = 1.0
         return logits
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         """ Sample function
         input_ids: shape [batch_size, context_length]
 
@@ -299,7 +299,7 @@ class FIDLlamaForSampling(LlamaForSampling):
 
         # Run the model
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
         if offset != 0:
             # Offset by offset * batch_size
