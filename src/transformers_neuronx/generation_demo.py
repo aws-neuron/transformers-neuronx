@@ -144,7 +144,11 @@ def run(args, hf_model_name, model_cls):
     encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
     print(encoded_text)
 
-    compile_batch_size = args.batch_size*args.beam
+    if args.do_sample:
+        compile_batch_size = args.batch_size*args.num_return_sequences*args.beam       
+    else:
+        compile_batch_size = args.batch_size*args.beam
+
     if args.device == "neuron":
         suffix = f"{neuronxcc.__version__}_{hf_model_name}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
         cache_path = f"neuronx_cache_{suffix}"

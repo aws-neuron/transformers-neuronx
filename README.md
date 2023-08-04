@@ -195,6 +195,10 @@ sample_output = model.generate(
 print([tokenizer.decode(tok) for tok in sample_output])
 ```
 
+Note: As HuggingFace generation API can expand the input's batch dimension based on different generation configurations, we need to compile the neuron model with different compile batch_size compared to the run time batch_size (batch dimension of inputs to generation API).
+- if do_sample=True, compile_batch_size = runtime_batch_size x num_return_sequences x beam_size
+- otherwise, compile_batch_size = runtime_batch_size x num_return_sequences
+
 ## int8 weight storage support
 
 Transformers Neuron supports int8 weight storage for the `GPT2` model class.
