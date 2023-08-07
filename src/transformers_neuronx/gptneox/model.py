@@ -22,12 +22,13 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import base
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class GPTNeoXForSampling(module.PretrainedModel):
+class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
