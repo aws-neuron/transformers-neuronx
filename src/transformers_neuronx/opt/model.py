@@ -49,10 +49,17 @@ class OPTForSampling(base.NeuronModelBase):
         if unroll is None:
             unroll = config.num_hidden_layers
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
+
         attention_head_size = config.hidden_size // config.num_attention_heads
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, # n_active_tokens
-            batch_size, attention_head_size, amp=amp,
+            self.batch_sizes, attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
             unroll=unroll, neuron_config=neuron_config
         )
@@ -64,25 +71,26 @@ class OPTForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
+        self.decoder_lm_head_for_context = dict()
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
         self.neuron_config = neuron_config
         if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree,
-                                                    [context_length_estimate],
-                                                    context_length_estimate,
-                                                    batch_size,
-                                                    attention_head_size,
-                                                    amp=amp,
-                                                    num_layers=config.num_hidden_layers,
+            for batch_size in self.batch_sizes:
+                self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                                                    tp_degree, 
+                                                    [context_length_estimate], 
+                                                    context_length_estimate, 
+                                                    batch_size, 
+                                                    attention_head_size, 
+                                                    amp=amp, 
+                                                    num_layers=config.num_hidden_layers, 
                                                     n_head=config.num_attention_heads,
                                                     unroll=context_unroll,
                                                     neuron_config=neuron_config,
                                                     allow_pad=self.decoder_lm_head.allow_pad
                                                 )
-            self.register_for_serialization(self.decoder_lm_head_for_context)
+                self.register_for_serialization(self.decoder_lm_head_for_context[batch_size])
 
     def to_neuron(self):
         ops.init()
@@ -118,7 +126,8 @@ class OPTForSampling(base.NeuronModelBase):
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context)
+            for batch_size in self.batch_sizes:
+                self.decoder_lm_head_for_context[batch_size] = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[batch_size])
 
     def reset(self):
         self.decoder_lm_head.reset()
@@ -127,7 +136,9 @@ class OPTForSampling(base.NeuronModelBase):
         return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
+        batch_size , _ = input_ids.shape
+        context_decoder = self.decoder_lm_head_for_context[batch_size]
+        return self._forward(context_decoder, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
@@ -135,7 +146,8 @@ class OPTForSampling(base.NeuronModelBase):
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        batch_size, _ = input_ids.shape
+        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids, batch_size)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
@@ -411,7 +423,8 @@ class OPTForGreedySearch(OPTForSampling):
 
     def forward(self, input_ids, cache_ids, start_ids=None):
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        batch_size, _ = input_ids.shape
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids, batch_size)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()

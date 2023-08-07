@@ -50,8 +50,15 @@ class BloomForSampling(base.NeuronModelBase):
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.max_positions = self.token_buckets[-1]
 
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
+
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp=amp,
+            tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head,
             unroll=unroll, neuron_config=neuron_config, allow_pad=True
         )
@@ -65,20 +72,21 @@ class BloomForSampling(base.NeuronModelBase):
         if self.context_buckets:
             self.decoder_lm_head_for_context = {}
             for context_length_estimate in self.context_buckets:
-                self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                    tp_degree,
-                    [context_length_estimate],
-                    context_length_estimate,
-                    batch_size,
-                    config.attention_head_size,
-                    amp=amp,
-                    num_layers=config.n_layer,
-                    n_head=config.n_head,
-                    unroll=context_unroll,
-                    neuron_config=neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad
-                )
-                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
+                for batch_size in self.batch_sizes:                    
+                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                        tp_degree,
+                        [context_length_estimate],
+                        context_length_estimate,
+                        batch_size,
+                        config.attention_head_size,
+                        amp=amp,
+                        num_layers=config.n_layer,
+                        n_head=config.n_head,
+                        unroll=context_unroll,
+                        neuron_config=neuron_config,
+                        allow_pad=self.decoder_lm_head.allow_pad
+                    )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 
     def to_neuron(self):
 
@@ -157,8 +165,9 @@ class BloomForSampling(base.NeuronModelBase):
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
-                model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate])
-                self.decoder_lm_head_for_context[context_length_estimate] = model
+                for batch_size in self.batch_sizes:
+                    model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
+                    self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
@@ -167,7 +176,10 @@ class BloomForSampling(base.NeuronModelBase):
         return self._forward(hidden, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+        batch_size, *_  = input_ids.shape
+        if batch_size not in self.batch_sizes:
+            raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
+
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
-
         return result

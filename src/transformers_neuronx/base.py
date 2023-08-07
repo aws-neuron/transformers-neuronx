@@ -98,6 +98,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             - if there is no context encoding model, simply do serial token generation for context
         """
         context_length = hidden.shape[1]
+        # batch_size is in dim 2 because of the transpose taken in _forward function
+        batch_size = hidden.shape[2]
 
         if self.is_fid:
             # Fusion-In-Decoder context encoding
@@ -130,7 +132,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 current = estimate
 
             if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
+                model = self.decoder_lm_head_for_context[estimate, batch_size]
                 logits = model(hidden_context, cache_context, start_ids, last_token_id)
 
         for i in range(current, context_length):
