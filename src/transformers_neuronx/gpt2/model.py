@@ -354,9 +354,14 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         n_embd = self.config.n_embd
         d_head = n_embd // config.n_head
         n_heads_tp = config.n_head // config.tp_degree
-        # Only share caches when we don't generate multiple suggestions.
-        self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size
-
+        # Since GPT2 does not support compilation for multiple batch sizes yet,
+        # assert the invariant
+        bsizes = self.decoder_lm_head.batch_size
+        assert len(bsizes) == 1, "GPT2 does not support compilation for multiple batch sizes"
+        bs_idx = 0
+        batch_size = self.decoder_lm_head.batch_size[bs_idx]
+        # Only share caches when we don't generate multiple suggestions
+        self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size[bs_idx]
         if self.context_buckets:
             self.decoder_lm_head_for_context={}
             self.broadcaster={}
@@ -431,27 +436,32 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         config = self.config
-
+        # Since GPT2 does not support compilation for multiple batch sizes yet,
+        # assert the invariant
+        bsizes = self.decoder_lm_head.batch_size
+        assert len(bsizes) == 1, "GPT2 does not support compilation for multiple batch sizes"
+        bs_idx = 0
+        batch_size = self.decoder_lm_head.batch_size[bs_idx]
         if self.context_buckets:
             for i, context_length_estimate in enumerate(self.context_buckets):
                 model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
                                                                     new=self.decoder_lm_head_for_context[context_length_estimate])
                 source_caches = []
                 for layer in model.layers:
-                    source_caches.append(layer.attn_k_cache)
-                    source_caches.append(layer.attn_v_cache)
+                    source_caches.append(layer.attn_k_cache[batch_size])
+                    source_caches.append(layer.attn_v_cache[batch_size])
                 manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
                 target_caches = []
                 for layer in self.decoder_lm_head.layers:
                     attn_k_cache = manipulator.slice_on_nc(
-                        layer.attn_k_cache,
+                        layer.attn_k_cache[batch_size],
                         0,
                         start=0,
                         end=context_length_estimate,
                         step=1,
                     )
                     attn_v_cache = manipulator.slice_on_nc(
-                        layer.attn_v_cache,
+                        layer.attn_v_cache[batch_size],
                         0,
                         start=0,
                         end=context_length_estimate,
@@ -529,7 +539,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         runtime_batch_size, context_length = input_ids.shape
-        batch_size = self.decoder_lm_head.batch_size
+        assert len(self.decoder_lm_head.batch_size) == 1, "GPT 2 does not support compilation of multiple batch sizes"
+        batch_size = self.decoder_lm_head.batch_size[0]
         if batch_size % runtime_batch_size:
             raise ValueError(
                 f"model batch_size must be multiples of runtime_batch_size; got "
