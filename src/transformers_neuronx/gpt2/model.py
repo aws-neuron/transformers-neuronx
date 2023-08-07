@@ -27,11 +27,12 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import tensor_pool
+from transformers_neuronx import base
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
 
-class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
+class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
@@ -58,28 +59,6 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
-
-    def reorder_cache(self, reorder_ids):
-        self.decoder_lm_head.reorder_cache(reorder_ids)
-
-    def setup_reorder_cache(self):
-        self.decoder_lm_head.setup_reorder_cache()
 
     def to_neuron(self):
         ops.init()
@@ -177,7 +156,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel):
 # (bowencc): Need to keep PreTrainedModel after module.PretrainedModel as the later
 # overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly 
 # since it doesn't pass config in suer().__init__
-class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
+class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.NeuronModelBase):
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, **kwargs):
         config = GPT2HuggingFaceConfig(config, batch_size, amp, tp_degree, **kwargs)
@@ -206,22 +185,6 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.cur_len = 0
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
     def load_state_dict_dir(self, state_dict_dir):
         self.chkpt_model.load_state_dict_dir(state_dict_dir)
