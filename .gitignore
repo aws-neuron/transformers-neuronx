@@ -4,3 +4,4 @@ dist/
 apt/
 pip/
 .attach_pid*
+__pycache__

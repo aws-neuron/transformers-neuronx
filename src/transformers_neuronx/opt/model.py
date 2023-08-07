@@ -23,12 +23,13 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import base
 from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import attention 
 
 
-class OPTForSampling(module.WrappingCheckpointCompatibleModel):
+class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
                  unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):

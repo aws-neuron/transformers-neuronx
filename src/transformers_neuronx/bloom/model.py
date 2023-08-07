@@ -20,13 +20,14 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import base
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
 
 
-class BloomForSampling(module.WrappingCheckpointCompatibleModel):
+class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
