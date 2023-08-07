@@ -1053,12 +1053,12 @@ class DecoderProgramMultiLayer(DecoderProgram):
         self.ln_lm_head_kernel(self.ln_lm_head_memory)
 
     def enable_executor(self):
-        for kernel, memories in zip(self.kernels, self.multi_layers_memories):
+        for layer_memories in self.multi_layers_memories:
             executors = list()
             self.layer_executors.append(executors)
-            for memory in memories:
+            for kernel, memories in zip(self.kernels,layer_memories):
                 # NOTE: No input/output returns from layers. Do one-time copy
-                executor = kernel.build_executor(memory, [], [])
+                executor = kernel.build_executor(memories, [], [])
                 executors.append(executor)
         output_tensors = [self.logits_buffer]
         executor = self.ln_lm_head_kernel.build_executor(self.ln_lm_head_memory, [], output_tensors)
@@ -1066,8 +1066,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
     def execute(self, bucket_id, *inputs, return_ranks=-1):
         self.inputs_host_to_device(inputs) # One-time input copy
-        for executor in self.layer_executors[bucket_id]:
-            executor([], return_ranks=0) # No returns from intermediate layers
+        for layer_executor in self.layer_executors:
+            layer_executor[bucket_id]([], return_ranks=0) # No returns from intermediate layers
         return self.lm_head_executor([], return_ranks=return_ranks)
 
 
