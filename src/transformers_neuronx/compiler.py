@@ -78,10 +78,11 @@ def compile_hlo_module(hlo_module, tag=None):
             dump_proto(hlo_module, hlo_module_path)
         neff_path = f'{hlo_module_path}.neff'
         neff_path = os.path.realpath(neff_path)
-        command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
-                        hlo_module_path, f'--output={neff_path}', *shlex.split(flags)]
-        command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
-        subprocess.check_call(command_line, cwd=dump_to)
+        if not os.path.exists(neff_path):
+            command_line = ['neuronx-cc', 'compile', '--framework=XLA', '--target=trn1',
+                            hlo_module_path, f'--output={neff_path}', *shlex.split(flags)]
+            command_line.extend(['--verbose=INFO', '--pipeline', 'compile', 'SaveTemps'])
+            subprocess.check_call(command_line, cwd=dump_to)
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
     else:
@@ -458,7 +459,7 @@ class HLOKernel:
                 cpu_output_buffers = [gen_zero_output(self.hlo_module, i) for i in range(output_count)]
             nc_output_buffers = []
             for o in cpu_output_buffers:
-                nc_output_buffers.append(self.manipulator.duplicate(o)) 
+                nc_output_buffers.append(self.manipulator.duplicate(o))
         self.memories.setup(nc_input_buffers, nc_output_buffers) # Segmentation fault (core dumped)
 
     def run(self):
