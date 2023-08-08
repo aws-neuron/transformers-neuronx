@@ -305,7 +305,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if context_length_estimate is None:
             context_length_estimate = config.n_positions
         self.context_unroll = context_unroll
-        self.token_buckets = bucket.token_sizes(config.n_positions+1)
+        self.token_buckets = bucket.token_sizes(config.n_positions)
         self.context_buckets = bucket.context_sizes(
             context_length_estimate, self.token_buckets
         )
