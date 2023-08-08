@@ -501,7 +501,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if batch_size % runtime_batch_size:
             raise ValueError(
                 f"model batch_size must be multiples of runtime_batch_size; got "
-                "batch_size={batch_size} and runtime_batch_size={runtime_batch_size}"
+                f"batch_size={batch_size} and runtime_batch_size={runtime_batch_size}"
             )
   
         # The context length estimate is chosen based on single (context+query)
