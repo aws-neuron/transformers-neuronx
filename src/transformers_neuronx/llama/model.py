@@ -298,7 +298,7 @@ class FIDLlamaForSampling(LlamaForSampling):
         input_ids = input_ids.reshape(fused_batch_size, context_length)
 
         # Run the model
-        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+        result = sampling.sample_llama(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
         if offset != 0:
