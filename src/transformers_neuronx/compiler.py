@@ -34,7 +34,9 @@ from neuronxcc import __version__ as compiler_version
 def get_hash_module(hlo_module, flags):
     # Hashing is pretty fast and neglegible compared to compilation time
     hash_gen = hashlib.sha256()
-    text = str(hlo_module) + flags.replace(" ", "")
+    text = str(hlo_module)
+    if flags is not None:
+        text += flags.replace(" ", "")
     hash_gen.update(text.encode('utf-8'))
     hash = str(hash_gen.hexdigest())[:20]
     return hash
@@ -58,16 +60,17 @@ def build_parallel_kernel(hlo_module, tp_degree):
 def compile_hlo_module(hlo_module, tag=None):
     flags = os.environ.get('NEURON_CC_FLAGS', '')
 
-    module_hash = get_hash_module(hlo_module, flags)
+    module_flag_hash = get_hash_module(hlo_module, flags)
+    module_hash = get_hash_module(hlo_module, None)
 
     dump = "NEURONX_DUMP_TO" in os.environ
-
+    neff_bytes = None
     if dump:
         # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
         if tag is None:
-            hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_hash}'
+            hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_flag_hash}'
         else:
-            hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_hash}'
+            hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
 
         dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
         dump_to = os.path.join(dump_to, hlo_module_name)
@@ -369,6 +372,7 @@ class ParallelKernel:
         self.neff_bytes = compile_hlo_module(self.hlo_module, tag)
 
     def load(self):
+        assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         self.model.load()
 
