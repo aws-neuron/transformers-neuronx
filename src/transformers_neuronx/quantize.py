@@ -15,7 +15,10 @@
 import torch
 from transformers_neuronx.config import QuantizationConfig
 
-def quantize_weights(tensor, quantize_config: QuantizationConfig, weight_transposed=True):
+def maybe_quantize_weights(tensor, quantize_config: QuantizationConfig, weight_transposed=True):
+    if tensor is None:
+        return None, None
+
     tensor = tensor.to(torch.float32)
     if quantize_config.quantize_method == 'vector_dynamic':
         reduce_dim = 0 if weight_transposed else 1
@@ -39,4 +42,3 @@ def quantize_weights(tensor, quantize_config: QuantizationConfig, weight_transpo
         raise NotImplementedError(f"{quantize_config.quantize_method} not implemented")
     
     return quantized_weights, scales
-    

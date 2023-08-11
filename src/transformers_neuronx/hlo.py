@@ -140,15 +140,22 @@ def dot01(lhs, rhs):
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
     return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
 
+def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
+    scribe = lhs.scribe
+    if enable_quantize:
+        if lhs.dtype == getattr(scribe, neuron_config.quant.quant_dtype):
+            lhs = rhs.dtype[lhs.sizes].Convert(lhs)
+        if rhs.dtype == getattr(scribe, neuron_config.quant.quant_dtype):
+            rhs = lhs.dtype[rhs.sizes].Convert(rhs)
+    dtype = lhs.dtype
+    return lhs, rhs, dtype
 
 def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
+    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
@@ -162,13 +169,9 @@ def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
+    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
     _, lhs_size = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
@@ -181,13 +184,9 @@ def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
     return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
+    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
     lhs_size, _ = lhs.sizes
     _, rhs_size = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
@@ -305,11 +304,15 @@ def gated_mlp(
     in0_weight,
     in1_weight,
     out_weight,
+    in0_scales=None,
+    in1_scales=None,
+    out_scales=None,
     in0_bias=None,
     in1_bias=None,
     out_bias=None,
     activation_function='silu',
-    tp_degree=1
+    tp_degree=1,
+    neuron_config=None,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -335,12 +338,15 @@ def gated_mlp(
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    hidden_active = dot10_add1(hidden, in0_weight, in0_bias)
+    hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+                               scales=in0_scales, neuron_config=neuron_config)
     hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias)
+    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+                               scales=in1_scales, neuron_config=neuron_config)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
 
-    result = dot10_add1(hidden_states, out_weight, out_bias)
+    result = dot10_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:

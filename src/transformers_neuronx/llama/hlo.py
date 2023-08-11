@@ -67,7 +67,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
-            in0_weight, in1_weight, out_weight,
+            in0_weight, in0_scales,
+            in1_weight, in1_scales,
+            out_weight, out_scales,
         ):
         dtype = hidden.dtype
         hidden = hlo.transpose210(hidden)
@@ -79,16 +81,19 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias,
-            neuron_config=self.neuron_config
+            attn_out_weight, attn_out_scales, attn_out_bias
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
         norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps)
         mlp_hidden = hlo.gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
+            in0_scales=in0_scales,
+            in1_scales=in1_scales,
+            out_scales=out_scales,
             activation_function='silu',
             tp_degree=self.config.tp_degree,
+            neuron_config=self.neuron_config
         )
         res_hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         res_hidden = hlo.transpose210(res_hidden)
@@ -105,7 +110,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         k_weight, k_scales, k_bias,
         v_weight, v_scales, v_bias,
         out_weight, out_scales, out_bias,
-        neuron_config=None
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -119,7 +123,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             k_weight, k_scales, k_bias,
             v_weight, v_scales, v_bias,
             d_head,
-            neuron_config=neuron_config,
+            neuron_config=self.neuron_config,
         )
 
         # Q = Rotate(Q)
@@ -153,7 +157,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
 
         # O = (C @ wO) + bO
-        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, neuron_config)
+        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
 
         # KCache[I] = K
         # VCache[I] = V

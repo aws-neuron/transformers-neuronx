@@ -448,8 +448,8 @@ class DecoderLayer(torch.nn.Module):
         self.extra_parameters = []
         self.allow_pad = allow_pad
 
-    def add_parameter(self, param, sharding=None, allow_pad=False):
-        self.extra_parameters.append((param, sharding, allow_pad))
+    def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False):
+        self.extra_parameters.append((param, sharding, allow_pad, allow_quantize))
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -534,19 +534,20 @@ class DecoderLayer(torch.nn.Module):
             self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
         if self.neuron_config and self.neuron_config.quant:
             self.mlp_in_weight, self.mlp_in_scales = \
-                quantize.quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
+                quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
             self.mlp_out_weight, self.mlp_out_scales = \
-                quantize.quantize_weights(self.mlp_out_weight, self.neuron_config.quant)
+                quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant)
 
             if self.neuron_config.quant.quantize_attn:
                 self.attn_q_weight, self.attn_q_scales = \
-                    quantize.quantize_weights(self.attn_q_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.attn_q_weight, self.neuron_config.quant)
                 self.attn_k_weight, self.attn_k_scales = \
-                    quantize.quantize_weights(self.attn_k_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.attn_k_weight, self.neuron_config.quant)
                 self.attn_v_weight, self.attn_v_scales = \
-                    quantize.quantize_weights(self.attn_v_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
                 self.attn_out_weight, self.attn_out_scales = \
-                    quantize.quantize_weights(self.attn_out_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant)
+
 
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
         maybe_duplicate = maybe_manipulator.duplicate
@@ -580,11 +581,22 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
 
         extras = []
-        for param, dim, allow_pad in self.extra_parameters:
+        for param, dim, allow_pad, allow_quantize in self.extra_parameters:
             if allow_pad:
                 size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
                 param = utils.pad(param, dim, size)
-            extras.append(maybe_manipulator.duplicate_or_shard_along(param, dim))
+
+            if allow_quantize and self.neuron_config.quant:
+                param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant)
+                scales_dim = 0 if dim == 1 else None
+                extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim),
+                               maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)])
+            elif allow_quantize:
+                # If the parameter is quantizable but the quantization is not enabled, we still need
+                # to add a scale placeholder to match the layer arguments
+                extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim), None])
+            else:
+                extras.append(maybe_manipulator.duplicate_or_shard_along(param, dim))
         self.extra_parameters = extras
 
         self.init_caches()
