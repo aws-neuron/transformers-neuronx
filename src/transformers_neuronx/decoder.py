@@ -586,7 +586,7 @@ class DecoderLayer(torch.nn.Module):
                 size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
                 param = utils.pad(param, dim, size)
 
-            if allow_quantize and self.neuron_config.quant:
+            if allow_quantize and self.neuron_config and self.neuron_config.quant:
                 param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant)
                 scales_dim = 0 if dim == 1 else None
                 extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim),
