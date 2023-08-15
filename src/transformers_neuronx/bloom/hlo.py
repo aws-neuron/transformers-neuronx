@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer, alibi
+from transformers_neuronx.layers import attention_hsb as attention, transformer, alibi
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -60,8 +60,7 @@ class BloomForSamplingNoEmbeddingHlo:
               post_mlp_ln_weight, post_mlp_ln_bias):
 
         dtype = hidden.dtype
-        hidden = hlo.transpose210(hidden)
-        ln_hidden = hlo.layer_norm_bsh(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
             attn_k_cache, attn_v_cache,
@@ -72,8 +71,8 @@ class BloomForSamplingNoEmbeddingHlo:
             neuron_config=self.neuron_config
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        ln_hidden = hlo.layer_norm_bsh(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_hidden = hlo.mlp_bsh(
+        ln_hidden = hlo.layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp_hidden = hlo.mlp(
             ln_hidden,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function='gelu_new',
@@ -83,7 +82,6 @@ class BloomForSamplingNoEmbeddingHlo:
         )
 
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
-        hidden = hlo.transpose210(hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
