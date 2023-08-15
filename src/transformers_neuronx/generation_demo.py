@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-from transformers_neuronx.gpt2.model import GPT2ForSampling
+from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWithContextBroadcasting
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
@@ -38,7 +38,7 @@ def amp_callback(model_type, model, dtype):
             block.fc1.to(dtype)
             block.fc2.to(dtype)
         model.lm_head.to(dtype)
-    elif model_type == "gpt2" or model_type == "gptj":
+    elif model_type == "gpt2" or model_type == "gptj" or model_type == "gpt2-contex":
         # cast attention and mlp to low precisions only; layernorms stay as f32
         for block in model.transformer.h:
             block.attn.to(dtype)
@@ -46,6 +46,10 @@ def amp_callback(model_type, model, dtype):
         model.lm_head.to(dtype)
 
     return model
+
+def dump(dump_dir, dump_file_name, data):
+    os.makedirs(dump_dir, exist_ok=True)
+    torch.save(data, os.path.join(dump_dir, dump_file_name))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -81,6 +85,7 @@ def main():
     run_parser.add_argument('--temperature', type=float, default=1.0)
     run_parser.add_argument('--no_repeat_ngram_size', type=int, default=0)
     run_parser.add_argument('--num_return_sequences', type=int, default=1)
+    run_parser.add_argument('--output_scores', action='store_true')
     # input prompt
     run_parser.add_argument('--various', action='store_true', help="Generated batched sequence with different length if set; otherwise using same length")
     run_parser.add_argument('--prompt', type=str, default= "Hello, I'm a language model, not a programming language. " \
@@ -92,6 +97,9 @@ def main():
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--cache', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
+    # dump logits
+    run_parser.add_argument('--dump_logits', action='store_true', default=None)
+    run_parser.add_argument('--dump_logits_limit', type=int, default=1)
 
     args = parser.parse_args()
 
@@ -101,6 +109,9 @@ def main():
     if model_type == 'gpt2':
         model_cls = GPT2ForSampling
         hf_model_name = 'gpt2'
+    elif model_type == "gpt2-context":
+        model_cls = GPT2ForSamplingWithContextBroadcasting
+        hf_model_name = "gpt2"
     elif model_type == 'opt':
         model_cls = OPTForSampling
         hf_model_name = 'facebook/opt-125m'
@@ -145,12 +156,12 @@ def run(args, hf_model_name, model_cls):
     print(encoded_text)
 
     if args.do_sample:
-        compile_batch_size = args.batch_size*args.num_return_sequences*args.beam       
+        compile_batch_size = args.batch_size*args.num_return_sequences*args.beam
     else:
         compile_batch_size = args.batch_size*args.beam
 
     if args.device == "neuron":
-        suffix = f"{neuronxcc.__version__}_{hf_model_name}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
+        suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
         cache_path = f"neuronx_cache_{suffix}"
         snapshot_path = f"neuronx_snapshot_{suffix}"
         if args.cache or args.snapshot:
@@ -183,11 +194,12 @@ def run(args, hf_model_name, model_cls):
         model = HuggingFaceGenerationModelAdapter(config, neuron_model)
         print('running model.to_neuron')
     else:
+        suffix = f"{hf_model_name}_{model_cls.__name__}_cpu"
         print(f'running {model_cls.__name__}.from_pretrained')
         model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
 
     with torch.inference_mode():
-        generated_sequence = model.generate(
+        outputs = model.generate(
             input_ids=encoded_text.input_ids,
             attention_mask=encoded_text.attention_mask,
             num_beams=args.beam,
@@ -198,10 +210,20 @@ def run(args, hf_model_name, model_cls):
             top_p=args.top_p,
             temperature=args.temperature,
             num_return_sequences=args.num_return_sequences,
+            return_dict_in_generate=True,
+            output_scores=args.output_scores,
         )
 
-    print('generated_sequence=', generated_sequence)
-    outputs = [tokenizer.decode(gen_seq) for gen_seq in generated_sequence]
+    if args.dump_logits:
+        dump_logits_dir = f"logits_dump_{suffix}"
+        assert args.output_scores, "Need to set --output_scores to dump logits"
+        print(f"Dumping logits into {dump_logits_dir}")
+        assert args.dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
+        for i in range(args.dump_logits_limit):
+            dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
+
+    print('generated_sequence=', outputs.sequences)
+    outputs = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
     print(outputs)
 
 if __name__ == "__main__":
