@@ -299,7 +299,7 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     return hidden
 
 
-def gated_mlp(
+def gated_mlp_bsh(
     hidden,
     in0_weight,
     in1_weight,
@@ -353,6 +353,56 @@ def gated_mlp(
         result = all_reduce_sum(result, tp_degree)
 
     return result
+
+
+def gated_mlp(
+    hidden,
+    in0_weight,
+    in1_weight,
+    out_weight,
+    in0_bias=None,
+    in1_bias=None,
+    out_bias=None,
+    activation_function='silu',
+    tp_degree=1
+):
+    """
+    An attention MLP using 2 input projections as found in LLama.
+
+    Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/llama/modeling_llama.py#L144
+
+    TODO: Support quantization
+
+    Sizes:
+        hidden:     [h, a, b]
+        in0_weight: [h, n / tp]
+        in1_weight: [h, n / tp]
+        out_weight: [n / tp, h]
+        in0_bias:   [n / tp]
+        in1_bias:   [n / tp]
+        out_bias:   [h]
+        result:     [h, a, b]
+    """
+
+    dtype = hidden.dtype
+    hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
+    hidden_r_sizes = hidden_size, n_active_tokens * batch_size
+
+    hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
+
+    hidden_active = dot00_add0(in0_weight, hidden, in0_bias)
+    hidden_active = getattr(activations, activation_function)(hidden_active)
+    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias)
+    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+
+    result = dot00_add0(out_weight, hidden_states, out_bias)
+    result = dtype[hidden_sizes].Reshape(result)
+
+    if tp_degree != 1:
+        result = all_reduce_sum(result, tp_degree)
+
+    return result
+
 
 
 def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
