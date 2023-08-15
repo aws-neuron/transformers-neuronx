@@ -85,7 +85,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
         norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps)
-        mlp_hidden = hlo.gated_mlp(
+        mlp_hidden = hlo.gated_mlp_bsh(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,
