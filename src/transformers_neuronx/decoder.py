@@ -513,7 +513,6 @@ class DecoderLayer(torch.nn.Module):
             self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
 
             self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=0)
-            self.attn_out_bias = maybe_pad(self.attn_out_bias, dim=0)
 
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
@@ -886,7 +885,7 @@ class DecoderProgram:
 
 
     def get_neff_bytes(self):
-        neff_bytes_arr = [kernel.neff_bytes for kernel in self.kernels] 
+        neff_bytes_arr = [kernel.neff_bytes for kernel in self.kernels]
         if self.need_reorder_cache:
             neff_bytes_arr += [self.reorder_cache_hlo_kernel.kernel.neff_bytes]
         return neff_bytes_arr
@@ -895,10 +894,10 @@ class DecoderProgram:
         if self.need_reorder_cache:
             kernels_neff_bytes, reorder_cache_kernel_bytes = kernels_neff_bytes[:-1], kernels_neff_bytes[-1]
             self.reorder_cache_hlo_kernel.kernel.neff_bytes = reorder_cache_kernel_bytes
-        
+
         for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes):
             kernel.neff_bytes = neff_bytes
-        
+
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -969,7 +968,7 @@ class DecoderProgram:
         reorder_ids_tensors_cpu = self.reorder_cache_hlo_kernel.manipulator.duplicate_on_cpu(reorder_ids_tensor)
         ops.parallel_write(self.reorder_ids_buffers, reorder_ids_tensors_cpu)
         self.reorder_cache_hlo_kernel.run()
-    
+
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
