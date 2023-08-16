@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-
+import os
 from transformers_neuronx import decoder
 from transformers_neuronx import module
 from transformers_neuronx import ops
@@ -56,6 +56,22 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = None
+
+    def _save_compiled_artifacts(self, directory):
+        if os.path.isfile(directory):
+            raise FileExistsError(
+                f'Artifacts should be saved to a directory. '
+                f'Found existing file: {directory}'
+            )
+        os.makedirs(directory, exist_ok=True)
+        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
+
+    def _load_compiled_artifacts(self, directory):
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f'Did not find directory: {directory}')
+        program_filename = os.path.join(directory, 'neuron-program.pkl')
+        if os.path.exists(program_filename):
+            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
     def to_neuron(self):
 
@@ -259,6 +275,22 @@ class FIDLlamaForSampling(LlamaForSampling):
         logits[:] = float('-inf')
         logits[self.bos_token_id] = 1.0
         return logits
+
+    def _save_compiled_artifacts(self, directory):
+        if os.path.isfile(directory):
+            raise FileExistsError(
+                f'Artifacts should be saved to a directory. '
+                f'Found existing file: {directory}'
+            )
+        os.makedirs(directory, exist_ok=True)
+        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
+
+    def _load_compiled_artifacts(self, directory):
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f'Did not find directory: {directory}')
+        program_filename = os.path.join(directory, 'neuron-program.pkl')
+        if os.path.exists(program_filename):
+            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         """ Sample function
