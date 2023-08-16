@@ -169,7 +169,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids)
+            hidden_slice = hidden[:, i:i+1].contiguous()
+            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
 
         return logits
 
