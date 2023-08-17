@@ -99,8 +99,9 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             new_layer.add_attention_value(v, v_bias)
 
             new_layer.add_attention_output(
-                attn.dense.weight.detach().T,
-                attn.dense.bias.detach()
+                attn.dense.weight.detach(),
+                attn.dense.bias.detach(),
+                sharding=1,
             )
             new_layer.add_pre_mlp_layer_norm(
                 layer.post_attention_layernorm.weight.detach(),
