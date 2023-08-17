@@ -362,9 +362,8 @@ def output(
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
-    _, hidden_size = out_weight.sizes
+    hidden_size, _ = out_weight.sizes
     hidden_sizes = hidden_size, n_active_tokens, n_seqs
-    hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
 
     enable_quantize = neuron_config and neuron_config.quant
     if enable_quantize:
@@ -372,15 +371,12 @@ def output(
 
     result_sizes_2d = n_active_tokens * n_seqs, n_heads_tp * d_head
     result = dtype[result_sizes_2d].Reshape(context)
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
-    result = dtype[hidden_r_sizes].Dot(out_weight, result, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        result = hlo.dequantize(result, out_scales, neuron_config, 0)
 
-    if out_bias is not None:
-        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[0])
-        result = dtype[hidden_r_sizes].Add(result, out_bias)
+    # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
+    result = hlo.dot11_add1(result, out_weight, out_bias, out_scales)
 
+    # (b * s, h) => (h, s, b)
+    result = hlo.transpose(result, 0, 1)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree == 1:

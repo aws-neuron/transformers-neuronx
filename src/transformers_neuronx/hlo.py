@@ -140,6 +140,7 @@ def dot01(lhs, rhs):
     dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[1])
     return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
 
+
 def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
     enable_quantize = neuron_config is not None \
                         and neuron_config.quant is not None
@@ -152,51 +153,64 @@ def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
     dtype = lhs.dtype
     return lhs, rhs, dtype
 
-def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
+
+def mmadd(
+    lhs,
+    rhs,
+    bias=None,
+    lhs_contracting_dimension=0,
+    rhs_contracting_dimension=0,
+    bias_dimension=0,
+    scales=None,
+    neuron_config=None
+):
+    """
+    Matrix-matrix multiplication and optional addition
+    """
+    assert len(lhs.sizes) == 2, f"Expected rank 2 LHS. Found shape={lhs.sizes}"
+    assert len(rhs.sizes) == 2, f"Expected rank 2 RHS. Found shape={rhs.sizes}"
+    lhs_size = lhs.sizes[lhs_contracting_dimension]
+    rhs_size = rhs.sizes[rhs_contracting_dimension]
+    assert lhs_size == rhs_size, (
+        f"Contracting dimension mismatch:"
+        f" LHS (dim={lhs_contracting_dimension} shape={lhs.sizes})"
+        f" RHS (dim={rhs_contracting_dimension} shape={rhs.sizes})"
+    )
+
     lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
     enable_quantize = neuron_config is not None \
                         and neuron_config.quant is not None
-    _, lhs_size = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
+
+    lhs_size = lhs.sizes[1 if lhs_contracting_dimension == 0 else 0]
+    rhs_size = rhs.sizes[1 if rhs_contracting_dimension == 0 else 0]
+    dot_dims = dict(
+        lhs_contracting_dimensions=[lhs_contracting_dimension],
+        rhs_contracting_dimensions=[rhs_contracting_dimension]
+    )
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
     if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 0)
+        dot = dequantize(dot, scales, neuron_config, bias_dimension)
     if bias is None:
         return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[0])
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
     return dtype[lhs_size, rhs_size].Add(dot, bias)
+
+
+def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
+    return mmadd(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None \
-                        and neuron_config.quant is not None
-    _, lhs_size = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 1)
-    if bias is None:
-        return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    return mmadd(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
+
 
 def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None \
-                        and neuron_config.quant is not None
-    lhs_size, _ = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 1)
-    if bias is None:
-        return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    return mmadd(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
+
+
+def dot11_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    return mmadd(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
+
 
 def gen_add_func(dtype):
 
@@ -375,38 +389,44 @@ def gated_mlp(
 
     Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/llama/modeling_llama.py#L144
 
-    TODO: Support quantization
-
     Sizes:
-        hidden:     [h, a, b]
-        in0_weight: [h, n / tp]
-        in1_weight: [h, n / tp]
-        out_weight: [n / tp, h]
-        in0_bias:   [n / tp]
-        in1_bias:   [n / tp]
+
+        i = n / tp
+
+        hidden:     [h, s, b]
+        in0_weight: [h, i]
+        in1_weight: [h, i]
+        out_weight: [h, i]
+        in0_bias:   [i]
+        in1_bias:   [i]
         out_bias:   [h]
-        result:     [h, a, b]
+        result:     [h, s, b]
     """
 
     dtype = hidden.dtype
     hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
-
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    hidden_active = dot00_add0(in0_weight, hidden, in0_bias, scales=in0_scales, neuron_config=neuron_config)
+    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+    hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
     hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias, scales=in1_scales, neuron_config=neuron_config)
+
+    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+    hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
 
-    result = dot00_add0(out_weight, hidden_states, out_bias, scales=out_scales, neuron_config=neuron_config)
+    # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+    result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+
+    # (b * s, h) = > (h, s, b)
+    result = transpose(result, 0, 1)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
         result = all_reduce_sum(result, tp_degree)
 
     return result
-
 
 
 def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
@@ -1454,16 +1474,24 @@ def index_select(tensor, dim, index):
     return result
 
 
-def add(a, b):
-    assert a.sizes == b.sizes
-    assert a.dtype == b.dtype
-    return a.dtype[a.sizes].Add(a, b)
+def add(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Add(lhs, rhs)
 
 
-def divide(a, b):
-    assert a.sizes == b.sizes
-    assert a.dtype == b.dtype
-    return a.dtype[a.sizes].Divide(a, b)
+def divide(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Divide(lhs, rhs)
 
 
 def reshape(tensor, shape):
