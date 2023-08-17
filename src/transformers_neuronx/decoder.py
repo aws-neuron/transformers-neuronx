@@ -467,9 +467,10 @@ class DecoderLayer(torch.nn.Module):
         self.attn_v_weight = weight
         self.attn_v_bias = bias
 
-    def add_attention_output(self, weight, bias):
+    def add_attention_output(self, weight, bias, sharding=0):
         self.attn_out_weight = weight
         self.attn_out_bias = bias
+        self.attn_out_sharding = sharding
 
     def add_post_attention_layer_norm(self, weight, bias):
         self.post_attn_ln_weight = weight
@@ -512,7 +513,7 @@ class DecoderLayer(torch.nn.Module):
             self.attn_v_weight = maybe_pad(self.attn_v_weight, dim=1)
             self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
 
-            self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=0)
+            self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
 
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
@@ -528,7 +529,7 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(self.attn_q_weight)
             self.attn_k_weight, self.attn_k_min, self.attn_k_max = utils.u8_encode(self.attn_k_weight)
             self.attn_v_weight, self.attn_v_min, self.attn_v_max = utils.u8_encode(self.attn_v_weight)
-            self.attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(self.attn_out_weight)
+            self.attn_out_weight, self.attn_out_min, self.attn_out_max = utils.u8_encode(self.attn_out_sharding)
             self.mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(self.mlp_in_weight)
             self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
         if self.neuron_config and self.neuron_config.quant:
@@ -563,7 +564,7 @@ class DecoderLayer(torch.nn.Module):
         self.attn_v_weight = maybe_shard_along(self.attn_v_weight, dim=1)
         self.attn_v_scales = maybe_shard_along(self.attn_v_scales, dim=0)
         self.attn_v_bias = maybe_shard_along(self.attn_v_bias, dim=0)
-        self.attn_out_weight = maybe_shard_along(self.attn_out_weight, dim=0)
+        self.attn_out_weight = maybe_shard_along(self.attn_out_weight, dim=self.attn_out_sharding)
         self.attn_out_scales = maybe_duplicate(self.attn_out_scales)
         self.attn_out_bias = maybe_primary_only(self.attn_out_bias)
         self.post_attn_ln_weight = maybe_duplicate(self.post_attn_ln_weight)
