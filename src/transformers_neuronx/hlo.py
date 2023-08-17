@@ -1002,6 +1002,42 @@ def reduce_mean(tensor, dims, keepdim=False):
 
 def cumsum(tensor, dim):
 
+    scribe = tensor.scribe
+    s32 = scribe.s32
+    pred = scribe.pred
+
+    last = len(tensor.sizes) - 1
+    dtype = tensor.dtype
+
+    if dim < 0:
+        dim %= len(tensor.sizes)
+
+    if dim != last:
+        tensor = transpose(tensor, dim, last)
+
+    size = tensor.sizes[last]
+    sizes = (size, size)
+
+    # Build triu mask
+    a = s32[sizes].Iota(dimensions=[0])
+    b = s32[sizes].Iota(dimensions=[1])
+    triu = pred[sizes].Compare(a, b, comparison_direction='LE')
+    triu = dtype[sizes].Convert(triu)
+
+    # Cumulative sum along final dimension
+    result = dtype[tensor.sizes].Dot(tensor, triu, dot_dimension_numbers=dict(
+        lhs_contracting_dimensions=[last],
+        rhs_contracting_dimensions=[0]
+    ))
+    if dim != last:
+        result = transpose(result, dim, last)
+
+    return result
+
+
+def _cumsum_reduce_window(tensor, dim):
+    # PERF: Scales poorly with large tensors
+
     dtype = tensor.dtype
 
     init = dtype.Constant(constant_value=0)
