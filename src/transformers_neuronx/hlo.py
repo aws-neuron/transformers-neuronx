@@ -360,11 +360,15 @@ def gated_mlp(
     in0_weight,
     in1_weight,
     out_weight,
+    in0_scales=None,
+    in1_scales=None,
+    out_scales=None,
     in0_bias=None,
     in1_bias=None,
     out_bias=None,
     activation_function='silu',
-    tp_degree=1
+    tp_degree=1,
+    neuron_config=None,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -390,12 +394,12 @@ def gated_mlp(
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    hidden_active = dot00_add0(in0_weight, hidden, in0_bias)
+    hidden_active = dot00_add0(in0_weight, hidden, in0_bias, scales=in0_scales, neuron_config=neuron_config)
     hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias)
+    hidden_linear = dot00_add0(in1_weight, hidden, in1_bias, scales=in1_scales, neuron_config=neuron_config)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
 
-    result = dot00_add0(out_weight, hidden_states, out_bias)
+    result = dot00_add0(out_weight, hidden_states, out_bias, scales=out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:

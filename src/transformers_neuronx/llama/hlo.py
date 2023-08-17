@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer, rotary
+from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 
@@ -71,10 +71,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             in1_weight, in1_scales,
             out_weight, out_scales,
         ):
-        dtype = hidden.dtype
-        hidden = hlo.transpose210(hidden)
         eps = self.config.rms_norm_eps
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps)
+        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
@@ -83,9 +81,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_v_weight, attn_v_scales, attn_v_bias,
             attn_out_weight, attn_out_scales, attn_out_bias
         )
-        hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps)
-        mlp_hidden = hlo.gated_mlp_bsh(
+        hidden = hlo.add(attn_output, hidden)
+        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=0)
+        mlp_hidden = hlo.gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,
@@ -95,8 +93,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             tp_degree=self.config.tp_degree,
             neuron_config=self.neuron_config
         )
-        res_hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
-        res_hidden = hlo.transpose210(res_hidden)
+        res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
