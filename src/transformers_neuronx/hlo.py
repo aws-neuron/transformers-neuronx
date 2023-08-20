@@ -1095,6 +1095,46 @@ def slice_along(tensor, dim, limit, start=0):
     )
 
 
+def dynamic_slice_along(tensor, dim, start, size):
+
+    scribe = tensor.scribe
+    s32 = scribe.s32
+    u32 = scribe.u32
+    s64 = scribe.s64
+    u64 = scribe.u64
+    dtype = tensor.dtype
+
+    assert isinstance(size, int), (
+        f"Parameter 'size' must be an integer. Found type={type(size)}"
+    )
+    assert not isinstance(start, int), (
+        f"Parameter 'start' must be a tensor. Found type={type(size)}"
+    )
+    assert len(start.sizes) == 0, (
+        f"Parameter 'start' must be a scalar. Found shape={start.sizes}"
+    )
+    assert start.dtype in (s32, u32, s64, u64), (
+        f"Parameter 'start' must be an integer type."
+    )
+
+    sizes = list(tensor.sizes)
+    assert size <= sizes[dim], (
+        f"Parameter 'size' ({size}) must less/equal to {sizes[dim]}. (dim={dim}, shape={sizes})"
+    )
+    sizes[dim] = size
+
+    start = cast(start, s32)
+    zero = s32.Constant(constant_value=0)
+    starts = [zero] * len(sizes)
+    starts[dim] = start
+
+    return dtype[sizes].DynamicSlice(
+        tensor,
+        *starts,
+        dynamic_slice_sizes=sizes,
+    )
+
+
 def pad(tensor, dim, size, value=0):
     rank = len(tensor.sizes)
     dtype = tensor.dtype
