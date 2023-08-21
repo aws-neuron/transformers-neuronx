@@ -852,9 +852,10 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, layers, hlo_modules, num_inputs, tp_degree):
+    def __init__(self, layers, hlo_modules, num_inputs, tp_degree, prefixed_length=0):
         self.layers = layers
         first_hlo, *_ = hlo_modules
+        self.prefixed_length = prefixed_length
         self.input_buffers = [compiler.gen_zero_input(first_hlo, idx) for idx in range(num_inputs)]
         self.kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in hlo_modules]
         self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
@@ -917,9 +918,12 @@ class DecoderProgram:
         return self.manipulator.unshard_along(self.logits_buffer, dim=0)
 
     def _fill_io_tensors(self, input_tensors, output_tensors, layers, npos):
+        end = npos
+        if self.prefixed_length > 0:
+            end = npos + self.prefixed_length
         for layer in layers:
             for cache in layer.attn_k_cache, layer.attn_v_cache:
-                cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=npos, step=1)
+                cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
                 input_tensors.append(cache_slice)
                 output_tensors.append(cache_slice)
         for layer in layers:
@@ -973,8 +977,8 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, layers, hlo_modules, num_inputs, tp_degree):
-        super().__init__(layers, hlo_modules, num_inputs, tp_degree)
+    def __init__(self, layers, hlo_modules, num_inputs, tp_degree, prefixed_length=0):
+        super().__init__(layers, hlo_modules, num_inputs, tp_degree, prefixed_length)
         first_hlo, *_ = hlo_modules
         self.logits_buffer = compiler.gen_zero_output(first_hlo, 0)
         self.memories = [kernel.build_memory() for kernel in self.kernels]
@@ -1017,8 +1021,8 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, layers, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree):
-        super().__init__(layers, hlo_modules, num_inputs, tp_degree)
+    def __init__(self, layers, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree, prefixed_length=0):
+        super().__init__(layers, hlo_modules, num_inputs, tp_degree, prefixed_length)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
         self.logits_buffer = compiler.gen_zero_output(ln_lm_head_hlo_module)
