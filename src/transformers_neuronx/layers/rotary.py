@@ -70,19 +70,35 @@ def get_up_down(q):
     q_down = hlo.slice_along(q, -1, head_dim, head_dim//2)
     return q_up, q_down
 
+def get_up_down_with_percentage(q, percentage):
+    """
+    Given a tensor, returns its upper and lower halves with given percentage (divided in the last dimension)
+    """
+    head_dim = q.sizes[-1]
+    q_up = hlo.slice_along(q, -1, int(head_dim * percentage))
+    q_down = hlo.slice_along(q, -1, head_dim, int(head_dim * percentage))
+    return q_up, q_down
 
-def rotate_vec(q, sin_r, cos_r):
+def rotate_vec(q, sin_r, cos_r, rotary_percentage=1):
     """
     Given vectors q, sin, and cos tables, apply rotation to vectors
     """
-    q_up, q_down = get_up_down(q)
-    q_rot_up = hlo.ax_minus_by(cos_r, q_up, sin_r, q_down)
-    q_rot_down = hlo.ax_plus_by(cos_r, q_down, sin_r, q_up)
-    q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
-    return q_rot
+    if rotary_percentage == 1:
+        q_up, q_down = get_up_down(q)
+        q_rot_up = hlo.ax_minus_by(cos_r, q_up, sin_r, q_down)
+        q_rot_down = hlo.ax_plus_by(cos_r, q_down, sin_r, q_up)
+        q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
+        return q_rot
+    else:
+        q_rotary, q_pass = get_up_down_with_percentage(q, rotary_percentage)
+        q_rotary_up, q_rotary_down = get_up_down(q_rotary)
+        q_rotary_rot_up = hlo.ax_minus_by(cos_r, q_rotary_up, sin_r, q_rotary_down)
+        q_rotary_rot_down = hlo.ax_plus_by(cos_r, q_rotary_down, sin_r, q_rotary_up)
+        q_rotary_rot = q.dtype[q_rotary.sizes].Concatenate(q_rotary_rot_up, q_rotary_rot_down, dimensions=[3])
+        return q.dtype[q.sizes].Concatenate(q_rotary_rot, q_pass, dimensions=[3])
 
 
-def rotate_half(query, key, sin_cos):
+def rotate_half(query, key, sin_cos, rotary_percentage=1):
     """
     A secondary projection to apply to input query/key projections (used in
     specific models: GPT-J/GPT-NeoX/Llama).
@@ -98,7 +114,7 @@ def rotate_half(query, key, sin_cos):
         | q_up sin + q_down cos |
     """
     # Rotate query and key
-    broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head // 2
+    broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, int((d_head // 2) * rotary_percentage)
 
     # Get sin and cos as upper and lower half of input embedding
     sin, cos = sin_cos
@@ -106,8 +122,8 @@ def rotate_half(query, key, sin_cos):
     cos_r = dtype[broadcast_sizes].Broadcast(cos, dimensions=[0,3])
 
     # Rotate query
-    query = rotate_vec(query, sin_r, cos_r)
+    query = rotate_vec(query, sin_r, cos_r, rotary_percentage)
 
     # Rotate key
-    key = rotate_vec(key, sin_r, cos_r)
+    key = rotate_vec(key, sin_r, cos_r, rotary_percentage)
     return query, key
