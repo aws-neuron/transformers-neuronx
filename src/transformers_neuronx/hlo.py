@@ -1328,6 +1328,7 @@ def topk(tensor, dim, k=50, tp_degree=1):
     k_size_br = f32[sizes].Broadcast(k_size, dimensions=[])
     iota = f32[sizes].Iota(dimensions=[dim])
     group_id = f32[sizes].Divide(iota, k_size_br)
+    group_id = f32[sizes].Floor(group_id)
     offset = f32[sizes].Multiply(group_id, rank_size_br)
     offset = dtype[sizes].Convert(offset)
     index = dtype[sizes].Add(index, offset)
