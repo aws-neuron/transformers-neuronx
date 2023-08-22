@@ -153,7 +153,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         return torch.cat(tokens, dim=-1)
 
 
-# (bowencc): Need to keep PreTrainedModel after module.PretrainedModel as the later
+# Need to keep PreTrainedModel after module.PretrainedModel as the later
 # overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly 
 # since it doesn't pass config in suer().__init__
 class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.NeuronModelBase):
