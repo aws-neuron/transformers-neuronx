@@ -261,7 +261,7 @@ class ParallelMemory:
 
 class Executor:
 
-    def __init__(self, model, memory, inputs, outputs):
+    def __init__(self, kernel, memory, inputs, outputs):
         """
         An optimized executor class that allocates a thread for each model rank.
 
@@ -278,10 +278,12 @@ class Executor:
         The combination of the above optimization can have a huge effect
         especially on small/fast models.
         """
+        self.kernel = kernel
+        self.memory = memory
         self.inputs = inputs
         self.outputs = outputs
         self.executor = torch.classes.neuron.ParallelExecutor(
-            model,
+            kernel.model,
             memory.inputs,  # All inputs (inputs, caches, weights)
             memory.outputs, # All outputs (outputs, caches)
             inputs,         # User provided inputs
@@ -310,7 +312,15 @@ class Executor:
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)
             casted.append(cpu)
-        outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+
+        if self.kernel.snapshot is not None:
+            self.kernel.snapshot_enter(self.memory.input_tensors)
+            self.kernel.snapshot_tensors(inputs, 'inputs')  # Overwrite with current values
+            outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+            self.kernel.snapshot_exit(self.memory.output_tensors)
+        else:
+            outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+
         if return_ranks == 1:
             result = tuple(shards[0] for shards in outputs)
         else:
@@ -320,6 +330,23 @@ class Executor:
         return result
 
 
+def write_tensors(tensors, folder):
+    os.makedirs(folder, exist_ok=True)
+    for i, tensor in enumerate(tensors):
+        filename = os.path.join(folder, f"{i}.npy")
+        if tensor.device != torch.device('cpu'):
+            tensor = ops.parallel_cpu(tensor)
+            if isinstance(tensor, list):
+                tensor = tensor[0]
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.view(torch.int16)
+            tensor = tensor.numpy()
+            tensor = tensor.view('|V2')
+        else:
+            tensor = tensor.detach().numpy()
+        np.save(filename, tensor)
+
+
 class ParallelKernel:
     hlo_snapshot_iter = 0
     def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
@@ -327,36 +354,11 @@ class ParallelKernel:
         self.tp_degree = tp_degree
         self.neff_bytes = None
         self.model = None
-        self.hlo_snapshot = None
-        self.generate_hlo_snapshot()
+        self.snapshot = os.environ.get("HLO_SNAPSHOT_PATH", None)
         self.g_start_device_id = g_start_device_id
         if g_device_count is None:
             g_device_count = tp_degree
         self.g_device_count = g_device_count
-
-    def generate_hlo_snapshot(self, tensors=None):
-        if tensors is None:
-            self.hlo_snapshot_folder = os.environ.get("HLO_SNAPSHOT_PATH", None)
-            self.hlo_snapshot = self.hlo_snapshot_folder is not None
-            if self.hlo_snapshot:
-                os.makedirs(f"{self.hlo_snapshot_folder}", exist_ok=True)
-        elif self.hlo_snapshot:
-            folder = os.path.join(self.hlo_snapshot_folder, f"iter{ParallelKernel.hlo_snapshot_iter}")
-            os.makedirs(folder, exist_ok=True)
-            for i, tensor in enumerate(tensors):
-                filename = os.path.join(folder, f"{i}.npy")
-                tensor_cpu = ops.parallel_cpu(tensor)
-                if isinstance(tensor_cpu, list):
-                    tensor_cpu = tensor_cpu[0]
-                if tensor_cpu.dtype == torch.bfloat16:
-                    tensor_cpu = tensor_cpu.view(torch.int16)
-                    tensor_cpu = tensor_cpu.numpy()
-                    tensor_cpu = tensor_cpu.view('|V2')
-                else:
-                    tensor_cpu = tensor_cpu.detach().numpy()
-                np.save(filename, tensor_cpu)
-            ParallelKernel.hlo_snapshot_iter += 1
-
 
     def build_memory(self):
         return ParallelMemory(self.hlo_module, self.tp_degree)
@@ -376,13 +378,40 @@ class ParallelKernel:
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         self.model.load()
 
+    def snapshot_path(self):
+        path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def snapshot_tensors(self, inputs, subdir):
+        folder = self.snapshot_path()
+        path = os.path.join(folder, subdir)
+        write_tensors(inputs, path)
+
+    def snapshot_enter(self, inputs):
+        folder = self.snapshot_path()
+        path = os.path.join(folder, 'graph.hlo.pb')
+        with open(path, 'wb') as f:
+            f.write(self.hlo_module.SerializeToString())
+        path = os.path.join(folder, 'graph.neff')
+        with open(path, 'wb') as f:
+            f.write(self.neff_bytes)
+        self.snapshot_tensors(inputs, 'inputs')
+
+    def snapshot_exit(self, outputs):
+        self.snapshot_tensors(outputs, 'outputs')
+        ParallelKernel.hlo_snapshot_iter += 1
+
     def __call__(self, memory):
-        if self.hlo_snapshot:
-            self.generate_hlo_snapshot(memory.input_tensors)
+        if self.snapshot is not None:
+            self.snapshot_enter(memory.input_tensors)
+            result = ops.parallel_run(self.model, memory.inputs, memory.outputs)
+            self.snapshot_exit(memory.output_tensors)
+            return result
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
     def build_executor(self, memory, inputs, outputs):
-        return Executor(self.model, memory, inputs, outputs)
+        return Executor(self, memory, inputs, outputs)
 
 
 def gen_zero_input(hlo_module, index):
