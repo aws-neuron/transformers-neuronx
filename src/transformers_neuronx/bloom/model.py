@@ -50,12 +50,27 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config, allow_pad=True
         )
+        self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
+
+        if self.context_length_estimate is not None:
+            self.decoder_lm_head_for_context = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                                                    tp_degree, 
+                                                    [context_length_estimate], 
+                                                    context_length_estimate, 
+                                                    batch_size, 
+                                                    config.attention_head_size, 
+                                                    amp, 
+                                                    config.n_layer, 
+                                                    context_unroll, 
+                                                    neuron_config=neuron_config, 
+                                                    allow_pad=self.decoder_lm_head.allow_pad
+                                                )
+            self.register_for_serialization(self.decoder_lm_head_for_context)
 
     def to_neuron(self):
 
@@ -131,12 +146,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.to_neuron()
 
         if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
-                n_positions_list=[self.context_length_estimate],
-                n_active_tokens=self.context_length_estimate,
-                unroll=self.context_unroll,
-                share_caches=True,
-            )
+            # doesn't override registration for serialization because build_weight_shared returns the context head
+            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context)
 
     def reset(self):
         self.decoder_lm_head.reset()
