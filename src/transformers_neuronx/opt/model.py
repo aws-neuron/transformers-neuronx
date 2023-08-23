@@ -16,6 +16,7 @@ import os
 import copy
 import warnings
 import torch
+from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
@@ -24,7 +25,6 @@ from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
-from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import attention
 
@@ -53,11 +53,12 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         # Provide a list of seq lens
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
         attention_head_size = config.hidden_size // config.num_attention_heads
-        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, # n_active_tokens
             batch_size, attention_head_size, amp,
             config.num_hidden_layers, unroll, neuron_config=neuron_config
         )
+        self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
                                                    config.activation_function, start_mask,
@@ -69,6 +70,20 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
         self.neuron_config = neuron_config
+        if self.context_length_estimate is not None:
+            self.decoder_lm_head_for_context = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                                                    tp_degree, 
+                                                    [context_length_estimate], 
+                                                    context_length_estimate, 
+                                                    batch_size, 
+                                                    attention_head_size, 
+                                                    amp, 
+                                                    config.num_hidden_layers, 
+                                                    context_unroll, 
+                                                    neuron_config=neuron_config, 
+                                                    allow_pad=self.decoder_lm_head.allow_pad
+                                                )
+            self.register_for_serialization(self.decoder_lm_head_for_context)
 
     def to_neuron(self):
         ops.init()
@@ -99,12 +114,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
-                n_positions_list=[self.context_length_estimate],
-                n_active_tokens=self.context_length_estimate,
-                unroll=self.context_unroll,
-                share_caches=True,
-            )
+            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context)
 
     def reset(self):
         self.decoder_lm_head.reset()

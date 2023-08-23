@@ -15,6 +15,7 @@
 import pickle
 import os
 import torch
+from transformers_neuronx import base
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -25,7 +26,7 @@ from transformers_neuronx import quantize
 from concurrent.futures import ProcessPoolExecutor
 
 
-class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
+class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=True,
@@ -53,12 +54,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.layer_builder = None
         self.ln_lm_head_builder = None
         self.program = None
-        self.compiler_artifacts_path = None
         self.pre_layer_parameters = []
         self.pre_layer_builder = None
         self.allow_pad = allow_pad
         self.use_executor = False
         self.return_ranks = -1
+        self.need_reorder_cache = False
+        self.compiler_artifacts_path = None
 
     def enable_executor(self, return_ranks=-1):
         self.use_executor = True
@@ -123,23 +125,38 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             ln_lm_head_params.append(self.lm_head_bias)
 
         self.program = self._build_program()
+        # setup_reorder_cache needs to be able to be called before to_neuron()
+        # and after to_neuron for backwards compatability.
+        # If called before to_neuron() this logic will be reached and it will
+        # create the HLO for reorder_cache, check if there is an available NEFF
+        # for deserialization, then compile. If called after, setup_reorder_cache
+        # will be called from the NeuronModelBase without serialization logic.
+        if self.need_reorder_cache:
+            self.program.setup_reorder_cache(also_compile_now=False)
+        if self.compiler_artifacts_path is not None:
+            self.set_neff_bytes()
         self.program.setup(self.layers, ln_lm_head_params)
+        # separate intialization and compilation
+        if self.need_reorder_cache:
+            self.program._setup_reorder_cache_kernel()
+
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
-                            unroll=None, share_caches=False):
-        if n_positions_list is None:
-            n_positions_list = self.n_positions_list
-        if n_active_tokens is None:
-            n_active_tokens = self.n_active_tokens
-        if batch_size is None:
-            batch_size = self.batch_size
-        if unroll is None:
-            unroll = self.unroll
-        new = DecoderLmHeadForSamplingNoEmbedding(
-            self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
-            prefixed_length=self.prefixed_length
-        )
+                            unroll=None, share_caches=False, new=None):
+        if new == None:
+            if n_positions_list is None:
+                n_positions_list = self.n_positions_list
+            if n_active_tokens is None:
+                n_active_tokens = self.n_active_tokens
+            if batch_size is None:
+                batch_size = self.batch_size
+            if unroll is None:
+                unroll = self.unroll
+            new = DecoderLmHeadForSamplingNoEmbedding(
+                self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
+                self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
+                prefixed_length=self.prefixed_length
+            )
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
@@ -160,6 +177,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
         new.program = new._build_program()
+        if new.compiler_artifacts_path is not None:
+            new.set_neff_bytes()
         new.program.setup(new.layers, ln_lm_head_params)
         return new
 
@@ -235,13 +254,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
 
-    def save_compiler_artifacts(self, path):
-        with open(path, 'wb') as f:
-            pickle.dump(self.program.get_neff_bytes(), f)
-
-    def load_compiler_artifacts_after_build(self, path):
-        self.compiler_artifacts_path = path
-
     def _build_program(self):
         if self.unroll == self.num_layers:
             hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
@@ -255,10 +267,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(self.layers, hlo_modules, ln_lm_head_hlo_module, num_inputs,
                                                self.num_layers, self.unroll, self.tp_degree, self.prefixed_length)
-        if self.compiler_artifacts_path is not None:
-            with open(self.compiler_artifacts_path, 'rb') as f:
-                kernels_neff_bytes = pickle.load(f)
-            program.set_neff_bytes(kernels_neff_bytes)
         return program
 
     def _hlo_fully_unrolled(self, n_positions):
@@ -368,12 +376,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
         return compiler.compile_py_func(ln_lm_head)
 
-    def reorder_cache(self, reorder_ids):
-        self.program.reorder_cache(reorder_ids)
+    # Mainly used for serialization purposes.
+    # Defines how to access all the kernels.
+    def get_all_kernels(self):
+        base = self.program.kernels
+        if isinstance(self.program, DecoderProgramMultiLayer):
+            base += [self.program.ln_lm_head_kernel]
+        if self.need_reorder_cache: # only true when reorder_cache called before to_neuron
+            base += [self.program.reorder_cache_hlo_kernel.kernel]
+        return base
 
-
-    def setup_reorder_cache(self):
-        self.program.setup_reorder_cache()
 
 
 def read_n_position(hlo_module, num_inputs):
@@ -908,7 +920,7 @@ class DecoderProgram:
     def setup(self, layers, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
-
+ 
         # Compile modules in parallel
         with ProcessPoolExecutor(max_workers=len(self.n_positions_list)) as executor:
             neff_bytes_futures = []
@@ -921,26 +933,11 @@ class DecoderProgram:
         for kernel in self.kernels:
             kernel.load(io_ring_cache_size)
 
-    def setup_reorder_cache(self):
+    def setup_reorder_cache(self, also_compile_now=True):
         self.need_reorder_cache = True
         self.reorder_cache_hlo_kernel = self._create_reoder_cache_kernel()
-        self._setup_reorder_cache_kernel()
-
-
-    def get_neff_bytes(self):
-        neff_bytes_arr = [kernel.neff_bytes for kernel in self.kernels]
-        if self.need_reorder_cache:
-            neff_bytes_arr += [self.reorder_cache_hlo_kernel.kernel.neff_bytes]
-        return neff_bytes_arr
-
-    def set_neff_bytes(self, kernels_neff_bytes):
-        if self.need_reorder_cache:
-            kernels_neff_bytes, reorder_cache_kernel_bytes = kernels_neff_bytes[:-1], kernels_neff_bytes[-1]
-            self.reorder_cache_hlo_kernel.kernel.neff_bytes = reorder_cache_kernel_bytes
-
-        for kernel, neff_bytes in zip(self.kernels, kernels_neff_bytes):
-            kernel.neff_bytes = neff_bytes
-
+        if also_compile_now:
+            self._setup_reorder_cache_kernel()
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -1115,7 +1112,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         return self.lm_head_executor([], return_ranks=return_ranks)
 
 
-class FastCacheBroadcaster:
+class FastCacheBroadcaster(base.NeuronBaseSerializer):
 
     def __init__(self, n_positions, from_batch_size, to_batch_size, n_heads_tp, d_head, amp,
                  tp_degree, n_layer):
@@ -1124,7 +1121,13 @@ class FastCacheBroadcaster:
         cache_broadcast_hlo_module = compiler.compile_py_func(cache_broadcast_impl)
         self.cache_broadcast_kernel = compiler.ParallelKernel(cache_broadcast_hlo_module, tp_degree)
         self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
+
+    def build(self):
+        if self.compiler_artifacts_path is not None:
+            self.set_neff_bytes()
         self.cache_broadcast_kernel.build()
+    
+    def load(self):
         self.cache_broadcast_kernel.load()
 
     def setup(self, source_caches, target_caches):
@@ -1132,3 +1135,6 @@ class FastCacheBroadcaster:
 
     def run_broadcast(self):
         self.cache_broadcast_kernel(self.cache_broadcast_memory)
+
+    def get_all_kernels(self):
+	    return [self.cache_broadcast_kernel]

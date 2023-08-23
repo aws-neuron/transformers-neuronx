@@ -43,7 +43,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
-            max_allowed_sequence_length = config.n_ctx
+            max_allowed_sequence_length = config.n_postitions
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
         if unroll is None:
@@ -59,6 +59,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.register_for_serialization(self.decoder_lm_head)
 
     def to_neuron(self):
         ops.init()
@@ -167,7 +168,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
-            max_allowed_sequence_length = config.n_ctx
+            max_allowed_sequence_length = config.n_positions
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
 
@@ -179,6 +180,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
         )
+        self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
@@ -294,7 +296,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
 class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -314,6 +316,10 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
         )
+
+        self.decoder_lm_head.need_reorder_cache = reorder_cache
+        self.register_for_serialization(self.decoder_lm_head)
+
         # TODO: the start_mask needs to be True with left padding for context estimate,
         # need to fix this after having right padding
         start_mask = True
@@ -322,10 +328,45 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
+
+        n_embd = self.config.n_embd
+        d_head = n_embd // config.n_head
+        n_heads_tp = config.n_head // config.tp_degree
+        # Only share caches when we don't generate multiple suggestions.
+        self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size
+
+        if self.context_buckets:
+            self.decoder_lm_head_for_context={}
+            self.broadcaster={}
+            for context_length_estimate in self.context_buckets:
+                self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                    tp_degree, 
+                    [context_length_estimate], 
+                    context_length_estimate, 
+                    self.prompt_batch_size, 
+                    attention_head_size, 
+                    amp, 
+                    config.n_layer, 
+                    context_unroll, 
+                    neuron_config=neuron_config, 
+                    allow_pad=self.decoder_lm_head.allow_pad
+                )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
+                if not self.share_caches:
+                    self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
+                        context_length_estimate,
+                        self.prompt_batch_size,
+                        self.decoder_lm_head.batch_size,
+                        n_heads_tp,
+                        d_head,
+                        config.amp,
+                        config.tp_degree,
+                        config.n_layer,
+                    )
+                    self.register_for_serialization(self.broadcaster[context_length_estimate])
+
         self.context_pre_hook = None
         self.context_hook = None
-        self.broadcaster = None
 
     def to_neuron(self):
         ops.init()
@@ -361,34 +402,11 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         config = self.config
-        n_heads_tp = config.n_head // config.tp_degree
-        d_head = n_embd // config.n_head
-        # Only share caches when we don't generate multiple suggestions.
-        self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size
+
         if self.context_buckets:
-            self.decoder_lm_head_for_context={}
-            self.broadcaster={}
-            for context_length_estimate in self.context_buckets:
-                model = (
-                    self.decoder_lm_head.build_weight_shared(
-                        n_positions_list=[context_length_estimate],
-                        n_active_tokens=context_length_estimate,
-                        batch_size=self.prompt_batch_size,
-                        unroll=self.context_unroll,
-                        share_caches=self.share_caches,
-                    )
-                )
-                if not self.share_caches:
-                    broadcaster = decoder.FastCacheBroadcaster(
-                        context_length_estimate,
-                        self.prompt_batch_size,
-                        self.decoder_lm_head.batch_size,
-                        n_heads_tp,
-                        d_head,
-                        config.amp,
-                        config.tp_degree,
-                        config.n_layer,
-                    )
+            for i, context_length_estimate in enumerate(self.context_buckets):
+                model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches, 
+                                                                    new=self.decoder_lm_head_for_context[context_length_estimate])
                 source_caches = []
                 for layer in model.layers:
                     source_caches.append(layer.attn_k_cache)
@@ -413,8 +431,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
                     target_caches.append(attn_k_cache)
                     target_caches.append(attn_v_cache)
                 if not self.share_caches:
-                    broadcaster.setup(source_caches, target_caches)
-                    self.broadcaster[context_length_estimate]=broadcaster
+                    self.broadcaster[context_length_estimate].build()
+                    self.broadcaster[context_length_estimate].load()
+                    self.broadcaster[context_length_estimate].setup(source_caches, target_caches)
                 self.tensor_pool = tensor_pool.TensorPool()
                 # We need to reset once, since there might be NaN initially in KVcache.
                 # This is done right after weight loading which is shared for different generation methods.
@@ -599,7 +618,7 @@ class GPT2Transformer(module.LowMemoryModule):
     def __init__(self, config):
         super().__init__()
         self.wte = module.LowMemoryEmbedding(config.vocab_size, config.n_embd)
-        self.wpe = module.LowMemoryEmbedding(config.n_ctx, config.n_embd)
+        self.wpe = module.LowMemoryEmbedding(config.n_positions, config.n_embd)
         self.h = module.LowMemoryModuleList()
         for _ in range(config.n_layer):
             self.h.append(GPT2Block(config))
