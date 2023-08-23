@@ -30,12 +30,12 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, **kwargs):
+                 neuron_config=None, prefixed_length=0, **kwargs):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.config = config
         self.neuron_config = neuron_config
-
+        self.prefixed_length = prefixed_length
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
@@ -45,6 +45,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        if prefixed_length:
+            if prefixed_length not in self.context_buckets:
+                self.context_buckets.append(prefixed_length)
+                self.context_buckets = sorted(self.context_buckets)
+                
         self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -164,6 +169,13 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         return logits
 
+    def set_prefixed(self, input_ids):
+        self.prefixed_input_ids = input_ids[:, :self.prefixed_length]
+        prefixed_length = self.prefixed_length
+        self.prefixed_length = 0
+        self.forward(self.prefixed_input_ids)
+        self.prefixed_length = prefixed_length
+
     def forward(self, input_ids, cache_ids=None, start_ids=None):
 
         batch_size, context_length = input_ids.shape
@@ -171,6 +183,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
+        if self.prefixed_length:
+            cache_ids += self.prefixed_length
 
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
         hidden = hidden.transpose(0, -1).contiguous()
@@ -195,14 +209,22 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         # for padding.
         offset = 0
         batch_size, context_length = input_ids.shape
+        prefixed_length = self.prefixed_length
+        if context_length < prefixed_length:
+            self.prefixed_length = 0
+        else:
+            input_ids = input_ids[:, prefixed_length:]
+            context_length -= prefixed_length
+            sequence_length -= prefixed_length
         estimate = bucket.find(self.context_buckets, context_length)
         if estimate:
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=True)
                 offset = estimate - context_length
-                if start_ids is None:
-                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
-                start_ids += offset
+                if not prefixed_length:
+                    if start_ids is None:
+                        start_ids = torch.zeros(batch_size, dtype=torch.int32)
+                    start_ids += offset
                 sequence_length += offset
                 # Sequence length cannot be greater than n_positions
                 sequence_length = min(sequence_length, self.max_positions)
