@@ -27,7 +27,8 @@ from concurrent.futures import ProcessPoolExecutor
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=True):
+                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=True,
+                 prefixed_length=0):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -40,6 +41,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         self.num_layers = num_layers
         self.unroll = unroll
         self.neuron_config = neuron_config
+        self.prefixed_length = prefixed_length
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
         self.ln_f_bias = None
@@ -134,7 +136,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             unroll = self.unroll
         new = DecoderLmHeadForSamplingNoEmbedding(
             self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad
+            self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
+            prefixed_length=self.prefixed_length
         )
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
@@ -242,7 +245,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
         if self.unroll == self.num_layers:
             hlo_modules = [self._hlo_fully_unrolled(npos) for npos in self.n_positions_list]
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree)
+            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.prefixed_length)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
@@ -250,7 +253,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
             ln_lm_head_hlo_module = self._hlo_ln_lm_head()
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(self.layers, hlo_modules, ln_lm_head_hlo_module, num_inputs,
-                                               self.num_layers, self.unroll, self.tp_degree)
+                                               self.num_layers, self.unroll, self.tp_degree, self.prefixed_length)
         if self.compiler_artifacts_path is not None:
             with open(self.compiler_artifacts_path, 'rb') as f:
                 kernels_neff_bytes = pickle.load(f)
