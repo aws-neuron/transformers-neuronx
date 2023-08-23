@@ -24,7 +24,6 @@ class GPT2HuggingFaceConfig(transformers.GPT2Config):
         kwargs.update(config.to_dict())
         super().__init__(**kwargs)
         self.activation_function = config.activation_function
-        self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.n_layer = config.n_layer
@@ -42,7 +41,6 @@ class GPT2Config:
 
     def __init__(self, config, batch_size, amp, tp_degree, **kwargs):
         self.activation_function = config.activation_function
-        self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
         self.n_head = config.n_head
         self.n_layer = config.n_layer

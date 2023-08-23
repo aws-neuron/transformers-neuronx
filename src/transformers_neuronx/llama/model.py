@@ -56,27 +56,27 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
             config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
         )
+        self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                    tp_degree, 
+                    [context_length_estimate], 
+                    context_length_estimate, 
+                    batch_size, 
+                    config.attention_head_size, 
+                    amp, 
+                    config.num_hidden_layers, 
+                    context_unroll, 
+                    neuron_config=neuron_config, 
+                    allow_pad=self.decoder_lm_head.allow_pad
+                )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
 
     def to_neuron(self):
 
@@ -117,14 +117,8 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.enable_executor()
 
         if self.context_buckets:
-            self.decoder_lm_head_for_context = {}
             for context_length_estimate in self.context_buckets:
-                model = self.decoder_lm_head.build_weight_shared(
-                    n_positions_list=[context_length_estimate],
-                    n_active_tokens=context_length_estimate,
-                    unroll=self.context_unroll,
-                    share_caches=True,
-                )
+                model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate])
                 # PERF: No latency improvement seen in multi-layer models from executor
                 if self.context_unroll == self.config.num_hidden_layers:
                     model.enable_executor()
@@ -243,12 +237,12 @@ class FIDLlamaForSampling(LlamaForSampling):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, **kwargs):
+                 neuron_config=None, reorder_cache=False, **kwargs):
         # Force batch_size=1 in NEFF
         super().__init__(config, n_positions=n_positions, batch_size=1, amp=amp,
                         tp_degree=tp_degree, context_length_estimate=context_length_estimate,
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
-                        **kwargs)
+                        reorder_cache=False, **kwargs)
         self.batch_size = batch_size
         self.bos_token_id = self.config.bos_token_id
 
@@ -297,22 +291,6 @@ class FIDLlamaForSampling(LlamaForSampling):
         logits[:] = float('-inf')
         logits[self.bos_token_id] = 1.0
         return logits
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         """ Sample function
