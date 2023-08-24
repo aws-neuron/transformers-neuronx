@@ -14,6 +14,7 @@
 # ==============================================================================
 import math
 import itertools
+import random
 
 import torch
 import torch.nn.functional as F
@@ -102,3 +103,52 @@ def u8_encode(tensor):
     tensor *= 255.0 / (tensor_max - tensor_min)
     tensor = tensor.round().to(torch.uint8)
     return tensor, tensor_min, tensor_max
+
+# Sparse attention related, put here for now
+def create_blk_mask(blks_q, blks_kv, num_global_blks=0, num_local_blks=1, num_random_blks=0, causal=False):
+    """
+    Create a block mask given the configs, and the number of blocks in each dimension.
+    Assume all heads use the same mask.
+    """
+    blk_mask = torch.zeros((blks_q, blks_kv), dtype=torch.int32)
+    # Add global blocks
+    if num_global_blks > 0:
+        blk_mask[:num_global_blks, :] = 1
+        blk_mask[:, :num_global_blks] = 1
+    # Add local blocks
+    if num_local_blks > 0:
+        width = num_local_blks // 2
+        for row in range(blks_q):
+            start = max(0, row - width)
+            end = min(row + width + 1, blks_kv)
+            blk_mask[row, start:end] = 1
+    # Add random blocks
+    if num_random_blks > 0:
+        assert blks_kv > num_random_blks, "Number of random blocks must be smaller than total number of col blocks!"
+        for row in range(blks_q):
+            # If causal, only draw blocks from the lower-triangular part of the matrix
+            pool = list(range(0, blks_kv)) if not causal else list(range(0, row+1))
+            selected = pool if len(pool) <= num_random_blks else random.sample(pool, num_random_blks)
+            for col in selected:
+                blk_mask[row, col] = 1
+
+    if causal:
+        blk_mask = torch.tril(blk_mask)
+
+    return blk_mask
+
+def build_dense_mask(q_seq_len, k_seq_len, mask, blk_size=128, causal=False):
+    row_blks = (q_seq_len + blk_size - 1) // blk_size
+    col_blks = (k_seq_len + blk_size - 1) // blk_size
+    assert tuple(mask.shape) == (row_blks, col_blks), f'Mask must have shape (q_seq_len // blk_size, k_seq_len // blk_size)'
+    dense_mask = torch.zeros((q_seq_len, k_seq_len), dtype=torch.int32)
+
+    for row_id in range(row_blks):
+        for col_id in range(col_blks):
+            if int(mask[row_id, col_id]) == 1:
+                last_row = min(q_seq_len, (row_id+1)*blk_size)
+                last_col = min(k_seq_len, (col_id+1)*blk_size)
+                dense_mask[row_id*blk_size:last_row, col_id*blk_size:last_col] = 1
+    if causal:
+        dense_mask = torch.tril(dense_mask)
+    return dense_mask
