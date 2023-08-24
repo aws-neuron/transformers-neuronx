@@ -99,6 +99,9 @@ def dump_proto(proto, path):
     with open(path, 'wb') as f:
         f.write(proto.SerializeToString())
 
+def dump_proto_str(proto, path):
+    with open(path, 'w') as f:
+        f.write(str(proto))
 
 def hlo2metaneff(hlo_module):
     prog_shape = hlo_module.host_program_shape

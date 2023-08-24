@@ -63,7 +63,7 @@ def query_key_value(
         active_q = dtype[active_sizes].Reshape(active_q)
         active_k = dtype[active_sizes].Reshape(active_k)
         active_v = dtype[active_sizes].Reshape(active_v)
-    else:       
+    else:
         n_heads_per_group = n_heads_tp // n_groups
         active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
         active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
@@ -159,7 +159,7 @@ def score(query, keys, n_groups=0):
         n_active_tokens, n_seqs, n_heads_tp, _ = query.sizes
         n_positions, n_seqs, n_heads_tp, _ = keys.sizes
         size_dot = n_seqs, n_heads_tp, n_active_tokens, n_positions
-        lhs_contract_dim = 3 
+        lhs_contract_dim = 3
     size = n_seqs, n_heads_tp, n_active_tokens, n_positions
 
     # Q @ K
@@ -170,7 +170,7 @@ def score(query, keys, n_groups=0):
 
 
     result_dot = dtype[size_dot].Dot(query, keys, dot_dimension_numbers=dot_dims)
-  
+
     if n_groups != 0:
         result_permute = dtype[size_permute].Transpose(result_dot, dimensions=[0, 1, 3, 2, 4])
         result = dtype[size].Reshape(result_permute)
@@ -180,11 +180,11 @@ def score(query, keys, n_groups=0):
     return result
 
 
-def mask(score, mask):
+def mask(score, mask, constant_val=-30000):
     """
     Masks the computed attention scores with the attention mask.
 
-    score = masked_fill(score, mask, -65535)
+    score = masked_fill(score, mask, constant_val)
     """
     scribe = score.scribe
     dtype = score.dtype
@@ -192,17 +192,18 @@ def mask(score, mask):
     pred = scribe.pred
 
     # Note: This value can cause NaN issues if it is too large
-    large_neg = dtype.Constant(constant_value=-30000) # Valid for fp32/fp16/bf16
-    large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
+    const = dtype.Constant(constant_value=constant_val) # Valid for fp32/fp16/bf16
+    const_br = dtype[score_sizes].Broadcast(const, dimensions=[])
     if len(mask.sizes) == 2:
         mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
     else:
         mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
-    score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
+    score = dtype[score_sizes].Select(mask_br, score, const_br)
     return score
 
 
-def context(past_scores, active_score, past_values, active_values, n_groups=0, dtype=None):
+def context(past_scores, active_score, past_values, active_values, n_groups=0, dtype=None,
+            sparse_mask=None, active_sparse_mask=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -214,7 +215,11 @@ def context(past_scores, active_score, past_values, active_values, n_groups=0, d
 
     If n_groups != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
+    If both sparse_mask and active_sparse_mask are provided, use sparse attention by masking them on
+    top of the softmax results.
     """
+
+    assert (sparse_mask is None) == (active_sparse_mask is None), "Both sparse masks must be valid to use sparse attention!"
 
     if dtype == None:
         dtype = active_score.dtype
@@ -242,6 +247,8 @@ def context(past_scores, active_score, past_values, active_values, n_groups=0, d
     # Pp = softmax(Sp)
     score_shifted = f32[past_scores.sizes].Subtract(past_scores, reduce_max_br)
     exp = f32[past_scores.sizes].Exp(score_shifted)
+    if sparse_mask is not None:
+        exp = mask(exp, sparse_mask, 0)
     zero = f32.Constant(constant_value=0)
     add_func = hlo.gen_add_func(f32)
     denom = f32[reduce_sizes].Reduce(exp, zero, dimensions=[3], to_apply=add_func)
@@ -249,6 +256,8 @@ def context(past_scores, active_score, past_values, active_values, n_groups=0, d
     reduce_max_bra = f32[active_score_sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
     active_score_shifted = f32[active_score_sizes].Subtract(active_score, reduce_max_bra)
     active_prob = f32[active_score_sizes].Exp(active_score_shifted)
+    if active_sparse_mask is not None:
+        active_prob = mask(active_prob, active_sparse_mask, 0)
     active_denom = f32[reduce_sizes].Reduce(active_prob, zero, dimensions=[3], to_apply=add_func)
     denom = f32[reduce_sizes].Add(denom, active_denom)
     active_prob = dtype[active_prob.sizes].Convert(active_prob)
@@ -300,7 +309,7 @@ def context(past_scores, active_score, past_values, active_values, n_groups=0, d
     return output
 
 
-def context_combined(score, values, n_groups=0, dtype=None):
+def context_combined(score, values, n_groups=0, dtype=None, sparse_mask=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -315,8 +324,12 @@ def context_combined(score, values, n_groups=0, dtype=None):
 
     If n_groups != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
+    If sparse_mask is not None, apply sparse mask after the softmax
     """
     probs = hlo.softmax(score)
+    if sparse_mask is not None:
+        # Mask with 0 because we have probabilities here
+        probs = mask(probs, sparse_mask, constant_val=0)
 
     n_seqs, n_heads_tp, n_active_tokens, n_positions = probs.sizes
     n_positions, n_seqs, n_heads_tp, d_head = values.sizes

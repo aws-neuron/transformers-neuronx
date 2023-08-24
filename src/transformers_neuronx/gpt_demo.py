@@ -25,7 +25,7 @@ from transformers import GPT2Config as GPT2ConfigTransformer
 from transformers import GPTJConfig as GPTJConfigTransformer
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-from transformers_neuronx.config import NeuronConfig, QuantizationConfig
+from transformers_neuronx.config import NeuronConfig, QuantizationConfig, SparseAttnConfig
 
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
@@ -52,6 +52,16 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--print_latency', action='store_true', help="Print latency for generation of each output token")
     run_parser.add_argument('--quantize', action='store_true', help="Quantize model")
+    # Sparse attention configs
+    run_parser.add_argument('--sparse_attn', type=str, choices=[None, 'blk_sparse', 'custom'],
+                            default=None, help="Use sparse attention or not. ")
+    run_parser.add_argument('--blk_size', type=int, default=128, help="Block size in blk-sparse attention")
+    run_parser.add_argument('--num_global_blks', type=int, default=0, help="Number of global blocks in blk-sparse attention")
+    run_parser.add_argument('--num_local_blks', type=int, default=1, help="Number of local blocks in blk-sparse attention")
+    run_parser.add_argument('--num_random_blks', type=int, default=0, help="Number of random blocks in blk-sparse attention")
+    run_parser.add_argument('--context_length_estimate', type=int, default=None, help="Context length estimate.")
+    # TODO: args for custom sparse attention not added
+
     args = parser.parse_args()
     if args.model_name is not None:
         model_name = args.model_name
@@ -89,12 +99,18 @@ def run(args, model_name, model_cls):
     prompt_text = "Hello, I'm a language model,"
     print(f'running {model_cls.__name__}.from_pretrained')
     neuron_config = None
-    if args.quantize:
-        neuron_config = NeuronConfig(
-                            quant=QuantizationConfig(dequant_dtype=args.amp))
+    quant_config = QuantizationConfig(dequant_dtype=args.amp) if args.quantize else None
+    sparse_attn_config = SparseAttnConfig(
+        attn_type=args.sparse_attn, causal=True, blk_size=args.blk_size,
+        num_global_blks=args.num_global_blks, num_local_blks=args.num_local_blks,
+        num_random_blks=args.num_random_blks
+    ) if args.sparse_attn else None
+    if args.quantize or args.sparse_attn:
+        neuron_config = NeuronConfig(quant=quant_config, sparse_attn=sparse_attn_config)
     model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                      unroll=args.unroll, neuron_config=neuron_config)
+                                      unroll=args.unroll, neuron_config=neuron_config,
+                                      context_length_estimate=args.context_length_estimate)
     if args.print_latency:
         latency_printer = LatencyPrinter()
         model.register_forward_pre_hook(latency_printer.pre_hook)
@@ -122,7 +138,7 @@ class LatencyPrinter:
     def pre_hook(self, module, input):
         if len(input) == 3:
             _, cache_offset, _ = input
-            print(f'cache_offset: {cache_offset}') 
+            print(f'cache_offset: {cache_offset}')
         self.start = time.time()
 
     def hook(self, *args):
