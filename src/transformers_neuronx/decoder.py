@@ -24,6 +24,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import quantize
 from concurrent.futures import ProcessPoolExecutor
 
+
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
@@ -900,7 +901,7 @@ class DecoderProgram:
         self.tp_degree = tp_degree
         self.need_reorder_cache = False
 
-    def setup(self, layers, ln_lm_head_params):
+    def setup(self, layers, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
 
@@ -914,7 +915,7 @@ class DecoderProgram:
                 kernel.neff_bytes = future.result()
 
         for kernel in self.kernels:
-            kernel.load()
+            kernel.load(io_ring_cache_size)
 
     def setup_reorder_cache(self):
         self.need_reorder_cache = True
@@ -1054,7 +1055,6 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         return self.executors[bucket_id](inputs, return_ranks)
 
 
-
 class DecoderProgramMultiLayer(DecoderProgram):
 
     def __init__(self, layers, hlo_modules, ln_lm_head_hlo_module, num_inputs, num_layers, unroll, tp_degree, prefixed_length=0):
@@ -1073,7 +1073,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         self.lm_head_executor = None
 
     def setup(self, layers, ln_lm_head_params):
-        super().setup(layers, ln_lm_head_params)
+        super().setup(layers, ln_lm_head_params, io_ring_cache_size=len(self.multi_layers_memories))
         hidden_buffer, *_ = self.input_buffers
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
