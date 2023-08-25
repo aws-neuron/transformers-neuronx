@@ -314,7 +314,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config
         )
-        start_mask = prompt_batch_size > 1
+        # TODO: the start_mask needs to be True with left padding for context estimate,
+        # need to fix this after having right padding
+        start_mask = True
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
                                                    neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
