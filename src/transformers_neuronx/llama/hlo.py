@@ -145,6 +145,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value)
 
+            # KCache[I] = K
+            # VCache[I] = V
+            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+            updated_values = attention.update_cache(cached_values, cache_ids, value)
+
         # Multi-Token Context Encoding
         else:
 
@@ -153,13 +158,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             score = attention.mask(score, mask)
             context = attention.context_combined(score, value)
 
+            # KCache = K
+            # VCache = V
+            updated_keys = key
+            updated_values = value
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
-
-        # KCache[I] = K
-        # VCache[I] = V
-        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-        updated_values = attention.update_cache(cached_values, cache_ids, value)
-
         return output, updated_keys, updated_values
