@@ -18,6 +18,7 @@ import subprocess
 import hashlib
 import tarfile
 import tempfile
+from contextlib import contextmanager
 import numpy as np
 from textwrap import dedent
 import torch
@@ -351,6 +352,42 @@ def write_tensors(tensors, folder):
         np.save(filename, tensor)
 
 
+
+@contextmanager
+def io_ring_cache_context(size):
+    """
+    A context which temporarily sets the IO ring cache size if it is not set.
+
+    The IO ring cache size environment variable controls the number of tensor
+    descriptor cache slots which are allocated to NeuronCore memory. This
+    tensor information is required to execute a NEFF. If the cache is not
+    configured, the Neuron runtime will generate tensor memory information upon
+    every execution. Caching improves performance by reusing the tensor
+    information after it has been generated the first time.
+
+    The number of allocated IO ring slots can be changed individually for
+    each NEFF by changing the environment variable prior to the call to load.
+
+    For optimal performance, this cache should be configured to be equal to the
+    number *unique* sets of weights used per NEFF:
+    - For a fully unrolled network the cache size should be 1 since it has
+      exactly 1 set of weights (all weights for all layers).
+    - For a multi-layer network (partial unroll), the cache size should equal
+      `n_layers / unroll` since the neff will be be executed that many times
+      with a different set of unique weights.
+
+    Arguments:
+        size: The number of cache slots to allocate for IO descriptors.
+    """
+    key = 'NEURON_RT_IO_RING_CACHE_SIZE'
+    if os.environ.get(key, None) is not None:
+        yield  # Do nothing if we have a user-provided cache configuration
+    else:
+        os.environ[key] = str(size)
+        yield
+        os.environ.pop(key)
+
+
 class ParallelKernel:
     hlo_snapshot_iter = 0
     def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
@@ -380,10 +417,11 @@ class ParallelKernel:
             return
         self.neff_bytes = compile_hlo_module(self.hlo_module, tag)
 
-    def load(self):
+    def load(self, io_ring_cache_size=1):
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
-        self.model.load()
+        with io_ring_cache_context(io_ring_cache_size):
+            self.model.load()
 
     def snapshot_path(self):
         path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
