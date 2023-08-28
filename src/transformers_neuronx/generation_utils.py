@@ -19,9 +19,11 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         self.model = model
         self.config = config
         self.cur_len = 0
+        self.do_context_encode = False # left padding needed for parallel context encoding
 
     def reset_generation(self):
         self.cur_len = 0
+        self.do_context_encode = False
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
             attention_mask=None, return_dict=False):
@@ -29,7 +31,14 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
-        out_logits = self.model.forward(input_ids, cache_ids, start_ids)
+
+        # TODO: remove this check after making forward api generalizez for serial/paralle context encoding
+        if  hasattr(self.model, "context_length_estimate") and self.do_context_encode:
+            out_logits = self.model.forward(input_ids, cache_ids, start_ids, is_context_encode=True)
+            self.do_context_encode = False
+        else:
+            out_logits = self.model.forward(input_ids, cache_ids, start_ids)
+
         out_logits = out_logits[:, None, :]
         if return_dict:
             return ModelOutput(
@@ -58,8 +67,13 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
             cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
         else:
             cache_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
-
-        self.cur_len += input_ids.shape[-1]
+            # TODO: remove this check after making forward api generalizez for serial/paralle context encoding
+            if hasattr(self.model, "context_length_estimate") and hasattr(self.model, "pad_context"):
+                # pad input_ids and start_ids
+                input_ids, start_ids, offset = self.model.pad_context(input_ids, start_ids=start_ids)
+                self.do_context_encode = True
+                print(f"Warning: the padding offset is {offset}, make sure max_length is maller than offset+n_positions")
+        self.cur_len += input_ids.shape[-1] 
         model_inputs = {
             "input_ids": input_ids,
             "cache_ids": cache_ids,
