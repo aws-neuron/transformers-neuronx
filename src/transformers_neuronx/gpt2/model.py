@@ -291,7 +291,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         return model_inputs
 
 
-class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel):
+class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
@@ -455,8 +455,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
  
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i + 1], cache_ids, start_ids)
- 
+            logits = self.decoder_lm_head(hidden[:, i:i + 1].contiguous(), cache_ids, start_ids)
         return logits
 
     def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
@@ -493,7 +492,32 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             task.wait()
             self.tensor_pool.push(hidden)
         return logits
+    
+    def pad_context(self, input_ids, start_ids):
+        runtime_batch_size, context_length = input_ids.shape
+       
+        # The context length estimate is chosen based on single (context+query)
+        estimate = bucket.find(self.context_buckets, context_length)
 
+        # populate key/value caches according to the prompt text
+        input_ids = input_ids[:, :estimate]
+        offset = 0
+        
+        if estimate:
+            if context_length < estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=True)
+                offset = estimate - context_length
+            
+            if not self.share_caches:
+                self.broadcaster[estimate].run_broadcast()
+
+            if start_ids is None:
+                start_ids = torch.zeros(runtime_batch_size, dtype=torch.int32)
+
+            start_ids += offset
+            
+        return input_ids, start_ids, offset
+    
     @torch.no_grad()
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         if self.context_pre_hook is not None:
@@ -551,6 +575,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             interleaved=interleaved[:, offset:]
         return interleaved
     
+
 class GPT2CheckpointCompatible(module.PretrainedModel):
 
     def __init__(self, config):
