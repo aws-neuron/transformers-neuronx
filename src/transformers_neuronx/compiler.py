@@ -22,6 +22,7 @@ import numpy as np
 from textwrap import dedent
 import torch
 import logging
+import json
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -358,6 +359,9 @@ class ParallelKernel:
         self.neff_bytes = None
         self.model = None
         self.snapshot = os.environ.get("HLO_SNAPSHOT_PATH", None)
+        self.snapshot_steps = os.environ.get("HLO_SNAPSHOT_STEPS", None)
+        if self.snapshot_steps:
+            self.snapshot_steps=json.loads(self.snapshot_steps)
         self.g_start_device_id = g_start_device_id
         if g_device_count is None:
             g_device_count = tp_degree
@@ -407,10 +411,13 @@ class ParallelKernel:
 
     def __call__(self, memory):
         if self.snapshot is not None:
-            self.snapshot_enter(memory.input_tensors)
-            result = ops.parallel_run(self.model, memory.inputs, memory.outputs)
-            self.snapshot_exit(memory.output_tensors)
-            return result
+            if self.snapshot_steps is None or ParallelKernel.hlo_snapshot_iter in self.snapshot_steps:
+                self.snapshot_enter(memory.input_tensors)
+                result = ops.parallel_run(self.model, memory.inputs, memory.outputs)
+                self.snapshot_exit(memory.output_tensors)
+                return result
+            else:
+                ParallelKernel.hlo_snapshot_iter += 1
         return ops.parallel_run(self.model, memory.inputs, memory.outputs)
 
     def build_executor(self, memory, inputs, outputs):
