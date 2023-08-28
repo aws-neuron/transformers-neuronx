@@ -19,7 +19,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         self.model = model
         self.config = config
         self.cur_len = 0
-        self.do_context_encode = False # left padding needed for parallel context encoding
+        self.do_context_encode = False
 
     def reset_generation(self):
         self.cur_len = 0
@@ -67,7 +67,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
             cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
         else:
             cache_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
-            # TODO: remove this check after making forward api generalizez for serial/paralle context encoding
+            # TODO: remove this check after making forward api generalized for both serial/paralle context encoding
             if hasattr(self.model, "context_length_estimate") and hasattr(self.model, "pad_context"):
                 # pad input_ids and start_ids
                 input_ids, start_ids, offset = self.model.pad_context(input_ids, start_ids=start_ids)
