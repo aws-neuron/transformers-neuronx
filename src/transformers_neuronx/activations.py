@@ -47,6 +47,12 @@ def relu(hidden):
     zero_br = dtype[sizes].Broadcast(zero, dimensions=[])
     return dtype[sizes].Maximum(hidden, zero_br)
 
+def solu(hidden):
+    dtype = hidden.dtype
+    sizes = hidden.sizes
+    softmax_hidden = dtype[sizes].CustomCall(hidden, custom_call_target="AwsNeuronSoftmax")
+    output = dtype[sizes].Multiply(hidden,softmax_hidden)
+    return output
 
 def sigmoid(tensor):
     return tensor.dtype[tensor.sizes].Logistic(tensor)
