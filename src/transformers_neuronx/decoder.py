@@ -462,8 +462,9 @@ class DecoderLayer(torch.nn.Module):
             self.sparse_mask = self.neuron_config.sparse_attn.create_sparse_mask(self.n_active_tokens, self.n_positions)
             self.active_sparse_mask = self.neuron_config.sparse_attn.create_active_sparse_mask(self.n_active_tokens)
 
-    def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False):
-        self.extra_parameters.append((param, sharding, allow_pad, allow_quantize))
+    def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
+                      out_feature_dim=1):
+        self.extra_parameters.append((param, sharding, allow_pad, allow_quantize, out_feature_dim))
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -481,10 +482,11 @@ class DecoderLayer(torch.nn.Module):
         self.attn_v_weight = weight
         self.attn_v_bias = bias
 
-    def add_attention_output(self, weight, bias, sharding=0):
+    def add_attention_output(self, weight, bias, sharding=0, transposed=True):
         self.attn_out_weight = weight
         self.attn_out_bias = bias
         self.attn_out_sharding = sharding
+        self.attn_out_transposed = transposed
 
     def add_post_attention_layer_norm(self, weight, bias):
         self.post_attn_ln_weight = weight
@@ -566,7 +568,8 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_weight, self.attn_v_scales = \
                     quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
                 self.attn_out_weight, self.attn_out_scales = \
-                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
+                                                    out_feature_dim = 1 if self.attn_out_transposed else 0)
 
 
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
@@ -603,14 +606,15 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
 
         extras = []
-        for param, dim, allow_pad, allow_quantize in self.extra_parameters:
+        for param, dim, allow_pad, allow_quantize, out_feature_dim in self.extra_parameters:
             if allow_pad:
                 size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
                 param = utils.pad(param, dim, size)
 
             if allow_quantize and self.neuron_config and self.neuron_config.quant:
-                param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant)
-                scales_dim = 0 if dim == 1 else None
+                param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant,
+                                                                out_feature_dim=out_feature_dim)
+                scales_dim = 0 if dim == out_feature_dim else None
                 extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim),
                                maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)])
             elif allow_quantize:
