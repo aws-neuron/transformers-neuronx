@@ -15,18 +15,21 @@
 import torch
 from transformers_neuronx.config import QuantizationConfig
 
-def maybe_quantize_weights(tensor, quantize_config: QuantizationConfig, weight_transposed=True):
+def maybe_quantize_weights(tensor, quantize_config: QuantizationConfig, out_feature_dim=1):
     if tensor is None:
         return None, None
 
+    assert tensor.dim() == 2, \
+        f"Only support 2-D dimension weight quantization, but got dim={tensor.dim()}"
+
     tensor = tensor.to(torch.float32)
     if quantize_config.quantize_method == 'vector_dynamic':
-        reduce_dim = 0 if weight_transposed else 1
+        reduce_dim = 0 if out_feature_dim == 1 else 1
         if quantize_config.quant_dtype == "s8":
              # Use W_f = W_q * scales
             int8_min = torch.iinfo(torch.int8).min
             int8_max = torch.iinfo(torch.int8).max
-            max_values, _ = torch.max(torch.abs(tensor), dim=reduce_dim, keepdim=not weight_transposed)
+            max_values, _ = torch.max(torch.abs(tensor), dim=reduce_dim, keepdim=(out_feature_dim==0))
             scales = max_values / int8_max
             if scales.count_nonzero() == 0:
                 # If the scales is all zeros, the weight tensor are zeros
@@ -36,6 +39,7 @@ def maybe_quantize_weights(tensor, quantize_config: QuantizationConfig, weight_t
                 quantized_weights = torch.round(quantized_weights)
                 quantized_weights = torch.clamp(quantized_weights, int8_min, int8_max)
                 quantized_weights = quantized_weights.to(torch.int8)
+                scales = scales.flatten()
         else:
             raise NotImplementedError(f"{quantize_config.quant_dtype} for {quantize_config.quantize_method}")
     else:

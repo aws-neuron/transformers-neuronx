@@ -373,7 +373,7 @@ def output(
     result = dtype[result_sizes_2d].Reshape(context)
 
     # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
-    result = hlo.dot11_add1(result, out_weight, out_bias, out_scales)
+    result = hlo.dot11_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
 
     # (b * s, h) => (h, s, b)
     result = hlo.transpose(result, 0, 1)
