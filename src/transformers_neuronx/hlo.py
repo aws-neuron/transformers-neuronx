@@ -14,6 +14,7 @@
 # ==============================================================================
 import functools
 import operator
+import warnings
 
 import torch
 
@@ -86,6 +87,32 @@ def layer_norm_bsh(hidden, weight, bias):
     weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
     output = f32[sizes].Multiply(bn_output, weight_br)
     bias_br = f32[sizes].Broadcast(bias, dimensions=[1])
+    output = f32[sizes].Add(output, bias_br)
+    output = dtype[sizes].Convert(output)
+    output = dtype[input_sizes].Reshape(output)
+    return output
+
+def group_norm(hidden, weight, bias, num_groups = 1):
+    scribe = hidden.scribe
+    dtype = hidden.dtype
+    f32 = scribe.f32
+    hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
+    if hidden_size % num_groups!= 0:
+        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
+    norm_size = n_active_tokens * batch_size * num_groups
+    sizes = hidden_size // num_groups, norm_size
+    hidden = dtype[sizes].Reshape(hidden)
+    hidden = f32[sizes].Convert(hidden)
+    one = f32.Constant(constant_value=1)
+    scale = f32[norm_size].Broadcast(one, dimensions=[])
+    zero = f32.Constant(constant_value=0)
+    offset = f32[norm_size].Broadcast(zero, dimensions=[])
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=1)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
+    output = f32[sizes].Multiply(bn_output, weight_br)
+    bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
     output = f32[sizes].Add(output, bias_br)
     output = dtype[sizes].Convert(output)
     output = dtype[input_sizes].Reshape(output)
