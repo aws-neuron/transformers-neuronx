@@ -17,8 +17,7 @@ pip install transformers-neuronx --extra-index-url=https://pip.repos.neuron.amaz
 
 ## Development Version
 
-The AWS Neuron team is currently restructuring the contribution model of this github repository.
-Within the period of 08/28/2023 and 10/18/2023, this github repository content
+The AWS Neuron team is currently restructuring the contribution model of this github repository. This github repository content
 does not reflect latest features and improvements of transformers-neuronx library. Please install the stable release version
 from https://pip.repos.neuron.amazonaws.com to get latest features and improvements.
 
