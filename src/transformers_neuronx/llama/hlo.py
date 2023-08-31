@@ -37,6 +37,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+                                                base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
 
         # NOTE: When using token generation network, we generate a mask for the
