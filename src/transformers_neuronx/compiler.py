@@ -61,7 +61,7 @@ def build_parallel_kernel(hlo_module, tp_degree):
 
 def compile_hlo_module(hlo_module, tag=None):
     flags = os.environ.get('NEURON_CC_FLAGS', '')
-
+    flags += ' --model-type=transformer'
     module_flag_hash = get_hash_module(hlo_module, flags)
     module_hash = get_hash_module(hlo_module, None)
 
