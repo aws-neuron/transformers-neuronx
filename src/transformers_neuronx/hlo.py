@@ -125,6 +125,39 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
     return result
 
 
+def dot_general(lhs, rhs, dimension_numbers):
+    # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
+
+    dtype = lhs.dtype
+    lhs_sizes = lhs.sizes
+    rhs_sizes = rhs.sizes
+    dot_dims = dict(lhs_contracting_dimensions=dimension_numbers.get("lhs_contracting_dimensions", [0]),
+                    lhs_batch_dimensions=dimension_numbers.get("lhs_batch_dimensions", []),
+                    rhs_contracting_dimensions=dimension_numbers.get("rhs_contracting_dimensions", [0]),
+                    rhs_batch_dimensions=dimension_numbers.get("rhs_batch_dimensions", []))
+    lhs_free_dimensions = list(filter(lambda x: x not in dot_dims["lhs_batch_dimensions"] and \
+                                      x not in dot_dims["lhs_contracting_dimensions"],
+                                      list(range(len(lhs_sizes)))))
+    rhs_free_dimensions = list(filter(lambda x: x not in dot_dims["rhs_batch_dimensions"] and \
+                                      x not in dot_dims["rhs_contracting_dimensions"],
+                                      list(range(len(rhs_sizes)))))
+
+    # Calculate batch/contracting/free sizes
+    lhs_batch_sizes = [lhs_sizes[idx] for idx in dot_dims["lhs_batch_dimensions"]]
+    rhs_batch_sizes = [rhs_sizes[idx] for idx in dot_dims["rhs_batch_dimensions"]]
+    assert lhs_batch_sizes == rhs_batch_sizes, f"unmatched batch_sizes ({lhs_batch_sizes}) vs ({rhs_batch_sizes})"
+    lhs_contracting_sizes = [lhs_sizes[idx] for idx in dot_dims["lhs_contracting_dimensions"]]
+    rhs_contracting_sizes = [rhs_sizes[idx] for idx in dot_dims["rhs_contracting_dimensions"]]
+    assert lhs_contracting_sizes == rhs_contracting_sizes, \
+        f"unmatched contracting_sizes ({lhs_contracting_sizes}) vs ({rhs_contracting_sizes})"
+    lhs_free_sizes = [lhs_sizes[idx] for idx in lhs_free_dimensions]
+    rhs_free_sizes = [rhs_sizes[idx] for idx in rhs_free_dimensions]
+
+    dot_sizes = lhs_batch_sizes + lhs_free_sizes + rhs_free_sizes
+    output_dot = dtype[dot_sizes].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    return output_dot
+
+
 def dot00(lhs, rhs):
     dtype = lhs.dtype
     _, lhs_size = lhs.sizes
