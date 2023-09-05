@@ -34,10 +34,10 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
 
         # TODO: remove this check after making forward api generalizez for serial/paralle context encoding
         if  hasattr(self.model, "context_length_estimate") and self.do_context_encode:
-            out_logits = self.model.forward(input_ids, cache_ids, start_ids, is_context_encode=True)
+            out_logits = self.model(input_ids, cache_ids, start_ids, is_context_encode=True)
             self.do_context_encode = False
         else:
-            out_logits = self.model.forward(input_ids, cache_ids, start_ids)
+            out_logits = self.model(input_ids, cache_ids, start_ids)
 
         out_logits = out_logits[:, None, :]
         if return_dict:
