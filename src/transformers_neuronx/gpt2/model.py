@@ -519,7 +519,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         return input_ids, start_ids, offset
     
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, output_scores=False):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         offset=0
@@ -568,11 +568,17 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
+            output_scores=output_scores,
         )
+        if output_scores:
+            interleaved, scores = interleaved
         interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
         interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
         if(offset!=0):
             interleaved=interleaved[:, offset:]
+
+        if output_scores:
+            return interleaved, scores
         return interleaved
     
 

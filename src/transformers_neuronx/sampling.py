@@ -16,13 +16,13 @@ import torch
 
 
 @torch.no_grad()
-def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None):
+def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False):
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
     cache_ids = torch.arange(start, dtype=torch.int32)
     next_token_scores = model(input_ids, cache_ids, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
-                       eos_token_id, top_k, streamer)
+                       eos_token_id, top_k, streamer, output_scores=output_scores)
 
 
 @torch.no_grad()
@@ -77,9 +77,10 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None):
+                top_k=50, streamer=None, output_scores=False):
     tokens = [input_ids]
     _, start = input_ids.shape
+    scores = []
     for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 
@@ -87,6 +88,8 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         next_token_scores[:, eos_token_id] = -float('inf')
 
         # Remove all tokens with a probability less than the last token of the top-k
+        if output_scores:
+            scores.append(next_token_scores)
         topk_values, topk_indices = torch.topk(next_token_scores, top_k)
 
         # sample
@@ -107,6 +110,9 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
 
     if streamer:
         streamer.end()
+
+    if output_scores:
+        return torch.cat(tokens, dim=-1), scores
 
     return torch.cat(tokens, dim=-1)
 
