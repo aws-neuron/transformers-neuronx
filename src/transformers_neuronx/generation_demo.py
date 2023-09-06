@@ -43,7 +43,7 @@ def main():
     for floatx, floaty in floatx_floaty_combinations:
         amp_choices.append(f'{floatx}-u8-{floaty}')
     parser.add_argument('model_type')
-    parser.add_argument('--amp', default='f32', choices=amp_choices)ca
+    parser.add_argument('--amp', default='f32', choices=amp_choices)
     subparsers = parser.add_subparsers()
 
     save_name = 'save'
