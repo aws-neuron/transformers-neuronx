@@ -14,11 +14,13 @@
 # ==============================================================================
 import argparse
 import itertools
+import os
 import sys
 import os
 import torch
 import neuronxcc
 import shutil
+import logging
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import AutoConfig
@@ -41,14 +43,16 @@ def main():
     for floatx, floaty in floatx_floaty_combinations:
         amp_choices.append(f'{floatx}-u8-{floaty}')
     parser.add_argument('model_type')
-    parser.add_argument('--amp', default='f32', choices=amp_choices)
+    parser.add_argument('--amp', default='f32', choices=amp_choices)ca
     subparsers = parser.add_subparsers()
+
     save_name = 'save'
     save_parser = subparsers.add_parser(save_name)
     save_parser.set_defaults(which=save_name)
     save_parser.add_argument('save', help="Directory to save the model")
     save_parser.add_argument('--random', action='store_true', help="Random weights flag. If true, config.json would be used to generate a model with random weight")
     save_parser.add_argument('--config', type=str, default='', help="Path to config.json file (example: path/to/config.json)")
+    
     run_name = 'run'
     run_parser = subparsers.add_parser(run_name)
     run_parser.set_defaults(which=run_name)
@@ -89,6 +93,12 @@ def main():
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
 
+    logits_analysis_name = 'analyze'
+    logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
+    logits_analysis_parser.set_defaults(which=logits_analysis_name)
+    logits_analysis_parser.add_argument('-d','--dirs', nargs='+', required=True)
+    logits_analysis_parser.add_argument('--plot', action='store_true')
+
     args = parser.parse_args()
 
     model_type = args.model_type
@@ -114,7 +124,71 @@ def main():
         save(args, hf_model_name, model_type)
     elif args.which == run_name:
         run(args, hf_model_name, model_cls)
+    elif args.which == logits_analysis_name:
+        logits_analysis(args, hf_model_name, model_cls)
 
+
+def logits_analysis(args, hf_model_name, model_cls):
+    logits_dirs = args.dirs
+
+    # load logits
+    def load_logits_from_dir(logits_dir):
+        filenames = [f for f in os.listdir(logits_dir) if os.path.isfile(os.path.join(logits_dir, f))]
+        filenames = sorted(filenames)
+        logits_array = [torch.load(os.path.join(logits_dir, f)) for f in filenames]
+        return logits_array
+
+
+    # load logits
+    logits_candidates = [load_logits_from_dir(d) for d in logits_dirs]
+
+
+    logits_golden = logits_candidates[-1]
+    golden_dir = logits_dirs[-1]
+    logits_candidates = logits_candidates[:-1]
+    candidates_dir = logits_dirs[:-1]
+    
+    
+    pairs = []
+    for i, logits in enumerate(logits_candidates):
+        print(f"========================== Start analysis on \n \t{candidates_dir[i]}\n vs\n \t{golden_dir} (golden) \n==================")
+        print(f"sentence length: {len(logits)} vs {len(logits_golden)}")
+        min_l = min(len(logits), len(logits_golden))
+        pairs.append([logits[:min_l], logits_golden[:min_l]])
+        for i in range(min_l):
+            
+            # assume we always check with greedy
+            token_candidate = torch.argmax(logits[i])
+            token_golden = torch.argmax(logits_golden[i])
+          
+            allclose_passed = torch.allclose(logits[i], logits_golden[i], atol=1.0, rtol=0.001)
+            if not allclose_passed:
+                logging.warning(f"Failed to match on step {i}, {logits[i]} vs {logits_golden[i]}")
+
+            if token_candidate != token_golden:
+                logging.error(f"mismatch happens on {i}, token_candidate: {token_candidate}, token_golden {token_golden}. candidate score ({logits[i][:, token_candidate]} vs {logits[i][:, token_golden]}). golden score({logits_golden[i][:, token_candidate]} vs {logits_golden[i][:, token_golden]})")
+                break
+
+    pairs.append([logits_golden, logits_golden])
+
+    if args.plot:
+        import matplotlib.pyplot as plt
+        
+        
+        # Create a new figure
+        plt.figure()
+        
+        # Plot each line from the tensor pairs
+        for x_vals, y_vals in pairs:
+            plt.plot(torch.concatenate(x_vals).reshape(-1), torch.concatenate(y_vals).reshape(-1))
+        
+        # Show legend if needed
+        labels = [logits_dirs]
+        plt.legend(labels)
+        
+        plt.savefig('line_plots.png')
+    
+        
 
 def save(args, hf_model_name, model_type):
     model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
@@ -171,6 +245,7 @@ def run(args, hf_model_name, model_cls):
         
         print(f'running {model_cls.__name__}.from_pretrained')
         if model_cls == GPT2ForSamplingWithContextBroadcasting:
+            suffix += f"_ctx{args.context_length_estimate}"
             neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                             tp_degree=args.tp_degree, n_positions=args.n_positions,
                                             unroll=args.unroll, context_length_estimate=args.context_length_estimate)
@@ -199,10 +274,11 @@ def run(args, hf_model_name, model_cls):
                 self.sequences = sequences
                 self.scores = scores
         with torch.inference_mode():
-            sequences = neuron_model.sample(encoded_text.input_ids, args.max_length, 
-                top_k=args.top_k, save_scores=args.output_scores)
+            max_length = args.max_length if args.max_length is not None else args.n_positions
+            sequences = neuron_model.sample(encoded_text.input_ids, max_length, 
+                top_k=args.top_k, output_scores=args.output_scores or args.dump_logits)
             scores = None
-            if args.output_scores:
+            if args.output_scores or args.dump_logits:
                 sequences, scores = sequences
 
             outputs = OutputClassForSimpleSample(sequences, scores)
@@ -228,6 +304,10 @@ def run(args, hf_model_name, model_cls):
         if args.max_new_tokens is not None:
             generation_config["max_new_tokens"] = args.max_new_tokens
 
+
+        if args.dump_logits:
+            generation_config['output_scores'] = True
+
         print("running HuggingFace Generation API, generation_config:\n", generation_config)
 
         with torch.inference_mode():
@@ -239,10 +319,12 @@ def run(args, hf_model_name, model_cls):
 
     if args.dump_logits:
         dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
-        assert args.output_scores, "Need to set --output_scores to dump logits"
         print(f"Dumping logits into {dump_logits_dir}")
-        assert args.dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
-        for i in range(args.dump_logits_limit):
+        dump_logits_limit = args.dump_logits_limit
+        if args.dump_logits_limit == -1: # dump all for analysis
+            dump_logits_limit = len(outputs.scores)
+        assert dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
+        for i in range(dump_logits_limit):
             dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
 
     print('generated_sequence=', outputs.sequences)
