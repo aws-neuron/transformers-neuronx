@@ -217,7 +217,9 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         token = torch.where(done_flags.eq(True), eos_token_id, inputs)
         tokens.append(token)
 
-        if streamer:
+        if streamer is not None and hasattr(streamer, 'response_with_prefix') and streamer.response_with_prefix:
+             streamer.put(torch.cat(tokens, dim=-1))
+        elif streamer:
             streamer.put(token)
 
         if next_len >= sequence_length or done_flags.all():
