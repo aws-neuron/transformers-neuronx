@@ -1434,6 +1434,15 @@ def full(value, dtype, sizes):
     return result
 
 
+# https://www.tensorflow.org/xla/operation_semantics#broadcastindim
+def broadcast(tensor, out_dim_size, broadcast_dimensions):
+    dtype = tensor.dtype
+    assert len(broadcast_dimensions) == len(tensor.sizes), \
+        f"input operand rank ({len(tensor.sizes)}) doesn't match num of elements in broadcast_dimensions ({broadcast_dimensions})"
+    output = dtype[out_dim_size].Broadcast(tensor, dimensions=broadcast_dimensions)
+    return output
+
+
 def literal(dtype, tensor):
 
     accessors = {
