@@ -5,3 +5,4 @@ apt/
 pip/
 .attach_pid*
 __pycache__
+copy.bara.tmp
