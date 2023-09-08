@@ -53,8 +53,10 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
-            config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
+            attention_head_size=config.attention_head_size, amp=amp,
+            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True,
         )
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
