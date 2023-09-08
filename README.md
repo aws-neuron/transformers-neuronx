@@ -201,7 +201,7 @@ Note: As HuggingFace generation API can expand the input's batch dimension based
 
 ## Neuron Persistent Cache
 
-The Neuron Persistent Cache is now enabled for Transformers Neuron by default. Model artifacts which have been compiled once will be cached and reused on successive runs when possible. Model artifacts will only be reused when compiling with the same compiler version (neuronx-cc), model configurations, and compiler flags. It also includes other features (i.e. using S3 bucket as cache backend), more defailed information available in the [link](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/torch-neuronx/programming-guide/training/pytorch-neuron-programming-guide.html#persistent-cache-for-compiled-graphs). 
+The Neuron Persistent Cache is now enabled for Transformers Neuron by default. Model artifacts which have been compiled once will be cached and reused on successive runs when possible. Model artifacts will only be reused when compiling with the same compiler version (neuronx-cc), model configurations, and compiler flags. It also includes other features (i.e. using S3 bucket as cache backend), more defailed information available in the [link](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/neuron-caching.html#neuron-caching). The feature is available with Neuron SDK version 2.13 and up.
 
 ## int8 weight storage support
 
