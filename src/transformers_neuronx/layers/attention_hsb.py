@@ -21,9 +21,8 @@ def query_key_value(
     k_weight, k_scales, k_bias,
     v_weight, v_scales, v_bias,
     d_head,
-    tp_degree=None,
     neuron_config=None,
-    shard_over_batch=False,
+    n_groups=0,
 ):
     """
     Self-attention input projections.
@@ -32,17 +31,18 @@ def query_key_value(
     K = (hidden @ wK) + bK
     V = (hidden @ wV) + bV
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
-    n_kv_heads == 0 -> outputs shapes [n_active_tokens, n_seqs, n_heads_tp, d_head]
-    n_kv_heads != 0 -> outputs shapes [n_active_tokens, n_seqs, n_kv_heads, n_repeats, d_head] (query)
-    and [n_active_tokens, n_seqs, n_kv_heads, d_head] (key/value)
+    If n_groups != 0, uses multi-query, multi-group attention.
+    n_groups == 0 -> outputs shapes [n_active_tokens, n_seqs, n_heads_tp, d_head]
+    n_groups != 0 -> outputs shapes [n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head] (query)
+    and [n_active_tokens, n_seqs, n_groups, d_head] (key/value)
     """
     dtype = hidden.dtype
     hidden_size, n_active_tokens, n_seqs = hidden.sizes
-    _, hidden_size_tp = q_weight.sizes
-    _, kv_hidden_size_tp = k_weight.sizes
-    n_heads_tp = hidden_size_tp // d_head
-    n_kv_heads_tp = kv_hidden_size_tp // d_head
+    hidden_size, d_head_tp = q_weight.sizes
+    if n_groups != 0:
+        n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
+    else:
+        n_heads_tp = d_head_tp // d_head
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
 
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
@@ -56,48 +56,19 @@ def query_key_value(
     # V = (hidden @ wV) + bV
     active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
 
-    if n_kv_heads_tp == n_heads_tp:
-        # multi-head attention
+
+    if n_groups == 0:
         active_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         active_q = dtype[active_sizes].Reshape(active_q)
         active_k = dtype[active_sizes].Reshape(active_k)
         active_v = dtype[active_sizes].Reshape(active_v)
     else:
-        # multi-query / grouped-query attention
-        if shard_over_batch:
-            # shard over batch
-            scribe = active_q.scribe
-            s32 = scribe.s32
-            zero = s32.Constant(constant_value=0)
-
-            # split along batch dimension, and concat along head dimension
-            # TODO(liangfc): Emit all-to-all CC op, instead of allgather+slice
-            full_q = hlo.all_gather(active_q, dim=1, tp_degree=tp_degree)
-            full_k = hlo.all_gather(active_k, dim=1, tp_degree=tp_degree)
-            full_v = hlo.all_gather(active_v, dim=1, tp_degree=tp_degree)
-
-            n_seqs_per_nc = n_seqs // tp_degree
-            slice_limit = n_active_tokens * n_seqs_per_nc
-            active_q = hlo.dynamic_slice_along(full_q, dim=0, size=slice_limit, start=zero)
-            active_k = hlo.dynamic_slice_along(full_k, dim=0, size=slice_limit, start=zero)
-            active_v = hlo.dynamic_slice_along(full_v, dim=0, size=slice_limit, start=zero)
-
-            n_heads = n_heads_tp * tp_degree
-            n_kv_heads = n_heads_tp * tp_degree // (hidden_size_tp // kv_hidden_size_tp)
-            n_repeats = n_heads // n_kv_heads
-            active_q_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads * n_repeats, d_head
-            active_kv_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads, d_head
-            active_q = hlo.reshape(active_q, active_q_sizes)
-            active_k = hlo.reshape(active_k, active_kv_sizes)
-            active_v = hlo.reshape(active_v, active_kv_sizes)
-        else:
-            # shard over head
-            n_repeats = hidden_size_tp // kv_hidden_size_tp
-            active_q_sizes = n_active_tokens, n_seqs, n_kv_heads_tp * n_repeats, d_head
-            active_kv_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, d_head
-            active_q = dtype[active_q_sizes].Reshape(active_q)
-            active_k = dtype[active_kv_sizes].Reshape(active_k)
-            active_v = dtype[active_kv_sizes].Reshape(active_v)
+        n_heads_per_group = n_heads_tp // n_groups
+        active_q_sizes = n_active_tokens, n_seqs, n_groups, n_heads_per_group, d_head
+        active_kv_sizes = n_active_tokens, n_seqs, n_groups, d_head
+        active_q = dtype[active_q_sizes].Reshape(active_q)
+        active_k = dtype[active_kv_sizes].Reshape(active_k)
+        active_v = dtype[active_kv_sizes].Reshape(active_v)
 
     return active_q, active_k, active_v
 
@@ -162,13 +133,13 @@ def scale(query, d_head):
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, tp_degree, n_kv_heads=0, shard_over_batch=False):
+def score(query, keys, n_groups=0):
     """
     Compute the attention score by combining scaled-query & keys.
 
     S = Q @ K
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
+    If n_groups != 0, uses multi-query, multi-group attention.
     """
 
     dtype = query.dtype
@@ -176,29 +147,39 @@ def score(query, keys, tp_degree, n_kv_heads=0, shard_over_batch=False):
     pred = scribe.pred
 
     # Check for multi-query attention
-    if n_kv_heads != 0:
-        if shard_over_batch:
-            _, _, n_heads, _ = query.sizes
-            n_repeats = n_heads // n_kv_heads
-            keys = repeat_kv(keys, n_repeats=n_repeats, repeat_dim=2)
-        else:
-            _, _, n_heads_tp, _ = query.sizes
-            n_heads = n_heads_tp * tp_degree
-            n_repeats = n_heads // n_kv_heads
-            keys = repeat_kv(keys, n_repeats=n_repeats, repeat_dim=2)
+    if n_groups != 0:
+        n_active_tokens, n_seqs, n_groups, n_heads_per_group, _ = query.sizes
+        n_positions, n_seqs, n_groups, _ = keys.sizes
+        size_dot = n_seqs, n_groups, n_active_tokens, n_heads_per_group, n_positions
+        size_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_positions
+        n_heads_tp = n_groups * n_heads_per_group
+        lhs_contract_dim = 4
+    else:
+        n_active_tokens, n_seqs, n_heads_tp, _ = query.sizes
+        n_positions, n_seqs, n_heads_tp, _ = keys.sizes
+        size_dot = n_seqs, n_heads_tp, n_active_tokens, n_positions
+        lhs_contract_dim = 3
+    size = n_seqs, n_heads_tp, n_active_tokens, n_positions
 
     # Q @ K
-    dot_dims = dict(lhs_contracting_dimensions=[3],
+    dot_dims = dict(lhs_contracting_dimensions=[lhs_contract_dim],
                     lhs_batch_dimensions=[1, 2],
                     rhs_contracting_dimensions=[3],
                     rhs_batch_dimensions=[1, 2])
 
-    result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
 
-    return result_dot
+    result_dot = dtype[size_dot].Dot(query, keys, dot_dimension_numbers=dot_dims)
+
+    if n_groups != 0:
+        result_permute = dtype[size_permute].Transpose(result_dot, dimensions=[0, 1, 3, 2, 4])
+        result = dtype[size].Reshape(result_permute)
+    else:
+        result = result_dot
+
+    return result
 
 
-def mask(score, mask, tp_degree, shard_over_batch=False):
+def mask(score, mask):
     """
     Masks the computed attention scores with the attention mask.
 
@@ -215,32 +196,12 @@ def mask(score, mask, tp_degree, shard_over_batch=False):
     if len(mask.sizes) == 2:
         mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
     else:
-        if shard_over_batch:
-            zero = scribe.s32.Constant(constant_value=0)
-            n_seqs_per_nc = score_sizes[0]
-            assert n_seqs_per_nc == mask.sizes[0] // tp_degree, f"invalid n_seqs_per_nc ({n_seqs_per_nc}) vs mask_sizes ({mask.sizes})"
-            mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
         mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
     score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
     return score
 
 
-# credit: https://github.com/facebookresearch/llama/blob/8992dea3b2c98e82e335efef004534413f4f2d2e/llama/model.py#L164-L173
-def repeat_kv(tensor, n_repeats, repeat_dim):
-    if n_repeats == 1:
-        return tensor
-    if repeat_dim == 2:
-        n_positions, n_seqs, n_kv_heads, d_head = tensor.sizes
-        tensor_re = hlo.reshape(tensor, [n_positions, n_seqs, n_kv_heads, 1, d_head])
-        tensor_br_sizes = n_positions, n_seqs, n_kv_heads, n_repeats, d_head
-        tensor_br = hlo.broadcast(tensor_re, out_dim_size=tensor_br_sizes, broadcast_dimensions=list(range(len(tensor_re.sizes))))
-        output = hlo.reshape(tensor_br, [n_positions, n_seqs, n_kv_heads * n_repeats, d_head])
-    else:
-        raise RuntimeError(f"invalid repeat_dim ({repeat_dim})")
-    return output
-
-
-def context(past_scores, active_score, past_values, active_values, n_kv_heads=0, dtype=None, shard_over_batch=False, tp_degree=None):
+def context(past_scores, active_score, past_values, active_values, n_groups=0, dtype=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -250,7 +211,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
 
     C = softmax(S) @ V
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
+    If n_groups != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
     """
 
@@ -259,16 +220,9 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     scribe = active_score.scribe
     f32 = scribe.f32
 
-    n_seqs, n_heads, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
-    n_seqs, n_heads, n_active_tokens, n_positions = past_scores.sizes
-    if shard_over_batch:
-        n_positions, n_seqs_per_nc, n_kv_heads, d_head = past_values.sizes
-        n_seqs = n_seqs_per_nc * tp_degree
-        n_heads_tp = n_heads // tp_degree
-    else:
-        n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
-        _, n_heads_tp, _, _ = active_score.sizes
-        n_heads = n_heads_tp * tp_degree
+    n_seqs, n_heads_tp, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
+    n_seqs, n_heads_tp, n_active_tokens, n_positions = past_scores.sizes
+    n_positions, n_seqs, n_heads_tp, d_head = past_values.sizes
 
     # Upcast to f32 before computation
     past_scores = hlo.cast(past_scores, f32)
@@ -308,32 +262,36 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
                     rhs_batch_dimensions=[1, 2])
     denom = dtype[denom.sizes].Convert(denom)
 
-    if n_kv_heads != 0:
-        n_repeats = n_heads // n_kv_heads
-        # values layout: (n_positions, n_seqs_per_nc, n_kv_heads, d_head) -> repeat_dim=2
-        past_values = repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
-        active_values = repeat_kv(active_values, n_repeats=n_repeats, repeat_dim=2)
+    if n_groups != 0:
+        n_heads_per_group = n_heads_tp // n_groups
+        prob_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_positions
+        active_prob_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_active_tokens
+        dot_sizes = n_seqs, n_groups, n_heads_per_group, n_active_tokens, d_head
+        lhs_contract_dim = 4
+        past_prob_reshape = dtype[prob_sizes_permute].Reshape(past_prob)
+        active_prob_reshape = dtype[active_prob_sizes_permute].Reshape(active_prob)
+    else:
+        lhs_contract_dim = 3
+        dot_sizes = sizes
+        past_prob_reshape = past_prob
+        active_prob_reshape = active_prob
 
-    # lhs (past_prob): (n_seqs, n_heads, n_active_tokens, n_positions)
-    # rhs (value): (n_positions, n_seqs, n_heads, d_head)
-    dot_dims = dict(lhs_contracting_dimensions=[3],
+    dot_dims = dict(lhs_contracting_dimensions=[lhs_contract_dim],
                 lhs_batch_dimensions=[0, 1],
                 rhs_contracting_dimensions=[0],
                 rhs_batch_dimensions=[1, 2])
 
-    output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
-    active_output_dot = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
-    output = dtype[sizes].Add(output_dot, active_output_dot)
+    output_dot = dtype[dot_sizes].Dot(past_prob_reshape, past_values, dot_dimension_numbers=dot_dims)
+    active_output_dot = dtype[dot_sizes].Dot(active_prob_reshape, active_values, dot_dimension_numbers=dot_dims)
 
-    if shard_over_batch:
-        scribe = output_dot.scribe
-        s32 = scribe.s32
-        zero = s32.Constant(constant_value=0)
+    if n_groups != 0:
+        output = dtype[sizes].Reshape(output_dot)
+        active_output = dtype[sizes].Reshape(active_output_dot)
+    else:
+        output = output_dot
+        active_output = active_output_dot
 
-        # concat along batch dimension and split along head dimension
-        full_output = hlo.all_gather(output, dim=0, tp_degree=tp_degree)
-        output = hlo.dynamic_slice_along(full_output, dim=1, start=zero, size=n_heads_tp)
-
+    output = dtype[sizes].Add(output, active_output)
     denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
     output = dtype[sizes].Divide(output, denom_br)
     sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
@@ -341,7 +299,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     return output
 
 
-def context_combined(score, values, n_kv_heads=0, dtype=None, tp_degree=None, shard_over_batch=False):
+def context_combined(score, values, n_groups=0, dtype=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -354,34 +312,38 @@ def context_combined(score, values, n_kv_heads=0, dtype=None, tp_degree=None, sh
 
     C = softmax(S) @ V
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
+    If n_groups != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
     """
     probs = hlo.softmax(score)
 
     n_seqs, n_heads_tp, n_active_tokens, n_positions = probs.sizes
-    _, _, n_kv_heads_tp, d_head = values.sizes
+    n_positions, n_seqs, n_heads_tp, d_head = values.sizes
 
     if dtype is None:
         dtype = values.dtype
     probs = hlo.cast(probs, dtype)
 
-    if n_kv_heads != 0:
-        if shard_over_batch:
-            _, n_seqs_per_nc, n_kv_heads, d_head = values.sizes
-            n_repeats = n_heads_tp // n_kv_heads
-        else:
-            _, n_seqs, n_kv_heads_tp, d_head = values.sizes
-            n_repeats = n_heads_tp // n_kv_heads_tp
-        values = repeat_kv(values, n_repeats=n_repeats, repeat_dim=2)
+    if n_groups != 0:
+        n_heads_per_group = n_heads_tp // n_groups
+        probs_sizes_permute = n_seqs, n_groups, n_heads_per_group, n_active_tokens, n_positions
+        probs = dtype[probs_sizes_permute].Reshape(probs)
+        dot_sizes = n_seqs, n_groups, n_heads_per_group, n_active_tokens, d_head
+        lhs_contract_dim = 4
+    else:
+        dot_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+        lhs_contract_dim = 3
 
     dot_dims = dict(
-        lhs_contracting_dimensions=[3],
+        lhs_contracting_dimensions=[lhs_contract_dim],
         lhs_batch_dimensions=[0, 1],
         rhs_contracting_dimensions=[0],
         rhs_batch_dimensions=[1, 2]
     )
-    result = hlo.dot_general(probs, values, dimension_numbers=dot_dims)
+    result = dtype[dot_sizes].Dot(probs, values, dot_dimension_numbers=dot_dims)
+    if n_groups != 0:
+        dot_sizes_permute = n_seqs, n_heads_tp, n_active_tokens, d_head
+        result = dtype[dot_sizes_permute].Reshape(result)
     sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
     result = dtype[sizes].Transpose(result, dimensions=[2, 0, 1, 3])
     return result
