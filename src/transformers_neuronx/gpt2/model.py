@@ -484,7 +484,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
         else:
-             logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
