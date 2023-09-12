@@ -26,9 +26,11 @@ from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
+# TODO: make it one-shot import 
 from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWithContextBroadcasting
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
+from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
@@ -43,6 +45,7 @@ def main():
     for floatx, floaty in floatx_floaty_combinations:
         amp_choices.append(f'{floatx}-u8-{floaty}')
     parser.add_argument('model_type')
+    parser.add_argument('--hf_model', default=None)
     parser.add_argument('--amp', default='f32', choices=amp_choices)
     subparsers = parser.add_subparsers()
 
@@ -68,6 +71,7 @@ def main():
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
     # generation configuration
+    # TODO: could we simply make unparsed arguments as generation configuration?
     run_parser.add_argument('--beam', type=int, default=1)
     run_parser.add_argument('--do_sample', action='store_true')
     run_parser.add_argument('--max_length', type=int, default=None)
@@ -78,6 +82,7 @@ def main():
     run_parser.add_argument('--no_repeat_ngram_size', type=int, default=0)
     run_parser.add_argument('--num_return_sequences', type=int, default=1)
     run_parser.add_argument('--output_scores', action='store_true')
+    run_parser.add_argument('--repetition_penalty', type=float, default=1)
     # input prompt
     run_parser.add_argument('--various', action='store_true', help="Generated batched sequence with different length if set; otherwise using same length")
     run_parser.add_argument('--prompt', type=str, default= "Hello, I'm a language model, not a programming language. " \
@@ -87,8 +92,8 @@ def main():
     run_parser.add_argument('--prompt_len', type=int, default=None)
     # neuron_utils utils 
     run_parser.add_argument('--snapshot', action='store_true')
-    run_parser.add_argument('--cache', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
+    run_parser.add_argument('--to_s3', default=None)
     # dump logits
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
@@ -103,19 +108,24 @@ def main():
 
     model_type = args.model_type
     model_cls = None
-    hf_model_name = None
+    hf_model_name = args.hf_model
+
+    get_hf_model = lambda x: hf_model_name if hf_model_name is not None else x
     if model_type == 'gpt2':
         model_cls = GPT2ForSampling
-        hf_model_name = 'gpt2'
+        hf_model_name = get_hf_model('gpt2')
     elif model_type == "gpt2-ctx":
         model_cls = GPT2ForSamplingWithContextBroadcasting
-        hf_model_name = "gpt2"
+        hf_model_name = get_hf_model('gpt2')
     elif model_type == 'opt':
         model_cls = OPTForSampling
-        hf_model_name = 'facebook/opt-125m'
+        hf_model_name = get_hf_model('facebook/opt-125m')
     elif model_type == "gptj":
         model_cls = GPTJForSampling
-        hf_model_name = 'EleutherAI/gpt-j-6B'
+        hf_model_name = get_hf_model('EleutherAI/gpt-j-6B')
+    elif model_type == "bloom":
+        model_cls = BloomForSampling
+        hf_model_name = get_hf_model('bigscience/bloom-560m')
     assert model_cls is not None, f"Invalid model_type: {model_type}"
 
     print(f"Running demo with model_type:{model_type}, hf_model_name:{hf_model_name}")
@@ -126,6 +136,31 @@ def main():
         run(args, hf_model_name, model_cls)
     elif args.which == logits_analysis_name:
         logits_analysis(args, hf_model_name, model_cls)
+
+
+def upload_folder_to_s3(local_folder, s3_url):
+    import boto3
+    from botocore.exceptions import NoCredentialsError
+    s3_url_parsed = s3_url.lstrip('s3://').split('/')
+    bucket_name = s3_url_parsed[0]
+    s3_prefix = '/'.join(s3_url_parsed[1:])
+
+    s3 = boto3.client('s3')
+    try:
+        for root, dirs, files in os.walk(local_folder):
+            for file in files:
+                local_file_path = os.path.join(root, file)
+                s3_object_key = os.path.join(s3_prefix, os.path.join(local_folder, local_file_path))
+
+                # Upload the file to S3
+                s3.upload_file(local_file_path, bucket_name, s3_object_key)
+
+                print(f'Uploaded: {local_file_path} to {s3_object_key} in {bucket_name}')
+
+        print('Upload completed successfully.')
+
+    except NoCredentialsError:
+        print('AWS credentials not available. Please configure your credentials.')
 
 
 def logits_analysis(args, hf_model_name, model_cls):
@@ -220,116 +255,123 @@ def run(args, hf_model_name, model_cls):
     else:
         compile_batch_size = args.batch_size*args.beam
 
-    if args.device == "neuron":
-        suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
-        cache_path = f"neuronx_cache_{suffix}"
-        snapshot_path = f"neuronx_snapshot_{suffix}"
-        if args.cache or args.snapshot:
-            os.environ["NEURONX_DUMP_TO"] = cache_path
-            print("Set cache path:", cache_path)
-        if args.snapshot:
-            os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
-            print("Set snapshot path:", snapshot_path)
+    # wrap whole thing with try and finally as we want to collect artifacts in the end
+    try:
+        if args.device == "neuron":
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
+            dump_path = f"neuronx_dump_{suffix}"
+            snapshot_path = f"neuronx_snapshot_{suffix}"
+            if args.snapshot or args.pack_artifacts:
+                os.environ["NEURONX_DUMP_TO"] = dump_path
+                os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
+                print(f"Set snapshot path {snapshot_path}, dump_path: {dump_path}")
+
+            
+            print(f'running {model_cls.__name__}.from_pretrained')
+            if model_cls == GPT2ForSamplingWithContextBroadcasting:
+                suffix += f"_ctx{args.context_length_estimate}"
+                neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
+                                                tp_degree=args.tp_degree, n_positions=args.n_positions,
+                                                unroll=args.unroll, context_length_estimate=args.context_length_estimate)
+            else:
+                neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
+                                                tp_degree=args.tp_degree, n_positions=args.n_positions,
+                                                unroll=args.unroll)
+            print('running model.to_neuron')
+            neuron_model.to_neuron()
+
+            config = AutoConfig.from_pretrained(args.load)
+            if args.beam > 1:
+                print("Setting up reorder_cache for beam operation")
+                neuron_model.setup_reorder_cache()
+            model = HuggingFaceGenerationModelAdapter(config, neuron_model)
+        else:
+            suffix = f"{hf_model_name}_{model_cls.__name__}_cpu"
+            print(f'running {model_cls.__name__}.from_pretrained')
+            model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
+            
+
+        if args.simple_sample:
+            assert args.device == "neuron", "cannot runing simple sample with non-neuron device"
+            print("running simple_sample")
+            class OutputClassForSimpleSample:
+                def __init__(self, sequences, scores=None):
+                    self.sequences = sequences
+                    self.scores = scores
+            with torch.inference_mode():
+                max_length = args.max_length if args.max_length is not None else args.n_positions
+                sequences = neuron_model.sample(encoded_text.input_ids, max_length, 
+                    top_k=args.top_k, output_scores=args.output_scores or args.dump_logits)
+                scores = None
+                if args.output_scores or args.dump_logits:
+                    sequences, scores = sequences
+
+                outputs = OutputClassForSimpleSample(sequences, scores)
+        else:
+
+
+            generation_config = {
+                "num_beams": args.beam,
+                "do_sample": args.do_sample,
+                "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                "top_k": args.top_k,
+                "top_p": args.top_p,
+                "temperature": args.temperature,
+                "num_return_sequences": args.num_return_sequences,
+                "return_dict_in_generate": True,
+                "output_scores": args.output_scores,
+                "repetition_penalty": args.repetition_penalty,
+            }
+
+            if args.max_length is None and args.max_new_tokens is None:
+                generation_config["max_length"] = args.n_positions
+            if args.max_length is not None:
+                generation_config["max_length"] = args.max_length
+            if args.max_new_tokens is not None:
+                generation_config["max_new_tokens"] = args.max_new_tokens
+
+
+            if args.dump_logits:
+                generation_config['output_scores'] = True
+
+            print("running HuggingFace Generation API, generation_config:\n", generation_config)
+
+            with torch.inference_mode():
+                outputs = model.generate(
+                    input_ids=encoded_text.input_ids,
+                    attention_mask=encoded_text.attention_mask,
+                    **generation_config,
+                )
+
+        if args.dump_logits:
+            dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
+            print(f"Dumping logits into {dump_logits_dir}")
+            dump_logits_limit = args.dump_logits_limit
+            if args.dump_logits_limit == -1: # dump all for analysis
+                dump_logits_limit = len(outputs.scores)
+            assert dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
+            for i in range(dump_logits_limit):
+                dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
+
+        print('generated_sequence=', outputs.sequences)
+        outputs = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
+        print(outputs)
+
+    finally:
 
         if args.pack_artifacts:
             compiler_artifacts_dir = f"compiler_artifacts_{suffix}"
             print(f"Save artifacts at: {compiler_artifacts_dir}")
             os.makedirs(compiler_artifacts_dir, exist_ok=True)
-            if os.path.exists(cache_path):
-                shutil.copytree(cache_path, os.path.join(compiler_artifacts_dir, cache_path))
+            if os.path.exists(dump_path):
+                shutil.copytree(dump_path, os.path.join(compiler_artifacts_dir, dump_path), dirs_exist_ok=True)
             if os.path.exists(snapshot_path):
-                shutil.copytree(snapshot_path, os.path.join(compiler_artifacts_dir, snapshot_path))
+                shutil.copytree(snapshot_path, os.path.join(compiler_artifacts_dir, snapshot_path), dirs_exist_ok=True)
             with open(os.path.join(compiler_artifacts_dir, "command.txt"), 'w') as f:
                 f.write(f"{' '.join(sys.argv)}\n")
 
-        
-        print(f'running {model_cls.__name__}.from_pretrained')
-        if model_cls == GPT2ForSamplingWithContextBroadcasting:
-            suffix += f"_ctx{args.context_length_estimate}"
-            neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
-                                            tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                            unroll=args.unroll, context_length_estimate=args.context_length_estimate)
-        else:
-            neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
-                                            tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                            unroll=args.unroll)
-        print('running model.to_neuron')
-        neuron_model.to_neuron()
-
-        config = AutoConfig.from_pretrained(args.load)
-        if args.beam > 1:
-            neuron_model.setup_reorder_cache()
-        model = HuggingFaceGenerationModelAdapter(config, neuron_model)
-    else:
-        suffix = f"{hf_model_name}_{model_cls.__name__}_cpu"
-        print(f'running {model_cls.__name__}.from_pretrained')
-        model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
-        
-
-    if args.simple_sample:
-        assert args.device == "neuron", "cannot runing simple sample with non-neuron device"
-        print("running simple_sample")
-        class OutputClassForSimpleSample:
-            def __init__(self, sequences, scores=None):
-                self.sequences = sequences
-                self.scores = scores
-        with torch.inference_mode():
-            max_length = args.max_length if args.max_length is not None else args.n_positions
-            sequences = neuron_model.sample(encoded_text.input_ids, max_length, 
-                top_k=args.top_k, output_scores=args.output_scores or args.dump_logits)
-            scores = None
-            if args.output_scores or args.dump_logits:
-                sequences, scores = sequences
-
-            outputs = OutputClassForSimpleSample(sequences, scores)
-    else:
-
-
-        generation_config = {
-            "num_beams": args.beam,
-            "do_sample": args.do_sample,
-            "no_repeat_ngram_size": args.no_repeat_ngram_size,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "temperature": args.temperature,
-            "num_return_sequences": args.num_return_sequences,
-            "return_dict_in_generate": True,
-            "output_scores": args.output_scores,
-        }
-
-        if args.max_length is None and args.max_new_tokens is None:
-            generation_config["max_length"] = args.n_positions
-        if args.max_length is not None:
-            generation_config["max_length"] = args.max_length
-        if args.max_new_tokens is not None:
-            generation_config["max_new_tokens"] = args.max_new_tokens
-
-
-        if args.dump_logits:
-            generation_config['output_scores'] = True
-
-        print("running HuggingFace Generation API, generation_config:\n", generation_config)
-
-        with torch.inference_mode():
-            outputs = model.generate(
-                input_ids=encoded_text.input_ids,
-                attention_mask=encoded_text.attention_mask,
-                **generation_config,
-            )
-
-    if args.dump_logits:
-        dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
-        print(f"Dumping logits into {dump_logits_dir}")
-        dump_logits_limit = args.dump_logits_limit
-        if args.dump_logits_limit == -1: # dump all for analysis
-            dump_logits_limit = len(outputs.scores)
-        assert dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
-        for i in range(dump_logits_limit):
-            dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
-
-    print('generated_sequence=', outputs.sequences)
-    outputs = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
-    print(outputs)
+            if args.to_s3 is not None:
+                upload_folder_to_s3(compiler_artifacts_dir, args.to_s3)
 
 if __name__ == "__main__":
     main()
