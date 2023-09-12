@@ -152,3 +152,27 @@ def build_dense_mask(q_seq_len, k_seq_len, mask, blk_size=128, causal=False):
     if causal:
         dense_mask = torch.tril(dense_mask)
     return dense_mask
+
+
+def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
+    """
+    Tokenize a list of texts with different lengths.
+
+    Args:
+        tokenizer_left_padded (tokenizer): Tokenzier with padding_side='left'. For example: AutoTokenizer.from_pretrained('gpt2', padding_side='left')
+        input_texts (list of strings): List of input texts. Texts can have different lengths
+        pad_token (int, optional): pad token
+
+    Returns:
+        tuple: input_ids, start_ids used as arguments for model.sample
+    """
+    if pad_token is not None:
+        tokenizer_left_padded.pad_token = pad_token
+    if not hasattr(tokenizer_left_padded, "pad_token") or tokenizer_left_padded.pad_token is None:
+        tokenizer_left_padded.pad_token = tokenizer_left_padded.eos_token
+    tok = tokenizer_left_padded(input_texts, return_tensors='pt', padding=True)
+    _, start_ids = tok.attention_mask.max(axis=1)
+    if (start_ids == 0).all():
+        start_ids = None
+    input_ids = tok.input_ids
+    return input_ids, start_ids
