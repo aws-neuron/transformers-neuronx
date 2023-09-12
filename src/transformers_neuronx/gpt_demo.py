@@ -107,10 +107,15 @@ def run(args, model_name, model_cls):
     ) if args.sparse_attn else None
     if args.quantize or args.sparse_attn:
         neuron_config = NeuronConfig(quant=quant_config, sparse_attn=sparse_attn_config)
-    model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
+    if args.context_length_estimate:
+        model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
                                       unroll=args.unroll, neuron_config=neuron_config,
                                       context_length_estimate=args.context_length_estimate)
+    else:
+        model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
+                                      tp_degree=args.tp_degree, n_positions=args.n_positions,
+                                      unroll=args.unroll, neuron_config=neuron_config)
     if args.print_latency:
         latency_printer = LatencyPrinter()
         model.register_forward_pre_hook(latency_printer.pre_hook)
