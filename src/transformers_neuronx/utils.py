@@ -164,7 +164,7 @@ def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
         pad_token (int, optional): pad token
 
     Returns:
-        tuple: input_ids, start_ids used as arguments for model.sample
+        tuple: input_ids, start_ids used as arguments for model.sample function
     """
     if pad_token is not None:
         tokenizer_left_padded.pad_token = pad_token
