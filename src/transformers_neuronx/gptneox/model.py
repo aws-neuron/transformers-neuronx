@@ -22,12 +22,13 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import base
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class GPTNeoXForSampling(module.PretrainedModel):
+class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
@@ -103,13 +104,14 @@ class GPTNeoXForSampling(module.PretrainedModel):
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
     def _run_program(self, program, bucket_id, input_ids, cache_offset, start_ids):
         active_n_positions = self.n_positions_list[bucket_id]
         hidden = self.gpt_neox.embed_in(input_ids)
+        hidden = hidden.transpose(0, -1).contiguous()
         input_buffers = program.buffers.get_input_buffers(bucket_id)
         hidden_buffer, pos_embd_buffer, *_ = input_buffers
         hidden = hidden.to(hidden_buffer.dtype)
