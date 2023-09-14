@@ -13,23 +13,23 @@
 # limitations under the License.
 # ==============================================================================
 import os
+import copy
 import warnings
 import torch
-from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
 from transformers_neuronx import module
 from transformers_neuronx import ops
+from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
-from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
-from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.decoder import DecoderLmHeadForSamplingNoEmbedding
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.layers import attention_hsb as attention, transformer
+from transformers_neuronx.layers import attention
 
 
-class OPTForSampling(base.NeuronModelBase):
+class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
                  unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
@@ -50,22 +50,14 @@ class OPTForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.num_hidden_layers
+        # Provide a list of seq lens
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
-        if isinstance(batch_size,int):
-            self.batch_sizes = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_sizes = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
-
         attention_head_size = config.hidden_size // config.num_attention_heads
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
+        self.decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, # n_active_tokens
-            self.batch_sizes, attention_head_size, amp=amp,
-            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
-            unroll=unroll, neuron_config=neuron_config
+            batch_size, attention_head_size, amp,
+            config.num_hidden_layers, unroll, neuron_config=neuron_config
         )
-        self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
                                                    config.activation_function, start_mask,
@@ -73,28 +65,10 @@ class OPTForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = dict()
+        self.decoder_lm_head_for_context = None
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
-        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
-        if self.context_length_estimate is not None:
-            for batch_size in self.batch_sizes:
-                self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree,
-                                                    [context_length_estimate],
-                                                    context_length_estimate,
-                                                    batch_size,
-                                                    attention_head_size,
-                                                    amp=amp,
-                                                    num_layers=config.num_hidden_layers,
-                                                    n_head=config.num_attention_heads,
-                                                    unroll=context_unroll,
-                                                    neuron_config=neuron_config,
-                                                    allow_pad=self.decoder_lm_head.allow_pad
-                                                )
-                self.register_for_serialization(self.decoder_lm_head_for_context[batch_size])
-        # Track number of processed tokens for sliding window attention
-        self.num_processed_tokens = 0
+        self.neuron_config = neuron_config
 
     def to_neuron(self):
         ops.init()
@@ -109,19 +83,11 @@ class OPTForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, attn.q_proj.bias.detach())
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, attn.k_proj.bias.detach())
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, attn.v_proj.bias.detach())
-            new_layer.add_attention_output(attn.out_proj.weight.detach(), attn.out_proj.bias.detach(), sharding=1, transposed=False)
+            new_layer.add_attention_output(attn.out_proj.weight.detach().T, attn.out_proj.bias.detach())
             new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
                                              layer.final_layer_norm.bias.detach())
             new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
-                new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
-            else:
-                new_layer.add_mlp_output(
-                    layer.fc2.weight.detach(),
-                    layer.fc2.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
+            new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.model.decoder.final_layer_norm
@@ -133,50 +99,32 @@ class OPTForSampling(base.NeuronModelBase):
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         if self.context_length_estimate is not None:
-            for batch_size in self.batch_sizes:
-                self.decoder_lm_head_for_context[batch_size] = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[batch_size], share_caches=True)
+            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
+                n_positions_list=[self.context_length_estimate],
+                n_active_tokens=self.context_length_estimate,
+                unroll=self.context_unroll,
+                share_caches=True,
+            )
 
     def reset(self):
         self.decoder_lm_head.reset()
-        # Reset the token counter
-        self.num_processed_tokens = 0
 
     def forward(self, input_ids, cache_ids, start_ids=None):
         return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
 
     def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        batch_size , _ = input_ids.shape
-        context_decoder = self.decoder_lm_head_for_context[batch_size]
-        return self._forward(context_decoder, input_ids, cache_ids, start_ids)
+        return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
-        # Check if sliding window attention is applied
-        sliding_window_attn_enabled = self.neuron_config and \
-                                      self.neuron_config.sparse_attn and \
-                                      self.neuron_config.sparse_attn.skip_masking_decode
-        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
-        batch_size, context_length = input_ids.shape
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        batch_size, _ = input_ids.shape
-        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids, batch_size)
+        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
-        # Compute the window starting index for specific mask patterns
-        # For other patterns we pass in a default value of 0, it won't be used
-        curr_window_start = \
-            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
-            if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-        logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
-        logits = self._cast_logits(logits)
+        logits = decoder_lm_head(hidden, cache_ids, start_ids)
+        logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
-        # Increment the token counter
-        # If running decode mode then last_token_id = 0
-        self.num_processed_tokens += (last_token_id+1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -185,7 +133,12 @@ class OPTForSampling(base.NeuronModelBase):
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
         _, start = input_ids.shape
         context_length = self.context_length_estimate
-        next_token_scores = self.forward_for_context(input_ids, None, start_ids)
+        cache_ids = torch.arange(context_length, dtype=torch.int32)
+        input_context = input_ids[:, :context_length]
+        if start < context_length:
+            input_pad = context_length - start
+            input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
+        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
         for cur_len in range(context_length, start):
             cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
             next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
@@ -268,36 +221,29 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None, shard_over_batch=False):
+    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
-        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
-        self.shard_over_batch = shard_over_batch
+        self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.s32.Parameter(parameter_number=3)
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
         # For the best perf, we only use kv prefetch in the token generation stage
-        use_prefetch = n_active_tokens != n_positions
-        triu_comparison = 'LT' if use_prefetch else 'LE'
-        mask, active_mask = hlo.decoder_attention_mask(
-            start_ids,
-            cache_ids,
-            n_positions,
-            triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=use_prefetch,
-            start_mask=True
-        )
-        return (hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask), (1, 0, None, None, None)
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        triu_comparison = 'LT' if allow_kv_dot_prefetch else 'LE'
+        mask, active_mask = hlo.decoder_attention_mask(start_ids, cache_ids, n_positions,
+                                                       triu_comparison, allow_kv_dot_prefetch,
+                                                       self.start_mask)
+        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
 
-    def layer(self, hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, cache_ids, mask, active_mask,
+              attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -307,160 +253,166 @@ class OPTForSamplingNoEmbeddingHlo:
               pre_mlp_ln_weight, pre_mlp_ln_bias,
               mlp_in_weight, mlp_in_scales, mlp_in_bias,
               mlp_out_weight, mlp_out_scales, mlp_out_bias,
+              sparse_mask, active_sparse_mask,
               post_mlp_ln_weight, post_mlp_ln_bias,
               ):
         dtype = hidden.dtype
-        ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
-        if self.neuron_config and self.neuron_config.fuse_qkv:
-            k_weight_shape = attn_q_weight.sizes
-            k_weight_dim = k_weight_shape[-1] // FUSED_QKV_TP_FACTOR
-        else:
-            k_weight_shape = attn_k_weight.sizes
-            k_weight_dim = k_weight_shape[-1]
-        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == k_weight_dim, \
-            f"kv cache shapxe ({attn_k_cache.sizes}) doesn't match kv weight shape ({k_weight_shape})"
+        hidden = hlo.transpose210(hidden)
+        ln_hidden = hlo.layer_norm_bsh(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == attn_k_weight.sizes[-1], \
+            f"kv cache shape ({attn_k_cache.sizes}) doesn't match kv weight shape ({attn_k_weight.sizes})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+            ln_hidden, cache_ids, mask, active_mask, sparse_mask, active_sparse_mask,
+            attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
             attn_out_weight, attn_out_scales, attn_out_bias,
             neuron_config=self.neuron_config
         )
-        hidden = hlo.add(attn_output, hidden)
-        ln_hidden = hlo.layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_hidden = hlo.mlp(
+        hidden = dtype[hidden.sizes].Add(attn_output, hidden)
+        ln_hidden = hlo.layer_norm_bsh(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp_hidden = hlo.mlp_bsh(
             ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function=self.activation_function, tp_degree=self.tp_degree,
             in_scales=mlp_in_scales, out_scales=mlp_out_scales, neuron_config=self.neuron_config,
-            transposed=True,
         )
-        hidden = hlo.add(mlp_hidden, hidden)
+        hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        hidden = hlo.transpose210(hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
-        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens)
+    def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
+        dtype = hidden.dtype
+        slice_threshold = 2  # 1 doesn't work for now; see P86509517
+        if n_active_tokens > slice_threshold:
+            slice_dimensions = [
+                dict(start=0, limit=hidden_size, stride=1),
+                dict(start=n_active_tokens-slice_threshold, limit=n_active_tokens, stride=1),
+                dict(start=0, limit=batch_size, stride=1),
+            ]
+            n_active_tokens = slice_threshold
+            sizes = hidden_size, n_active_tokens, batch_size
+            hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
+        ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+        ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
+        logits = hlo.dot00(lm_head_weight, ln_hidden)
+        if lm_head_bias is not None:
+            lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
+            logits = dtype[logits.sizes].Add(logits, lm_head_bias)
+        vocab_size, _ = logits.sizes
+        return dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-    def attention(self, hidden, curr_window_start, cache_ids, mask, active_mask,
+
+    def attention(self, hidden, cache_ids,
+                  mask, active_mask, sparse_mask, active_sparse_mask,
                   cached_keys, cached_values,
                   q_weight, q_scales, q_bias,
                   k_weight, k_scales, k_bias,
                   v_weight, v_scales, v_bias,
                   out_weight, out_scales, out_bias,
                   neuron_config=None):
+        enable_quantize = neuron_config and neuron_config.quant
+        if enable_quantize and not neuron_config.quant.quantize_attn:
+            neuron_config = copy.deepcopy(neuron_config)
+            neuron_config.quant = None
+            enable_quantize = False
         enable_sparse_attn = neuron_config and neuron_config.sparse_attn
-        sparse_mask = None
-        window_attn_decode = False
-        if enable_sparse_attn:
-            # Generate the sparse masks if necessary. Our behavior here:
-            # - If in prefill mode (n_active_tokens > 1), sparse mask is always
-            #   generated or provided by user.
-            # - If in decode mode (n_active_tokens = 1), sparse mask is not
-            #   generated if 1) window attention is used, or 2) block-sparse
-            #   attention with only local blocks is used. Otherwise it's generated.
-            # - Active sparse mask is only generated in decode mode. Similarly,
-            #   it's only generated if user is not using the two patterns mentioned
-            #   above.
-
-            # Determine sparse mask shapes according to the attention mask shapes
-            n_active_tokens, n_positions = mask.sizes[-2:]
-            sparse_mask = neuron_config.sparse_attn.create_sparse_mask(n_active_tokens, n_positions)
-            # Directly convert the masks to HLO constants
-            if sparse_mask is not None:
-                sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
-            window_attn_decode = neuron_config.sparse_attn.skip_masking_decode
 
         dtype = hidden.dtype
         scribe = hidden.scribe
         f32 = scribe.f32
+        pred = scribe.pred
 
-        hidden_size, n_active_tokens, n_seqs = hidden.sizes
+        n_seqs, n_active_tokens, hidden_size = hidden.sizes
 
-        max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
-        _, hidden_size_tp = q_weight.sizes
-        fuse_qkv = neuron_config and neuron_config.fuse_qkv
-        if fuse_qkv:
-            hidden_size_tp //= FUSED_QKV_TP_FACTOR
-            kv_hidden_size_tp = hidden_size_tp
-        else:
-            _, kv_hidden_size_tp = k_weight.sizes
-        n_head = hidden_size // d_head
-        tp_degree = hidden_size // hidden_size_tp
-        n_kv_heads = n_kv_heads_tp * tp_degree
+        max_ctx_plus_n_active_tokens, _, n_groups, d_head = cached_keys.sizes
+        n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
+        n_heads_per_group = n_heads_tp // n_groups
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV
-        query, key, value = attention.query_key_value(
+        query, key, value= attention.query_key_value(
             hidden,
             q_weight, q_scales, q_bias,
             k_weight, k_scales, k_bias,
             v_weight, v_scales, v_bias,
             d_head,
             neuron_config=neuron_config,
-            tp_degree=tp_degree,
-            shard_over_batch=self.shard_over_batch,
+            n_groups=n_groups,
         )
+
+        can_skip_scatter = n_active_tokens == max_ctx_plus_n_active_tokens
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
 
-        # Single Token Generation ("Prefetch"-style)
-        if active_mask is not None:
-            # When using window attention, directly slice the KV cache
-            # Since GPT uses left padding, we always pick the right-most side of the KV cache
-            # KV cache layout: (n_positions, bs, n_heads, head_size)
-            # Mask layout: (bs, n_active_tokens, n_positions)
-            useful_cached_keys = cached_keys
-            useful_cached_values = cached_values
-            useful_mask = mask
-            if window_attn_decode:
-                window_size = neuron_config.sparse_attn.sparse_attn_config.window_size
-                useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=window_size)
-                useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=window_size)
-                useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=window_size)
+        # For the best perf, we only use kv prefetch in the token generation stage
+        allow_kv_dot_prefetch = self.allow_kv_dot_prefetch and n_active_tokens == 1
+        if allow_kv_dot_prefetch:
+            # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+            active_score_sizes = n_seqs, n_heads_tp, n_active_tokens, n_active_tokens
+            active_score = attention.score(query, key, n_groups=n_groups)
 
-            # Sp = Q @ Kp
-            prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            # Apply the sparse mask to the raw scores, notice that we don't have the mask for window attention
-            if enable_sparse_attn and not window_attn_decode:
-                assert sparse_mask is not None, "Require a valid sparse mask when not using sliding window attention during decode!"
-                # Not sharding over batch because the sparse mask is not supposed to have a batch dimension
-                prior_scores = attention.mask(prior_scores, sparse_mask, tp_degree=None, shard_over_batch=False)
-            prior_scores = hlo.cast(prior_scores, f32)
+            large_neg = dtype.Constant(constant_value=-30000)
+            large_neg_br = dtype[active_score_sizes].Broadcast(large_neg, dimensions=[])
+            if active_mask is not None:
+                active_mask_sh = hlo.unsqueeze(active_mask, 1)
+                active_score = attention.mask(active_score, active_mask_sh)
+            # Apply sparse mask if sparse attention is enabled
+            if enable_sparse_attn:
+                assert len(active_sparse_mask.sizes) == 2, 'Only supports 2D sparse masks!'
+                active_sparse_mask_convert = pred[active_sparse_mask.sizes].Convert(active_sparse_mask)
+                active_score = attention.mask(active_score, active_sparse_mask_convert)
+            active_score = f32[active_score_sizes].Convert(active_score)
+        else:
+            if can_skip_scatter:
+                cached_keys = key
+            else:
+                cached_keys = attention.update_cache(cached_keys, cache_ids, key)
 
-            # Sa = Q @ Ka
-            active_score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            active_score = hlo.cast(active_score, f32)
+        # einsum("nbgrk,mbgk->bgrnm", query_layer, key_layer)
+        score_sizes = n_seqs, n_heads_tp, n_active_tokens, max_ctx_plus_n_active_tokens
+        score = attention.score(query, cached_keys, n_groups=n_groups)
+        #pred = score.scribe.pred
+        score = attention.mask(score, mask)
+        # Apply sparse mask if sparse attention is enabled
+        if enable_sparse_attn:
+            assert len(sparse_mask.sizes) == 2, 'Only supports 2D sparse masks!'
+            sparse_mask_convert = pred[sparse_mask.sizes].Convert(sparse_mask)
+            score = attention.mask(score, sparse_mask_convert)
+        # Convert raw score to fp32
+        score = f32[score_sizes].Convert(score)
 
-            # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, useful_cached_values, value, sparse_mask=sparse_mask,
-                                        n_kv_heads=n_kv_heads, dtype=dtype, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-
-            # KCache[I] = K
-            # VCache[I] = V
+        if allow_kv_dot_prefetch:
+            # Main logic:
+            # 1. Split softmax into exp / sum(exp) where exp is independent along axis 3
+            #   probs_post_scatter = softmax(score_post_scatter)
+            #   output = probs_post_scatter @ cached_values_post_scatter
+            #          = exps_post_scatter / sum(exps_post_scatter) @ cached_values_post_scatter
+            #          = exps_post_scatter @ cached_values_post_scatter / sum(exps_post_scatter)
+            # 2. Split exps @ cached_values dot into a sum of dots
+            #   dot = exps_post_scatter @ cached_values_post_scatter
+            #       = exps_pre_scatter @ cached_values_pre_scatter + exp_active @ cached_values_active
+            #   Note that exps_pre_scatter @ cached_values_active and exp_active @ cached_values_pre_scatter
+            #   are assumed to be 0 due to the use of attention mask.
+            context = attention.context(score, active_score, cached_values, value, n_groups=n_groups, dtype=dtype,
+                                        sparse_mask=sparse_mask_convert if enable_sparse_attn else None,
+                                        active_sparse_mask=active_sparse_mask_convert if enable_sparse_attn else None)
             cached_keys = attention.update_cache(cached_keys, cache_ids, key)
             cached_values = attention.update_cache(cached_values, cache_ids, value)
-
-        # Multi-Token Context Encoding
         else:
-            # S = Q @ K
-            score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            if enable_sparse_attn:
-                score = attention.mask(score, sparse_mask, tp_degree=None, shard_over_batch=False)
-            score = hlo.cast(score, f32)
-            context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=n_kv_heads, dtype=dtype, \
-                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-
-            # KCache = K
-            # VCache = V
-            cached_keys = key
-            cached_values = value
+            if can_skip_scatter:
+                cached_values = value
+            else:
+                cached_values = attention.update_cache(cached_values, cache_ids, value)
+            context = attention.context_combined(
+                score, cached_values, n_groups=n_groups, dtype=None,
+                sparse_mask=sparse_mask_convert if enable_sparse_attn else None)
 
         output = attention.output(context, out_weight, out_scales, out_bias, self.tp_degree, neuron_config)
+
         return output, cached_keys, cached_values
 
 
@@ -496,8 +448,7 @@ class OPTForGreedySearch(OPTForSampling):
 
     def forward(self, input_ids, cache_ids, start_ids=None):
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        batch_size, _ = input_ids.shape
-        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids, batch_size)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()

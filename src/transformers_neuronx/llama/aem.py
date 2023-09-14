@@ -66,8 +66,9 @@ class AEMLlamaForSampling(LlamaForSampling):
         aems = self.run_aems(hidden)
         logits = self.lmhead(hidden)
 
-        logits = self._cast_logits(logits)
         # We need to also apply Llama's LLM head as well
+
+        logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits

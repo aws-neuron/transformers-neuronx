@@ -32,15 +32,3 @@ def to_amp(dtype):
         torch.bfloat16: 'bf16',
     }
     return mapping[dtype]
-
-
-def to_pyhlo_type(scribe, dtype):
-    """
-    Map a torch dtype to the corresponding scribe dtype object.
-    """
-    mapping = {
-        "float32": scribe.f32,
-        "float16": scribe.f16,
-        "bfloat16": scribe.bf16,
-    }
-    return mapping[dtype]

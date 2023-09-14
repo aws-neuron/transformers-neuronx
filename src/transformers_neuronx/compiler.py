@@ -335,14 +335,14 @@ class Executor:
         return result
 
 
-def write_tensors(tensors, folder, worker=0):
+def write_tensors(tensors, folder):
     os.makedirs(folder, exist_ok=True)
     for i, tensor in enumerate(tensors):
         filename = os.path.join(folder, f"{i}.npy")
         if tensor.device != torch.device('cpu'):
             tensor = ops.parallel_cpu(tensor)
             if isinstance(tensor, list):
-                tensor = tensor[worker]
+                tensor = tensor[0]
         if tensor.dtype == torch.bfloat16:
             tensor = tensor.view(torch.int16)
             tensor = tensor.numpy()
@@ -350,6 +350,7 @@ def write_tensors(tensors, folder, worker=0):
         else:
             tensor = tensor.detach().numpy()
         np.save(filename, tensor)
+
 
 
 @contextmanager
@@ -429,14 +430,8 @@ class ParallelKernel:
 
     def snapshot_tensors(self, inputs, subdir):
         folder = self.snapshot_path()
-        snapshot_all_workers = os.environ.get("HLO_SNAPSHOT_ALL_WORKERS", None)
-        if snapshot_all_workers:
-            for worker in range(self.tp_degree):
-                path = os.path.join(folder, subdir, f'worker{worker}')
-                write_tensors(inputs, path, worker)
-        else:
-            path = os.path.join(folder, subdir)
-            write_tensors(inputs, path)
+        path = os.path.join(folder, subdir)
+        write_tensors(inputs, path)
 
     def snapshot_enter(self, inputs):
         folder = self.snapshot_path()

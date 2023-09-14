@@ -18,9 +18,7 @@ import os
 import sys
 import os
 import torch
-import time
 import neuronxcc
-import math
 import shutil
 import logging
 from transformers import AutoModelForCausalLM
@@ -28,157 +26,17 @@ from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-# TODO: make it one-shot import
+# TODO: make it one-shot import 
 from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWithContextBroadcasting
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
 from transformers_neuronx.bloom.model import BloomForSampling
-from transformers_neuronx.llama.model import LlamaForSampling
-from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
 def dump(dump_dir, dump_file_name, data):
     os.makedirs(dump_dir, exist_ok=True)
     torch.save(data, os.path.join(dump_dir, dump_file_name))
-
-
-def percentile(data, q: int = 50) -> float:
-    """
-    Compute the q-th percentile of a collection of measurements.
-
-    Arguments:
-        data: The collection of values to compute the percentile on.
-        q: The percentile to compute. Expected to be between 0 and 100.
-
-    Returns:
-        A single percentile float.
-    """
-    index = (len(data) - 1) * (q / 100)
-    lower = math.floor(index)
-    upper = math.ceil(index)
-    alpha = index - lower
-    data = sorted(data)
-    return (data[lower] * (1 - alpha)) + (data[upper] * alpha)
-
-class MetricsCollectorWrapper:
-
-    def __init__(self, neuron_monitor_wrapper=None):
-        self.start = None
-        self.latency_list = []
-        self.latency_collector = LatencyCollector()
-        self.neuron_monitor = NeuronMonitor(neuron_monitor_wrapper)
-
-    def pre_hook(self, *args):
-        self.latency_collector.pre_hook()
-        self.neuron_monitor.pre_hook()
-
-    def hook(self, *args):
-        self.latency_collector.hook()
-        self.neuron_monitor.hook()
-
-
-class LatencyCollector:
-
-    def __init__(self):
-        self.start = None
-        self.latency_list = []
-
-    def pre_hook(self, *args):
-        self.start = time.time()
-
-    def hook(self, *args):
-        self.latency_list.append(time.time() - self.start)
-
-    def percentile(self, percent):
-        latency_list = self.latency_list
-        pos_float = len(latency_list) * percent / 100
-        max_pos = len(latency_list) - 1
-        pos_floor = min(math.floor(pos_float), max_pos)
-        pos_ceil = min(math.ceil(pos_float), max_pos)
-        latency_list = sorted(latency_list)
-        return latency_list[pos_ceil] if pos_float - pos_floor > 0.5 else latency_list[pos_floor]
-
-def benchmark(
-    args,
-    neuron_model,
-    forward_func,
-    context_length,
-    output_length,
-    warmup=2,
-    iterations=5
-):
-    """
-    Benchmark autoregressive inference using greedy decoding.
-
-    Arguments:
-        model: The model for benchmarking.
-        batch_size: The batch size of the input data.
-        n_positions: The length of the input prompt + number of generated tokens.
-        context_length: The length of the input prompt.
-        iterations: The number of iterations for benchmarking.
-
-    Returns:
-        A dictionary of performance statisics.
-    """
-
-    # Warmup
-    print(f"Warmup ({warmup} iterations) ...")
-    for _ in range(warmup):
-        forward_func()
-
-    # Add latency hooks
-    latency_collector_all = LatencyCollector()
-    neuron_model.register_forward_pre_hook(latency_collector_all.pre_hook)
-    neuron_model.register_forward_hook(latency_collector_all.hook)
-
-
-    # Benchmark and record durations
-    print(f"Benchmark loop ({iterations} iterations) ...")
-    latencies = []
-    begin = time.time()
-    for _ in range(iterations):
-        start = time.time()
-        forward_func()
-        finish = time.time()
-        latencies.append((finish - start) * 1000)
-    end = time.time()
-
-    latency_list = latency_collector_all.latency_list
-    num_inference_per_iter = len(latency_list) // iterations
-    context_encoding_latency_list = latency_list[::int(num_inference_per_iter)]
-
-
-    # Compute metrics
-    boundaries = [0, 50, 90, 95, 99, 100]
-    percentiles = {}
-    for boundary in boundaries:
-        name = f"sequence_latency_p{boundary}"
-        percentiles[name] = percentile(latencies, boundary)
-    duration = end - begin
-    inferences = len(latencies) * args.batch_size
-    throughput = inferences / duration
-    mean_latency = sum(latencies) / len(latencies)
-
-
-    # Metrics
-    metrics = {
-        "hf_model": args.hf_model,
-        "model": args.hf_model,
-        "sequence_length": args.n_positions,
-        "context_length": context_length,
-        "output_length": output_length,
-        "batch_size": args.batch_size,
-        "batches": len(latencies),
-        "inferences": inferences,
-        "total_duration_seconds": duration,
-        "mean_context_encoding_latency": sum(context_encoding_latency_list) / len(context_encoding_latency_list),
-        "output_token_throughput": (inferences * (output_length - context_length)) / duration,
-        "mean_output_token_latency": mean_latency / (output_length - context_length),
-    }
-
-    print(metrics)
-    return metrics
 
 def main():
     parser = argparse.ArgumentParser()
@@ -197,7 +55,7 @@ def main():
     save_parser.add_argument('save', help="Directory to save the model")
     save_parser.add_argument('--random', action='store_true', help="Random weights flag. If true, config.json would be used to generate a model with random weight")
     save_parser.add_argument('--config', type=str, default='', help="Path to config.json file (example: path/to/config.json)")
-
+    
     run_name = 'run'
     run_parser = subparsers.add_parser(run_name)
     run_parser.set_defaults(which=run_name)
@@ -208,7 +66,7 @@ def main():
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--device', type=str, default="cpu")
-    run_parser.add_argument('--context_length_estimate', type=int, default=None)
+    run_parser.add_argument('--context_length_estimate', type=int, default=64)
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
@@ -232,28 +90,19 @@ def main():
         "I'm not going to tell you how I learned to code, or how much I've learned. " \
         "But I will tell the story of my first programming experience, and how it changed my life.")
     run_parser.add_argument('--prompt_len', type=int, default=None)
-    # neuron_utils utils
+    # neuron_utils utils 
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
     run_parser.add_argument('--to_s3', default=None)
     # dump logits
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
-    # benchmark
-    run_parser.add_argument('--benchmark', action='store_true', default=None)
-    # suffix
-    run_parser.add_argument('--suffix', type=str, default=None)
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
     logits_analysis_parser.set_defaults(which=logits_analysis_name)
     logits_analysis_parser.add_argument('-d','--dirs', nargs='+', required=True)
     logits_analysis_parser.add_argument('--plot', action='store_true')
-
-    visual_name = 'visual'
-    visual_parser = subparsers.add_parser(visual_name)
-    visual_parser.set_defaults(which=visual_name)
-    visual_parser.add_argument('-d','--dirs', nargs='+', required=True)
 
     args = parser.parse_args()
 
@@ -274,15 +123,9 @@ def main():
     elif model_type == "gptj":
         model_cls = GPTJForSampling
         hf_model_name = get_hf_model('EleutherAI/gpt-j-6B')
-    elif model_type == "llama":
-        model_cls = LlamaForSampling
-        hf_model_name = get_hf_model('openlm-research/open_llama_3b')
     elif model_type == "bloom":
         model_cls = BloomForSampling
         hf_model_name = get_hf_model('bigscience/bloom-560m')
-    elif model_type == "gptneox":
-        model_cls = GPTNeoXForSampling
-        hf_model_name = get_hf_model('EleutherAI/gpt-neox-20b')
     assert model_cls is not None, f"Invalid model_type: {model_type}"
 
     print(f"Running demo with model_type:{model_type}, hf_model_name:{hf_model_name}")
@@ -293,46 +136,7 @@ def main():
         run(args, hf_model_name, model_cls)
     elif args.which == logits_analysis_name:
         logits_analysis(args, hf_model_name, model_cls)
-    elif args.which == visual_name:
-        visual(args)
 
-def visual(args):
-    logit_paths = args.dirs
-    logit_paths = [os.path.join(path, "0.pt") for path in logit_paths]
-    golden_path = logit_paths[-1]
-
-    pairs = []
-    for path in logit_paths[:-1]:
-        logits = torch.load(path)
-        print(path, logits)
-        pairs.append([logits])
-
-
-    golden_logits = torch.load(golden_path)
-
-    for pair in pairs:
-        pair.append(golden_logits)
-
-
-    pairs.append([golden_logits, golden_logits])
-
-    import matplotlib.pyplot as plt
-
-    # Create a new figure
-    plt.figure()
-
-    # Plot each line from the tensor pairs
-    for x_vals, y_vals in pairs:
-        plt.plot(x_vals.reshape(-1), y_vals.reshape(-1))
-
-    # Show legend if needed
-    labels = [path.split('/')[-2] for path in logit_paths]
-    plt.legend(labels)
-
-    plt.savefig('line_plots.png')
-
-    # Show the plot
-    plt.show()
 
 def upload_folder_to_s3(local_folder, s3_url):
     import boto3
@@ -378,8 +182,8 @@ def logits_analysis(args, hf_model_name, model_cls):
     golden_dir = logits_dirs[-1]
     logits_candidates = logits_candidates[:-1]
     candidates_dir = logits_dirs[:-1]
-
-
+    
+    
     pairs = []
     for i, logits in enumerate(logits_candidates):
         print(f"========================== Start analysis on \n \t{candidates_dir[i]}\n vs\n \t{golden_dir} (golden) \n==================")
@@ -387,11 +191,11 @@ def logits_analysis(args, hf_model_name, model_cls):
         min_l = min(len(logits), len(logits_golden))
         pairs.append([logits[:min_l], logits_golden[:min_l]])
         for i in range(min_l):
-
+            
             # assume we always check with greedy
             token_candidate = torch.argmax(logits[i])
             token_golden = torch.argmax(logits_golden[i])
-
+          
             allclose_passed = torch.allclose(logits[i], logits_golden[i], atol=1.0, rtol=0.001)
             if not allclose_passed:
                 logging.warning(f"Failed to match on step {i}, {logits[i]} vs {logits_golden[i]}")
@@ -404,22 +208,22 @@ def logits_analysis(args, hf_model_name, model_cls):
 
     if args.plot:
         import matplotlib.pyplot as plt
-
-
+        
+        
         # Create a new figure
         plt.figure()
-
+        
         # Plot each line from the tensor pairs
         for x_vals, y_vals in pairs:
             plt.plot(torch.concatenate(x_vals).reshape(-1), torch.concatenate(y_vals).reshape(-1))
-
+        
         # Show legend if needed
         labels = [logits_dirs]
         plt.legend(labels)
-
+        
         plt.savefig('line_plots.png')
-
-
+    
+        
 
 def save(args, hf_model_name, model_type):
     model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
@@ -446,7 +250,6 @@ def run(args, hf_model_name, model_cls):
     print(encoded_text, "len:", encoded_text.input_ids.shape[-1])
 
 
-    forward_func = None
     if args.do_sample:
         compile_batch_size = args.batch_size*args.num_return_sequences*args.beam
     else:
@@ -455,7 +258,7 @@ def run(args, hf_model_name, model_cls):
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
-            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}" if args.suffix is None else args.suffix
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
             if args.snapshot or args.pack_artifacts:
@@ -463,9 +266,9 @@ def run(args, hf_model_name, model_cls):
                 os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
                 print(f"Set snapshot path {snapshot_path}, dump_path: {dump_path}")
 
-
+            
             print(f'running {model_cls.__name__}.from_pretrained')
-            if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
+            if model_cls == GPT2ForSamplingWithContextBroadcasting:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
@@ -486,7 +289,7 @@ def run(args, hf_model_name, model_cls):
             suffix = f"{hf_model_name}_{model_cls.__name__}_cpu"
             print(f'running {model_cls.__name__}.from_pretrained')
             model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
-
+            
 
         if args.simple_sample:
             assert args.device == "neuron", "cannot runing simple sample with non-neuron device"
@@ -497,10 +300,8 @@ def run(args, hf_model_name, model_cls):
                     self.scores = scores
             with torch.inference_mode():
                 max_length = args.max_length if args.max_length is not None else args.n_positions
-                forward_func = lambda : neuron_model.sample(encoded_text.input_ids, max_length,
-                    top_k=args.top_k)
-                sequences = forward_func()
-
+                sequences = neuron_model.sample(encoded_text.input_ids, max_length, 
+                    top_k=args.top_k, output_scores=args.output_scores or args.dump_logits)
                 scores = None
                 if args.output_scores or args.dump_logits:
                     sequences, scores = sequences
@@ -536,12 +337,11 @@ def run(args, hf_model_name, model_cls):
             print("running HuggingFace Generation API, generation_config:\n", generation_config)
 
             with torch.inference_mode():
-                forward_func = lambda : model.generate(
+                outputs = model.generate(
                     input_ids=encoded_text.input_ids,
                     attention_mask=encoded_text.attention_mask,
                     **generation_config,
                 )
-                outputs = forward_func()
 
         if args.dump_logits:
             dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
@@ -554,8 +354,8 @@ def run(args, hf_model_name, model_cls):
                 dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
 
         print('generated_sequence=', outputs.sequences)
-        outputs_sentences = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
-        print(outputs_sentences)
+        outputs = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
+        print(outputs)
 
     finally:
 
@@ -572,9 +372,6 @@ def run(args, hf_model_name, model_cls):
 
             if args.to_s3 is not None:
                 upload_folder_to_s3(compiler_artifacts_dir, args.to_s3)
-
-    if args.benchmark:
-        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=encoded_text.input_ids.shape[-1])
 
 if __name__ == "__main__":
     main()

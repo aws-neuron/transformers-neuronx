@@ -98,30 +98,23 @@ def rotate_vec(q, sin_r, cos_r, rotary_percentage=1):
         return q.dtype[q.sizes].Concatenate(q_rotary_rot, q_pass, dimensions=[3])
 
 
-def rotate_half(query, key, sin_cos, rotary_percentage=1, tp_degree=None, shard_over_batch=False):
+def rotate_half(query, key, sin_cos, rotary_percentage=1):
     """
     A secondary projection to apply to input query/key projections (used in
     specific models: GPT-J/GPT-NeoX/Llama).
 
     """
     dtype = key.dtype
-    if shard_over_batch:
-        n_active_tokens, n_seqs_per_nc, n_kv_heads, d_head = active_sizes = key.sizes
-        _, _, n_heads, _ = query.sizes
-        broadcast_sizes = n_active_tokens, n_seqs_per_nc, n_heads, int((d_head // 2) * rotary_percentage)
-        kv_broadcast_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads, int((d_head // 2) * rotary_percentage)
-    else:
-        n_active_tokens, n_seqs, n_kv_heads_tp, d_head = active_sizes = key.sizes
-        _, _, n_heads_tp, _ = query.sizes
+    n_active_tokens, n_seqs, n_heads_tp, d_head = active_sizes = key.sizes
+    active_r_sizes = n_active_tokens, n_seqs * n_heads_tp, d_head
 
-        """
-            Vector approach:
-            | q_up cos - q_down sin |
-            | q_up sin + q_down cos |
-        """
-        # Rotate query and key
-        broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, int((d_head // 2) * rotary_percentage)
-        kv_broadcast_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, int((d_head // 2) * rotary_percentage)
+    """
+        Vector approach:
+        | q_up cos - q_down sin |
+        | q_up sin + q_down cos |
+    """
+    # Rotate query and key
+    broadcast_sizes = n_active_tokens, n_seqs, n_heads_tp, int((d_head // 2) * rotary_percentage)
 
     # Get sin and cos as upper and lower half of input embedding
     sin, cos = sin_cos
@@ -131,11 +124,6 @@ def rotate_half(query, key, sin_cos, rotary_percentage=1, tp_degree=None, shard_
     # Rotate query
     query = rotate_vec(query, sin_r, cos_r, rotary_percentage)
 
-    # Get sin and cos as upper and lower half of input embedding
-    sin, cos = sin_cos
-    kv_sin_r = dtype[kv_broadcast_sizes].Broadcast(sin, dimensions=[0,3])
-    kv_cos_r = dtype[kv_broadcast_sizes].Broadcast(cos, dimensions=[0,3])
-
     # Rotate key
-    key = rotate_vec(key, kv_sin_r, kv_cos_r, rotary_percentage)
+    key = rotate_vec(key, sin_r, cos_r, rotary_percentage)
     return query, key

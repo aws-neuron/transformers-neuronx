@@ -77,9 +77,6 @@ class GPTJForSampling(module.PretrainedModel):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
-        batch_size, context_length = input_ids.shape
-        if cache_offset is None:
-            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -94,7 +91,7 @@ class GPTJForSampling(module.PretrainedModel):
             inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = self._cast_logits(logits)
+        logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
@@ -171,7 +168,7 @@ class GPTJBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target + 1)
+    return next(idx for idx, val in enumerate(values) if val >= target)
 
 
 class GPTJTransformer(module.LowMemoryModule):

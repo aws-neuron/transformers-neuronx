@@ -15,21 +15,13 @@
 from transformers_neuronx import hlo
 
 
-def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
+def ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
     """
     Language model head with layer normalization.
 
-    Context encoding network: 
-    n_active_tokens will be equal to context_length_estimate and n_parallel_output_tokens will be equal to 1.
-    In this case we slice the hidden input and compute the next token logits only for the last context token.
-
-    Normal token gen network: 
-    n_active_tokens will be 1 and n_parallel_output_tokens will be 1.
-    No slicing required. Will return the next token logits for the current active token.
-
-    Speculative sampling token gen network:
-    n_active_tokens and n_parallel_output_tokens will be equal to "k" (k value is passed by user)
-    No slicing required. Will return next token logits for "k" active tokens.
+    This slices the hidden input to compute output for a single output token
+    rather than `n_active_tokens`. During context encoding this means that
+    the next token logits will be computed *only* for the last context token.
 
     Models: GPT2, OPT, GPT-J, GPTNeoX, BLOOM.
 
@@ -37,12 +29,15 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     """
     hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
-
-    #Check and perform slicing if needed
-    if n_active_tokens > 1 and n_parallel_output_tokens==1:
-        hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
+    if n_active_tokens > 1:
+        slice_dimensions = [
+            dict(start=0, limit=hidden_size, stride=1),
+            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
+            dict(start=0, limit=batch_size, stride=1),
+        ]
         n_active_tokens = 1
-
+        sizes = hidden_size, n_active_tokens, batch_size
+        hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
     ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
     ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
     logits = hlo.dot00(lm_head_weight, ln_hidden)
@@ -54,21 +49,13 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     return result
 
 
-def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1, eps=1e-6):
+def rms_lm_head(hidden, rms_weight, lm_head_weight, lm_head_bias, eps=1e-6):
     """
     Language model head with rms normalization.
 
-    Context encoding network: 
-    n_active_tokens will be equal to context_length_estimate and n_parallel_output_tokens will be equal to 1.
-    In this case we slice the hidden input and compute the next token logits only for the last context token.
-
-    Normal token gen network: 
-    n_active_tokens will be 1 and n_parallel_output_tokens will be 1.
-    No slicing required. Will return the next token logits for the current active token.
-
-    Speculative sampling token gen network:
-    n_active_tokens and n_parallel_output_tokens will be equal to "k" (k value is passed by user)
-    No slicing required. Will return next token logits for "k" active tokens.
+    This slices the hidden input to compute output for a single output token
+    rather than `n_active_tokens`. During context encoding this means that
+    the next token logits will be computed *only* for the last context token.
 
     Models: LLaMa.
 
@@ -76,12 +63,15 @@ def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias,
     """
     hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
-
-    #Check and perform slicing if needed
-    if n_active_tokens > 1 and n_parallel_output_tokens==1:
-        hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
+    if n_active_tokens > 1:
+        slice_dimensions = [
+            dict(start=0, limit=hidden_size, stride=1),
+            dict(start=n_active_tokens - 1, limit=n_active_tokens, stride=1),
+            dict(start=0, limit=batch_size, stride=1),
+        ]
         n_active_tokens = 1
-
+        sizes = hidden_size, n_active_tokens, batch_size
+        hidden = dtype[sizes].Slice(hidden, slice_dimensions=slice_dimensions)
     rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, dim=0)
     rms_hidden = dtype[hidden_size, n_active_tokens*batch_size].Reshape(rms_hidden)
     logits = hlo.dot00(lm_head_weight, rms_hidden)

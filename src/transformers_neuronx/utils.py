@@ -14,11 +14,10 @@
 # ==============================================================================
 import math
 import itertools
+import random
 
 import torch
 import torch.nn.functional as F
-
-from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 
 def get_closest_pow2_bucket_size(size):
@@ -105,6 +104,55 @@ def u8_encode(tensor):
     tensor = tensor.round().to(torch.uint8)
     return tensor, tensor_min, tensor_max
 
+# Sparse attention related, put here for now
+def create_blk_mask(blks_q, blks_kv, num_global_blks=0, num_local_blks=1, num_random_blks=0, causal=False):
+    """
+    Create a block mask given the configs, and the number of blocks in each dimension.
+    Assume all heads use the same mask.
+    """
+    blk_mask = torch.zeros((blks_q, blks_kv), dtype=torch.int32)
+    # Add global blocks
+    if num_global_blks > 0:
+        blk_mask[:num_global_blks, :] = 1
+        blk_mask[:, :num_global_blks] = 1
+    # Add local blocks
+    if num_local_blks > 0:
+        width = num_local_blks // 2
+        for row in range(blks_q):
+            start = max(0, row - width)
+            end = min(row + width + 1, blks_kv)
+            blk_mask[row, start:end] = 1
+    # Add random blocks
+    if num_random_blks > 0:
+        assert blks_kv > num_random_blks, "Number of random blocks must be smaller than total number of col blocks!"
+        for row in range(blks_q):
+            # If causal, only draw blocks from the lower-triangular part of the matrix
+            pool = list(range(0, blks_kv)) if not causal else list(range(0, row+1))
+            selected = pool if len(pool) <= num_random_blks else random.sample(pool, num_random_blks)
+            for col in selected:
+                blk_mask[row, col] = 1
+
+    if causal:
+        blk_mask = torch.tril(blk_mask)
+
+    return blk_mask
+
+def build_dense_mask(q_seq_len, k_seq_len, mask, blk_size=128, causal=False):
+    row_blks = (q_seq_len + blk_size - 1) // blk_size
+    col_blks = (k_seq_len + blk_size - 1) // blk_size
+    assert tuple(mask.shape) == (row_blks, col_blks), f'Mask must have shape (q_seq_len // blk_size, k_seq_len // blk_size)'
+    dense_mask = torch.zeros((q_seq_len, k_seq_len), dtype=torch.int32)
+
+    for row_id in range(row_blks):
+        for col_id in range(col_blks):
+            if int(mask[row_id, col_id]) == 1:
+                last_row = min(q_seq_len, (row_id+1)*blk_size)
+                last_col = min(k_seq_len, (col_id+1)*blk_size)
+                dense_mask[row_id*blk_size:last_row, col_id*blk_size:last_col] = 1
+    if causal:
+        dense_mask = torch.tril(dense_mask)
+    return dense_mask
+
 
 def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
     """
@@ -128,59 +176,3 @@ def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
         start_ids = None
     input_ids = tok.input_ids
     return input_ids, start_ids
-
-
-def interleave_qkv(q, k, v, tp_degree, dim=1):
-    """
-    Create a merged QKV Tensor with weights arranged for sharding.
-    
-    Args:
-        q(torch.Tensor): Weights/Bias for Q
-        k(torch.Tensor): Weights/Bias for K
-        v(torch.Tensor): Weights/Bias for V
-        tp_degree(int): tp_degree used for sharding
-        dim(int): Dimension to concatenate tensors
-    Returns:
-        tensor: Concatenated QKV tensor with interleaved weights
-    """
-    def get_slice_params(tensor, dim, tp_degree):
-        size = tensor.shape[dim]
-        shard_size = size // tp_degree
-        slices = [slice(None) for _ in tensor.shape]
-        return size, shard_size, slices
-
-    def get_shard_tensors(tensors, size, shard_size, slices, dim):
-        for idx, start in enumerate(range(0, size, shard_size)):
-            slices[dim] = slice(start, start+shard_size, 1)
-            shard_tensors = [t[tuple(slices)].contiguous() for t in tensors]
-            yield idx, shard_tensors
-
-    if q.shape[dim] == k.shape[dim]:
-        size, shard_size, slices = get_slice_params(q, dim, tp_degree)
-        is_single_dim = len(q.shape) == 1
-        if is_single_dim:
-            tensor = torch.zeros((size * FUSED_QKV_TP_FACTOR), dtype=q.dtype)
-        else:
-            hidden_dim, interleave_dim = q.shape
-            tensor = torch.zeros((hidden_dim, interleave_dim * FUSED_QKV_TP_FACTOR), dtype=q.dtype)
-        for idx, shard_tensors in get_shard_tensors((q, k, v), size, shard_size, slices, dim):
-            shard = torch.cat(shard_tensors, dim=dim).contiguous()
-            if is_single_dim:
-                tensor[(idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
-            else:
-                tensor[:, (idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
-    else:
-        q_hidden_dim, q_interleave_dim = q.shape
-        _, kv_interleave_dim = k.shape
-        tensor = torch.zeros((q_hidden_dim, q_interleave_dim + kv_interleave_dim * 2), dtype=q.dtype)
-        q_size, q_shard_size, q_slices = get_slice_params(q, dim, tp_degree)
-        kv_size, kv_shard_size, kv_slices = get_slice_params(k, dim, tp_degree)
-        for idx, ((_, q_shard_tensors), (_, kv_shard_tensors)) in enumerate(zip(
-            get_shard_tensors((q,), q_size, q_shard_size, q_slices, dim),
-            get_shard_tensors((k,v), kv_size, kv_shard_size, kv_slices, dim)
-        )):
-            q_shard = q_shard_tensors[0]
-            kv_shard = torch.concat(kv_shard_tensors, dim=dim).contiguous()
-            shard = torch.cat((q_shard, kv_shard), dim=dim).contiguous()
-            tensor[:, (idx)*shard.shape[1]:(idx+1)*shard.shape[1]] = shard
-    return tensor

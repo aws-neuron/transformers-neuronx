@@ -31,7 +31,6 @@ def gen_random_pretrained(model_name, save, empty=False, print_shapes=False):
         json.dump(config, fp, indent=2)
     vocab_size = config['vocab_size']
     hidden_size = config['n_embd']
-    kv_hidden_size = config.get('n_kv_head', config['n_head']) * (hidden_size // config['n_head'])
     max_position_embeddings = config['n_ctx']
     ffn_dim = hidden_size * 4
     num_hidden_layers = config['n_layer']
@@ -48,8 +47,8 @@ def gen_random_pretrained(model_name, save, empty=False, print_shapes=False):
         'ln_1.bias': [hidden_size],      
         'attn.bias': [hidden_size],
         'attn.masked_bias': [hidden_size],
-        'attn.c_attn.weight': [hidden_size, 2 * kv_hidden_size + hidden_size],
-        'attn.c_attn.bias': [2 * hidden_size + hidden_size],
+        'attn.c_attn.weight': [hidden_size, 3 * hidden_size],
+        'attn.c_attn.bias': [3 * hidden_size],
         'attn.c_proj.weight': [hidden_size, hidden_size],
         'attn.c_proj.bias': [hidden_size],
         'ln_2.weight': [hidden_size],

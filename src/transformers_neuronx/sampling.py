@@ -23,7 +23,9 @@ from transformers_neuronx.config import GenerationConfig
 @torch.no_grad()
 def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False):
     # populate key/value caches according to the prompt text
-    next_token_scores = model(input_ids, None, start_ids)
+    _, start = input_ids.shape
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
                        eos_token_id, top_k, streamer, output_scores=output_scores)
 
@@ -47,7 +49,8 @@ def sample_tokens(
     batch_size, start = input_ids.shape
 
     # Populate the KV cache with prompt
-    next_tokens = model(input_ids, None, start_ids)
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_tokens = model(input_ids, cache_ids, start_ids)
 
     cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
@@ -97,7 +100,8 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
     This is useful as a reference implementation for on-device greedy sampling.
     """
     _, start = input_ids.shape
-    next_token_scores = model(input_ids, None, start_ids)
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
 
     tokens = [input_ids]
     for cur_len in range(start, sequence_length):
@@ -114,11 +118,11 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None, output_scores=False, n_parallel_output_tokens=1):
+                top_k=50, streamer=None, output_scores=False):
     tokens = [input_ids]
     _, start = input_ids.shape
     scores = []
-    for cur_len in range(start, sequence_length, n_parallel_output_tokens):
+    for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 
         # don't sample EOS
@@ -142,7 +146,7 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
             break
 
         # forward pass to get next token
-        cache_ids = torch.arange(cur_len, cur_len+n_parallel_output_tokens, dtype=torch.int32)
+        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
@@ -186,7 +190,7 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
         only on the filtered result from top_k filtering.
         """
         def filter_sorted(sorted_scores):
-            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
+            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1), dim=-1)
             mask = cumulative_probs <= top_p
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
@@ -246,7 +250,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
 
         # sample
-        probs = torch.nn.functional.softmax(top_values, dim=-1, dtype=torch.float32)
+        probs = torch.nn.functional.softmax(top_values, dim=-1)
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
@@ -284,7 +288,8 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
 
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
-    next_token_scores = model(input_ids, None, start_ids)
+    cache_ids = torch.arange(start, dtype=torch.int32)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )
