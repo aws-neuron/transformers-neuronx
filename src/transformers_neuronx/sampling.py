@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Optional
+
 import torch
+import transformers
+
+from transformers_neuronx.config import GenerationConfig
 
 
 @torch.no_grad()
@@ -26,28 +31,64 @@ def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, 
 
 
 @torch.no_grad()
-def sample_tokens(model, input_ids, start_ids=None, sequence_length=128):
+def sample_tokens(
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        start_ids: Optional[torch.Tensor] = None,
+        *,
+        sequence_length: int = 128,
+        config: Optional[GenerationConfig] = None,
+        streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+    ):
     """
     A sampling loop for a model that emits selected tokens.
 
     This sampling loop should be used when the token selection is built into
     the model itself.
     """
-    _, start = input_ids.shape
+    batch_size, start = input_ids.shape
 
+    # Populate the KV cache with prompt
     cache_ids = torch.arange(start, dtype=torch.int32)
     next_tokens = model(input_ids, cache_ids, start_ids)
 
     cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
 
+    # Use a default config if none is provided
+    if config is None:
+        config = GenerationConfig()
+
+    early_stop = False
+    if config.eos_token_id is not None:
+        done_flags = torch.full((batch_size, 1), False)
+        eos_token = torch.tensor(config.eos_token_id, dtype=torch.int32)
+        early_stop = True
+
+    # Generate loop
     for current, cache_id in zip(range(start + 1, sequence_length + 1), cache_ids):
 
+        if early_stop:
+            done_flags |= (next_tokens == eos_token)
+            if batch_size > 1:  # Avoid writing tokens to completed sequnces
+                next_tokens[done_flags] = eos_token
+
         tokens.append(next_tokens)
+
+        if streamer:
+            streamer.put(next_tokens)
+
+        if early_stop:
+            if done_flags.all():
+                break
+
         if current >= sequence_length:
             break
 
         next_tokens = model(next_tokens, cache_id, start_ids)
+
+    if streamer:
+        streamer.end()
 
     return torch.cat(tokens, dim=-1)
 
