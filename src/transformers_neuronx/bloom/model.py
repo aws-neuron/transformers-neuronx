@@ -20,13 +20,14 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import base
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
 
 
-class BloomForSampling(module.WrappingCheckpointCompatibleModel):
+class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
@@ -98,8 +99,9 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
             new_layer.add_attention_value(v, v_bias)
 
             new_layer.add_attention_output(
-                attn.dense.weight.detach().T,
-                attn.dense.bias.detach()
+                attn.dense.weight.detach(),
+                attn.dense.bias.detach(),
+                sharding=1,
             )
             new_layer.add_pre_mlp_layer_norm(
                 layer.post_attention_layernorm.weight.detach(),
@@ -168,7 +170,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i+1], cache_ids, start_ids)
+            hidden_slice = hidden[:, i:i+1].contiguous()
+            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
 
         return logits
 
@@ -182,6 +185,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
 
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
+        hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
@@ -189,7 +193,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel):
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
 
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 

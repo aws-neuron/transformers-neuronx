@@ -195,6 +195,18 @@ sample_output = model.generate(
 print([tokenizer.decode(tok) for tok in sample_output])
 ```
 
+Note: As HuggingFace generation API can expand the input's batch dimension based on different generation configurations, we need to compile the neuron model with different compile batch_size compared to the run time batch_size (batch dimension of inputs to generation API).
+- if do_sample=True, compile_batch_size = runtime_batch_size x num_return_sequences x beam_size
+- otherwise, compile_batch_size = runtime_batch_size x num_return_sequences
+
+## Neuron Persistent Cache
+
+The Neuron Persistent Cache is now enabled for Transformers Neuron by default. This feature is available with Neuron SDK version 2.13 and up. Model artifacts which have been compiled once will be cached and reused on successive runs when possible. Model artifacts will only be reused when compiling with the same compiler version (neuronx-cc), model configurations, and compiler flags. 
+
+To keep cache size small and to enable weights/parameters updates without recompilation, only the compute graphs are cached when using transformers-neuronx (weights/parameters are inputs to the compute graphs). This caching mechanism of compute graphs is the same as training flow using torch-neuronx's XLA, where weights/parameters must be separate from compute graphs so they can be updated during training (weights/parameters are inputs and outputs of the compute graphs). 
+
+Neuron Persistent Cache also includes other features (i.e. using S3 bucket as cache backend), more defailed information available in the [link](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/arch/neuron-features/neuron-caching.html#neuron-caching). 
+
 ## int8 weight storage support
 
 Transformers Neuron supports int8 weight storage for the `GPT2` model class.

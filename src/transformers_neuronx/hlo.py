@@ -14,6 +14,7 @@
 # ==============================================================================
 import functools
 import operator
+import warnings
 
 import torch
 
@@ -91,8 +92,34 @@ def layer_norm_bsh(hidden, weight, bias):
     output = dtype[input_sizes].Reshape(output)
     return output
 
+def group_norm(hidden, weight, bias, num_groups = 1):
+    scribe = hidden.scribe
+    dtype = hidden.dtype
+    f32 = scribe.f32
+    hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
+    if hidden_size % num_groups!= 0:
+        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
+    norm_size = n_active_tokens * batch_size * num_groups
+    sizes = hidden_size // num_groups, norm_size
+    hidden = dtype[sizes].Reshape(hidden)
+    hidden = f32[sizes].Convert(hidden)
+    one = f32.Constant(constant_value=1)
+    scale = f32[norm_size].Broadcast(one, dimensions=[])
+    zero = f32.Constant(constant_value=0)
+    offset = f32[norm_size].Broadcast(zero, dimensions=[])
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=1)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
+    output = f32[sizes].Multiply(bn_output, weight_br)
+    bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
+    output = f32[sizes].Add(output, bias_br)
+    output = dtype[sizes].Convert(output)
+    output = dtype[input_sizes].Reshape(output)
+    return output
 
-def rms_norm(hidden, weight, eps=1e-6):
+
+def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     batch_size, n_active_tokens, hidden_size = size = hidden.sizes
@@ -104,12 +131,13 @@ def rms_norm(hidden, weight, eps=1e-6):
 
     # PERF: Is it better to use BatchNormTraining operation here?
     square = f32[hidden.sizes].Multiply(hidden, hidden)
-    variance = reduce_mean(square, 2)
+    variance = reduce_mean(square, dim)
     eps = f32.Constant(constant_value=eps)
     eps_br = f32[variance.sizes].Broadcast(eps, dimensions=[])
     mean_eps = f32[variance.sizes].Add(variance, eps_br)
     rsqrt = f32[variance.sizes].Rsqrt(mean_eps)
-    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=[0, 1])
+    dims = [idx for idx in range(len(hidden.sizes)) if idx != dim]
+    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=dims)
     scaled = f32[size].Multiply(hidden, rsqrt_br)
 
     if weight is None:
@@ -117,11 +145,44 @@ def rms_norm(hidden, weight, eps=1e-6):
         return scaled
 
     weight = cast(weight, f32)
-    weight_br = f32[size].Broadcast(weight, dimensions=[2])
+    weight_br = f32[size].Broadcast(weight, dimensions=[dim])
     result = f32[size].Multiply(scaled, weight_br)
     result = cast(result, dtype)
 
     return result
+
+
+def dot_general(lhs, rhs, dimension_numbers):
+    # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
+
+    dtype = lhs.dtype
+    lhs_sizes = lhs.sizes
+    rhs_sizes = rhs.sizes
+    dot_dims = dict(lhs_contracting_dimensions=dimension_numbers.get("lhs_contracting_dimensions", [0]),
+                    lhs_batch_dimensions=dimension_numbers.get("lhs_batch_dimensions", []),
+                    rhs_contracting_dimensions=dimension_numbers.get("rhs_contracting_dimensions", [0]),
+                    rhs_batch_dimensions=dimension_numbers.get("rhs_batch_dimensions", []))
+    lhs_free_dimensions = list(filter(lambda x: x not in dot_dims["lhs_batch_dimensions"] and \
+                                      x not in dot_dims["lhs_contracting_dimensions"],
+                                      list(range(len(lhs_sizes)))))
+    rhs_free_dimensions = list(filter(lambda x: x not in dot_dims["rhs_batch_dimensions"] and \
+                                      x not in dot_dims["rhs_contracting_dimensions"],
+                                      list(range(len(rhs_sizes)))))
+
+    # Calculate batch/contracting/free sizes
+    lhs_batch_sizes = [lhs_sizes[idx] for idx in dot_dims["lhs_batch_dimensions"]]
+    rhs_batch_sizes = [rhs_sizes[idx] for idx in dot_dims["rhs_batch_dimensions"]]
+    assert lhs_batch_sizes == rhs_batch_sizes, f"unmatched batch_sizes ({lhs_batch_sizes}) vs ({rhs_batch_sizes})"
+    lhs_contracting_sizes = [lhs_sizes[idx] for idx in dot_dims["lhs_contracting_dimensions"]]
+    rhs_contracting_sizes = [rhs_sizes[idx] for idx in dot_dims["rhs_contracting_dimensions"]]
+    assert lhs_contracting_sizes == rhs_contracting_sizes, \
+        f"unmatched contracting_sizes ({lhs_contracting_sizes}) vs ({rhs_contracting_sizes})"
+    lhs_free_sizes = [lhs_sizes[idx] for idx in lhs_free_dimensions]
+    rhs_free_sizes = [rhs_sizes[idx] for idx in rhs_free_dimensions]
+
+    dot_sizes = lhs_batch_sizes + lhs_free_sizes + rhs_free_sizes
+    output_dot = dtype[dot_sizes].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    return output_dot
 
 
 def dot00(lhs, rhs):
@@ -140,63 +201,76 @@ def dot01(lhs, rhs):
     return dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
 
 
-def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
+def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
+    scribe = lhs.scribe
     if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
-    _, lhs_size = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
+        if lhs.dtype == getattr(scribe, neuron_config.quant.quant_dtype):
+            lhs = rhs.dtype[lhs.sizes].Convert(lhs)
+        if rhs.dtype == getattr(scribe, neuron_config.quant.quant_dtype):
+            rhs = lhs.dtype[rhs.sizes].Convert(rhs)
+    dtype = lhs.dtype
+    return lhs, rhs, dtype
+
+
+def mmadd(
+    lhs,
+    rhs,
+    bias=None,
+    lhs_contracting_dimension=0,
+    rhs_contracting_dimension=0,
+    bias_dimension=0,
+    scales=None,
+    neuron_config=None
+):
+    """
+    Matrix-matrix multiplication and optional addition
+    """
+    assert len(lhs.sizes) == 2, f"Expected rank 2 LHS. Found shape={lhs.sizes}"
+    assert len(rhs.sizes) == 2, f"Expected rank 2 RHS. Found shape={rhs.sizes}"
+    lhs_size = lhs.sizes[lhs_contracting_dimension]
+    rhs_size = rhs.sizes[rhs_contracting_dimension]
+    assert lhs_size == rhs_size, (
+        f"Contracting dimension mismatch:"
+        f" LHS (dim={lhs_contracting_dimension} shape={lhs.sizes})"
+        f" RHS (dim={rhs_contracting_dimension} shape={rhs.sizes})"
+    )
+
+    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None \
+                        and neuron_config.quant is not None
+
+    lhs_size = lhs.sizes[1 if lhs_contracting_dimension == 0 else 0]
+    rhs_size = rhs.sizes[1 if rhs_contracting_dimension == 0 else 0]
+    dot_dims = dict(
+        lhs_contracting_dimensions=[lhs_contracting_dimension],
+        rhs_contracting_dimensions=[rhs_contracting_dimension]
+    )
     dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
     if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 0)
+        dot = dequantize(dot, scales, neuron_config, bias_dimension)
     if bias is None:
         return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[0])
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
     return dtype[lhs_size, rhs_size].Add(dot, bias)
+
+
+def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
+    return mmadd(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
-    _, lhs_size = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 1)
-    if bias is None:
-        return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    return mmadd(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
+
 
 def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    dtype = bias.dtype if bias is not None else rhs.dtype
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        if rhs.dtype != dtype:
-            rhs = dtype[rhs.sizes].Convert(rhs)
-        if lhs.dtype != dtype:
-            lhs = dtype[lhs.sizes].Convert(lhs)
-    lhs_size, _ = lhs.sizes
-    _, rhs_size = rhs.sizes
-    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        dot = dequantize(dot, scales, neuron_config, 1)
-    if bias is None:
-        return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[1])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    return mmadd(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
+
+
+def dot11_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    return mmadd(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
+
 
 def gen_add_func(dtype):
 
@@ -299,16 +373,20 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     return hidden
 
 
-def gated_mlp(
+def gated_mlp_bsh(
     hidden,
     in0_weight,
     in1_weight,
     out_weight,
+    in0_scales=None,
+    in1_scales=None,
+    out_scales=None,
     in0_bias=None,
     in1_bias=None,
     out_bias=None,
     activation_function='silu',
-    tp_degree=1
+    tp_degree=1,
+    neuron_config=None,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -334,12 +412,75 @@ def gated_mlp(
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    hidden_active = dot10_add1(hidden, in0_weight, in0_bias)
+    hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+                               scales=in0_scales, neuron_config=neuron_config)
     hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias)
+    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+                               scales=in1_scales, neuron_config=neuron_config)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
 
-    result = dot10_add1(hidden_states, out_weight, out_bias)
+    result = dot10_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
+    result = dtype[hidden_sizes].Reshape(result)
+
+    if tp_degree != 1:
+        result = all_reduce_sum(result, tp_degree)
+
+    return result
+
+
+def gated_mlp(
+    hidden,
+    in0_weight,
+    in1_weight,
+    out_weight,
+    in0_scales=None,
+    in1_scales=None,
+    out_scales=None,
+    in0_bias=None,
+    in1_bias=None,
+    out_bias=None,
+    activation_function='silu',
+    tp_degree=1,
+    neuron_config=None,
+):
+    """
+    An attention MLP using 2 input projections as found in LLama.
+
+    Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/llama/modeling_llama.py#L144
+
+    Sizes:
+
+        i = n / tp
+
+        hidden:     [h, s, b]
+        in0_weight: [h, i]
+        in1_weight: [h, i]
+        out_weight: [h, i]
+        in0_bias:   [i]
+        in1_bias:   [i]
+        out_bias:   [h]
+        result:     [h, s, b]
+    """
+
+    dtype = hidden.dtype
+    hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
+    hidden_r_sizes = hidden_size, n_active_tokens * batch_size
+    hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
+
+    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+    hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
+    hidden_active = getattr(activations, activation_function)(hidden_active)
+
+    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+    hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
+    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+
+    # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+    result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+
+    # (b * s, h) = > (h, s, b)
+    result = transpose(result, 0, 1)
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
@@ -662,7 +803,7 @@ def gather(tensor, dim, index):
     return result
 
 
-def _argmax(tensor, dim, keepdim=False):
+def _argmax(tensor, dim, keepdim=False, return_values=False):
     """
     Performs argmax on a single partition
     """
@@ -682,13 +823,15 @@ def _argmax(tensor, dim, keepdim=False):
         keepdim_shape[dim] = 1
         index = u32[keepdim_shape].Reshape(index)
 
+    if return_values:
+        return reduce_max(tensor, dim, keepdim), index
     return index
 
 
-def argmax(tensor, dim, keepdim=False, tp_degree=1):
+def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
 
     if tp_degree == 1:
-        return _argmax(tensor, dim, keepdim)
+        return _argmax(tensor, dim, keepdim, return_values=return_values)
 
     scribe = tensor.scribe
 
@@ -725,10 +868,14 @@ def argmax(tensor, dim, keepdim=False, tp_degree=1):
     replica_index = dtype[rs_size].Reshape(replica_index)
 
     mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
-    mask = index.dtype[mask.sizes].Convert(mask)
-    masked = dtype[sizes].Multiply(mask, index)
-    return reduce_sum(masked, dim=dim, keepdim=keepdim)
+    mask_index = index.dtype[mask.sizes].Convert(mask)
+    masked = dtype[sizes].Multiply(index, mask_index)
+    index = reduce_sum(masked, dim=dim, keepdim=keepdim)
 
+    if return_values:
+        value = reduce_max(value, dim=dim, keepdim=keepdim)
+        return value, index
+    return index
 
 def _embedding(weight, index):
     """
@@ -759,7 +906,7 @@ def _embedding(weight, index):
     )
 
     # Reshape embedding tensor to look like the original index shape
-    return dtype[(embedding_dim, *index.sizes)].Reshape(result)
+    return dtype[(*index.sizes, embedding_dim)].Reshape(result)
 
 
 def embedding(weight, index, tp_degree=1, dim=1):
@@ -838,7 +985,8 @@ def embedding(weight, index, tp_degree=1, dim=1):
 
     # Case 3: Partitioned embedding: Concatenate embedding pieces
     if dim == 1:
-        return all_gather(result, 0, tp_degree=tp_degree)
+        # Using BSH, concatenate along the last dim
+        return all_gather(result, 2, tp_degree=tp_degree)
 
     raise NotImplementedError(
         f'Embedding operation does not support dim={dim}'
@@ -934,6 +1082,42 @@ def reduce_mean(tensor, dims, keepdim=False):
 
 def cumsum(tensor, dim):
 
+    scribe = tensor.scribe
+    s32 = scribe.s32
+    pred = scribe.pred
+
+    last = len(tensor.sizes) - 1
+    dtype = tensor.dtype
+
+    if dim < 0:
+        dim %= len(tensor.sizes)
+
+    if dim != last:
+        tensor = transpose(tensor, dim, last)
+
+    size = tensor.sizes[last]
+    sizes = (size, size)
+
+    # Build triu mask
+    a = s32[sizes].Iota(dimensions=[0])
+    b = s32[sizes].Iota(dimensions=[1])
+    triu = pred[sizes].Compare(a, b, comparison_direction='LE')
+    triu = dtype[sizes].Convert(triu)
+
+    # Cumulative sum along final dimension
+    result = dtype[tensor.sizes].Dot(tensor, triu, dot_dimension_numbers=dict(
+        lhs_contracting_dimensions=[last],
+        rhs_contracting_dimensions=[0]
+    ))
+    if dim != last:
+        result = transpose(result, dim, last)
+
+    return result
+
+
+def _cumsum_reduce_window(tensor, dim):
+    # PERF: Scales poorly with large tensors
+
     dtype = tensor.dtype
 
     init = dtype.Constant(constant_value=0)
@@ -988,6 +1172,46 @@ def slice_along(tensor, dim, limit, start=0):
     return tensor.dtype[sizes].Slice(
         tensor,
         slice_dimensions=dimensions
+    )
+
+
+def dynamic_slice_along(tensor, dim, start, size):
+
+    scribe = tensor.scribe
+    s32 = scribe.s32
+    u32 = scribe.u32
+    s64 = scribe.s64
+    u64 = scribe.u64
+    dtype = tensor.dtype
+
+    assert isinstance(size, int), (
+        f"Parameter 'size' must be an integer. Found type={type(size)}"
+    )
+    assert not isinstance(start, int), (
+        f"Parameter 'start' must be a tensor. Found type={type(size)}"
+    )
+    assert len(start.sizes) == 0, (
+        f"Parameter 'start' must be a scalar. Found shape={start.sizes}"
+    )
+    assert start.dtype in (s32, u32, s64, u64), (
+        f"Parameter 'start' must be an integer type."
+    )
+
+    sizes = list(tensor.sizes)
+    assert size <= sizes[dim], (
+        f"Parameter 'size' ({size}) must less/equal to {sizes[dim]}. (dim={dim}, shape={sizes})"
+    )
+    sizes[dim] = size
+
+    start = cast(start, s32)
+    zero = s32.Constant(constant_value=0)
+    starts = [zero] * len(sizes)
+    starts[dim] = start
+
+    return dtype[sizes].DynamicSlice(
+        tensor,
+        *starts,
+        dynamic_slice_sizes=sizes,
     )
 
 
@@ -1111,6 +1335,10 @@ def topk(tensor, dim, k=50, tp_degree=1):
     - The input `tensor` size along dimension `dim` must be a multiple of 8
     - The input `tensor` may not be 1d. The compiler will fail.
     """
+
+    if k == 1:
+        return argmax(tensor, dim, return_values=True, keepdim=True, tp_degree=tp_degree)
+
     scribe = tensor.scribe
     f32 = scribe.f32
 
@@ -1160,8 +1388,9 @@ def topk(tensor, dim, k=50, tp_degree=1):
     k_size_br = f32[sizes].Broadcast(k_size, dimensions=[])
     iota = f32[sizes].Iota(dimensions=[dim])
     group_id = f32[sizes].Divide(iota, k_size_br)
-    group_id = dtype[sizes].Convert(group_id)
-    offset = dtype[sizes].Multiply(group_id, rank_size_br)
+    group_id = f32[sizes].Floor(group_id)
+    offset = f32[sizes].Multiply(group_id, rank_size_br)
+    offset = dtype[sizes].Convert(offset)
     index = dtype[sizes].Add(index, offset)
 
     # Find the final global index
@@ -1279,3 +1508,63 @@ def select(tensor, dim, index, keepdim=False):
     if keepdim:
         result = unsqueeze(result, dim)
     return result
+
+
+def index_select(tensor, dim, index):
+    dtype = tensor.dtype
+    n_index, = index.sizes
+
+    sizes = list(tensor.sizes)
+    sizes[dim] = n_index
+    offset_dims = list(range(len(tensor.sizes)))
+    offset_dims.pop(dim)
+    gather_slice_sizes = list(tensor.sizes)
+    gather_slice_sizes[dim] = 1
+
+    result = dtype[sizes].Gather(
+        tensor,
+        index,
+        gather_dimension_numbers=dict(
+            offset_dims=offset_dims,
+            collapsed_slice_dims=[dim],
+            start_index_map=[dim],
+            index_vector_dim=1,
+        ),
+        gather_slice_sizes=gather_slice_sizes,
+    )
+    return result
+
+
+def add(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Add(lhs, rhs)
+
+
+def divide(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Divide(lhs, rhs)
+
+
+def reshape(tensor, shape):
+    if shape == tensor.sizes:
+        return tensor
+    dst_numel = functools.reduce(operator.mul, shape)
+    src_numel = functools.reduce(operator.mul, tensor.sizes)
+    assert dst_numel == src_numel
+    return tensor.dtype[shape].Reshape(tensor)
+
+
+def transpose210(tensor):
+    dtype = tensor.dtype
+    size0, size1, size2 = tensor.sizes
+    return dtype[size2,size1,size0].Transpose(tensor, dimensions=[2, 1, 0])

@@ -38,6 +38,8 @@ class LlamaConfig:
         self.eos_token_id = config.eos_token_id
         self.max_position_embeddings = config.max_position_embeddings
         self.rms_norm_eps = config.rms_norm_eps
+        self.rotary_percentage = getattr(config, "rotary_percentage", 1)
+        self.rope_theta = getattr(config, "rope_theta", 10000)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
 
         utils.maybe_override_attributes(self, kwargs)

@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer, rotary
+from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 
@@ -30,13 +30,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, head_dim, cache_ids,
+        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+                                                base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
 
         # NOTE: When using token generation network, we generate a mask for the
@@ -66,30 +67,35 @@ class LlamaForSamplingNoEmbeddingHlo:
             pre_mlp_ln_weight, pre_mlp_ln_bias,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
+            sparse_mask, active_sparse_mask,
             post_mlp_ln_weight, post_mlp_ln_bias,
-            in0_weight, in1_weight, out_weight,
+            in0_weight, in0_scales,
+            in1_weight, in1_scales,
+            out_weight, out_scales,
         ):
-        dtype = hidden.dtype
         eps = self.config.rms_norm_eps
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps)
+        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias,
-            neuron_config=self.neuron_config
+            attn_out_weight, attn_out_scales, attn_out_bias
         )
-        hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps)
+        hidden = hlo.add(attn_output, hidden)
+        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=0)
         mlp_hidden = hlo.gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
+            in0_scales=in0_scales,
+            in1_scales=in1_scales,
+            out_scales=out_scales,
             activation_function='silu',
             tp_degree=self.config.tp_degree,
+            neuron_config=self.neuron_config
         )
-        res_hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
+        res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
@@ -103,7 +109,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         k_weight, k_scales, k_bias,
         v_weight, v_scales, v_bias,
         out_weight, out_scales, out_bias,
-        neuron_config=None
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -117,12 +122,12 @@ class LlamaForSamplingNoEmbeddingHlo:
             k_weight, k_scales, k_bias,
             v_weight, v_scales, v_bias,
             d_head,
-            neuron_config=neuron_config,
+            neuron_config=self.neuron_config,
         )
 
         # Q = Rotate(Q)
         # K = Rotate(K)
-        query, key = rotary.rotate_half(query, key, pos_embed)
+        query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
@@ -141,6 +146,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value)
 
+            # KCache[I] = K
+            # VCache[I] = V
+            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+            updated_values = attention.update_cache(cached_values, cache_ids, value)
+
         # Multi-Token Context Encoding
         else:
 
@@ -149,13 +159,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             score = attention.mask(score, mask)
             context = attention.context_combined(score, value)
 
+            # KCache = K
+            # VCache = V
+            updated_keys = key
+            updated_values = value
 
         # O = (C @ wO) + bO
-        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, neuron_config)
-
-        # KCache[I] = K
-        # VCache[I] = V
-        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-        updated_values = attention.update_cache(cached_values, cache_ids, value)
-
+        output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
