@@ -47,6 +47,11 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
                 [("logits", out_logits), ("past_key_values", tuple())],
             )
         return (out_logits,)
+    
+    # keep the generation stateless
+    def generate(self, *args, **kwargs):
+        self.reset_generation()
+        return super().generate(*args, **kwargs)
 
     # implemented for beam search
     # we ignore past as we don't expose k/v_cache
