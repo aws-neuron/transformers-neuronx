@@ -480,6 +480,8 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             # The big tensor destruction is slow in CPU. Use asynchronous clear 
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
+        if start_ids.shape[0] != batch_size:
+            start_ids = start_ids.repeat(batch_size)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids)
