@@ -19,7 +19,6 @@ from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
-from transformers_neuronx import hlo
 from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
@@ -88,7 +87,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
                                             c_attn_bias[n_embd:n_embd*2])
                 new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                               c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
+            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
@@ -221,7 +220,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
                                             c_attn_bias[n_embd:n_embd*2])
                 new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                               c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
+            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
@@ -237,7 +236,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         self.decoder_lm_head.to_neuron()
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.
-        self.reset()   
+        self.reset()
 
     def reset(self):
         # self.decoder_lm_head.reset()
@@ -257,7 +256,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
             attention_mask=None, return_dict=False):
-        
+
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
@@ -387,7 +386,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
                                         c_attn_bias[n_embd:n_embd*2])
             new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                           c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach())
+            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
@@ -489,14 +488,14 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
     def forward(self, input_ids, cache_ids=None, start_ids=None, is_context_encode=False):
         batch_size, context_length = input_ids.shape
         estimate = bucket.find(self.context_buckets, context_length)
-        
+
         model=self.decoder_lm_head
         if is_context_encode:
             model=self.decoder_lm_head_for_context[estimate]
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
         if is_context_encode:
-            # The big tensor destruction is slow in CPU. Use asynchronous clear 
+            # The big tensor destruction is slow in CPU. Use asynchronous clear
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
         if start_ids.shape[0] != batch_size:
