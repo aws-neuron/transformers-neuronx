@@ -28,6 +28,7 @@ class GPT2HuggingFaceConfig(transformers.GPT2Config):
         self.n_head = config.n_head
         self.n_layer = config.n_layer
         self.n_positions = config.n_positions
+        self.max_position_embeddings = config.max_position_embeddings
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
         utils.maybe_override_attributes(self, kwargs)
@@ -45,6 +46,7 @@ class GPT2Config:
         self.n_head = config.n_head
         self.n_layer = config.n_layer
         self.n_positions = config.n_positions
+        self.max_position_embeddings = config.max_position_embeddings
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
         utils.maybe_override_attributes(self, kwargs)

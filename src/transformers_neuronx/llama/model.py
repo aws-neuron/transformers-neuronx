@@ -118,7 +118,7 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
-                model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate])
+                model = self.decoder_lm_head.build_weight_shared(share_caches=True, new=self.decoder_lm_head_for_context[context_length_estimate])
                 # PERF: No latency improvement seen in multi-layer models from executor
                 if self.context_unroll == self.config.num_hidden_layers:
                     model.enable_executor()
