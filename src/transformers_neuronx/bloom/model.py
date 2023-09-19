@@ -20,6 +20,7 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
@@ -44,10 +45,13 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         if unroll is None:
             unroll = config.n_layer
-        self.n_positions_list = utils.power_of_two_bucket_sizes(32, n_positions)
+
+        self.token_buckets = bucket.token_sizes(n_positions)
+        self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
+            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
             config.n_layer, unroll, neuron_config=neuron_config, allow_pad=True
         )
         self.register_for_serialization(self.decoder_lm_head)
@@ -57,20 +61,22 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
 
-        if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree, 
-                                                    [context_length_estimate], 
-                                                    context_length_estimate, 
-                                                    batch_size, 
-                                                    config.attention_head_size, 
-                                                    amp, 
-                                                    config.n_layer, 
-                                                    context_unroll, 
-                                                    neuron_config=neuron_config, 
-                                                    allow_pad=self.decoder_lm_head.allow_pad
-                                                )
-            self.register_for_serialization(self.decoder_lm_head_for_context)
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                    tp_degree, 
+                    [context_length_estimate], 
+                    context_length_estimate, 
+                    batch_size, 
+                    config.attention_head_size, 
+                    amp, 
+                    config.n_layer, 
+                    context_unroll,
+                    neuron_config=neuron_config,
+                    allow_pad=self.decoder_lm_head.allow_pad
+                )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
 
     def to_neuron(self):
 
@@ -145,9 +151,10 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
         self.decoder_lm_head.to_neuron()
 
-        if self.context_length_estimate is not None:
-            # doesn't override registration for serialization because build_weight_shared returns the context head
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context)
+        if self.context_buckets:
+            for context_length_estimate in self.context_buckets:
+                model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate])
+                self.decoder_lm_head_for_context[context_length_estimate] = model
 
     def reset(self):
         self.decoder_lm_head.reset()
@@ -155,7 +162,7 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
     def context(self, hidden, cache_ids, start_ids):
         context_length = hidden.shape[1]
         current = 0
-        estimate = self.context_length_estimate
+        estimate = bucket.find(self.context_buckets, context_length)
         if estimate is not None:
             hidden_context = hidden
             cache_context = cache_ids
@@ -177,7 +184,8 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                 current = estimate
 
             if current == estimate:
-                logits = self.decoder_lm_head_for_context(hidden_context, cache_context, start_ids)
+                model = self.decoder_lm_head_for_context[estimate]
+                logits = model(hidden_context, cache_context, start_ids)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
