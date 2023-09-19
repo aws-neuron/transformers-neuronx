@@ -144,6 +144,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
                             unroll=None, share_caches=False, new=None):
         if new == None:
+            new = DecoderLmHeadForSamplingNoEmbedding(
+                self.tp_degree, self.n_positions_list, self.n_active_tokens, self.batch_size, self.attention_head_size,
+                self.amp, self.num_layers, self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
+                prefixed_length=self.prefixed_length
+            )
+        else:
             if n_positions_list is None:
                 n_positions_list = self.n_positions_list
             if n_active_tokens is None:
@@ -152,11 +158,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 batch_size = self.batch_size
             if unroll is None:
                 unroll = self.unroll
-            new = DecoderLmHeadForSamplingNoEmbedding(
-                self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-                self.amp, self.num_layers, unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
-                prefixed_length=self.prefixed_length
-            )
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)

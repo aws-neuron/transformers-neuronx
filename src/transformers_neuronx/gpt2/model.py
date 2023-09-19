@@ -43,7 +43,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
-            max_allowed_sequence_length = config.n_positions
+            max_allowed_sequence_length = config.max_position_embeddings
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
         if unroll is None:
@@ -168,7 +168,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
-            max_allowed_sequence_length = config.n_positions
+            max_allowed_sequence_length = config.max_position_embeddings
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
 
@@ -618,7 +618,7 @@ class GPT2Transformer(module.LowMemoryModule):
     def __init__(self, config):
         super().__init__()
         self.wte = module.LowMemoryEmbedding(config.vocab_size, config.n_embd)
-        self.wpe = module.LowMemoryEmbedding(config.n_positions, config.n_embd)
+        self.wpe = module.LowMemoryEmbedding(config.max_position_embeddings, config.n_embd)
         self.h = module.LowMemoryModuleList()
         for _ in range(config.n_layer):
             self.h.append(GPT2Block(config))
