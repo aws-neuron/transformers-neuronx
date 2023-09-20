@@ -1447,6 +1447,15 @@ def full(value, dtype, sizes):
     return result
 
 
+# https://www.tensorflow.org/xla/operation_semantics#broadcastindim
+def broadcast(tensor, out_dim_size, broadcast_dimensions):
+    dtype = tensor.dtype
+    assert len(broadcast_dimensions) == len(tensor.sizes), \
+        f"input operand rank ({len(tensor.sizes)}) doesn't match num of elements in broadcast_dimensions ({broadcast_dimensions})"
+    output = dtype[out_dim_size].Broadcast(tensor, dimensions=broadcast_dimensions)
+    return output
+
+
 def literal(dtype, tensor):
 
     accessors = {
@@ -1581,3 +1590,17 @@ def transpose210(tensor):
     dtype = tensor.dtype
     size0, size1, size2 = tensor.sizes
     return dtype[size2,size1,size0].Transpose(tensor, dimensions=[2, 1, 0])
+
+
+# credit: https://github.com/facebookresearch/llama/blob/8992dea3b2c98e82e335efef004534413f4f2d2e/llama/model.py#L164-L173
+def repeat_kv(tensor, n_repeats, repeat_dim):
+    if n_repeats == 1:
+        return tensor
+    if repeat_dim == 2:
+        n_positions, n_seqs, n_kv_heads, d_head = tensor.sizes
+        tensor_br_sizes = n_positions, n_seqs, n_kv_heads, n_repeats, d_head
+        tensor_br = broadcast(tensor, out_dim_size=tensor_br_sizes, broadcast_dimensions=[0, 1, 2, 4])
+        output = reshape(tensor_br, [n_positions, n_seqs, n_kv_heads * n_repeats, d_head])
+    else:
+        raise RuntimeError(f"invalid repeat_dim ({repeat_dim})")
+    return output
