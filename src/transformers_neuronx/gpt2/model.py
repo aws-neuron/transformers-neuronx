@@ -51,10 +51,11 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config
+            config.n_layer, unroll, neuron_config=neuron_config, n_kv_head=config.n_kv_head,
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config,
+                                                   shard_over_batch=config.shard_over_batch)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -177,7 +178,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config
+            config.n_layer, unroll=unroll, neuron_config=neuron_config, n_head=config.n_head, n_kv_head=config.n_kv_head
         )
         self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
@@ -204,17 +205,23 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
             mlp = layer.mlp
             c_attn_weight = attn.c_attn.weight.detach()
             c_attn_bias = attn.c_attn.bias.detach()
+            _, n_embd_qkv = c_attn_weight.shape
+            is_multi_query_attn = n_embd_qkv < n_embd * 3
             new_layer = self.decoder_lm_head.new_layer()
             new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
                                                    layer.ln_1.bias.detach())
             new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
             _, n_embd_qkv = c_attn_weight.shape
-            if n_embd_qkv < n_embd * 3:
-                n_group = (n_embd_qkv - n_embd) // 2
-                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_group],
-                                            c_attn_bias[n_embd:n_embd+n_group])
-                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_group:],
-                                              c_attn_bias[n_embd+n_group:])
+            if is_multi_query_attn:
+                n_kv_heads_x_size_per_head = (n_embd_qkv - n_embd) // 2
+                assert n_kv_heads_x_size_per_head == (self.config.n_kv_head * (self.config.n_embd // self.config.n_head)), \
+                    f"mismatch between weights tensor size and model config: " \
+                    f"n_kv_heads*size_per_head(weights)={n_kv_heads_x_size_per_head}, " \
+                    f"n_kv_heads*size_per_head(config)={self.config.n_kv_head * (self.config.n_embd // self.config.n_head)}"
+                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_kv_heads_x_size_per_head],
+                                            c_attn_bias[n_embd:n_embd+n_kv_heads_x_size_per_head])
+                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_kv_heads_x_size_per_head:],
+                                              c_attn_bias[n_embd+n_kv_heads_x_size_per_head:])
             else:
                 new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
                                             c_attn_bias[n_embd:n_embd*2])

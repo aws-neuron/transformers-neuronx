@@ -29,8 +29,8 @@ from concurrent.futures import ProcessPoolExecutor
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, unroll=None, neuron_config=None, allow_pad=True,
-                 prefixed_length=0):
+                 attention_head_size, amp, num_layers, n_head, n_kv_head=0, unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
+                 shard_over_batch=False):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -38,7 +38,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.n_positions_list = n_positions_list
         self.n_active_tokens = n_active_tokens
         self.batch_size = batch_size
-        self.attention_head_size = attention_head_size
+        self.attention_head_size = attention_head_size  # TODO: rename to size_per_head
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
+        self.shard_over_batch = shard_over_batch
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
@@ -84,9 +87,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def new_layer(self):
         *_, n_positions = self.n_positions_list
-        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size,
-                             self.attention_head_size, self.amp, self.neuron_config,
-                             self.allow_pad, self.n_active_tokens)
+        layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
+                             amp=self.amp, neuron_config=self.neuron_config, allow_pad=self.allow_pad, n_active_tokens=self.n_active_tokens,
+                             n_head=self.n_head, n_kv_head=self.n_kv_head, shard_over_batch=self.shard_over_batch)
         self.layers.append(layer)
         return layer
 
@@ -279,6 +282,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
+            hidden = maybe_transfer_with_static_ring(hidden)
             hidden, tensors = self._hlo_pre_layer(hidden, tensors, param_builder)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
@@ -414,8 +418,8 @@ class MaybePadder:
 
 class DecoderLayer(torch.nn.Module):
 
-    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, amp,
-                 neuron_config=None, allow_pad=False, n_active_tokens=None):
+    def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, n_head, amp,
+                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, shard_over_batch=False):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -459,8 +463,11 @@ class DecoderLayer(torch.nn.Module):
         self.attn_v_cache = None
         self.tp_degree = tp_degree
         self.n_positions = n_positions
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head
         self.batch_size = batch_size
-        self.attention_head_size = attention_head_size
+        self.attention_head_size = attention_head_size  # TODO: rename this to size_per_head
+        self.tp_degree = tp_degree
         self.amp = amp
         dtype, _, _ = utils.parse_amp(amp)
         self.cache_dtype = dtypes.to_torch_dtype(dtype)
@@ -474,6 +481,7 @@ class DecoderLayer(torch.nn.Module):
         if self.neuron_config and self.neuron_config.sparse_attn:
             self.sparse_mask = self.neuron_config.sparse_attn.create_sparse_mask(self.n_active_tokens, self.n_positions)
             self.active_sparse_mask = self.neuron_config.sparse_attn.create_active_sparse_mask(self.n_active_tokens)
+        self.shard_over_batch = shard_over_batch
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1):
@@ -531,7 +539,6 @@ class DecoderLayer(torch.nn.Module):
 
         # If we allow padding then we need to pad non-sharded QKV weight dimensions
         if self.allow_pad:
-
             # Hidden size padding
             hidden_size, _ = self.attn_q_weight.shape
             n_heads = hidden_size // self.attention_head_size
@@ -542,11 +549,12 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_weight = maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = maybe_pad(self.attn_q_bias, dim=0)
 
-            self.attn_k_weight = maybe_pad(self.attn_k_weight, dim=1)
-            self.attn_k_bias = maybe_pad(self.attn_k_bias, dim=0)
+            if self.n_head == self.n_kv_head:
+                self.attn_k_weight = maybe_pad(self.attn_k_weight, dim=1)
+                self.attn_k_bias = maybe_pad(self.attn_k_bias, dim=0)
 
-            self.attn_v_weight = maybe_pad(self.attn_v_weight, dim=1)
-            self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
+                self.attn_v_weight = maybe_pad(self.attn_v_weight, dim=1)
+                self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
 
             self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
 
@@ -641,26 +649,27 @@ class DecoderLayer(torch.nn.Module):
         self.init_caches()
 
     def init_caches(self):
-
-        hidden_size, _ = self.attn_q_weight.shape
+        n_heads_kv_cache = self.n_kv_head
 
         # When padding, compute the hidden size based on the padding. We must
         # allow the KV cache to be padded so it can be evenly divisible across
         # NeuronCores.
-        if self.allow_pad:
-            hidden_size, _ = self.attn_q_weight.shape
-            n_heads = hidden_size // self.attention_head_size
-            n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
-            hidden_size = n_heads_padded * self.attention_head_size
+        if self.allow_pad and not self.shard_over_batch:
+            n_heads_kv_cache = utils.round_up_to_divisor(self.n_kv_head, self.tp_degree)
 
-        n_heads = hidden_size // self.attention_head_size
-        n_heads_kv_cache = n_heads * self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1]
         cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache, self.attention_head_size]
         cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
-        self.cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
-        self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=2)
-        self.attn_v_cache = manipulator.shard_along(cpu_cache, dim=2)
+        if self.shard_over_batch:
+            self.cache_shape = [self.n_positions, self.batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
+            self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=1)
+            self.attn_v_cache = manipulator.shard_along(cpu_cache, dim=1)
+        else:
+            assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
+                f"cannot shard along kv_heads dimension: n_kv_head={n_head_kv_cache}, tp_degree={self.tp_degree}"
+            self.cache_shape = [self.n_positions, self.batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+            self.attn_k_cache = manipulator.shard_along(cpu_cache, dim=2)
+            self.attn_v_cache = manipulator.shard_along(cpu_cache, dim=2)
 
     def all_parameters(self):
         return [

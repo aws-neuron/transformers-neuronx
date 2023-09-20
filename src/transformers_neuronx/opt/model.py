@@ -228,13 +228,14 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None):
+    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None, shard_over_batch=False):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = neuron_config
+        self.shard_over_batch = shard_over_batch
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
@@ -303,17 +304,15 @@ class OPTForSamplingNoEmbeddingHlo:
         scribe = hidden.scribe
         f32 = scribe.f32
 
-        # _, _, n_groups, d_head = cached_keys.sizes
-        _, _, _, d_head = cached_keys.sizes
-        # TODO: update the n_groups logic to work correctly for MQA/MGA.
-        #       At the moment, n_groups is != 0 even when standard MHA is used.
-        #       This is because n_groups was defined as
-        #       n_groups = n_heads * self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1]
-        #       which is > 1 since self.attn_k_weight.shape[-1] // self.attn_q_weight.shape[-1] = 1 for MHA.
-        n_groups = 0
-        # n_heads_tp = n_groups * q_weight.sizes[-1] // k_weight.sizes[-1]
-        # n_heads_per_group = n_heads_tp // n_groups
+        hidden_size, n_active_tokens, n_seqs = hidden.sizes
 
+        max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
+        _, hidden_size_tp = q_weight.sizes
+        _, kv_hidden_size_tp = k_weight.sizes
+        n_head = hidden_size // d_head
+        tp_degree = hidden_size // hidden_size_tp
+        n_kv_heads = n_kv_heads_tp * tp_degree
+        
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV
@@ -324,7 +323,8 @@ class OPTForSamplingNoEmbeddingHlo:
             v_weight, v_scales, v_bias,
             d_head,
             neuron_config=neuron_config,
-            n_groups=n_groups,
+            tp_degree=tp_degree,
+            shard_over_batch=self.shard_over_batch,
         )
 
         # Q = Q / sqrt(d_head)
@@ -334,17 +334,18 @@ class OPTForSamplingNoEmbeddingHlo:
         if active_mask is not None:
 
             # Sp = Q @ Kp
-            prior_scores = attention.score(query, cached_keys, n_groups=n_groups)
-            prior_scores = attention.mask(prior_scores, mask)
+            prior_scores = attention.score(query, cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             prior_scores = hlo.cast(prior_scores, f32)
 
             # Sa = Q @ Ka
-            active_score = attention.score(query, key, n_groups=n_groups)
-            active_score = attention.mask(active_score, active_mask)
+            active_score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             active_score = hlo.cast(active_score, f32)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values, value, n_groups=n_groups, dtype=dtype)
+            context = attention.context(prior_scores, active_score, cached_values, value, n_kv_heads=n_kv_heads, dtype=dtype, \
+                                        tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -355,10 +356,11 @@ class OPTForSamplingNoEmbeddingHlo:
         else:
 
             # S = Q @ K
-            score = attention.score(query, key)
-            score = attention.mask(score, mask)
+            score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             score = hlo.cast(score, f32)
-            context = attention.context_combined(score, value, n_groups=n_groups, dtype=dtype)
+            context = attention.context_combined(score, value, n_kv_heads=n_kv_heads, dtype=dtype, \
+                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # KCache = K
             # VCache = V
