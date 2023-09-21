@@ -29,7 +29,8 @@ from concurrent.futures import ProcessPoolExecutor
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
 
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
-                 attention_head_size, amp, num_layers, n_head, n_kv_head=0, unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
+                 attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
+                 unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
                  shard_over_batch=False):
         super().__init__()
         if unroll is None:
@@ -149,7 +150,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if new == None:
             new = DecoderLmHeadForSamplingNoEmbedding(
                 self.tp_degree, self.n_positions_list, self.n_active_tokens, self.batch_size, self.attention_head_size,
-                self.amp, self.num_layers, self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
+                amp=self.amp, num_layers=self.num_layers, n_head=self.n_head, n_kv_head=self.n_kv_head,
+                unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
                 prefixed_length=self.prefixed_length
             )
         else:

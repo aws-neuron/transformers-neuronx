@@ -258,7 +258,6 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     else:
         n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
         _, n_heads_tp, _, _ = active_score.sizes
-        n_heads = n_heads_tp * tp_degree
         reduce_sizes = n_seqs, n_heads_tp, n_active_tokens
 
     # Upcast to f32 before computation
@@ -299,6 +298,9 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     denom = dtype[denom.sizes].Convert(denom)
 
     if n_kv_heads != 0:
+        assert isinstance(tp_degree, int), \
+            f"tp_degree ({tp_degree}) is required to be an integer for grouped-query attention."
+        n_heads = n_heads_tp * tp_degree
         n_repeats = n_heads // n_kv_heads
         # values layout: (n_positions, n_seqs_per_nc, n_kv_heads, d_head) -> repeat_dim=2
         past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)

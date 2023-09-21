@@ -52,8 +52,9 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         attention_head_size = config.hidden_size // config.num_attention_heads
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, # n_active_tokens
-            batch_size, attention_head_size, amp,
-            config.num_hidden_layers, unroll, neuron_config=neuron_config
+            batch_size, attention_head_size, amp=amp,
+            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
+            unroll=unroll, neuron_config=neuron_config
         )
         self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
@@ -74,9 +75,10 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
                                                     context_length_estimate, 
                                                     batch_size, 
                                                     attention_head_size, 
-                                                    amp, 
-                                                    config.num_hidden_layers, 
-                                                    context_unroll, 
+                                                    amp=amp, 
+                                                    num_layers=config.num_hidden_layers, 
+                                                    n_head=config.num_attention_heads,
+                                                    unroll=context_unroll, 
                                                     neuron_config=neuron_config, 
                                                     allow_pad=self.decoder_lm_head.allow_pad
                                                 )

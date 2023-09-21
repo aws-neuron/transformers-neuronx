@@ -100,7 +100,7 @@ class DecoderLmHeadTopKForSamplingNoEmbedding(torch.nn.Module):
             unroll = self.unroll
         new = DecoderLmHeadForSamplingNoEmbedding(
             self.tp_degree, n_positions_list, n_active_tokens, batch_size, self.attention_head_size,
-            self.amp, self.num_layers, unroll,
+            amp=self.amp, num_layers=self.num_layers, n_head=self.n_head, n_kv_head=self.n_kv_head, unroll=unroll
         )
         new.add_inputs_builder(self.inputs_builder)
         new.add_layer_builder(self.layer_builder)
