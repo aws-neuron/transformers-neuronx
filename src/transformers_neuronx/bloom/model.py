@@ -51,8 +51,9 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.max_positions = self.token_buckets[-1]
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config, allow_pad=True
+            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head,
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True
         )
         self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
