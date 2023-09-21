@@ -50,8 +50,9 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config, n_kv_head=config.n_kv_head,
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=neuron_config
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config,
@@ -178,7 +179,8 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         attention_head_size = config.n_embd // config.n_head
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll=unroll, neuron_config=neuron_config, n_head=config.n_head, n_kv_head=config.n_kv_head
+            config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=neuron_config
         )
         self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
@@ -319,8 +321,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         )
         self.max_positions=self.token_buckets[-1]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config
+            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=neuron_config
         )
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
@@ -346,14 +349,16 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             self.broadcaster={}
             for context_length_estimate in self.context_buckets:
                 self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                    tp_degree, 
-                    [context_length_estimate], 
-                    context_length_estimate, 
-                    self.prompt_batch_size, 
-                    attention_head_size, 
-                    amp, 
-                    config.n_layer, 
-                    context_unroll, 
+                    tp_degree,
+                    [context_length_estimate],
+                    context_length_estimate,
+                    self.prompt_batch_size,
+                    attention_head_size,
+                    amp=amp,
+                    num_layers=config.n_layer,
+                    n_head=config.n_head,
+                    n_kv_head=config.n_kv_head,
+                    unroll=context_unroll,
                     neuron_config=neuron_config, 
                     allow_pad=self.decoder_lm_head.allow_pad
                 )
