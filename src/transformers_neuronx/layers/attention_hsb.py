@@ -215,7 +215,8 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False):
             n_seqs_per_nc = score_sizes[0]
             assert n_seqs_per_nc == mask.sizes[0] // tp_degree, f"invalid n_seqs_per_nc ({n_seqs_per_nc}) vs mask_sizes ({mask.sizes})"
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
+        # broadcast from [n_seqs, n_active_tokens] to [n_seqs, n_heads, n_active_tokens, n_positions]
+        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2])
     else:
         if shard_over_batch:
             assert isinstance(tp_degree, int), \
