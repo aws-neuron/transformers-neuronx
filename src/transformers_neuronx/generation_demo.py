@@ -18,7 +18,9 @@ import os
 import sys
 import os
 import torch
+import time
 import neuronxcc
+import math
 import shutil
 import logging
 from transformers import AutoModelForCausalLM
@@ -31,12 +33,151 @@ from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWith
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
 from transformers_neuronx.bloom.model import BloomForSampling
+from transformers_neuronx.llama.model import LlamaForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
 def dump(dump_dir, dump_file_name, data):
     os.makedirs(dump_dir, exist_ok=True)
     torch.save(data, os.path.join(dump_dir, dump_file_name))
+
+
+def percentile(data, q: int = 50) -> float:
+    """
+    Compute the q-th percentile of a collection of measurements.
+
+    Arguments:
+        data: The collection of values to compute the percentile on.
+        q: The percentile to compute. Expected to be between 0 and 100.
+
+    Returns:
+        A single percentile float.
+    """
+    index = (len(data) - 1) * (q / 100)
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    alpha = index - lower
+    data = sorted(data)
+    return (data[lower] * (1 - alpha)) + (data[upper] * alpha)
+
+class MetricsCollectorWrapper:
+
+    def __init__(self, neuron_monitor_wrapper=None):
+        self.start = None
+        self.latency_list = []
+        self.latency_collector = LatencyCollector()
+        self.neuron_monitor = NeuronMonitor(neuron_monitor_wrapper)
+
+    def pre_hook(self, *args):
+        self.latency_collector.pre_hook()
+        self.neuron_monitor.pre_hook()
+
+    def hook(self, *args):
+        self.latency_collector.hook()
+        self.neuron_monitor.hook()
+
+
+class LatencyCollector:
+
+    def __init__(self):
+        self.start = None
+        self.latency_list = []
+
+    def pre_hook(self, *args):
+        self.start = time.time()
+
+    def hook(self, *args):
+        self.latency_list.append(time.time() - self.start)
+
+    def percentile(self, percent):
+        latency_list = self.latency_list
+        pos_float = len(latency_list) * percent / 100
+        max_pos = len(latency_list) - 1
+        pos_floor = min(math.floor(pos_float), max_pos)
+        pos_ceil = min(math.ceil(pos_float), max_pos)
+        latency_list = sorted(latency_list)
+        return latency_list[pos_ceil] if pos_float - pos_floor > 0.5 else latency_list[pos_floor]
+
+def benchmark(
+    args,
+    neuron_model,
+    forward_func,
+    context_length,
+    output_length,
+    warmup=2,
+    iterations=5
+):
+    """
+    Benchmark autoregressive inference using greedy decoding.
+
+    Arguments:
+        model: The model for benchmarking.
+        batch_size: The batch size of the input data.
+        n_positions: The length of the input prompt + number of generated tokens.
+        context_length: The length of the input prompt.
+        iterations: The number of iterations for benchmarking.
+
+    Returns:
+        A dictionary of performance statisics.
+    """
+
+    # Warmup
+    print(f"Warmup ({warmup} iterations) ...")
+    for _ in range(warmup):
+        forward_func()
+
+    # Add latency hooks
+    latency_collector_all = LatencyCollector()
+    neuron_model.register_forward_pre_hook(latency_collector_all.pre_hook)
+    neuron_model.register_forward_hook(latency_collector_all.hook)
+
+
+    # Benchmark and record durations
+    print(f"Benchmark loop ({iterations} iterations) ...")
+    latencies = []
+    begin = time.time()
+    for _ in range(iterations):
+        start = time.time()
+        forward_func()
+        finish = time.time()
+        latencies.append((finish - start) * 1000)
+    end = time.time()
+
+    latency_list = latency_collector_all.latency_list
+    num_inference_per_iter = len(latency_list) // iterations
+    context_encoding_latency_list = latency_list[::int(num_inference_per_iter)]
+
+
+    # Compute metrics
+    boundaries = [0, 50, 90, 95, 99, 100]
+    percentiles = {}
+    for boundary in boundaries:
+        name = f"sequence_latency_p{boundary}"
+        percentiles[name] = percentile(latencies, boundary)
+    duration = end - begin
+    inferences = len(latencies) * args.batch_size
+    throughput = inferences / duration
+    mean_latency = sum(latencies) / len(latencies)
+
+
+    # Metrics
+    metrics = {
+        "hf_model": args.hf_model,
+        "model": args.hf_model,
+        "sequence_length": args.n_positions,
+        "context_length": context_length,
+        "output_length": output_length,
+        "batch_size": args.batch_size,
+        "batches": len(latencies),
+        "inferences": inferences,
+        "total_duration_seconds": duration,
+        "mean_context_encoding_latency": sum(context_encoding_latency_list) / len(context_encoding_latency_list),
+        "output_token_throughput": (inferences * (output_length - context_length)) / duration,
+        "mean_output_token_latency": mean_latency / (output_length - context_length),
+    }
+
+    print(metrics)
+    return metrics
 
 def main():
     parser = argparse.ArgumentParser()
@@ -97,6 +238,8 @@ def main():
     # dump logits
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
+    # benchmark
+    run_parser.add_argument('--benchmark', action='store_true', default=None)
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -123,6 +266,9 @@ def main():
     elif model_type == "gptj":
         model_cls = GPTJForSampling
         hf_model_name = get_hf_model('EleutherAI/gpt-j-6B')
+    elif model_type == "llama":
+        model_cls = LlamaForSampling
+        hf_model_name = get_hf_model('openlm-research/open_llama_3b')
     elif model_type == "bloom":
         model_cls = BloomForSampling
         hf_model_name = get_hf_model('bigscience/bloom-560m')
@@ -250,6 +396,7 @@ def run(args, hf_model_name, model_cls):
     print(encoded_text, "len:", encoded_text.input_ids.shape[-1])
 
 
+    forward_func = None
     if args.do_sample:
         compile_batch_size = args.batch_size*args.num_return_sequences*args.beam
     else:
@@ -268,7 +415,7 @@ def run(args, hf_model_name, model_cls):
 
             
             print(f'running {model_cls.__name__}.from_pretrained')
-            if model_cls == GPT2ForSamplingWithContextBroadcasting:
+            if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
@@ -300,8 +447,10 @@ def run(args, hf_model_name, model_cls):
                     self.scores = scores
             with torch.inference_mode():
                 max_length = args.max_length if args.max_length is not None else args.n_positions
-                sequences = neuron_model.sample(encoded_text.input_ids, max_length, 
-                    top_k=args.top_k, output_scores=args.output_scores or args.dump_logits)
+                forward_func = lambda : neuron_model.sample(encoded_text.input_ids, max_length, 
+                    top_k=args.top_k) 
+                sequences = forward_func()
+
                 scores = None
                 if args.output_scores or args.dump_logits:
                     sequences, scores = sequences
@@ -337,11 +486,12 @@ def run(args, hf_model_name, model_cls):
             print("running HuggingFace Generation API, generation_config:\n", generation_config)
 
             with torch.inference_mode():
-                outputs = model.generate(
+                forward_func = lambda : model.generate(
                     input_ids=encoded_text.input_ids,
                     attention_mask=encoded_text.attention_mask,
                     **generation_config,
                 )
+                outputs = forward_func()
 
         if args.dump_logits:
             dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
@@ -354,8 +504,8 @@ def run(args, hf_model_name, model_cls):
                 dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
 
         print('generated_sequence=', outputs.sequences)
-        outputs = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
-        print(outputs)
+        outputs_sentences = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
+        print(outputs_sentences)
 
     finally:
 
@@ -372,6 +522,9 @@ def run(args, hf_model_name, model_cls):
 
             if args.to_s3 is not None:
                 upload_folder_to_s3(compiler_artifacts_dir, args.to_s3)
+
+    if args.benchmark:
+        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=encoded_text.input_ids.shape[-1])
 
 if __name__ == "__main__":
     main()
