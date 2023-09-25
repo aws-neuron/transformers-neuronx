@@ -71,9 +71,10 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                     context_length_estimate, 
                     batch_size, 
                     config.attention_head_size, 
-                    amp, 
-                    config.n_layer, 
-                    context_unroll,
+                    amp=amp,
+                    num_layers=config.n_layer,
+                    n_head=config.n_head,
+                    unroll=context_unroll,
                     neuron_config=neuron_config,
                     allow_pad=self.decoder_lm_head.allow_pad
                 )
