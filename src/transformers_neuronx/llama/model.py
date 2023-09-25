@@ -72,9 +72,11 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                     context_length_estimate, 
                     batch_size, 
                     config.attention_head_size, 
-                    amp, 
-                    config.num_hidden_layers, 
-                    context_unroll, 
+                    amp=amp,
+                    num_layers=config.num_hidden_layers,
+                    n_head=config.num_attention_heads,
+                    n_kv_head=config.num_key_value_heads,
+                    unroll=context_unroll,
                     neuron_config=neuron_config, 
                     allow_pad=self.decoder_lm_head.allow_pad
                 )
