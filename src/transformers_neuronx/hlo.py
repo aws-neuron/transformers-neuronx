@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
+
 import functools
 import operator
 import warnings
 
 import torch
+import numpy as np
 
 from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx import utils
 from transformers_neuronx import compiler
-
+from transformers_neuronx import constants
 
 def ax_plus_by(a, x, b, y):
     """
@@ -300,6 +303,50 @@ def dot11_add1(lhs, rhs, bias, scales=None, neuron_config=None):
     return mmadd(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
 
 
+def dot_with_tiled_weight_add(lhs, rhs, bias,
+                              lhs_contracting_dimensions,
+                              rhs_contracting_dimensions,
+                              bias_dimension=0,
+                              scales=None, neuron_config=None):
+    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config and neuron_config.quant
+    dot_result_lhs_dims = list(filter(lambda x: x not in lhs_contracting_dimensions,
+                                       list(range(len(lhs.sizes)))))
+    dot_result_lhs_sizes = [lhs.sizes[i] for i in dot_result_lhs_dims]
+    dot_result_rhs_dims = list(filter(lambda x: x not in rhs_contracting_dimensions,
+                                       list(range(len(rhs.sizes)))))
+    dot_result_rhs_sizes = [rhs.sizes[i] for i in dot_result_rhs_dims]
+    dot_dims = dict(lhs_contracting_dimensions=lhs_contracting_dimensions,
+                    rhs_contracting_dimensions=rhs_contracting_dimensions)
+    dot_result_sizes = dot_result_lhs_sizes + dot_result_rhs_sizes
+    dot = dtype[dot_result_sizes].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    lhs_size = np.product(dot_result_lhs_sizes)
+    rhs_size = np.product(dot_result_rhs_sizes)
+    dot = dtype[lhs_size, rhs_size].Reshape(dot)
+
+    if enable_quantize:
+        dot = dequantize(dot, scales, neuron_config, bias_dimension)
+    if bias is None:
+        return dot
+    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
+    return dtype[lhs_size, rhs_size].Add(dot, bias)    
+
+
+def dot_1220_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    return dot_with_tiled_weight_add(lhs, rhs, bias, 
+                                     lhs_contracting_dimensions=[1, 2],
+                                     rhs_contracting_dimensions=[2, 0],
+                                     bias_dimension=1,
+                                     scales=scales, neuron_config=neuron_config)
+
+def dot_0120_add1(lhs, rhs, bias, scales=None, neuron_config=None):
+    return dot_with_tiled_weight_add(lhs, rhs, bias, 
+                                     lhs_contracting_dimensions=[0, 1],
+                                     rhs_contracting_dimensions=[2, 0],
+                                     bias_dimension=1,
+                                     scales=scales, neuron_config=neuron_config)
+
+
 def gen_add_func(dtype):
 
     def add_func(scribe):
@@ -354,16 +401,28 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
-    hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
-    hidden = getattr(activations, activation_function)(hidden)
-
-    if transposed:
-        # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
-        hidden = dot11_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+        assert hidden_size % constants.TILE_SIZE == 0, \
+                f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+        hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens, 
+        hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
+        hidden = dot_0120_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
+        hidden = getattr(activations, activation_function)(hidden)
+        hidden = dot_1220_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
     else:
-        # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
-        hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+        # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+        hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden = getattr(activations, activation_function)(hidden)
+
+        if transposed:
+            # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+            hidden = dot11_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+        else:
+            # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
+            hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
 
     # (b * s, h) = > (h, s, b)
     hidden = transpose(hidden, 0, 1)
