@@ -24,6 +24,9 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import utils
 from transformers_neuronx import quantize
+from transformers_neuronx import constants
+from transformers_neuronx.config import NeuronConfig
+
 from concurrent.futures import ProcessPoolExecutor
 
 
@@ -54,7 +57,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
-        self.neuron_config = neuron_config
+        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.prefixed_length = prefixed_length
         self.layers = torch.nn.ModuleList()
         self.ln_f_weight = None
@@ -493,7 +496,7 @@ class DecoderLayer(torch.nn.Module):
         self.amp = amp
         dtype, _, _ = utils.parse_amp(amp)
         self.cache_dtype = dtypes.to_torch_dtype(dtype)
-        self.neuron_config = neuron_config
+        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.extra_parameters = []
         self.allow_pad = allow_pad
         # Create sparse mask if necessary
@@ -590,6 +593,10 @@ class DecoderLayer(torch.nn.Module):
             if self.mlp_in_weight is not None:
                 _, intermediate_size = self.mlp_in_weight.shape
                 intermediate_size_padded = utils.round_up_to_divisor(intermediate_size, self.tp_degree)
+                if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                    intermediate_size_padded = \
+                        utils.round_up_to_divisor(intermediate_size // self.tp_degree,
+                                                  constants.TILE_SIZE) * self.tp_degree
                 maybe_pad = MaybePadder(intermediate_size_padded)
 
                 self.mlp_in_weight = maybe_pad(self.mlp_in_weight, dim=1)
@@ -626,6 +633,7 @@ class DecoderLayer(torch.nn.Module):
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
         maybe_primary_only = maybe_manipulator.primary_only
+        maybe_shard_and_transform_along = maybe_manipulator.shard_and_transform_along
         self.pre_attn_ln_weight = maybe_duplicate(self.pre_attn_ln_weight)
         self.pre_attn_ln_bias = maybe_duplicate(self.pre_attn_ln_bias)
         self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
@@ -646,10 +654,10 @@ class DecoderLayer(torch.nn.Module):
         self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
         self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
         self.pre_mlp_ln_bias = maybe_duplicate(self.pre_mlp_ln_bias)
-        self.mlp_in_weight = maybe_shard_along(self.mlp_in_weight, dim=1)
+        self.mlp_in_weight = maybe_shard_and_transform_along(self.mlp_in_weight, 1)
         self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
         self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
-        self.mlp_out_weight = maybe_shard_along(self.mlp_out_weight, dim=self.mlp_out_sharding)
+        self.mlp_out_weight = maybe_shard_and_transform_along(self.mlp_out_weight, dim=self.mlp_out_sharding)
         self.mlp_out_scales = maybe_duplicate(self.mlp_out_scales)
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
@@ -924,6 +932,34 @@ class MaybeParallelTensorManipulator:
             return self.duplicate(tensor)
         return self.shard_along(tensor, dim)
 
+    def transform_and_tile_weight_layout(self, tensors):
+        if tensors is None:
+            return None
+
+        if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+            new_tensors = []
+            for tensor in tensors:
+                K, N = tensor.shape
+                assert(K % constants.TILE_SIZE == 0 and N % constants.TILE_SIZE == 0)
+                reshape_sizes = [K // constants.TILE_SIZE,
+                                 constants.TILE_SIZE,
+                                 N // constants.TILE_SIZE,
+                                 constants.TILE_SIZE]
+                tensor = tensor.reshape(reshape_sizes) \
+                               .permute([1, 2, 0, 3])
+                tensor = tensor.contiguous()
+                new_tensors.append(tensor)
+            return new_tensors
+
+        return tensors
+
+    def shard_and_transform_along(self, tensor, dim):
+        if tensor is None:
+            return None
+        tensors = self.manipulator.shard_along_on_cpu(tensor, dim)
+        tensors = self.transform_and_tile_weight_layout(tensors)
+        tensor = ops.parallel_to_nc(tensors)
+        return tensor
 
 class DecoderParameterBuilder:
 

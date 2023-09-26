@@ -92,12 +92,15 @@ class GPT2ForSampling(base.NeuronModelBase):
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(
-                mlp.c_proj.weight.detach().T,
-                mlp.c_proj.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            else:
+                new_layer.add_mlp_output(
+                    mlp.c_proj.weight.detach().T,
+                    mlp.c_proj.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -240,12 +243,15 @@ class GPT2ForHuggingFaceSampling(base.NeuronModelBase):
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(
-                mlp.c_proj.weight.detach().T,
-                mlp.c_proj.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            else:            
+                new_layer.add_mlp_output(
+                    mlp.c_proj.weight.detach().T,
+                    mlp.c_proj.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -424,12 +430,15 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(
-                mlp.c_proj.weight.detach().T,
-                mlp.c_proj.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            else:
+                new_layer.add_mlp_output(
+                    mlp.c_proj.weight.detach().T,
+                    mlp.c_proj.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f

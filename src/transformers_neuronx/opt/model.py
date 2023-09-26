@@ -23,6 +23,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import attention_hsb as attention, transformer
 
@@ -74,7 +75,7 @@ class OPTForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_context = dict()
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
-        self.neuron_config = neuron_config
+        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         if self.context_length_estimate is not None:
             for batch_size in self.batch_sizes:
                 self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -109,12 +110,15 @@ class OPTForSampling(base.NeuronModelBase):
             new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
                                              layer.final_layer_norm.bias.detach())
             new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
-            new_layer.add_mlp_output(
-                layer.fc2.weight.detach(),
-                layer.fc2.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
+            else:
+                new_layer.add_mlp_output(
+                    layer.fc2.weight.detach(),
+                    layer.fc2.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.model.decoder.final_layer_norm
@@ -252,7 +256,7 @@ class OPTForSamplingNoEmbeddingHlo:
         self.activation_function = activation_function
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
-        self.neuron_config = neuron_config
+        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.shard_over_batch = shard_over_batch
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
