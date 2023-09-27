@@ -153,15 +153,15 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
 
 def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
-  
+
     dtype = hidden.dtype
     shape = hidden.sizes
     scribe = hidden.scribe
     backend_config = str(dim).encode()
-    eps = hidden.scribe.f32.Constant(constant_value=eps) 
+    eps = hidden.scribe.f32.Constant(constant_value=eps)
     f32 = scribe.f32
     hidden = cast(hidden, f32)
-  
+
     return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
 
 
@@ -316,18 +316,18 @@ def gen_max_func(dtype):
 
 
 def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None):
+        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
     #   in_bias: [4h]
-    #   out_weight: [4h, h]
+    #   out_weight: [4h, h] or [h, 4h] when transposed
     #   out_bias: [h]
     # t-way tp:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h/t]
     #   in_bias: [4h/t]
-    #   out_weight: [4h/t, h]
+    #   out_weight: [4h/t, h] or [h, 4h/t] when transposed
     #   out_bias: [h]
     dtype = hidden.dtype
     if u8_bounds is not None:
@@ -338,16 +338,25 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden_size, n_active_tokens, batch_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
+
+    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
     hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
     hidden = getattr(activations, activation_function)(hidden)
-    hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
-    hidden = dtype[hidden_r_sizes].Transpose(hidden, dimensions=[1, 0])
+
+    if transposed:
+        # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+        hidden = dot11_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+    else:
+        # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
+        hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+
+    # (b * s, h) = > (h, s, b)
+    hidden = transpose(hidden, 0, 1)
     hidden = dtype[hidden_sizes].Reshape(hidden)
-    if tp_degree == 1:
-        return hidden
-    replica_groups = [list(range(tp_degree))]
-    add_func = gen_add_func(dtype)
-    hidden = dtype[hidden_sizes].AllReduce(hidden, replica_groups=replica_groups, to_apply=add_func)
+
+    if tp_degree != 1:
+        hidden = all_reduce_sum(hidden, tp_degree)
+
     return hidden
 
 

@@ -70,16 +70,16 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         self.neuron_config = neuron_config
         if self.context_length_estimate is not None:
             self.decoder_lm_head_for_context = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree, 
-                                                    [context_length_estimate], 
-                                                    context_length_estimate, 
-                                                    batch_size, 
-                                                    attention_head_size, 
-                                                    amp=amp, 
-                                                    num_layers=config.num_hidden_layers, 
+                                                    tp_degree,
+                                                    [context_length_estimate],
+                                                    context_length_estimate,
+                                                    batch_size,
+                                                    attention_head_size,
+                                                    amp=amp,
+                                                    num_layers=config.num_hidden_layers,
                                                     n_head=config.num_attention_heads,
-                                                    unroll=context_unroll, 
-                                                    neuron_config=neuron_config, 
+                                                    unroll=context_unroll,
+                                                    neuron_config=neuron_config,
                                                     allow_pad=self.decoder_lm_head.allow_pad
                                                 )
             self.register_for_serialization(self.decoder_lm_head_for_context)
@@ -101,7 +101,12 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
             new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
                                              layer.final_layer_norm.bias.detach())
             new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
-            new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
+            new_layer.add_mlp_output(
+                layer.fc2.weight.detach(),
+                layer.fc2.bias.detach(),
+                sharding=1,
+                transposed=False,
+            )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.model.decoder.final_layer_norm
@@ -287,6 +292,7 @@ class OPTForSamplingNoEmbeddingHlo:
             ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function=self.activation_function, tp_degree=self.tp_degree,
             in_scales=mlp_in_scales, out_scales=mlp_out_scales, neuron_config=self.neuron_config,
+            transposed=True,
         )
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
@@ -314,7 +320,7 @@ class OPTForSamplingNoEmbeddingHlo:
         n_head = hidden_size // d_head
         tp_degree = hidden_size // hidden_size_tp
         n_kv_heads = n_kv_heads_tp * tp_degree
-        
+
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV

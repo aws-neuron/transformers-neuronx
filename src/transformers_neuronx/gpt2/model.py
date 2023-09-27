@@ -92,7 +92,12 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            new_layer.add_mlp_output(
+                mlp.c_proj.weight.detach().T,
+                mlp.c_proj.bias.detach(),
+                sharding=1,
+                transposed=False,
+            )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -156,7 +161,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
 
 
 # Need to keep PreTrainedModel after module.PretrainedModel as the later
-# overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly 
+# overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly
 # since it doesn't pass config in suer().__init__
 class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.NeuronModelBase):
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
@@ -232,7 +237,12 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            new_layer.add_mlp_output(
+                mlp.c_proj.weight.detach().T,
+                mlp.c_proj.bias.detach(),
+                sharding=1,
+                transposed=False,
+            )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -359,7 +369,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
                     n_head=config.n_head,
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
-                    neuron_config=neuron_config, 
+                    neuron_config=neuron_config,
                     allow_pad=self.decoder_lm_head.allow_pad
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
@@ -401,7 +411,12 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
+            new_layer.add_mlp_output(
+                mlp.c_proj.weight.detach().T,
+                mlp.c_proj.bias.detach(),
+                sharding=1,
+                transposed=False,
+            )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -416,7 +431,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
 
         if self.context_buckets:
             for i, context_length_estimate in enumerate(self.context_buckets):
-                model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches, 
+                model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
                                                                     new=self.decoder_lm_head_for_context[context_length_estimate])
                 source_caches = []
                 for layer in model.layers:
@@ -462,27 +477,27 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if estimate is not None:
             hidden_context = hidden
             cache_context = cache_ids
- 
+
             # Slice context that when it is too large
             if context_length > estimate:
                 current = estimate
                 hidden_context = hidden[:, :estimate]
                 cache_context = cache_ids[:estimate]
- 
+
             # Cannot use context encoding for a context that is too small. This
             # is because the caller must be aware of the cache-ids/start-ids
             # used.
             elif context_length < estimate:
                 current = 0
- 
+
             # Directly pass input to the context network when exactly sized
             else:
                 current = estimate
- 
+
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate]
                 logits = model(hidden_context, cache_context, start_ids)
- 
+
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
             logits = self.decoder_lm_head(hidden[:, i:i + 1].contiguous(), cache_ids, start_ids)
@@ -524,22 +539,22 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             task.wait()
             self.tensor_pool.push(hidden)
         return logits
-    
+
     def pad_context(self, input_ids, start_ids):
         runtime_batch_size, context_length = input_ids.shape
-       
+
         # The context length estimate is chosen based on single (context+query)
         estimate = bucket.find(self.context_buckets, context_length)
 
         # populate key/value caches according to the prompt text
         input_ids = input_ids[:, :estimate]
         offset = 0
-        
+
         if estimate:
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=True)
                 offset = estimate - context_length
-            
+
             if not self.share_caches:
                 self.broadcaster[estimate].run_broadcast()
 
@@ -547,9 +562,9 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
                 start_ids = torch.zeros(runtime_batch_size, dtype=torch.int32)
 
             start_ids += offset
-            
+
         return input_ids, start_ids, offset
-    
+
     @torch.no_grad()
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, output_scores=False):
         if self.context_pre_hook is not None:
@@ -612,7 +627,7 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         if output_scores:
             return interleaved, scores
         return interleaved
-    
+
 
 class GPT2CheckpointCompatible(module.PretrainedModel):
 
