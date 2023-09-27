@@ -241,12 +241,19 @@ def main():
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
     # benchmark
     run_parser.add_argument('--benchmark', action='store_true', default=None)
+    # suffix
+    run_parser.add_argument('--suffix', type=str, default=None)
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
     logits_analysis_parser.set_defaults(which=logits_analysis_name)
     logits_analysis_parser.add_argument('-d','--dirs', nargs='+', required=True)
     logits_analysis_parser.add_argument('--plot', action='store_true')
+
+    visual_name = 'visual'
+    visual_parser = subparsers.add_parser(visual_name)
+    visual_parser.set_defaults(which=visual_name)
+    visual_parser.add_argument('-d','--dirs', nargs='+', required=True)
 
     args = parser.parse_args()
 
@@ -286,7 +293,46 @@ def main():
         run(args, hf_model_name, model_cls)
     elif args.which == logits_analysis_name:
         logits_analysis(args, hf_model_name, model_cls)
+    elif args.which == visual_name:
+        visual(args)
 
+def visual(args):
+    logit_paths = args.dirs
+    logit_paths = [os.path.join(path, "0.pt") for path in logit_paths]
+    golden_path = logit_paths[-1]
+
+    pairs = []
+    for path in logit_paths[:-1]:
+        logits = torch.load(path)
+        print(path, logits)
+        pairs.append([logits])
+
+
+    golden_logits = torch.load(golden_path)
+
+    for pair in pairs:
+        pair.append(golden_logits)
+
+
+    pairs.append([golden_logits, golden_logits])
+
+    import matplotlib.pyplot as plt
+
+    # Create a new figure
+    plt.figure()
+
+    # Plot each line from the tensor pairs
+    for x_vals, y_vals in pairs:
+        plt.plot(x_vals.reshape(-1), y_vals.reshape(-1))
+
+    # Show legend if needed
+    labels = [path.split('/')[-2] for path in logit_paths]
+    plt.legend(labels)
+
+    plt.savefig('line_plots.png')
+
+    # Show the plot
+    plt.show()
 
 def upload_folder_to_s3(local_folder, s3_url):
     import boto3
@@ -409,7 +455,7 @@ def run(args, hf_model_name, model_cls):
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
-            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}"
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}" if args.suffix is None else args.suffix
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
             if args.snapshot or args.pack_artifacts:
