@@ -26,7 +26,7 @@ from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
 
 
-class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class LlamaForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
@@ -128,45 +128,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                     model.enable_executor()
                 self.decoder_lm_head_for_context[context_length_estimate] = model
 
-    def reset(self):
-        self.decoder_lm_head.reset()
-
-    def context(self, hidden, cache_ids, start_ids):
-        context_length = hidden.shape[1]
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context that when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-                logits = model(hidden_context, cache_context, start_ids)
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        return logits
-
     def set_prefixed(self, input_ids):
         self.prefixed_input_ids = input_ids[:, :self.prefixed_length]
         prefixed_length = self.prefixed_length
@@ -175,37 +136,13 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.prefixed_length = prefixed_length
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-
-        batch_size, context_length = input_ids.shape
-        if start_ids is None:
-            start_ids = torch.zeros(batch_size, dtype=torch.int32)
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
-        if self.prefixed_length:
-            cache_ids += self.prefixed_length
-
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        hidden = hidden.transpose(0, -1).contiguous()
-
-        if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids)
-        else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
-
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
-        return logits
+        return self._forward(hidden, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):
 
-        # To enable optimized context encoding network, we must pad
-        # up to the context length estimate or we will not correctly
-        # select the final context logits (See: layers/transformer.py).
-        # This also means we need to shift the start_ids over to correct
-        # for padding.
-        offset = 0
         batch_size, context_length = input_ids.shape
         prefixed_length = self.prefixed_length
         if context_length < prefixed_length:
@@ -214,18 +151,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             input_ids = input_ids[:, prefixed_length:]
             context_length -= prefixed_length
             sequence_length -= prefixed_length
-        estimate = bucket.find(self.context_buckets, context_length)
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if not prefixed_length:
-                    if start_ids is None:
-                        start_ids = torch.zeros(batch_size, dtype=torch.int32)
-                    start_ids += offset
-                sequence_length += offset
-                # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.max_positions)
 
         result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
@@ -233,8 +158,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer
         )
 
-        if offset != 0:
-            result = result[:, offset:]
         return result
 
 class FIDLlamaForSampling(LlamaForSampling):
@@ -250,51 +173,6 @@ class FIDLlamaForSampling(LlamaForSampling):
         self.batch_size = batch_size
         self.bos_token_id = self.config.bos_token_id
 
-    def context(self, hidden, cache_ids, start_ids):
-        # Fusion-In-Decoder context encoding
-        fused_context_length = hidden.shape[1]
-        context_length = fused_context_length // self.batch_size
-
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-
-                # Run each context separately in-place
-                for j in range(self.batch_size):
-                    single_context_slice = slice(j * context_length, (j+1) * context_length)
-                    logits = model(hidden_context[:, single_context_slice, :], cache_context[single_context_slice], start_ids)
-
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        logits[:] = float('-inf')
-        logits[self.bos_token_id] = 1.0
-        return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         """ Sample function
@@ -319,17 +197,6 @@ class FIDLlamaForSampling(LlamaForSampling):
         if batch_size * estimate >= sequence_length:
             raise ValueError(f"sequence_length [{sequence_length}] should be larger than fused input context estimates [{estimate} x {batch_size}]")
 
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if start_ids is None:
-                    start_ids = torch.zeros(fused_batch_size, dtype=torch.int32)
-                start_ids += offset
-                sequence_length += offset
-                # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.max_positions)
-                context_length = estimate
 
         # Flatten input_ids
         context_length = batch_size * context_length
@@ -339,7 +206,4 @@ class FIDLlamaForSampling(LlamaForSampling):
         result = sampling.sample_llama(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
-        if offset != 0:
-            # Offset by offset * batch_size
-            result = result[:, context_length:]
         return result

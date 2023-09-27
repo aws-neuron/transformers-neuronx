@@ -27,10 +27,10 @@ from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import attention_hsb as attention, transformer
 
 
-class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class OPTForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=12, neuron_config=None, **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
@@ -130,12 +130,16 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
         return self._forward(self.decoder_lm_head_for_context, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
+        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+        batch_size, context_length = input_ids.shape
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
-        logits = decoder_lm_head(hidden, cache_ids, start_ids)
+        logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -147,12 +151,7 @@ class OPTForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelB
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
         _, start = input_ids.shape
         context_length = self.context_length_estimate
-        cache_ids = torch.arange(context_length, dtype=torch.int32)
-        input_context = input_ids[:, :context_length]
-        if start < context_length:
-            input_pad = context_length - start
-            input_context = torch.nn.functional.pad(input_context, (0, input_pad, 0, 0))
-        next_token_scores = self.forward_for_context(input_context, cache_ids, start_ids)
+        next_token_scores = self.forward_for_context(input_ids, None, start_ids)
         for cur_len in range(context_length, start):
             cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
             next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
@@ -249,6 +248,7 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.u32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.u32[batch_size].Parameter(parameter_number=2)
+        last_token_id = scribe.u32.Parameter(parameter_number=3)
         # For the best perf, we only use kv prefetch in the token generation stage
         token_generation = n_active_tokens == 1
         triu_comparison = 'LT' if token_generation else 'LE'
@@ -260,9 +260,9 @@ class OPTForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=token_generation,
             start_mask=True
         )
-        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
+        return (hidden, last_token_id, cache_ids, mask, active_mask), (1, 0, None, None)
 
-    def layer(self, hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, last_token_id, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -297,8 +297,8 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
-        return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
+        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
 
     def attention(self, hidden, cache_ids, mask, active_mask,
                   cached_keys, cached_values,

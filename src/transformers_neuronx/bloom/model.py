@@ -28,7 +28,7 @@ from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
 
 
-class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class BloomForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
@@ -160,86 +160,14 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                 model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate])
                 self.decoder_lm_head_for_context[context_length_estimate] = model
 
-    def reset(self):
-        self.decoder_lm_head.reset()
-
-    def context(self, hidden, cache_ids, start_ids):
-        context_length = hidden.shape[1]
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context that when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-                logits = model(hidden_context, cache_context, start_ids)
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        return logits
-
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-
-        batch_size, context_length = input_ids.shape
-        if start_ids is None:
-            start_ids = torch.zeros(batch_size, dtype=torch.int32)
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
-
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        hidden = hidden.transpose(0, -1).contiguous()
-
-        if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids)
-        else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
-
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
-        return logits
+        return self._forward(hidden, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-
-        # To enable optimized context encoding network, we must pad
-        # up to the context length estimate or we will not correctly
-        # select the final context logits (See: layers/transformer.py).
-        # This also means we need to shift the start_ids over to correct
-        # for padding.
-        offset = 0
-        if self.context_length_estimate:
-            batch_size, context_length = input_ids.shape
-            estimate = self.context_length_estimate
-            if context_length < self.context_length_estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if start_ids is None:
-                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
-                start_ids += offset
-                sequence_length += offset
-
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
 
-        return result[:, offset:]
+        return result

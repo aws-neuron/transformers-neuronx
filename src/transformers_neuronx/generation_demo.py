@@ -207,7 +207,7 @@ def main():
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--device', type=str, default="cpu")
-    run_parser.add_argument('--context_length_estimate', type=int, default=64)
+    run_parser.add_argument('--context_length_estimate', type=int, default=None)
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
