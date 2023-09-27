@@ -131,7 +131,7 @@ def ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight):
     ln_f_weight = hlo.transfer_with_static_ring(ln_f_weight)
     ln_f_bias = hlo.transfer_with_static_ring(ln_f_bias)
     lm_head_weight = hlo.transfer_with_static_ring(lm_head_weight)
-    return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, None)
+    return transformer.ln_lm_head(hidden, None, ln_f_weight, ln_f_bias, lm_head_weight, None)
 
 
 def gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_caches, blocks_params, ln_lm_head_params, config):
