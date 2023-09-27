@@ -36,6 +36,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+        last_token_id = scribe.s32.Parameter(parameter_number=3)
         pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
@@ -53,10 +54,10 @@ class LlamaForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=token_generation,
             start_mask=True,
         )
-        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, 0, None)
+        return (hidden, last_token_id, pos_embed, cache_ids, mask, active_mask), (1, 0, None, None)
 
     def layer(
-            self, hidden, pos_embed, cache_ids, mask, active_mask,
+            self, hidden, last_token_id, pos_embed, cache_ids, mask, active_mask,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -98,8 +99,8 @@ class LlamaForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
-        return transformer.rms_lm_head(hidden, rms_weight, lm_head_weight, lm_head_bias, eps=self.config.rms_norm_eps)
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
+        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, eps=self.config.rms_norm_eps)
 
     def attention(
         self,
