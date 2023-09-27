@@ -23,9 +23,7 @@ from transformers_neuronx.config import GenerationConfig
 @torch.no_grad()
 def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False):
     # populate key/value caches according to the prompt text
-    _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
                        eos_token_id, top_k, streamer, output_scores=output_scores)
 
@@ -49,8 +47,7 @@ def sample_tokens(
     batch_size, start = input_ids.shape
 
     # Populate the KV cache with prompt
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_tokens = model(input_ids, cache_ids, start_ids)
+    next_tokens = model(input_ids, None, start_ids)
 
     cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
@@ -100,8 +97,7 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
     This is useful as a reference implementation for on-device greedy sampling.
     """
     _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
 
     tokens = [input_ids]
     for cur_len in range(start, sequence_length):
@@ -288,8 +284,7 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
 
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )

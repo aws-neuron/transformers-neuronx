@@ -31,7 +31,7 @@ from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 
 
-class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
@@ -163,7 +163,7 @@ class GPT2ForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModel
 # Need to keep PreTrainedModel after module.PretrainedModel as the later
 # overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly
 # since it doesn't pass config in suer().__init__
-class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.NeuronModelBase):
+class GPT2ForHuggingFaceSampling(base.NeuronModelBase):
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         config = GPT2HuggingFaceConfig(config, batch_size, amp, tp_degree, **kwargs)
@@ -311,7 +311,7 @@ class GPT2ForHuggingFaceSampling(module.PretrainedModel, PreTrainedModel, base.N
         return model_inputs
 
 
-class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
@@ -470,39 +470,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context[context_length_estimate].reset()
 
-    def context(self, hidden, cache_ids, start_ids):
-        context_length = hidden.shape[1]
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context that when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-                logits = model(hidden_context, cache_context, start_ids)
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            logits = self.decoder_lm_head(hidden[:, i:i + 1].contiguous(), cache_ids, start_ids)
-        return logits
-
     def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
@@ -512,13 +479,24 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             self.tensor_pool.push([inputs_embeds, position_embeds])
         return hidden, start_ids
 
-    def forward(self, input_ids, cache_ids=None, start_ids=None, is_context_encode=False):
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
         batch_size, context_length = input_ids.shape
+        is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
+
+        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+        batch_size, context_length = input_ids.shape
 
         model=self.decoder_lm_head
         if is_context_encode:
             model=self.decoder_lm_head_for_context[estimate]
+
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+    
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
         if is_context_encode:
@@ -529,47 +507,24 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             start_ids = start_ids.repeat(batch_size)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids)
+            logits = self.context(hidden, cache_ids, start_ids, last_token_id)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
             self.tensor_pool.push(hidden)
+        if is_context_encode and not self.share_caches:
+            self.broadcaster[estimate].run_broadcast()
+
         return logits
-
-    def pad_context(self, input_ids, start_ids):
-        runtime_batch_size, context_length = input_ids.shape
-
-        # The context length estimate is chosen based on single (context+query)
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        # populate key/value caches according to the prompt text
-        input_ids = input_ids[:, :estimate]
-        offset = 0
-
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-
-            if not self.share_caches:
-                self.broadcaster[estimate].run_broadcast()
-
-            if start_ids is None:
-                start_ids = torch.zeros(runtime_batch_size, dtype=torch.int32)
-
-            start_ids += offset
-
-        return input_ids, start_ids, offset
 
     @torch.no_grad()
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, output_scores=False):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
-        offset=0
         runtime_batch_size, context_length = input_ids.shape
         batch_size = self.decoder_lm_head.batch_size
         if batch_size % runtime_batch_size:
@@ -578,33 +533,10 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
                 f"batch_size={batch_size} and runtime_batch_size={runtime_batch_size}"
             )
 
-        # The context length estimate is chosen based on single (context+query)
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        # populate key/value caches according to the prompt text
-        cache_ids = torch.arange(estimate, dtype=torch.int32)
-        input_ids = input_ids[:, :estimate]
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if start_ids is None:
-                   start_ids = torch.zeros(runtime_batch_size, dtype=torch.int32)
-                start_ids += offset
-                sequence_length += offset
-                # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.max_positions)
-            next_token_scores = self.forward(
-                input_ids, cache_ids, start_ids, is_context_encode=True
-            )
-            if not self.share_caches:
-                self.broadcaster[estimate].run_broadcast()
-            repeat_factor = batch_size // runtime_batch_size
-            input_ids = input_ids.repeat([repeat_factor, 1])
-            next_token_scores = next_token_scores.repeat([repeat_factor, 1])
-            for cur_len in range(estimate, context_length):
-                cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-                next_token_scores = self(input_ids[:, cur_len : cur_len + 1], cache_ids, start_ids)
+        next_token_scores = self.forward(input_ids, start_ids=start_ids)
+        repeat_factor = batch_size // runtime_batch_size
+        input_ids = input_ids.repeat([repeat_factor, 1])
+        next_token_scores = next_token_scores.repeat([repeat_factor, 1])
         if self.context_hook is not None:
             self.context_hook()
         interleaved = sampling.sample_loop(
@@ -621,8 +553,6 @@ class GPT2ForSamplingWithContextBroadcasting(module.WrappingCheckpointCompatible
             interleaved, scores = interleaved
         interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
         interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
-        if(offset!=0):
-            interleaved=interleaved[:, offset:]
 
         if output_scores:
             return interleaved, scores
