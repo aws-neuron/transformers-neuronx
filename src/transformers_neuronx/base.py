@@ -15,9 +15,14 @@
 
 import os
 import pickle
+import torch
+from transformers_neuronx import bucket
+from transformers_neuronx import utils
+from transformers_neuronx import module
 
 # Mainly used to expose top level APIs to the model object for serialization
-class NeuronModelBase:
+class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
+    is_fid = False
 
     # top level api
     def save(self, directory):
@@ -76,6 +81,134 @@ class NeuronModelBase:
         nbs_obj.compiler_artifacts_path = None
         temp.append(nbs_obj)
         self.nbs_objs = temp
+
+    def reset(self):
+        self.decoder_lm_head.reset()
+
+    def context(self, hidden, cache_ids, start_ids, last_token_id):
+        """A helper to process context (prompt)
+        1) if there is available context encoding model (infered from self.context_buckets)
+            - when context_length >= estimate, slice the context up to estimate,
+                and call context encoding model
+            - when context_length < estimate, skip and fall back to serial token generation model
+            
+            and mark `current` accrodingly
+
+        2) process the left over tokens accroding to `current`
+            - if there is no context encoding model, simply do serial token generation for context
+        """
+        context_length = hidden.shape[1]
+
+        if self.is_fid:
+            # Fusion-In-Decoder context encoding
+            fused_context_length = hidden.shape[1]
+            context_length = fused_context_length // self.batch_size
+        
+        current = 0
+
+        estimate = bucket.find(self.context_buckets, context_length)
+
+
+        if estimate is not None:
+            hidden_context = hidden
+            cache_context = cache_ids
+
+            # Slice context that when it is too large
+            if context_length > estimate:
+                current = estimate
+                hidden_context = hidden[:, :estimate]
+                cache_context = cache_ids[:estimate]
+
+            # Cannot use context encoding for a context that is too small. This
+            # is because the caller must be aware of the cache-ids/start-ids
+            # used.
+            elif context_length < estimate:
+                raise ValueError(f"context_length ({context_length}) shouldn't be smaller than estimate ({estimate})")
+
+            # Directly pass input to the context network when exactly sized
+            else:
+                current = estimate
+
+            if current == estimate:
+                model = self.decoder_lm_head_for_context[estimate]
+                logits = model(hidden_context, cache_context, start_ids, last_token_id)
+
+        for i in range(current, context_length):
+            cache_ids = torch.as_tensor([i], dtype=torch.int32)
+            hidden_slice = hidden[:, i:i+1].contiguous()
+            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id)
+
+        if self.is_fid:
+            logits[:] = float('-inf')
+            logits[self.bos_token_id] = 1.0
+
+        return logits
+
+    def _prepare_for_par_ctx_rhs_padding(self, input_ids):
+        """A helper to do rhs padding on prompt for parallel context encoding model
+        i.e.
+            input_ids = [[111, 222, 333]]
+            context_length = 3
+
+            if context bucket size is 4
+            we will pad input_ids to [[111, 222, 333, 0]]
+
+            last_token_id = 2 (used for generation to mark the last token is at index 2 instead 3)
+
+        Note: 
+            - there is no change on start_ids with right padding.
+            - cache_ids will be set to [0, 1, 2, 3] in self.forward()
+        """
+        batch_size, context_length = input_ids.shape
+        last_token_id = torch.as_tensor(context_length - 1, dtype=torch.int32)
+
+        if context_length == 1:
+            return input_ids, last_token_id
+
+        # TODO: check context_buckets for compatibility with OPT
+        if hasattr(self, "context_buckets"):
+            estimate = bucket.find(self.context_buckets, context_length)
+        else:
+            estimate = self.context_length_estimate
+        
+        if estimate:
+            if context_length < estimate:
+                input_ids = utils.pad(input_ids, 1, estimate, left=False)
+
+        return input_ids, last_token_id
+    
+    def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
+        # right pad the input_ids if neccessary
+        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+
+        # note: this context_length is after right padded
+        batch_size, context_length = input_ids.shape
+
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+    
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
+        if hasattr(self, "prefixed_length") and self.prefixed_length:
+            cache_ids += self.prefixed_length
+
+        return input_ids, cache_ids, start_ids, last_token_id
+
+    def _forward(self, hidden, *args):
+        hidden = hidden.transpose(0, -1).contiguous()
+
+        _, context_length, _ = hidden.shape
+
+        if context_length > 1:
+            logits = self.context(hidden, *args)
+        else:
+            logits = self.decoder_lm_head(hidden, *args)
+
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, -1, :]
+        logits = logits.transpose(0, 1)
+        return logits
 
     def serialization_enabled(self):
         return getattr(self, 'nbs_objs', None) is not None

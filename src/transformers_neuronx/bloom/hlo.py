@@ -27,7 +27,7 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-
+        last_token_id = scribe.s32.Parameter(parameter_number=3)
         # NOTE: When using token generation network, we generate a mask for the
         #       past tokens and the current tokens separately. This allows us
         #       use the split "prefetch" attention layer.
@@ -41,13 +41,13 @@ class BloomForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=token_generation,
             start_mask=True
         )
-        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
+        return (hidden, last_token_id, cache_ids, mask, active_mask), (1, 0, None, None)
 
-    def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
+    def pre_layer(self, hidden, last_token_id, cache_ids, mask, active_mask, slopes):
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
-        return hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi
+        return hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
-    def layer(self, hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -86,8 +86,8 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
-        return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
+        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
 
     def attention(self,
         hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,

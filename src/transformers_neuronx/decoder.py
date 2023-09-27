@@ -282,6 +282,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             dtype = getattr(scribe, amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, n_positions, self.n_active_tokens, self.batch_size)
+            last_token_id = tensors[0]
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions)
             hidden = maybe_transfer_with_static_ring(hidden)
@@ -295,7 +296,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
             head_weight = maybe_transfer_with_static_ring(head_weight)
             head_bias = maybe_transfer_with_static_ring(head_bias)
-            logits = self.ln_lm_head_builder(hidden, ln_f_weight, ln_f_bias, head_weight, head_bias)
+            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias)
             outputs = [logits, *out_caches]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
@@ -374,12 +375,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         def ln_lm_head(scribe):
             dtype = getattr(scribe, self.amp)
             hidden = dtype[tuple(hidden_sizes)].Parameter(parameter_number=0)
-            param_builder = DecoderParameterBuilder(scribe, 1)
+            next_tok_id = scribe.s32.Parameter(parameter_number=1)
+            param_builder = DecoderParameterBuilder(scribe, 2)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
-            return self.ln_lm_head_builder(hidden, ln_f_weight, ln_f_bias, head_weight, head_bias)
+            return self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias)
 
         return compiler.compile_py_func(ln_lm_head)
 
@@ -1090,7 +1092,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
     def setup(self, layers, ln_lm_head_params):
         super().setup(layers, ln_lm_head_params, io_ring_cache_size=len(self.multi_layers_memories))
-        hidden_buffer, *_ = self.input_buffers
+        hidden_buffer, last_token_id_buffer, *_ = self.input_buffers
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
         for memories, multi_layer in zip(self.multi_layers_memories, multi_layers):
@@ -1099,7 +1101,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
                 output_tensors = [hidden_buffer]
                 self._fill_io_tensors(input_tensors, output_tensors, multi_layer, npos)
                 memory.setup(input_tensors, output_tensors)
-        self.ln_lm_head_memory.setup([hidden_buffer, *ln_lm_head_params], [self.logits_buffer])
+        self.ln_lm_head_memory.setup([hidden_buffer, last_token_id_buffer, *ln_lm_head_params], [self.logits_buffer])
         self.ln_lm_head_kernel.build()
         self.ln_lm_head_kernel.load()
 
