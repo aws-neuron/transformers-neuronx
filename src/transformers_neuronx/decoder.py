@@ -486,6 +486,10 @@ class DecoderLayer(torch.nn.Module):
             self.sparse_mask = self.neuron_config.sparse_attn.create_sparse_mask(self.n_active_tokens, self.n_positions)
             self.active_sparse_mask = self.neuron_config.sparse_attn.create_active_sparse_mask(self.n_active_tokens)
         self.shard_over_batch = shard_over_batch
+        self.attn_out_sharding = 0
+        self.attn_out_transposed = True
+        self.mlp_out_sharding = 0
+        self.mlp_out_transposed = True
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1):
