@@ -14,11 +14,12 @@
 # ==============================================================================
 
 import os
-import pickle
 import torch
+import hashlib
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
+
 
 # Mainly used to expose top level APIs to the model object for serialization
 class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
@@ -33,6 +34,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._load_compiled_artifacts(directory)
+            
+    # simple implementation that doesn't take into account cache and serialization
+    def is_compiled(self):
+        # First check if the kernels have neffs already
+        try:
+            if all([kernel.neff_bytes is not None for kernel in self._get_all_kernels()]):
+                return True
+        # AttributeError means kernels don't even exist yet.
+        except AttributeError:
+            pass
+        return False
 
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.program.reorder_cache(reorder_ids)
@@ -51,16 +63,22 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             )
         os.makedirs(directory, exist_ok=True)
         for i, nbs_obj in enumerate(self.nbs_objs):
-            nbs_obj.save_compiler_artifacts(os.path.join(directory, f'neuron-program-{i}.pkl'))
+            nbs_obj.save_compiler_artifacts(directory)
 
     def _load_compiled_artifacts(self, directory):
         if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}, '
-                                    f'ensure that your saved model and loaded model are using the same parameters.')
+            raise FileNotFoundError(f'Did not find directory: {directory}.')
 
         for i, nbs_obj in enumerate(self.nbs_objs):
-            program_filename = os.path.join(directory, f'neuron-program-{i}.pkl')
-            nbs_obj.load_compiler_artifacts_after_build(program_filename)
+            nbs_obj.load_compiler_artifacts_after_build(directory)
+    
+    def _get_all_kernels(self):
+        all_kernels = []
+        for nbs in self.nbs_objs:
+            for kernel in nbs.get_all_kernels():
+                all_kernels.append(kernel)
+        return all_kernels
+
 
     # To enable serialization, have the model call this
     # function to register all nbs_obj of your model.
@@ -222,6 +240,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 class NeuronBaseSerializer:
 
     def save_compiler_artifacts(self, path):
+<<<<<<< HEAD
         with open(path, 'wb') as f:
             pickle.dump(self.get_neff_bytes(), f)
 
@@ -237,8 +256,37 @@ class NeuronBaseSerializer:
             kernels_neff_bytes = pickle.load(f)
         for kernel, neff_bytes in zip(self.get_all_kernels(), kernels_neff_bytes):
             kernel.neff_bytes = neff_bytes
+=======
+        for kernel in self.get_all_kernels():
+            hlo_hash = hash_hlo(kernel.hlo_module)
+            with open(os.path.join(path, hlo_hash), 'wb') as f:
+                assert kernel.neff_bytes is not None, "cannot save a model which has not been successfully compiled"
+                f.write(kernel.neff_bytes)
+    
+    def load_compiler_artifacts_after_build(self, path):
+        self.compiler_artifacts_path = path
+
+    def set_neff_bytes(self):
+        for kernel in self.get_all_kernels():
+            hlo_hash = hash_hlo(kernel.hlo_module)
+            try:
+                with open(os.path.join(self.compiler_artifacts_path, hlo_hash), 'rb') as f:
+                    kernel.neff_bytes = f.read()
+            except FileNotFoundError:
+                raise FileNotFoundError(('Could not find a matching NEFF for your HLO in this directory. '
+                                          'Ensure that the model you are trying to load is the same type and '
+                                          'has the same parameters as the one you saved or call "save" on '
+                                          'this model to reserialize it.'))
+>>>>>>> dcf3192 (Change serialization to use HLO hashing, add very basic is_compiled function)
 
     def get_all_kernels(self):
         raise NotImplementedError(
             f'Class {type(self)} deriving from NeuronBaseSerializer must implement get_all_kernels'
         )
+
+def hash_hlo(hlo_module):
+    hash_gen = hashlib.sha256()
+    text = str(hlo_module)
+    hash_gen.update(text.encode('utf-8'))
+    hash = str(hash_gen.hexdigest())[:20]
+    return hash + '.neff'
