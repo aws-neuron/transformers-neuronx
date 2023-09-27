@@ -523,9 +523,11 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_in_weight = weight
         self.mlp_in_bias = bias
 
-    def add_mlp_output(self, weight, bias):
+    def add_mlp_output(self, weight, bias, sharding=0, transposed=True):
         self.mlp_out_weight = weight
         self.mlp_out_bias = bias
+        self.mlp_out_sharding = sharding
+        self.mlp_out_transposed = transposed
 
     def add_post_mlp_layer_norm(self, weight, bias):
         self.post_mlp_ln_weight = weight
@@ -568,7 +570,7 @@ class DecoderLayer(torch.nn.Module):
 
                 self.mlp_in_weight = maybe_pad(self.mlp_in_weight, dim=1)
                 self.mlp_in_bias = maybe_pad(self.mlp_in_bias, dim=0)
-                self.mlp_out_weight = maybe_pad(self.mlp_out_weight, dim=0)
+                self.mlp_out_weight = maybe_pad(self.mlp_out_weight, dim=self.mlp_out_sharding)
 
         if utils.amp_is_u8(self.amp):
             self.attn_q_weight, self.attn_q_min, self.attn_q_max = utils.u8_encode(self.attn_q_weight)
@@ -581,7 +583,8 @@ class DecoderLayer(torch.nn.Module):
             self.mlp_in_weight, self.mlp_in_scales = \
                 quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
             self.mlp_out_weight, self.mlp_out_scales = \
-                quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant)
+                quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant,
+                                                out_feature_dim = 1 if self.mlp_out_transposed else 0)
 
             if self.neuron_config.quant.quantize_attn:
                 self.attn_q_weight, self.attn_q_scales = \
@@ -622,7 +625,7 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_in_weight = maybe_shard_along(self.mlp_in_weight, dim=1)
         self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
         self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
-        self.mlp_out_weight = maybe_shard_along(self.mlp_out_weight, dim=0)
+        self.mlp_out_weight = maybe_shard_along(self.mlp_out_weight, dim=self.mlp_out_sharding)
         self.mlp_out_scales = maybe_duplicate(self.mlp_out_scales)
         self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
@@ -932,7 +935,7 @@ class DecoderProgram:
     def setup(self, layers, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [self.manipulator.duplicate(buf) for buf in self.input_buffers]
         self.logits_buffer = self.manipulator.duplicate(self.logits_buffer)
- 
+
         # Compile modules in parallel
         with ProcessPoolExecutor(max_workers=len(self.n_positions_list)) as executor:
             neff_bytes_futures = []
@@ -1138,7 +1141,7 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
         if self.compiler_artifacts_path is not None:
             self.set_neff_bytes()
         self.cache_broadcast_kernel.build()
-    
+
     def load(self):
         self.cache_broadcast_kernel.load()
 

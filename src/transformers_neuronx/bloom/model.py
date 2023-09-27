@@ -66,11 +66,11 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             self.decoder_lm_head_for_context = {}
             for context_length_estimate in self.context_buckets:
                 self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                    tp_degree, 
-                    [context_length_estimate], 
-                    context_length_estimate, 
-                    batch_size, 
-                    config.attention_head_size, 
+                    tp_degree,
+                    [context_length_estimate],
+                    context_length_estimate,
+                    batch_size,
+                    config.attention_head_size,
                     amp=amp,
                     num_layers=config.n_layer,
                     n_head=config.n_head,
@@ -135,8 +135,10 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                 mlp.dense_h_to_4h.bias.detach()
             )
             new_layer.add_mlp_output(
-                mlp.dense_4h_to_h.weight.detach().T,
-                mlp.dense_4h_to_h.bias.detach()
+                mlp.dense_4h_to_h.weight.detach(),
+                mlp.dense_4h_to_h.bias.detach(),
+                sharding=1,
+                transposed=False,
             )
             new_layer.to_neuron()
             layer.nullify()

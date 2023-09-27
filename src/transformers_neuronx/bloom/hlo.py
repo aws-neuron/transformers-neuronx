@@ -79,7 +79,8 @@ class BloomForSamplingNoEmbeddingHlo:
             activation_function='gelu_new',
             tp_degree=self.config.tp_degree,
             in_scales=mlp_in_scales, out_scales=mlp_out_scales,
-            neuron_config=self.neuron_config
+            neuron_config=self.neuron_config,
+            transposed=True,
         )
 
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
