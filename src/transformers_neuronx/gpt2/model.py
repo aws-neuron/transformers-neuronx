@@ -317,7 +317,7 @@ class GPT2ForHuggingFaceSampling(base.NeuronModelBase):
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, n_parallel_output_tokens=1, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -332,11 +332,12 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.context_buckets = bucket.context_sizes(
             context_length_estimate, self.token_buckets
         )
+        self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions=self.token_buckets[-1]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config
+            unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens
         )
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
@@ -378,7 +379,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
                     neuron_config=neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad
+                    allow_pad=self.decoder_lm_head.allow_pad,
+                    n_parallel_output_tokens=self.n_parallel_output_tokens
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
                 if not self.share_caches:
@@ -524,7 +526,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         else:
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
+        if self.n_parallel_output_tokens>1:
+            logits = logits[:self.config.vocab_size, -self.n_parallel_output_tokens:, :]
+        else:
+            logits = logits[:self.config.vocab_size, -1, :]   
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
