@@ -361,13 +361,16 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         assert len(bsizes) == 1, "GPT2 does not support compilation for multiple batch sizes"
         bs_idx = 0
         batch_size = self.decoder_lm_head.batch_size[bs_idx]
+        self.decoder_batch_size = batch_size
         # Only share caches when we don't generate multiple suggestions
         self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size[bs_idx]
         if self.context_buckets:
             self.decoder_lm_head_for_context={}
             self.broadcaster={}
             for context_length_estimate in self.context_buckets:
-                self.decoder_lm_head_for_context[context_length_estimate] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                # todo - GPT2 does not support compilation for multiple batch sizes. However context decoding in base.py/context
+                # is common across all models, to satisfy the indexing mechanism, add 'batch_size' to the key
+                self.decoder_lm_head_for_context[context_length_estimate, batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
                     tp_degree,
                     [context_length_estimate],
                     context_length_estimate,
@@ -382,7 +385,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     allow_pad=self.decoder_lm_head.allow_pad,
                     n_parallel_output_tokens=self.n_parallel_output_tokens
                 )
-                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate])
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                 if not self.share_caches:
                     self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
                         context_length_estimate,
@@ -447,7 +450,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if self.context_buckets:
             for i, context_length_estimate in enumerate(self.context_buckets):
                 model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
-                                                                    new=self.decoder_lm_head_for_context[context_length_estimate])
+                                                                    new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                 source_caches = []
                 for layer in model.layers:
                     source_caches.append(layer.attn_k_cache[batch_size])
@@ -478,12 +481,12 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 self.tensor_pool = tensor_pool.TensorPool()
                 # We need to reset once, since there might be NaN initially in KVcache.
                 # This is done right after weight loading which is shared for different generation methods.
-                self.decoder_lm_head_for_context[context_length_estimate] = model
+                self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
                 self.reset(context_length_estimate=context_length_estimate)
 
     def reset(self,context_length_estimate):
         self.decoder_lm_head.reset()
-        self.decoder_lm_head_for_context[context_length_estimate].reset()
+        self.decoder_lm_head_for_context[context_length_estimate, self.decoder_batch_size].reset()
 
     def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
@@ -504,7 +507,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         model=self.decoder_lm_head
         if is_context_encode:
-            model=self.decoder_lm_head_for_context[estimate]
+            model=self.decoder_lm_head_for_context[estimate, batch_size]
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
