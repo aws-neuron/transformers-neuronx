@@ -116,6 +116,9 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
+        batch_size, context_length = input_ids.shape
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
@@ -493,7 +496,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
-    
+
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 

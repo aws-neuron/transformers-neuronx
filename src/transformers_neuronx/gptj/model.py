@@ -77,6 +77,9 @@ class GPTJForSampling(module.PretrainedModel):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
+        batch_size, context_length = input_ids.shape
+        if cache_offset is None:
+            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
