@@ -22,13 +22,12 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx import base
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
+class GPTNeoXForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
@@ -79,10 +78,11 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
-
+        batch_size, context_length = input_ids.shape
         if start_ids is None:
             start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
-
+        if cache_offset is None:
+            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]

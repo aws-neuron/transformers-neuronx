@@ -28,12 +28,13 @@ from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-# TODO: make it one-shot import 
+# TODO: make it one-shot import
 from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWithContextBroadcasting
 from transformers_neuronx.opt.model import OPTForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
 from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling
+from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
@@ -196,7 +197,7 @@ def main():
     save_parser.add_argument('save', help="Directory to save the model")
     save_parser.add_argument('--random', action='store_true', help="Random weights flag. If true, config.json would be used to generate a model with random weight")
     save_parser.add_argument('--config', type=str, default='', help="Path to config.json file (example: path/to/config.json)")
-    
+
     run_name = 'run'
     run_parser = subparsers.add_parser(run_name)
     run_parser.set_defaults(which=run_name)
@@ -231,7 +232,7 @@ def main():
         "I'm not going to tell you how I learned to code, or how much I've learned. " \
         "But I will tell the story of my first programming experience, and how it changed my life.")
     run_parser.add_argument('--prompt_len', type=int, default=None)
-    # neuron_utils utils 
+    # neuron_utils utils
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
     run_parser.add_argument('--to_s3', default=None)
@@ -272,6 +273,9 @@ def main():
     elif model_type == "bloom":
         model_cls = BloomForSampling
         hf_model_name = get_hf_model('bigscience/bloom-560m')
+    elif model_type == "gptneox":
+        model_cls = GPTNeoXForSampling
+        hf_model_name = get_hf_model('EleutherAI/gpt-neox-20b')
     assert model_cls is not None, f"Invalid model_type: {model_type}"
 
     print(f"Running demo with model_type:{model_type}, hf_model_name:{hf_model_name}")
@@ -328,8 +332,8 @@ def logits_analysis(args, hf_model_name, model_cls):
     golden_dir = logits_dirs[-1]
     logits_candidates = logits_candidates[:-1]
     candidates_dir = logits_dirs[:-1]
-    
-    
+
+
     pairs = []
     for i, logits in enumerate(logits_candidates):
         print(f"========================== Start analysis on \n \t{candidates_dir[i]}\n vs\n \t{golden_dir} (golden) \n==================")
@@ -337,11 +341,11 @@ def logits_analysis(args, hf_model_name, model_cls):
         min_l = min(len(logits), len(logits_golden))
         pairs.append([logits[:min_l], logits_golden[:min_l]])
         for i in range(min_l):
-            
+
             # assume we always check with greedy
             token_candidate = torch.argmax(logits[i])
             token_golden = torch.argmax(logits_golden[i])
-          
+
             allclose_passed = torch.allclose(logits[i], logits_golden[i], atol=1.0, rtol=0.001)
             if not allclose_passed:
                 logging.warning(f"Failed to match on step {i}, {logits[i]} vs {logits_golden[i]}")
@@ -354,22 +358,22 @@ def logits_analysis(args, hf_model_name, model_cls):
 
     if args.plot:
         import matplotlib.pyplot as plt
-        
-        
+
+
         # Create a new figure
         plt.figure()
-        
+
         # Plot each line from the tensor pairs
         for x_vals, y_vals in pairs:
             plt.plot(torch.concatenate(x_vals).reshape(-1), torch.concatenate(y_vals).reshape(-1))
-        
+
         # Show legend if needed
         labels = [logits_dirs]
         plt.legend(labels)
-        
+
         plt.savefig('line_plots.png')
-    
-        
+
+
 
 def save(args, hf_model_name, model_type):
     model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
@@ -413,7 +417,7 @@ def run(args, hf_model_name, model_cls):
                 os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
                 print(f"Set snapshot path {snapshot_path}, dump_path: {dump_path}")
 
-            
+
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
@@ -436,7 +440,7 @@ def run(args, hf_model_name, model_cls):
             suffix = f"{hf_model_name}_{model_cls.__name__}_cpu"
             print(f'running {model_cls.__name__}.from_pretrained')
             model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
-            
+
 
         if args.simple_sample:
             assert args.device == "neuron", "cannot runing simple sample with non-neuron device"
@@ -447,8 +451,8 @@ def run(args, hf_model_name, model_cls):
                     self.scores = scores
             with torch.inference_mode():
                 max_length = args.max_length if args.max_length is not None else args.n_positions
-                forward_func = lambda : neuron_model.sample(encoded_text.input_ids, max_length, 
-                    top_k=args.top_k) 
+                forward_func = lambda : neuron_model.sample(encoded_text.input_ids, max_length,
+                    top_k=args.top_k)
                 sequences = forward_func()
 
                 scores = None
