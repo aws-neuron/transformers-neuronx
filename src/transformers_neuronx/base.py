@@ -62,7 +62,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             program_filename = os.path.join(directory, f'neuron-program-{i}.pkl')
             nbs_obj.load_compiler_artifacts_after_build(program_filename)
 
-    # To enable serialization, have the model call this 
+    # To enable serialization, have the model call this
     # function to register all nbs_obj of your model.
     # The nbs_obj must follow 3 rules:
     #   1. The nbs_obj must inherit from NeuronBaseSerializer.
@@ -91,7 +91,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             - when context_length >= estimate, slice the context up to estimate,
                 and call context encoding model
             - when context_length < estimate, skip and fall back to serial token generation model
-            
+
             and mark `current` accrodingly
 
         2) process the left over tokens accroding to `current`
@@ -105,7 +105,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             # Fusion-In-Decoder context encoding
             fused_context_length = hidden.shape[1]
             context_length = fused_context_length // self.batch_size
-        
+
         current = 0
 
         estimate = bucket.find(self.context_buckets, context_length)
@@ -157,28 +157,32 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             last_token_id = 2 (used for generation to mark the last token is at index 2 instead 3)
 
-        Note: 
+        Note:
             - there is no change on start_ids with right padding.
             - cache_ids will be set to [0, 1, 2, 3] in self.forward()
         """
         batch_size, context_length = input_ids.shape
-        last_token_id = torch.as_tensor(context_length - 1, dtype=torch.int32)
+
 
         if context_length == 1:
-            return input_ids, last_token_id
+            # last_token_id is not used, simply set to 0
+            return input_ids, torch.as_tensor(0, dtype=torch.int32)
 
         # TODO: check context_buckets for compatibility with OPT
         if hasattr(self, "context_buckets"):
             estimate = bucket.find(self.context_buckets, context_length)
         else:
             estimate = self.context_length_estimate
-        
+
+        # when context length is larger than estimate, last_token_id=estimate-1
+        last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
+
         if estimate:
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
 
         return input_ids, last_token_id
-    
+
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
         # right pad the input_ids if neccessary
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
@@ -188,7 +192,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
-    
+
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
@@ -221,17 +225,17 @@ class NeuronBaseSerializer:
     def save_compiler_artifacts(self, path):
         with open(path, 'wb') as f:
             pickle.dump(self.get_neff_bytes(), f)
-    
+
     def load_compiler_artifacts_after_build(self, path):
         self.compiler_artifacts_path = path
-    
+
     def get_neff_bytes(self):
         neff_bytes_arr = [kernel.neff_bytes for kernel in self.get_all_kernels()]
         return neff_bytes_arr
 
     def set_neff_bytes(self):
         with open(self.compiler_artifacts_path, 'rb') as f:
-            kernels_neff_bytes = pickle.load(f)    
+            kernels_neff_bytes = pickle.load(f)
         for kernel, neff_bytes in zip(self.get_all_kernels(), kernels_neff_bytes):
             kernel.neff_bytes = neff_bytes
 
