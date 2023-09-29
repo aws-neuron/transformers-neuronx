@@ -92,32 +92,47 @@ def layer_norm_bsh(hidden, weight, bias):
     output = dtype[input_sizes].Reshape(output)
     return output
 
+
 def group_norm(hidden, weight, bias, num_groups = 1):
     scribe = hidden.scribe
-    dtype = hidden.dtype
     f32 = scribe.f32
     hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
     if hidden_size % num_groups!= 0:
         raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
-    norm_size = n_active_tokens * batch_size * num_groups
-    sizes = hidden_size // num_groups, norm_size
-    hidden = dtype[sizes].Reshape(hidden)
+
+    # Reshape hidden to (H // g, S, B * g)
+    group_size = hidden_size // num_groups
+    norm_size = batch_size * num_groups
+    sizes = group_size, n_active_tokens, norm_size
+    hidden = reshape(hidden, sizes)
     hidden = f32[sizes].Convert(hidden)
     one = f32.Constant(constant_value=1)
     scale = f32[norm_size].Broadcast(one, dimensions=[])
     zero = f32.Constant(constant_value=0)
     offset = f32[norm_size].Broadcast(zero, dimensions=[])
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=1)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
-    weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
-    output = f32[sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
-    output = f32[sizes].Add(output, bias_br)
-    output = dtype[sizes].Convert(output)
-    output = dtype[input_sizes].Reshape(output)
-    return output
 
+    # Calculate norm of each group
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+
+    # Reshape to (H // g, S, B, g)
+    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
+    bn_output = reshape(bn_output, unpacked_shape)
+
+    # Permute to (g, H // g, S, B)
+    bn_output = permute(bn_output, [3, 0, 1, 2])
+
+    # Reshape to (H, S, B)
+    bn_output = reshape(bn_output, input_sizes)
+
+    # Scale with weight and bias
+    weight_br = f32[input_sizes].Broadcast(weight, dimensions=[0])
+    output = f32[input_sizes].Multiply(bn_output, weight_br)
+    bias_br = f32[input_sizes].Broadcast(bias, dimensions=[0])
+    output = f32[input_sizes].Add(output, bias_br)
+
+    return output
 
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
@@ -1259,6 +1274,12 @@ def transpose(tensor, src, dst):
     dimensions[src] = dst
     dimensions[dst] = src
     return tensor.dtype[size].Transpose(tensor, dimensions=dimensions)
+
+
+def permute(tensor, dimensions):
+    size = list(tensor.sizes)
+    permuted_size = [size[dim] for dim in dimensions]
+    return tensor.dtype[permuted_size].Transpose(tensor, dimensions=dimensions)
 
 
 def _topk(tensor, k):
