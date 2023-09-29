@@ -292,7 +292,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_lm_head_hlo_modules = [self._hlo_ln_lm_head(batch_size) for batch_size in self.batch_size]
             num_inputs = len(self.inputs_sdim)
             program = DecoderProgramMultiLayer(self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
-                                                self.num_layers, self.unroll, self.tp_degree, 
+                                                self.num_layers, self.unroll, self.tp_degree,
                                                 self.n_positions_list, self.batch_size, self.prefixed_length)
 
         return program
@@ -1200,13 +1200,13 @@ class DecoderProgramMultiLayer(DecoderProgram):
         hidden_buffers = list()
         last_token_id_buffers = list()
         for input_buffer in self.input_buffers:
-            hidden_buffer, last_token_id_buffer, *_ = input_buffer
+            hidden_buffer, *_, last_token_id_buffer = input_buffer
             hidden_buffers.append(hidden_buffer)
             last_token_id_buffers.append(last_token_id_buffer)
 
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
-        
+
         for multi_layer_idx, multi_layer in enumerate(multi_layers):
             multi_layer_memory = self.multi_layers_memories[multi_layer_idx]
             for bs_idx, batch_size in enumerate(self.batch_sizes):
