@@ -31,7 +31,7 @@ from transformers_neuronx.layers import attention_hsb as attention, transformer
 class OPTForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, context_length_estimate=None, context_unroll=12, neuron_config=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
