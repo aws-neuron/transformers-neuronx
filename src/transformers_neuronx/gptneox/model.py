@@ -122,12 +122,10 @@ class GPTNeoXForSampling(module.PretrainedModel):
         pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, offset=last_offset)
         pos_embd = pos_embd.unsqueeze(0)
         pos_embd = pos_embd.to(pos_embd_buffer.dtype)
-        hidden = self.manipulator.duplicate_on_cpu(hidden)
-        pos_embd = self.manipulator.duplicate_on_cpu(pos_embd)
-        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        start_ids = self.manipulator.duplicate_on_cpu(start_ids)
         for in_buffer, in_tensor in zip(input_buffers, [hidden, pos_embd, cache_offset, start_ids]):
-            ops.parallel_write(in_buffer, in_tensor)
+            in_tensor = in_tensor.to(in_buffer.dtype)
+            duplicated_tensor = self.manipulator.duplicate_on_cpu(in_tensor)
+            ops.parallel_write(in_buffer, duplicated_tensor)
         return program.run(bucket_id)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
