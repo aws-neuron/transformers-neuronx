@@ -683,16 +683,36 @@ def gated_mlp(
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
-    hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
-    hidden_active = getattr(activations, activation_function)(hidden_active)
+    if len(in0_weight.sizes) == 4:
+        assert hidden_size % constants.TILE_SIZE == 0, \
+                f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+        hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
+        hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
 
-    # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
-    hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
-    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        hidden_active = dot_0120_add1(hidden, in0_weight, in0_bias,
+                                      scales=in0_scales, neuron_config=neuron_config)
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+        hidden_linear = dot_0120_add1(hidden, in1_weight, in1_bias,
+                                      scales=in1_scales, neuron_config=neuron_config)
 
-    # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
-    result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        hidden_states_tiled_sizes = hidden_states.sizes[0], hidden_states.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden_states = hidden_states.dtype[hidden_states_tiled_sizes].Reshape(hidden_states)
+
+        result = dot_1220_add1(hidden_states, out_weight, out_bias,
+                               scales=out_scales, neuron_config=neuron_config)
+    else:
+        # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+        hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+
+        # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+        hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+
+        # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+        result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
 
     # (b * s, h) = > (h, s, b)
     result = transpose(result, 0, 1)
