@@ -396,7 +396,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
                         context_length_estimate,
                         self.prompt_batch_size,
-                        self.decoder_lm_head.batch_size,
+                        self.decoder_lm_head.batch_size[bs_idx],
                         n_heads_tp,
                         d_head,
                         config.amp,
