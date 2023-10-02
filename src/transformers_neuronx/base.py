@@ -163,10 +163,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         """
         batch_size, context_length = input_ids.shape
 
-
+        # if last_token_id not used, simply set to 0
+        last_token_id = torch.as_tensor(0, dtype=torch.int32)
         if context_length == 1:
-            # last_token_id is not used, simply set to 0
-            return input_ids, torch.as_tensor(0, dtype=torch.int32)
+            return input_ids, last_token_id
 
         # TODO: check context_buckets for compatibility with OPT
         if hasattr(self, "context_buckets"):
@@ -174,10 +174,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         else:
             estimate = self.context_length_estimate
 
-        # when context length is larger than estimate, last_token_id=estimate-1
-        last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
-
         if estimate:
+            # when context length is larger than estimate, last_token_id=estimate-1
+            last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
 
