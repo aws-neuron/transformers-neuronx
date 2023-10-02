@@ -137,6 +137,113 @@ def group_norm(hidden, weight, bias, num_groups = 1):
 
     return output
 
+
+def group_norm_shb(hidden, weight, bias, num_groups):
+    """
+    Perform GroupNorm on input with shape (S, H, B).
+    """
+    scribe = hidden.scribe
+    f32 = scribe.f32
+    n_active_tokens, hidden_size, batch_size = hidden.sizes
+    hsb_size = hidden_size, n_active_tokens, batch_size
+
+    if hidden_size % num_groups!= 0:
+        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
+
+    # Permute to H, S, B
+    hidden = permute(hidden, [1, 0, 2])
+
+    # Reshape hidden to (H // g, S, B * g)
+    group_size = hidden_size // num_groups
+    norm_size = batch_size * num_groups
+    sizes = group_size, n_active_tokens, norm_size
+    hidden = reshape(hidden, sizes)
+    hidden = f32[sizes].Convert(hidden)
+    one = f32.Constant(constant_value=1)
+    scale = f32[norm_size].Broadcast(one, dimensions=[])
+    zero = f32.Constant(constant_value=0)
+    offset = f32[norm_size].Broadcast(zero, dimensions=[])
+
+    # Calculate norm of each group
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+
+    # Reshape to (H // g, S, B, g)
+    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
+    bn_output = reshape(bn_output, unpacked_shape)
+
+    # Permute to (g, H // g, S, B)
+    bn_output = permute(bn_output, [3, 0, 1, 2])
+
+    # Reshape to (H, S, B)
+    bn_output = reshape(bn_output, hsb_size)
+
+    # Scale with weight and bias
+    weight_br = f32[hsb_size].Broadcast(weight, dimensions=[0])
+    output = f32[hsb_size].Multiply(bn_output, weight_br)
+    bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
+    output = f32[hsb_size].Add(output, bias_br)
+
+    # Permute to S, H, B
+    output = permute(output, [1, 0, 2])
+
+    return output
+
+
+def group_norm_bsh(hidden, weight, bias, num_groups):
+    """
+    Perform GroupNorm on input with shape (B, S, H).
+    """
+    scribe = hidden.scribe
+    f32 = scribe.f32
+    batch_size, n_active_tokens, hidden_size = hidden.sizes
+    hsb_size = hidden_size, n_active_tokens, batch_size
+
+    if hidden_size % num_groups!= 0:
+        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
+
+    # Permute to H, S, B
+    hidden = permute(hidden, [2, 1, 0])
+
+    # Reshape hidden to (H // g, S, B * g)
+    group_size = hidden_size // num_groups
+    norm_size = batch_size * num_groups
+    sizes = group_size, n_active_tokens, norm_size
+    hidden = reshape(hidden, sizes)
+    hidden = f32[sizes].Convert(hidden)
+    one = f32.Constant(constant_value=1)
+    scale = f32[norm_size].Broadcast(one, dimensions=[])
+    zero = f32.Constant(constant_value=0)
+    offset = f32[norm_size].Broadcast(zero, dimensions=[])
+
+    # Calculate norm of each group
+    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
+    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
+    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+
+    # Reshape to (H // g, S, B, g)
+    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
+    bn_output = reshape(bn_output, unpacked_shape)
+
+    # Permute to (g, H // g, S, B)
+    bn_output = permute(bn_output, [3, 0, 1, 2])
+
+    # Reshape to (H, S, B)
+    bn_output = reshape(bn_output, hsb_size)
+
+    # Scale with weight and bias
+    weight_br = f32[hsb_size].Broadcast(weight, dimensions=[0])
+    output = f32[hsb_size].Multiply(bn_output, weight_br)
+    bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
+    output = f32[hsb_size].Add(output, bias_br)
+
+    # Permute to B, S, H
+    output = permute(output, [2, 1, 0])
+
+    return output
+
+
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
