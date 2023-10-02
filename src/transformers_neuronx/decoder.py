@@ -513,8 +513,8 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_transposed = True
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
-                      out_feature_dim=1):
-        self.extra_parameters.append((param, sharding, allow_pad, allow_quantize, out_feature_dim))
+                      out_feature_dim=1, allow_transform=False):
+        self.extra_parameters.append((param, sharding, allow_pad, allow_quantize, out_feature_dim, allow_transform))
 
     def add_pre_attention_layer_norm(self, weight, bias):
         self.pre_attn_ln_weight = weight
@@ -611,11 +611,12 @@ class DecoderLayer(torch.nn.Module):
             self.mlp_in_weight, self.mlp_in_min, self.mlp_in_max = utils.u8_encode(self.mlp_in_weight)
             self.mlp_out_weight, self.mlp_out_min, self.mlp_out_max = utils.u8_encode(self.mlp_out_weight)
         if self.neuron_config and self.neuron_config.quant:
-            self.mlp_in_weight, self.mlp_in_scales = \
-                quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
-            self.mlp_out_weight, self.mlp_out_scales = \
-                quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant,
-                                                out_feature_dim = 1 if self.mlp_out_transposed else 0)
+            if self.mlp_in_weight is not None:
+                self.mlp_in_weight, self.mlp_in_scales = \
+                    quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
+                self.mlp_out_weight, self.mlp_out_scales = \
+                    quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant,
+                                                    out_feature_dim = 1 if self.mlp_out_transposed else 0)
 
             if self.neuron_config.quant.quantize_attn:
                 self.attn_q_weight, self.attn_q_scales = \
@@ -633,7 +634,7 @@ class DecoderLayer(torch.nn.Module):
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
         maybe_primary_only = maybe_manipulator.primary_only
-        maybe_shard_and_transform_along = maybe_manipulator.shard_and_transform_along
+        maybe_shard_along_and_transform = maybe_manipulator.shard_along_and_transform
         self.pre_attn_ln_weight = maybe_duplicate(self.pre_attn_ln_weight)
         self.pre_attn_ln_bias = maybe_duplicate(self.pre_attn_ln_bias)
         self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
@@ -654,33 +655,46 @@ class DecoderLayer(torch.nn.Module):
         self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
         self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
         self.pre_mlp_ln_bias = maybe_duplicate(self.pre_mlp_ln_bias)
-        self.mlp_in_weight = maybe_shard_and_transform_along(self.mlp_in_weight, 1)
-        self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
-        self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
-        self.mlp_out_weight = maybe_shard_and_transform_along(self.mlp_out_weight, dim=self.mlp_out_sharding)
-        self.mlp_out_scales = maybe_duplicate(self.mlp_out_scales)
-        self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
+        if self.mlp_in_weight is not None:
+            self.mlp_in_weight = maybe_shard_along_and_transform(self.mlp_in_weight, 1)
+            self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
+            self.mlp_in_bias = maybe_shard_along(self.mlp_in_bias, dim=0)
+            self.mlp_out_weight = maybe_shard_along_and_transform(self.mlp_out_weight, dim=self.mlp_out_sharding)
+            self.mlp_out_scales = maybe_duplicate(self.mlp_out_scales)
+            self.mlp_out_bias = maybe_primary_only(self.mlp_out_bias)
         self.post_mlp_ln_weight = maybe_duplicate(self.post_mlp_ln_weight)
         self.post_mlp_ln_bias = maybe_duplicate(self.post_mlp_ln_bias)
 
         extras = []
-        for param, dim, allow_pad, allow_quantize, out_feature_dim in self.extra_parameters:
+        for param, dim, allow_pad, allow_quantize, out_feature_dim, allow_transform in self.extra_parameters:
             if allow_pad:
                 size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None) and allow_transform:
+                    size = utils.round_up_to_divisor(size // self.tp_degree,
+                                                     constants.TILE_SIZE) * self.tp_degree
                 param = utils.pad(param, dim, size)
 
-            if allow_quantize and self.neuron_config and self.neuron_config.quant:
-                param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant,
-                                                                out_feature_dim=out_feature_dim)
-                scales_dim = 0 if dim == out_feature_dim else None
-                extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim),
-                               maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)])
-            elif allow_quantize:
-                # If the parameter is quantizable but the quantization is not enabled, we still need
-                # to add a scale placeholder to match the layer arguments
-                extras.extend([maybe_manipulator.duplicate_or_shard_along(param, dim), None])
+            if allow_quantize:
+                # If the parameter is quantizable and the quantization is enabled, we calculate the
+                # scaling factors here, otherwise we still need to add a scale placeholder to match
+                # the layer arguments
+                if self.neuron_config and self.neuron_config.quant:
+                    param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant,
+                                                                    out_feature_dim=out_feature_dim)
+                    scales_dim = 0 if dim == out_feature_dim else None
+                    scales = maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)
+                else:
+                    scales = None
+
+            if allow_transform:
+                param = maybe_shard_along_and_transform(param, dim)
             else:
-                extras.append(maybe_manipulator.duplicate_or_shard_along(param, dim))
+                param = maybe_manipulator.duplicate_or_shard_along(param, dim)
+
+            extras.append(param)
+            if allow_quantize:
+                extras.append(scales)
+
         self.extra_parameters = extras
 
         self.init_caches()
@@ -953,7 +967,7 @@ class MaybeParallelTensorManipulator:
 
         return tensors
 
-    def shard_and_transform_along(self, tensor, dim):
+    def shard_along_and_transform(self, tensor, dim):
         if tensor is None:
             return None
         tensors = self.manipulator.shard_along_on_cpu(tensor, dim)
