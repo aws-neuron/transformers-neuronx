@@ -262,9 +262,9 @@ class OPTForSamplingNoEmbeddingHlo:
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        cache_ids = scribe.u32[n_active_tokens].Parameter(parameter_number=1)
-        start_ids = scribe.u32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.u32.Parameter(parameter_number=3)
+        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
+        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+        last_token_id = scribe.s32.Parameter(parameter_number=3)
         # For the best perf, we only use kv prefetch in the token generation stage
         token_generation = n_active_tokens == 1
         triu_comparison = 'LT' if token_generation else 'LE'
