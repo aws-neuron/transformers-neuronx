@@ -72,7 +72,7 @@ class BloomForSampling(base.NeuronModelBase):
         if self.context_buckets:
             self.decoder_lm_head_for_context = {}
             for context_length_estimate in self.context_buckets:
-                for batch_size in self.batch_sizes:                    
+                for batch_size in self.batch_sizes:
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
                         tp_degree,
                         [context_length_estimate],
@@ -166,7 +166,7 @@ class BloomForSampling(base.NeuronModelBase):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
-                    model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
+                    model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate, batch_size], share_caches=True)
                     self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
