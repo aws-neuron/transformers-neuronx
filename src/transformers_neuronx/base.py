@@ -286,7 +286,7 @@ class NeuronBaseSerializer:
 
 def hash_hlo(hlo_module):
     hash_gen = hashlib.sha256()
-    text = str(hlo_module)
+    text = hlo_module.SerializeToString()
     hash_gen.update(text.encode('utf-8'))
     hash = str(hash_gen.hexdigest())[:20]
     return hash + '.neff'
