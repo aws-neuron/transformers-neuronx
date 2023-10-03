@@ -79,13 +79,13 @@ class OPTForSampling(base.NeuronModelBase):
         if self.context_length_estimate is not None:
             for batch_size in self.batch_sizes:
                 self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree, 
-                                                    [context_length_estimate], 
-                                                    context_length_estimate, 
-                                                    batch_size, 
-                                                    attention_head_size, 
-                                                    amp=amp, 
-                                                    num_layers=config.num_hidden_layers, 
+                                                    tp_degree,
+                                                    [context_length_estimate],
+                                                    context_length_estimate,
+                                                    batch_size,
+                                                    attention_head_size,
+                                                    amp=amp,
+                                                    num_layers=config.num_hidden_layers,
                                                     n_head=config.num_attention_heads,
                                                     unroll=context_unroll,
                                                     neuron_config=neuron_config,
@@ -131,7 +131,7 @@ class OPTForSampling(base.NeuronModelBase):
         self.decoder_lm_head.to_neuron()
         if self.context_length_estimate is not None:
             for batch_size in self.batch_sizes:
-                self.decoder_lm_head_for_context[batch_size] = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[batch_size])
+                self.decoder_lm_head_for_context[batch_size] = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[batch_size], share_caches=True)
 
     def reset(self):
         self.decoder_lm_head.reset()
