@@ -29,7 +29,7 @@ from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
-
+from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 class GPT2ForSampling(base.NeuronModelBase):
 
@@ -166,158 +166,16 @@ class GPT2ForSampling(base.NeuronModelBase):
         return torch.cat(tokens, dim=-1)
 
 
-# Need to keep PreTrainedModel after module.PretrainedModel as the later
-# overrides from_pretrained methods. Cannot use module.WrappingCheckpointCompatibleModel directly
-# since it doesn't pass config in suer().__init__
-class GPT2ForHuggingFaceSampling(base.NeuronModelBase):
-    def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
-        config = GPT2HuggingFaceConfig(config, batch_size, amp, tp_degree, **kwargs)
-        super().__init__(config) # will call transformers.PreTrainedModel(confg)
-        self.chkpt_model = GPT2CheckpointCompatible(config)
-        self.config = config
+class GPT2ForHuggingFaceSampling(GPT2ForSampling):
 
-        # Check if input sequence length is allowed given position embedding dimensions
-        sequence_length = kwargs.get("n_positions", None)
-        if sequence_length:
-            max_allowed_sequence_length = config.max_position_embeddings
-            if sequence_length > max_allowed_sequence_length:
-                raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
+    def __init__(self, *args, **kwargs):
+        warnings.warn("GPT2ForHuggingFaceSampling class is deprecated. It now falls back to use GPT2ForSampling. "
+            "Please use HuggingFaceGenerationModelAdapter for generation API.", category=DeprecationWarning)
+        super().__init__(*args, **kwargs)
+        self.wrapper = HuggingFaceGenerationModelAdapter(self)
 
-        if unroll is None:
-            unroll = config.n_layer
-        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
-        attention_head_size = config.n_embd // config.n_head
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp,
-            config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config
-        )
-        self.register_for_serialization(self.decoder_lm_head)
-        start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
-        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
-        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
-        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.cur_len = 0
-
-    def load_state_dict_dir(self, state_dict_dir):
-        self.chkpt_model.load_state_dict_dir(state_dict_dir)
-
-    def load_state_dict_low_memory(self, state_dict):
-        self.chkpt_model.load_state_dict_low_memory(state_dict)
-
-    def to_neuron(self):
-        ops.init()
-        self.chkpt_model.transformer.wte.materialize()
-        self.chkpt_model.transformer.wpe.materialize()
-        n_embd = self.config.n_embd
-        for layer in self.chkpt_model.transformer.h:
-            layer.materialize()
-            attn = layer.attn
-            mlp = layer.mlp
-            c_attn_weight = attn.c_attn.weight.detach()
-            c_attn_bias = attn.c_attn.bias.detach()
-            _, n_embd_qkv = c_attn_weight.shape
-            is_multi_query_attn = n_embd_qkv < n_embd * 3
-            new_layer = self.decoder_lm_head.new_layer()
-            new_layer.add_pre_attention_layer_norm(layer.ln_1.weight.detach(),
-                                                   layer.ln_1.bias.detach())
-            new_layer.add_attention_query(c_attn_weight[:, :n_embd], c_attn_bias[:n_embd])
-            _, n_embd_qkv = c_attn_weight.shape
-            if is_multi_query_attn:
-                n_kv_heads_x_size_per_head = (n_embd_qkv - n_embd) // 2
-                assert n_kv_heads_x_size_per_head == (self.config.n_kv_head * (self.config.n_embd // self.config.n_head)), \
-                    f"mismatch between weights tensor size and model config: " \
-                    f"n_kv_heads*size_per_head(weights)={n_kv_heads_x_size_per_head}, " \
-                    f"n_kv_heads*size_per_head(config)={self.config.n_kv_head * (self.config.n_embd // self.config.n_head)}"
-                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd+n_kv_heads_x_size_per_head],
-                                            c_attn_bias[n_embd:n_embd+n_kv_heads_x_size_per_head])
-                new_layer.add_attention_value(c_attn_weight[:, n_embd+n_kv_heads_x_size_per_head:],
-                                              c_attn_bias[n_embd+n_kv_heads_x_size_per_head:])
-            else:
-                new_layer.add_attention_key(c_attn_weight[:, n_embd:n_embd*2],
-                                            c_attn_bias[n_embd:n_embd*2])
-                new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
-                                              c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
-            new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
-            new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
-                new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
-            else:            
-                new_layer.add_mlp_output(
-                    mlp.c_proj.weight.detach().T,
-                    mlp.c_proj.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
-            new_layer.to_neuron()
-            layer.nullify()
-        ln_f = self.chkpt_model.transformer.ln_f
-        ln_f.materialize()
-        self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
-        lm_head = self.chkpt_model.lm_head
-        lm_head.materialize()
-        self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
-        lm_head.nullify()
-        self.decoder_lm_head.to_neuron()
-        # We need to reset once, since there might be NaN initially in KVcache.
-        # This is done right after weight loading which is shared for different generation methods.
-        self.reset()
-
-    def reset(self):
-        # self.decoder_lm_head.reset()
-        self.cur_len = 0
-
-    def _forward(self, input_ids, cache_ids, start_ids=None):
-        inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
-        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
-        position_embeds = self.chkpt_model.transformer.wpe(position_ids)
-        hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2).contiguous()
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size]
-        logits = logits.permute([2, 1, 0])
-        return logits
-
-    def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
-            attention_mask=None, return_dict=False):
-
-        if  output_hidden_states or output_attentions or attention_mask is not None:
-            warnings.warn("Warning: These arguments are not used by forward(): \
-                (output_hidden_states, output_attentions, attention_mask)")
-        out_logits = self._forward(input_ids, cache_ids, start_ids)
-        if return_dict:
-            return ModelOutput(
-                [("logits", out_logits)]
-            )
-        return (out_logits,)
-
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
-        # convert attention_mask to start_ids
-        attention_mask = None
-        start_ids = None
-        if "attention_mask" in kwargs:
-            attention_mask = kwargs["attention_mask"]
-        if attention_mask is not None:
-            _, start_ids = attention_mask.max(axis=1)
-
-        if self.cur_len > 0:
-            input_ids = input_ids[:, -1:]
-            cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
-        else:
-            cache_ids = torch.arange(input_ids.shape[-1], dtype=torch.int32)
-
-        self.cur_len += input_ids.shape[-1]
-        model_inputs = {
-            "input_ids": input_ids,
-            "cache_ids": cache_ids,
-            "start_ids": start_ids,
-        }
-
-        return model_inputs
+    def generate(self, *args, **kwargs):
+        return self.wrapper.generate(*args, **kwargs)
 
 
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
@@ -542,7 +400,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if self.n_parallel_output_tokens>1:
             logits = logits[:self.config.vocab_size, -self.n_parallel_output_tokens:, :]
         else:
-            logits = logits[:self.config.vocab_size, -1, :]   
+            logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
