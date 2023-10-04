@@ -97,9 +97,15 @@ def layer_norm_bsh(hidden, weight, bias):
 
 
 def group_norm(hidden, weight, bias, num_groups = 1):
+    """
+    Perform GroupNorm on input with shape (H, S, B).
+    """
+    dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
+
     hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
+
     if hidden_size % num_groups!= 0:
         raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
 
@@ -108,7 +114,7 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     norm_size = batch_size * num_groups
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = cast(hidden, f32)
     one = f32.Constant(constant_value=1)
     scale = f32[norm_size].Broadcast(one, dimensions=[])
     zero = f32.Constant(constant_value=0)
@@ -134,7 +140,7 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     output = f32[input_sizes].Multiply(bn_output, weight_br)
     bias_br = f32[input_sizes].Broadcast(bias, dimensions=[0])
     output = f32[input_sizes].Add(output, bias_br)
-
+    output = cast(output, dtype)
     return output
 
 
@@ -142,8 +148,10 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     """
     Perform GroupNorm on input with shape (S, H, B).
     """
+    dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
+
     n_active_tokens, hidden_size, batch_size = hidden.sizes
     hsb_size = hidden_size, n_active_tokens, batch_size
 
@@ -158,7 +166,7 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     norm_size = batch_size * num_groups
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = cast(hidden, f32)
     one = f32.Constant(constant_value=1)
     scale = f32[norm_size].Broadcast(one, dimensions=[])
     zero = f32.Constant(constant_value=0)
@@ -184,6 +192,7 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     output = f32[hsb_size].Multiply(bn_output, weight_br)
     bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
     output = f32[hsb_size].Add(output, bias_br)
+    output = cast(output, dtype)
 
     # Permute to S, H, B
     output = permute(output, [1, 0, 2])
@@ -195,8 +204,10 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     """
     Perform GroupNorm on input with shape (B, S, H).
     """
+    dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
+
     batch_size, n_active_tokens, hidden_size = hidden.sizes
     hsb_size = hidden_size, n_active_tokens, batch_size
 
@@ -211,7 +222,7 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     norm_size = batch_size * num_groups
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = cast(hidden, f32)
     one = f32.Constant(constant_value=1)
     scale = f32[norm_size].Broadcast(one, dimensions=[])
     zero = f32.Constant(constant_value=0)
@@ -237,6 +248,7 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     output = f32[hsb_size].Multiply(bn_output, weight_br)
     bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
     output = f32[hsb_size].Add(output, bias_br)
+    output = cast(output, dtype)
 
     # Permute to B, S, H
     output = permute(output, [2, 1, 0])
