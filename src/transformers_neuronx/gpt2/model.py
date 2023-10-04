@@ -376,7 +376,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             for context_length_estimate in self.context_buckets:
                 # todo - GPT2 does not support compilation for multiple batch sizes. However context decoding in base.py/context
                 # is common across all models, to satisfy the indexing mechanism, add 'batch_size' to the key
-                self.decoder_lm_head_for_context[context_length_estimate, batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                # note the batch size for decoder_lm_head_for_context is the self.prompt_batch_size
+                self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
                     tp_degree,
                     [context_length_estimate],
                     context_length_estimate,
@@ -391,7 +392,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     allow_pad=self.decoder_lm_head.allow_pad,
                     n_parallel_output_tokens=self.n_parallel_output_tokens
                 )
-                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, batch_size])
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
                     self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
                         context_length_estimate,
@@ -459,11 +460,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if self.context_buckets:
             for i, context_length_estimate in enumerate(self.context_buckets):
                 model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
-                                                                    new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
+                                                                    new=self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 source_caches = []
                 for layer in model.layers:
-                    source_caches.append(layer.attn_k_cache[batch_size])
-                    source_caches.append(layer.attn_v_cache[batch_size])
+                    source_caches.append(layer.attn_k_cache[model.batch_size[bs_idx]])
+                    source_caches.append(layer.attn_v_cache[model.batch_size[bs_idx]])
                 manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
                 target_caches = []
                 for layer in self.decoder_lm_head.layers:

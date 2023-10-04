@@ -153,7 +153,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.program.setup(self.layers, ln_lm_head_params)
         # separate intialization and compilation
         if self.need_reorder_cache:
-            self.program._setup_reorder_cache_kernel()
+            self.program.setup_reorder_cache_kernels()
 
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
@@ -1022,9 +1022,8 @@ class DecoderProgram:
         self.need_reorder_cache = True
         self.reorder_cache_hlo_kernels = [self._create_reoder_cache_kernel(batch_size) for batch_size in self.batch_sizes]
         if also_compile_now:
-            for bs_idx, batch_size in  enumerate(self.batch_sizes):
-                reorder_cache_hlo_kernel = self.reorder_cache_hlo_kernels[bs_idx]
-                self._setup_reorder_cache_kernel(reorder_cache_hlo_kernel, batch_size)
+            self.setup_reorder_cache_kernels()
+
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
@@ -1077,6 +1076,11 @@ class DecoderProgram:
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
         return compiler.HLOKernel(_reorder_cache, self.tp_degree)
+
+    def setup_reorder_cache_kernels(self):
+        for bs_idx, batch_size in  enumerate(self.batch_sizes):
+            reorder_cache_hlo_kernel = self.reorder_cache_hlo_kernels[bs_idx]
+            self._setup_reorder_cache_kernel(reorder_cache_hlo_kernel, batch_size)
 
     def _setup_reorder_cache_kernel(self, reorder_cache_hlo_kernel, batch_size):
         reorder_cache_hlo_kernel.build()
