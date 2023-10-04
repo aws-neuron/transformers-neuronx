@@ -240,23 +240,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 class NeuronBaseSerializer:
 
     def save_compiler_artifacts(self, path):
-<<<<<<< HEAD
-        with open(path, 'wb') as f:
-            pickle.dump(self.get_neff_bytes(), f)
-
-    def load_compiler_artifacts_after_build(self, path):
-        self.compiler_artifacts_path = path
-
-    def get_neff_bytes(self):
-        neff_bytes_arr = [kernel.neff_bytes for kernel in self.get_all_kernels()]
-        return neff_bytes_arr
-
-    def set_neff_bytes(self):
-        with open(self.compiler_artifacts_path, 'rb') as f:
-            kernels_neff_bytes = pickle.load(f)
-        for kernel, neff_bytes in zip(self.get_all_kernels(), kernels_neff_bytes):
-            kernel.neff_bytes = neff_bytes
-=======
         for kernel in self.get_all_kernels():
             hlo_hash = hash_hlo(kernel.hlo_module)
             with open(os.path.join(path, hlo_hash), 'wb') as f:
@@ -277,7 +260,6 @@ class NeuronBaseSerializer:
                                           'Ensure that the model you are trying to load is the same type and '
                                           'has the same parameters as the one you saved or call "save" on '
                                           'this model to reserialize it.'))
->>>>>>> dcf3192 (Change serialization to use HLO hashing, add very basic is_compiled function)
 
     def get_all_kernels(self):
         raise NotImplementedError(
@@ -286,7 +268,7 @@ class NeuronBaseSerializer:
 
 def hash_hlo(hlo_module):
     hash_gen = hashlib.sha256()
-    text = hlo_module.SerializeToString()
+    text = str(hlo_module)
     hash_gen.update(text.encode('utf-8'))
     hash = str(hash_gen.hexdigest())[:20]
     return hash + '.neff'
