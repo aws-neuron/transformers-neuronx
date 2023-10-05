@@ -233,10 +233,12 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions=self.token_buckets[-1]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens, 
+            batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
             unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens
         )
+
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
         self.register_for_serialization(self.decoder_lm_head)
@@ -281,8 +283,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
                     neuron_config=neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad,
-                    n_parallel_output_tokens=self.n_parallel_output_tokens
+                    allow_pad=self.decoder_lm_head.allow_pad
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
@@ -431,10 +432,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         else:
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
         logits = logits.to(torch.float32)
-        if self.n_parallel_output_tokens>1:
-            logits = logits[:self.config.vocab_size, -self.n_parallel_output_tokens:, :]
+        _,n_active_tokens,_=logits.shape
+        if n_active_tokens>1:
+            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
         else:
-            logits = logits[:self.config.vocab_size, -1, :]
+            logits = logits[:self.config.vocab_size, -1, :] 
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
@@ -472,6 +474,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
             output_scores=output_scores,
+            n_parallel_output_tokens=self.n_parallel_output_tokens,
         )
         if output_scores:
             interleaved, scores = interleaved
