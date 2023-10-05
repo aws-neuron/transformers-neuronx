@@ -1040,7 +1040,7 @@ class DecoderProgram:
 
 
     def find_bucket_id(self, length):
-        return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length)
+        return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
 
     def inputs_host_to_device(self, input_tensors, batch_size):
         input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
