@@ -266,14 +266,14 @@ class OPTForSamplingNoEmbeddingHlo:
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         last_token_id = scribe.s32.Parameter(parameter_number=3)
         # For the best perf, we only use kv prefetch in the token generation stage
-        token_generation = n_active_tokens == 1
-        triu_comparison = 'LT' if token_generation else 'LE'
+        use_prefetch = n_active_tokens != n_positions
+        triu_comparison = 'LT' if use_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(
             start_ids,
             cache_ids,
             n_positions,
             triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=token_generation,
+            allow_kv_dot_prefetch=use_prefetch,
             start_mask=True
         )
         return (hidden, last_token_id, cache_ids, mask, active_mask), (1, 0, None, None)
