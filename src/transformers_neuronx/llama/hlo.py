@@ -44,14 +44,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         # NOTE: When using token generation network, we generate a mask for the
         #       past tokens and the current tokens separately. This allows us
         #       use the split "prefetch" attention layer.
-        token_generation = n_active_tokens == 1
-        triu_comparison = 'LT' if token_generation else 'LE'
+        use_prefetch = n_active_tokens != n_positions
+        triu_comparison = 'LT' if use_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(
             start_ids,
             cache_ids,
             n_positions,
             triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=token_generation,
+            allow_kv_dot_prefetch=use_prefetch,
             start_mask=True,
         )
         return (hidden, last_token_id, pos_embed, cache_ids, mask, active_mask), (1, 0, None, None)
@@ -100,7 +100,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
-        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, n_parallel_output_tokens,eps=self.config.rms_norm_eps)
+        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, n_parallel_output_tokens, eps=self.config.rms_norm_eps)
 
     def attention(
         self,

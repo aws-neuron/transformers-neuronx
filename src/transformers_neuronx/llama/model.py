@@ -30,7 +30,7 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, prefixed_length=0, **kwargs):
+                 neuron_config=None, prefixed_length=0, n_parallel_output_tokens=1, **kwargs):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.config = config
@@ -49,7 +49,7 @@ class LlamaForSampling(base.NeuronModelBase):
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
                 self.context_buckets = sorted(self.context_buckets)
-                
+        self.n_parallel_output_tokens=n_parallel_output_tokens        
         self.max_positions = self.token_buckets[-1]
 
         if isinstance(batch_size,int):
@@ -60,10 +60,11 @@ class LlamaForSampling(base.NeuronModelBase):
             raise TypeError("batch_size must be list of ints or int type")
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
-            attention_head_size=config.attention_head_size, amp=amp,
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens, 
+            batch_size=self.batch_sizes, attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch,
+            n_parallel_output_tokens= self.n_parallel_output_tokens
         )
         self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
