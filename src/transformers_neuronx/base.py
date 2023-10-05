@@ -229,7 +229,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits = self.decoder_lm_head(hidden, *args)
 
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
+        _,n_active_tokens,_=logits.shape
+        if n_active_tokens>1:
+            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
+        else:
+            logits = logits[:self.config.vocab_size, -1, :] 
         logits = logits.transpose(0, 1)
         return logits
 
