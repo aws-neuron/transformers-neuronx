@@ -589,7 +589,7 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     all_reduce_dtype = None
     if neuron_config:
         all_reduce_dtype = neuron_config.all_reduce_dtype
-    result = all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
+    hidden = all_reduce_sum(hidden, tp_degree, dtype=all_reduce_dtype)
     return hidden
 
 
