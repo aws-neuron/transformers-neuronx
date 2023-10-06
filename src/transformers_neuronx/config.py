@@ -125,12 +125,23 @@ class SparseAttnConfig:
 
 
 class NeuronConfig():
-    """ The class contains all Neuron related configs """
+    """
+    Configuration class to store all Neuron related configs.
+
+    Arguments:
+        all_reduce_dtype (str, optional): Data type that's used for AllReduce
+            CC ops, to be selected from `["float32", "float16", "bfloat16"]`.
+            Default: `None`.
+        sparse_attn (`SparseAttnConfig`, optional): Sparse attention related
+            configurations. Default: `None`.
+        quant (`QuantizationConfig`, optional): Quantization related
+            configurations. Default: `None`.
+    """
     def __init__(self, **kargs):
-        # Quantization related configurations
-        self.quant = kargs.pop('quant', None)
-        # Sparse attention related configurations
+        self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
         self.sparse_attn = kargs.pop('sparse_attn', None)
+        self.quant = kargs.pop('quant', None)
+
 
 class GenerationConfig:
 

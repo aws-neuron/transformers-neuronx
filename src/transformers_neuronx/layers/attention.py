@@ -418,7 +418,8 @@ def output(
     if tp_degree == 1:
         return result
 
-    replica_groups = [list(range(tp_degree))]
-    add_func = hlo.gen_add_func(dtype)
-    result = dtype[hidden_sizes].AllReduce(result, replica_groups=replica_groups, to_apply=add_func)
+    all_reduce_dtype = None
+    if neuron_config:
+        all_reduce_dtype = neuron_config.all_reduce_dtype
+    result = hlo.all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
     return result
