@@ -26,6 +26,7 @@ from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx import utils
 from transformers_neuronx import compiler
 from transformers_neuronx import constants
+from transformers_neuronx import dtypes
 
 def ax_plus_by(a, x, b, y):
     """
@@ -548,7 +549,10 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden = dtype[hidden_sizes].Reshape(hidden)
 
     if tp_degree != 1:
-        hidden = all_reduce_sum(hidden, tp_degree)
+        all_reduce_dtype = None
+        if neuron_config:
+            all_reduce_dtype = neuron_config.all_reduce_dtype
+        hidden = all_reduce_sum(hidden, tp_degree, dtype=all_reduce_dtype)
 
     return hidden
 
@@ -582,9 +586,10 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     hidden = dtype[hidden_sizes].Reshape(hidden)
     if tp_degree == 1:
         return hidden
-    replica_groups = [list(range(tp_degree))]
-    add_func = gen_add_func(dtype)
-    hidden = dtype[hidden_sizes].AllReduce(hidden, replica_groups=replica_groups, to_apply=add_func)
+    all_reduce_dtype = None
+    if neuron_config:
+        all_reduce_dtype = neuron_config.all_reduce_dtype
+    result = all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
     return hidden
 
 
@@ -639,7 +644,10 @@ def gated_mlp_bsh(
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
-        result = all_reduce_sum(result, tp_degree)
+        all_reduce_dtype = None
+        if neuron_config:
+            all_reduce_dtype = neuron_config.all_reduce_dtype
+        result = all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
 
     return result
 
@@ -719,7 +727,10 @@ def gated_mlp(
     result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
-        result = all_reduce_sum(result, tp_degree)
+        all_reduce_dtype = None
+        if neuron_config:
+            all_reduce_dtype = neuron_config.all_reduce_dtype
+        result = all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
 
     return result
 
@@ -939,6 +950,31 @@ def reduce_sum(tensor, dim, keepdim=False):
     return value
 
 
+def all_reduce(tensor, replica_groups, to_apply, dtype=None):
+    size = tensor.sizes
+    tensor_dtype = tensor.dtype
+    scribe = tensor.scribe
+
+    if dtype is None:
+        all_reduce_dtype = tensor_dtype
+    elif isinstance(dtype, str):
+        all_reduce_dtype = dtypes.to_pyhlo_type(scribe, dtype)
+    else:
+        all_reduce_dtype = dtype
+
+    tensor = cast(tensor, all_reduce_dtype)
+
+    result = all_reduce_dtype[size].AllReduce(
+        tensor,
+        replica_groups=replica_groups,
+        to_apply=to_apply
+    )
+
+    result = cast(result, tensor_dtype)
+
+    return result
+
+
 def all_gather(tensor, dim, tp_degree):
     shape = list(tensor.sizes)
     shape[dim] *= tp_degree
@@ -950,19 +986,26 @@ def all_gather(tensor, dim, tp_degree):
     )
 
 
-def all_reduce_sum(tensor, tp_degree):
-    size = tensor.sizes
-    dtype = tensor.dtype
+def all_reduce_sum(tensor, tp_degree, dtype=None):
+    scribe = tensor.scribe
+
+    if dtype is None:
+        all_reduce_dtype =  tensor.dtype
+    elif isinstance(dtype, str):
+        all_reduce_dtype = dtypes.to_pyhlo_type(scribe, dtype)
+    else:
+        all_reduce_dtype = dtype
 
     def reducer(scribe):
-        p0 = dtype.Parameter(parameter_number=0)
-        p1 = dtype.Parameter(parameter_number=1)
-        return dtype.Add(p0, p1)
+        p0 = all_reduce_dtype.Parameter(parameter_number=0)
+        p1 = all_reduce_dtype.Parameter(parameter_number=1)
+        return all_reduce_dtype.Add(p0, p1)
 
-    return dtype[size].AllReduce(
+    return all_reduce(
         tensor,
         replica_groups=[list(range(tp_degree))],
-        to_apply=reducer
+        to_apply=reducer,
+        dtype=all_reduce_dtype
     )
 
 
@@ -1520,23 +1563,30 @@ def full_like(tensor, value):
     return result
 
 
-def all_reduce_max(tensor, tp_degree=1):
-    size = tensor.sizes
-    dtype = tensor.dtype
+def all_reduce_max(tensor, tp_degree=1, dtype=None):
+    scribe = tensor.scribe
+
+    if dtype is None:
+        all_reduce_dtype = tensor.dtype
+    elif isinstance(dtype, str):
+        all_reduce_dtype = dtypes.to_pyhlo_type(scribe, dtype)
+    else:
+        all_reduce_dtype = dtype
 
     def reducer(scribe):
-        p0 = dtype.Parameter(parameter_number=0)
-        p1 = dtype.Parameter(parameter_number=1)
-        return dtype.Maximum(p0, p1)
+        p0 = all_reduce_dtype.Parameter(parameter_number=0)
+        p1 = all_reduce_dtype.Parameter(parameter_number=1)
+        return all_reduce_dtype.Maximum(p0, p1)
 
-    return dtype[size].AllReduce(
+    return all_reduce(
         tensor,
         replica_groups=[list(range(tp_degree))],
-        to_apply=reducer
+        to_apply=reducer,
+        dtype=all_reduce_dtype
     )
 
 
-def all_reduce_max_with_indices(tensor, index, tp_degree=1):
+def all_reduce_max_with_indices(tensor, index, tp_degree=1, dtype=None):
     """
     Select the maximum value and its associated index across ranks.
 
@@ -1551,7 +1601,7 @@ def all_reduce_max_with_indices(tensor, index, tp_degree=1):
     assert tensor.sizes == index.sizes
 
     # Find maximum value across ranks
-    maximum = all_reduce_max(tensor, tp_degree)
+    maximum = all_reduce_max(tensor, tp_degree, dtype=dtype)
 
     # Zero out all rank-local indices which do not correspond global maximum
     mask = pred[size].Compare(tensor, maximum, comparison_direction='EQ')
@@ -1559,7 +1609,7 @@ def all_reduce_max_with_indices(tensor, index, tp_degree=1):
     index = index.dtype[index.sizes].Select(mask, index, zero)
 
     # Reduce masked indices from across ranks (Note: Max instead of sum due to potential duplicate values)
-    index = all_reduce_max(index, tp_degree)
+    index = all_reduce_max(index, tp_degree, dtype=dtype)
 
     return maximum, index
 
