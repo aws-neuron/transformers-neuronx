@@ -168,14 +168,17 @@ class GPT2ForSampling(base.NeuronModelBase):
 
 class GPT2ForHuggingFaceSampling(GPT2ForSampling):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         warnings.warn("GPT2ForHuggingFaceSampling class is deprecated. It now falls back to use GPT2ForSampling. "
-            "Please use HuggingFaceGenerationModelAdapter for generation API.", category=DeprecationWarning)
-        super().__init__(*args, **kwargs)
-        self.wrapper = HuggingFaceGenerationModelAdapter(self)
+            "Please use HuggingFaceGenerationModelAdapter for generation API.")
+        super().__init__(config, *args, **kwargs)
+        self.wrapper = HuggingFaceGenerationModelAdapter(config, self)
 
     def generate(self, *args, **kwargs):
         return self.wrapper.generate(*args, **kwargs)
+
+    def reset_generation(self):
+        self.wrapper.reset_generation()
 
 
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
