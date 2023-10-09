@@ -210,7 +210,7 @@ class GPTNeoXBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    return next(idx for idx, val in enumerate(values) if val >= target + 1)
 
 
 class GPTNeoXTransformer(module.LowMemoryModule):

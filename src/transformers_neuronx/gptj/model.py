@@ -171,7 +171,7 @@ class GPTJBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    return next(idx for idx, val in enumerate(values) if val >= target + 1)
 
 
 class GPTJTransformer(module.LowMemoryModule):
