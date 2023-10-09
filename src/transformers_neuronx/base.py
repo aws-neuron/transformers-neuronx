@@ -34,7 +34,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._load_compiled_artifacts(directory)
-            
+
     # simple implementation that doesn't take into account cache and serialization
     def is_compiled(self):
         # First check if the kernels have neffs already
@@ -71,7 +71,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         for i, nbs_obj in enumerate(self.nbs_objs):
             nbs_obj.load_compiler_artifacts_after_build(directory)
-    
+
     def _get_all_kernels(self):
         all_kernels = []
         for nbs in self.nbs_objs:
@@ -245,7 +245,7 @@ class NeuronBaseSerializer:
             with open(os.path.join(path, hlo_hash), 'wb') as f:
                 assert kernel.neff_bytes is not None, "cannot save a model which has not been successfully compiled"
                 f.write(kernel.neff_bytes)
-    
+
     def load_compiler_artifacts_after_build(self, path):
         self.compiler_artifacts_path = path
 
@@ -268,7 +268,7 @@ class NeuronBaseSerializer:
 
 def hash_hlo(hlo_module):
     hash_gen = hashlib.sha256()
-    text = str(hlo_module)
-    hash_gen.update(text.encode('utf-8'))
+    message = hlo_module.SerializeToString()
+    hash_gen.update(message)
     hash = str(hash_gen.hexdigest())[:20]
     return hash + '.neff'
