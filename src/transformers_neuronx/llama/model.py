@@ -22,6 +22,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
@@ -144,6 +145,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.prefixed_length = 0
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
+
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)

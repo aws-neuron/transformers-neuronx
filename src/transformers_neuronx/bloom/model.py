@@ -23,6 +23,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
@@ -33,11 +34,11 @@ class BloomForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
-                 unroll=None, neuron_config=None, **kwargs):
+                 unroll=None, neuron_config=NeuronConfig(), **kwargs):
         config = BloomConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(BloomForCausalLM, config)
         self.config = config
-        self.neuron_config =  neuron_config
+        self.neuron_config = neuron_config
 
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:

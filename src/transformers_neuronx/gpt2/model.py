@@ -28,6 +28,7 @@ from transformers_neuronx import bucket
 from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
@@ -35,7 +36,7 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=NeuronConfig(), **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config

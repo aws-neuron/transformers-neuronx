@@ -85,28 +85,34 @@ class Executor:
 
 class ParallelTensorManipulator:
 
-    def __init__(self, tp_degree):
+    def __init__(self, tp_degree, rank_id=0, local_tp_degree=None):
         self.tp_degree = tp_degree
+        self.rank_id = rank_id
+        if local_tp_degree is None:
+            local_tp_degree = tp_degree
+        self.local_tp_degree = local_tp_degree
 
     def duplicate_on_cpu(self, tensor):
-        return [tensor for ordinal in range(self.tp_degree)]
+        return [tensor for ordinal in range(self.local_tp_degree)]
 
     def duplicate(self, tensor):
-        return ops.parallel_to_nc([tensor for ordinal in range(self.tp_degree)])
+        return ops.parallel_to_nc([tensor for ordinal in range(self.local_tp_degree)])
 
     def shard_along_on_cpu(self, tensor, dim):
         size = tensor.shape[dim]
         shard_size = size // self.tp_degree
         slices = [slice(None) for _ in tensor.shape]
         tensors = []
-        for start in range(0, size, shard_size):
+        slice_start = self.rank_id * self.local_tp_degree * shard_size
+        slice_end = (self.rank_id + 1) * self.local_tp_degree * shard_size
+        for start in range(slice_start, slice_end, shard_size):
             slices[dim] = slice(start, start+shard_size, 1)
             shard = tensor[tuple(slices)].contiguous()
             tensors.append(shard)
-        if len(tensors) != self.tp_degree:
+        if len(tensors) != self.local_tp_degree:
             raise ValueError(
                 f'Weight with shape {tensor.shape} cannot be sharded along dimension {dim}. '
-                f'This results in {len(tensors)} weight partitions which cannot be distributed to {self.tp_degree} NeuronCores evenly. '
+                f'This results in {len(tensors)} weight partitions which cannot be distributed to {self.local_tp_degree} NeuronCores evenly. '
                 f'To fix this issue either the model parameters or the `tp_degree` must be changed to allow the weight to be evenly split'
             )
         return tensors
@@ -121,7 +127,7 @@ class ParallelTensorManipulator:
 
     def primary_only(self, tensor):
         tensors = [tensor]
-        tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.tp_degree))
+        tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.local_tp_degree))
         return ops.parallel_to_nc(tensors)
 
     def unshard_along(self, sharded_tensors, dim):
