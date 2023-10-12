@@ -15,6 +15,8 @@
 from transformers_neuronx import constants
 
 
+import os
+
 class QuantizationConfig:
     """ The config class that contains all quantization related settings """
 
@@ -87,6 +89,21 @@ class NeuronConfig():
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
+
+        self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
+
+        self.local_tp = os.getenv("NEURON_LOCAL_TP", None)
+
+        if self.local_tp is not None:
+            self.local_tp = int(self.local_tp)
+
+    def get_local_tp(self, tp):
+        if self.local_tp is None:
+            return tp
+        return self.local_tp
+
+    def get_g_start_device_id(self, tp):
+        return self.rank_id*self.get_local_tp(tp)
 
 
 class GenerationConfig:
