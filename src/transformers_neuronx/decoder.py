@@ -152,7 +152,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     unroll=unroll,
                     neuron_config=self.neuron_config,
                     allow_pad=self.allow_pad,
-                    return_all_outputs=False
+                    return_all_outputs=False,
                 )
                 base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
         return decoder_lm_head
@@ -239,7 +239,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.lm_head_bias = bias
 
     def to_neuron(self):
-        manipulator = MaybeParallelTensorManipulator(self.tp_degree)
+        manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
 
         extras = []
         for param, dim, allow_pad in self.pre_layer_parameters:
@@ -404,7 +404,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             num_inputs = len(self.inputs_sdim)
             batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
                 if self.neuron_config.continuous_batching else None
-            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches)
+            program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
@@ -413,7 +413,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
             ln_lm_head_hlo_modules = [self._hlo_ln_lm_head(batch_size) for batch_size in self.batch_size]
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramMultiLayer(self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+            program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                 self.num_layers, self.unroll, self.tp_degree,
                                                 self.n_positions_list, self.batch_size, self.prefixed_length)
 
@@ -879,7 +879,7 @@ class DecoderLayer(torch.nn.Module):
                                                     out_feature_dim = 1 if self.attn_out_transposed else 0)
 
 
-        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
+        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
         maybe_primary_only = maybe_manipulator.primary_only
@@ -964,7 +964,7 @@ class DecoderLayer(torch.nn.Module):
         if self.allow_pad and not self.shard_over_batch:
             n_heads_kv_cache = utils.round_up_to_divisor(self.n_kv_head, self.tp_degree)
         # Separate KV cache for each batch size
-        manipulator = parallel.ParallelTensorManipulator(self.tp_degree)
+        manipulator = parallel.ParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         for batch_size in self.batch_sizes:
             cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
             cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
@@ -1121,7 +1121,7 @@ class DecoderLayer(torch.nn.Module):
     def reset(self):
         for batch_size in self.batch_sizes:
             zero_cache = torch.zeros(self.attn_k_cache[batch_size].shape, dtype=self.attn_k_cache[batch_size].dtype)
-            zero_cache = [zero_cache for _ in range(self.tp_degree)]
+            zero_cache = [zero_cache for _ in range(self.neuron_config.get_local_tp(self.tp_degree))]
             ops.parallel_write(self.attn_k_cache[batch_size], zero_cache)
             ops.parallel_write(self.attn_v_cache[batch_size], zero_cache)
 
@@ -1168,8 +1168,8 @@ class DecoderLayer(torch.nn.Module):
 
 class MaybeParallelTensorManipulator:
 
-    def __init__(self, tp_degree):
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+    def __init__(self, tp_degree, rank_id=0, local_tp_degree=None):
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=rank_id, local_tp_degree=local_tp_degree)
 
     def duplicate(self, tensor):
         if tensor is None:
@@ -1242,9 +1242,10 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False):
+    def __init__(self, neuron_config, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False):
         # Each hlo module corresponds to one npos and one batch_size
         # hlo_modules is a 2D map (i,j) i is npos , j is batch_size
+        self.neuron_config = neuron_config
         self.layers = layers
         self.batch_sizes = batch_sizes
         self.batch_size_for_shared_caches = batch_size_for_shared_caches
@@ -1257,10 +1258,10 @@ class DecoderProgram:
         self.input_buffers = [[compiler.gen_zero_input(hlo,idx) for idx in range(num_inputs)] for hlo in hlos_for_input]
         self.kernels = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], tp_degree)
+            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), tp_degree)
         # self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree)
+        self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
         self.tp_degree = tp_degree
         self.need_reorder_cache = False
 
@@ -1301,7 +1302,10 @@ class DecoderProgram:
 
     def logits_device_to_host(self, batch_size):
         idx = self.batch_sizes.index(batch_size)
-        return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+        if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
+            return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+        else:
+            return ops.parallel_cpu(self.logits_buffer[idx])[0]
 
     def _fill_io_tensors(self, input_tensors, output_tensors, layers, npos, batch_size):
         end = npos
@@ -1385,8 +1389,8 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None):
-        super().__init__(layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches)
+    def __init__(self, neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None):
+        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches)
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
         self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]
@@ -1443,8 +1447,8 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0):
-        super().__init__(layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length)
+    def __init__(self, neuron_config, layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0):
+        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
@@ -1456,7 +1460,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
             for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
                 memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
             self.multi_layers_memories.append(memories)
-        self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, tp_degree) for hm in ln_lm_head_hlo_modules]
+        self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), tp_degree) for hm in ln_lm_head_hlo_modules]
         self.ln_lm_head_memories = [ln_lm_head_kernel.build_memory() for ln_lm_head_kernel in self.ln_lm_head_kernels]
         self.layer_executors = list()
         self.lm_head_executors = list()

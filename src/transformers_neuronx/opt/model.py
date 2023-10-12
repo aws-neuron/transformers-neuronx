@@ -33,7 +33,7 @@ from transformers_neuronx.layers import transformer
 class OPTForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=NeuronConfig(), **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
@@ -42,6 +42,7 @@ class OPTForSampling(base.NeuronModelBase):
         # Build model in Python, result in self.chkpt_model
         super().__init__(OPTCheckpointCompatible, config)
         self.config = config
+        self.neuron_config = neuron_config
 
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = n_positions
@@ -77,7 +78,6 @@ class OPTForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_context = dict()
         self.context_length_estimate = context_length_estimate
         self.context_unroll = context_unroll
-        self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         if self.context_length_estimate is not None:
             for batch_size in self.batch_sizes:
                 self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -351,7 +351,7 @@ class OPTForSamplingNoEmbeddingHlo:
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, self.neuron_config)
+        return transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
 
     def attention(self, hidden, curr_window_start, cache_ids, mask, active_mask,
                   cached_keys, cached_values,

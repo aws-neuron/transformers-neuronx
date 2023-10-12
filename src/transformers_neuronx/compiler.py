@@ -420,6 +420,7 @@ class ParallelKernel:
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         with io_ring_cache_context(io_ring_cache_size):
+            logging.debug(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
             self.model.load()
 
     def snapshot_path(self):

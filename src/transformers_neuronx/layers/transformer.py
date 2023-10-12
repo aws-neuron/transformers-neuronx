@@ -16,15 +16,15 @@ from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
 
 
-def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
+def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
     Language model head with layer normalization.
 
-    Context encoding network: 
+    Context encoding network:
     n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
     In this case we slice the hidden input and compute the next token logits only for the last context token.
 
-    Normal token gen network: 
+    Normal token gen network:
     n_active_tokens will be 1 and return_all_outputs will be True.
     No slicing required. Will return the next token logits for the current active token.
 
@@ -56,18 +56,22 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
         logits = dtype[logits.sizes].Add(logits, lm_head_bias)
     vocab_size, _ = logits.sizes
     result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
+
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+        result = hlo.all_gather(result, 0, tp_degree)
+
     return result
 
 
-def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6, neuron_config=None):
+def rms_lm_head(tp_degeree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6, neuron_config=None):
     """
     Language model head with rms normalization.
 
-    Context encoding network: 
+    Context encoding network:
     n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
     In this case we slice the hidden input and compute the next token logits only for the last context token.
 
-    Normal token gen network: 
+    Normal token gen network:
     n_active_tokens will be 1 and return_all_outputs will be True.
     No slicing required. Will return the next token logits for the current active token.
 
@@ -99,4 +103,9 @@ def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias,
         logits = dtype[logits.sizes].Add(logits, lm_head_bias)
     vocab_size, _ = logits.sizes
     result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
+
+
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+        result = hlo.all_gather(result, 0, tp_degree)
+
     return result
