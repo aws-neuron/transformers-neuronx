@@ -142,7 +142,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         hidden = hidden.transpose(0, 2).contiguous()
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
         logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         # The model always runs in decode mode
@@ -433,7 +433,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         _,n_active_tokens,_=logits.shape
         if n_active_tokens>1:
             logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
