@@ -51,11 +51,15 @@ class NeuronConfig():
             attention related configurations. Default: `None`.
         quant (`QuantizationConfig`, optional): Quantization related
             configurations. Default: `None`.
+        cast_logits_dtype (`str`, optional): Cast logits to this dtype at the end
+            of every forward pass. Must be selected from `["float32", "float16", "bfloat16"]`.
+            Default: Upcasts all logits to `float32`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
         self.sparse_attn = kargs.pop('sparse_attn', None)
         self.quant = kargs.pop('quant', None)
+        self.cast_logits_dtype = kargs.pop('cast_logits_dtype', 'float32')
 
 
 class GenerationConfig:

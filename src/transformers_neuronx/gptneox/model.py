@@ -103,7 +103,11 @@ class GPTNeoXForSampling(module.PretrainedModel):
                     print(f"Var name: {name}\nTensor:\n{tensor}")
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
+        # Cast logits to float32 or the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        logits = logits.to(logits_dtype)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits

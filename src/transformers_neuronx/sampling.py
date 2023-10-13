@@ -168,6 +168,7 @@ def validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep):
 def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep)
 
+    scores = scores.to(torch.float32)
     input_size = scores.size(dim=-1)
 
     def safe_size(size):

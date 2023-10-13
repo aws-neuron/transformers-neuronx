@@ -220,6 +220,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         return input_ids, cache_ids, start_ids, last_token_id
 
+    def _cast_logits(self, logits):
+         # Cast logits to float32 or the dtype specified in the neuron config
+         logits_dtype = torch.float32
+         if self.neuron_config:
+             logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+         return logits.to(logits_dtype)
+
     def _forward(self, hidden, *args):
         hidden = hidden.transpose(0, -1).contiguous()
 
@@ -230,7 +237,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         else:
             logits = self.decoder_lm_head(hidden, *args)
 
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         _,n_active_tokens,_=logits.shape
         if n_active_tokens>1:
             logits = logits[:self.config.vocab_size, -n_active_tokens:, :]

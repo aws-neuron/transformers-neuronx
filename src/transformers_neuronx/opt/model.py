@@ -170,7 +170,7 @@ class OPTForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         # Increment the token counter
