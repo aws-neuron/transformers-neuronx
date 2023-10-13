@@ -790,6 +790,9 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     triu_sizes = n_active_tokens, n_positions
     int_dtype = position_ids.dtype
     pred = position_ids.scribe.pred
+    if batch_size==1 and n_active_tokens > 1 and n_positions == n_active_tokens:
+        position_ids = int_dtype[n_active_tokens].Iota(dimensions=[0])
+        start_ids = int_dtype[1].Iota(dimensions=[0])
     iota1 = int_dtype[n_positions].Iota(dimensions=[0])
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
     position_ids_br = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
