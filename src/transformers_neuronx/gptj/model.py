@@ -94,7 +94,7 @@ class GPTJForSampling(module.PretrainedModel):
             inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
