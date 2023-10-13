@@ -34,8 +34,7 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, context_length_estimate=None,
-                 context_unroll=None, neuron_config=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -48,21 +47,10 @@ class GPT2ForSampling(base.NeuronModelBase):
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
         if unroll is None:
             unroll = config.n_layer
+        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
-        self.context_unroll = context_unroll
-        self.token_buckets = bucket.token_sizes(config.n_positions)
-        self.context_buckets = bucket.context_sizes(
-            context_length_estimate, self.token_buckets
-        )
-        if isinstance(batch_size,int):
-            self.batch_sizes = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_sizes = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
-        self.max_positions = self.token_buckets[-1]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
             unroll=unroll, neuron_config=neuron_config
         )
@@ -73,26 +61,6 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.register_for_serialization(self.decoder_lm_head)
-        if self.context_buckets:
-            self.decoder_lm_head_for_context = {}
-            self.broadcaster = {}
-            for context_length_estimate in self.context_buckets:
-                for batch_size in self.batch_sizes:
-                    self.decoder_lm_head_for_context[context_length_estimate, batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                        tp_degree,
-                        [context_length_estimate],
-                        context_length_estimate,
-                        batch_size,
-                        attention_head_size,
-                        amp=amp,
-                        num_layers=config.n_layer,
-                        n_head=config.n_head,
-                        n_kv_head=config.n_kv_head,
-                        unroll=context_unroll,
-                        neuron_config=neuron_config,
-                        allow_pad=self.decoder_lm_head.allow_pad
-                    )
-                    self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, batch_size])
 
     def to_neuron(self):
         ops.init()
@@ -146,23 +114,24 @@ class GPT2ForSampling(base.NeuronModelBase):
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.
         self.reset()
-        if self.context_buckets:
-            for context_length_estimate in self.context_buckets:
-                for batch_size in self.batch_sizes:
-                    model = self.decoder_lm_head.build_weight_shared(share_caches=True,
-                                                                     new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
-                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
     def reset(self):
         self.decoder_lm_head.reset()
 
     def forward(self, input_ids, cache_ids, start_ids=None):
-        input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        batch_size, context_length = input_ids.shape
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
-        return self._forward(hidden, cache_ids, start_ids, last_token_id)
+        hidden = hidden.transpose(0, 2).contiguous()
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, -1, :]
+        logits = logits.transpose(0, 1)
+        return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
