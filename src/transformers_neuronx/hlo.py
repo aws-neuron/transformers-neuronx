@@ -784,7 +784,6 @@ def transfer_with_static_ring(shape):
 
 def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
                            allow_kv_dot_prefetch=False, start_mask=True):
-
     batch_size, = start_ids.sizes
     n_active_tokens, = position_ids.sizes
     triu_sizes = n_active_tokens, n_positions
