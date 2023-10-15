@@ -57,7 +57,6 @@ class BloomForSamplingNoEmbeddingHlo:
               pre_mlp_ln_weight, pre_mlp_ln_bias,
               mlp_in_weight, mlp_in_scales, mlp_in_bias,
               mlp_out_weight, mlp_out_scales, mlp_out_bias,
-              sparse_mask, active_sparse_mask,
               post_mlp_ln_weight, post_mlp_ln_bias):
 
         dtype = hidden.dtype

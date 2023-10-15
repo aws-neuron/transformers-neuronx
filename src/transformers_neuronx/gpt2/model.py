@@ -61,6 +61,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.register_for_serialization(self.decoder_lm_head)
+        # Token counter for sliding window attention
+        self.num_processed_tokens = 0
 
     def to_neuron(self):
         ops.init()
@@ -117,20 +119,33 @@ class GPT2ForSampling(base.NeuronModelBase):
 
     def reset(self):
         self.decoder_lm_head.reset()
+        self.num_processed_tokens = 0
 
     def forward(self, input_ids, cache_ids, start_ids=None):
         batch_size, context_length = input_ids.shape
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = \
+            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
+            if sliding_window_attn_enabled else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, curr_window_start)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
+        # The model always runs in decode mode
+        self.num_processed_tokens += 1
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -202,7 +217,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions=self.token_buckets[-1]
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens, 
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
             batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
             unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens
@@ -270,6 +285,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         self.context_pre_hook = None
         self.context_hook = None
+        # Token counter for sliding window attention
+        self.num_processed_tokens = 0
 
     def to_neuron(self):
         ops.init()
@@ -359,6 +376,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
     def reset(self,context_length_estimate):
         self.decoder_lm_head.reset()
         self.decoder_lm_head_for_context[context_length_estimate, self.decoder_batch_size].reset()
+        self.num_processed_tokens = 0
 
     def _embedding(self, decoder_lm_head, input_ids, cache_ids, start_ids, is_context_encode):
         inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
@@ -370,6 +388,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         return hidden, start_ids
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
         batch_size, context_length = input_ids.shape
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
@@ -389,6 +411,12 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = \
+            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
+            if sliding_window_attn_enabled else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         if is_context_encode:
             # The big tensor destruction is slow in CPU. Use asynchronous clear
             # to parallel the tensor free with the context encoding execution.
@@ -397,15 +425,18 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             start_ids = start_ids.repeat(batch_size)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids, last_token_id)
+            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        # Increment the token counter
+        # If running decode mode then last_token_id = 0
+        self.num_processed_tokens += (last_token_id + 1)
         logits = logits.to(torch.float32)
         _,n_active_tokens,_=logits.shape
         if n_active_tokens>1:
             logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
         else:
-            logits = logits[:self.config.vocab_size, -1, :] 
+            logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()

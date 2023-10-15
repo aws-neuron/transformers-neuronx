@@ -92,6 +92,8 @@ class OPTForSampling(base.NeuronModelBase):
                                                     allow_pad=self.decoder_lm_head.allow_pad
                                                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[batch_size])
+        # Track number of processed tokens for sliding window attention
+        self.num_processed_tokens = 0
 
     def to_neuron(self):
         ops.init()
@@ -135,6 +137,8 @@ class OPTForSampling(base.NeuronModelBase):
 
     def reset(self):
         self.decoder_lm_head.reset()
+        # Reset the token counter
+        self.num_processed_tokens = 0
 
     def forward(self, input_ids, cache_ids, start_ids=None):
         return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
@@ -145,6 +149,10 @@ class OPTForSampling(base.NeuronModelBase):
         return self._forward(context_decoder, input_ids, cache_ids, start_ids)
 
     def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
         batch_size, context_length = input_ids.shape
         if cache_ids is None:
@@ -155,10 +163,19 @@ class OPTForSampling(base.NeuronModelBase):
         position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
-        logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id)
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = \
+            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
+            if sliding_window_attn_enabled else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
+        # Increment the token counter
+        # If running decode mode then last_token_id = 0
+        self.num_processed_tokens += (last_token_id+1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -265,6 +282,7 @@ class OPTForSamplingNoEmbeddingHlo:
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         last_token_id = scribe.s32.Parameter(parameter_number=3)
+        curr_window_start = scribe.s32.Parameter(parameter_number=4)
         # For the best perf, we only use kv prefetch in the token generation stage
         use_prefetch = n_active_tokens != n_positions
         triu_comparison = 'LT' if use_prefetch else 'LE'
@@ -276,9 +294,9 @@ class OPTForSamplingNoEmbeddingHlo:
             allow_kv_dot_prefetch=use_prefetch,
             start_mask=True
         )
-        return (hidden, last_token_id, cache_ids, mask, active_mask), (1, 0, None, None)
+        return (hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask), (1, 0, None, None, None)
 
-    def layer(self, hidden, last_token_id, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -288,14 +306,14 @@ class OPTForSamplingNoEmbeddingHlo:
               pre_mlp_ln_weight, pre_mlp_ln_bias,
               mlp_in_weight, mlp_in_scales, mlp_in_bias,
               mlp_out_weight, mlp_out_scales, mlp_out_bias,
-              sparse_mask, active_sparse_mask,
-              post_mlp_ln_weight, post_mlp_ln_bias):
+              post_mlp_ln_weight, post_mlp_ln_bias,
+              ):
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == attn_k_weight.sizes[-1], \
             f"kv cache shape ({attn_k_cache.sizes}) doesn't match kv weight shape ({attn_k_weight.sizes})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+            ln_hidden, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -316,13 +334,34 @@ class OPTForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
         return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens)
 
-    def attention(self, hidden, cache_ids, mask, active_mask,
+    def attention(self, hidden, curr_window_start, cache_ids, mask, active_mask,
                   cached_keys, cached_values,
                   q_weight, q_scales, q_bias,
                   k_weight, k_scales, k_bias,
                   v_weight, v_scales, v_bias,
                   out_weight, out_scales, out_bias,
                   neuron_config=None):
+        enable_sparse_attn = neuron_config and neuron_config.sparse_attn
+        sparse_mask = None
+        window_attn_decode = False
+        if enable_sparse_attn:
+            # Generate the sparse masks if necessary. Our behavior here:
+            # - If in prefill mode (n_active_tokens > 1), sparse mask is always
+            #   generated or provided by user.
+            # - If in decode mode (n_active_tokens = 1), sparse mask is not
+            #   generated if 1) window attention is used, or 2) block-sparse
+            #   attention with only local blocks is used. Otherwise it's generated.
+            # - Active sparse mask is only generated in decode mode. Similarly,
+            #   it's only generated if user is not using the two patterns mentioned
+            #   above.
+
+            # Determine sparse mask shapes according to the attention mask shapes
+            n_active_tokens, n_positions = mask.sizes[-2:]
+            sparse_mask = neuron_config.sparse_attn.create_sparse_mask(n_active_tokens, n_positions)
+            # Directly convert the masks to HLO constants
+            if sparse_mask is not None:
+                sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
+            window_attn_decode = neuron_config.sparse_attn.skip_masking_decode
 
         dtype = hidden.dtype
         scribe = hidden.scribe
@@ -356,10 +395,27 @@ class OPTForSamplingNoEmbeddingHlo:
 
         # Single Token Generation ("Prefetch"-style)
         if active_mask is not None:
+            # When using window attention, directly slice the KV cache
+            # Since GPT uses left padding, we always pick the right-most side of the KV cache
+            # KV cache layout: (n_positions, bs, n_heads, head_size)
+            # Mask layout: (bs, n_active_tokens, n_positions)
+            useful_cached_keys = cached_keys
+            useful_cached_values = cached_values
+            useful_mask = mask
+            if window_attn_decode:
+                window_size = neuron_config.sparse_attn.sparse_attn_config.window_size
+                useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=window_size)
+                useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=window_size)
+                useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=window_size)
 
             # Sp = Q @ Kp
-            prior_scores = attention.score(query, cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            # Apply the sparse mask to the raw scores, notice that we don't have the mask for window attention
+            if enable_sparse_attn and not window_attn_decode:
+                assert sparse_mask is not None, "Require a valid sparse mask when not using sliding window attention during decode!"
+                # Not sharding over batch because the sparse mask is not supposed to have a batch dimension
+                prior_scores = attention.mask(prior_scores, sparse_mask, tp_degree=None, shard_over_batch=False)
             prior_scores = hlo.cast(prior_scores, f32)
 
             # Sa = Q @ Ka
@@ -368,8 +424,8 @@ class OPTForSamplingNoEmbeddingHlo:
             active_score = hlo.cast(active_score, f32)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values, value, n_kv_heads=n_kv_heads, dtype=dtype, \
-                                        tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            context = attention.context(prior_scores, active_score, useful_cached_values, value, sparse_mask=sparse_mask,
+                                        n_kv_heads=n_kv_heads, dtype=dtype, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -378,12 +434,13 @@ class OPTForSamplingNoEmbeddingHlo:
 
         # Multi-Token Context Encoding
         else:
-
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            if enable_sparse_attn:
+                score = attention.mask(score, sparse_mask, tp_degree=None, shard_over_batch=False)
             score = hlo.cast(score, f32)
-            context = attention.context_combined(score, value, n_kv_heads=n_kv_heads, dtype=dtype, \
+            context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=n_kv_heads, dtype=dtype, \
                                                  tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # KCache = K
