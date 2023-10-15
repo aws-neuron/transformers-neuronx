@@ -103,7 +103,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def context(self, hidden, cache_ids, start_ids, last_token_id):
+    def context(self, hidden, cache_ids, start_ids, last_token_id, *rest):
         """A helper to process context (prompt)
         1) if there is available context encoding model (infered from self.context_buckets)
             - when context_length >= estimate, slice the context up to estimate,
@@ -114,6 +114,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         2) process the left over tokens accroding to `current`
             - if there is no context encoding model, simply do serial token generation for context
+
+        Other arguments that are required by the model are contained in `rest`.
         """
         context_length = hidden.shape[1]
         # batch_size is in dim 2 because of the transpose taken in _forward function
@@ -151,12 +153,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
-                logits = model(hidden_context, cache_context, start_ids, last_token_id)
+                logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
             hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id)
+            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest)
 
         if self.is_fid:
             logits[:] = float('-inf')
