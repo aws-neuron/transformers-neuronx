@@ -499,13 +499,6 @@ class DecoderLayer(torch.nn.Module):
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.extra_parameters = []
         self.allow_pad = allow_pad
-        # Create sparse mask if necessary
-        self.n_active_tokens = n_active_tokens if n_active_tokens else n_positions
-        self.sparse_mask = None
-        self.active_sparse_mask = None
-        if self.neuron_config and self.neuron_config.sparse_attn:
-            self.sparse_mask = self.neuron_config.sparse_attn.create_sparse_mask(self.n_active_tokens, self.n_positions)
-            self.active_sparse_mask = self.neuron_config.sparse_attn.create_active_sparse_mask(self.n_active_tokens)
         self.shard_over_batch = shard_over_batch
         self.attn_out_sharding = 0
         self.attn_out_transposed = True
@@ -559,12 +552,6 @@ class DecoderLayer(torch.nn.Module):
     def add_post_mlp_layer_norm(self, weight, bias):
         self.post_mlp_ln_weight = weight
         self.post_mlp_ln_bias = bias
-
-    def add_sparse_mask(self, sparse_mask):
-        self.sparse_mask = sparse_mask
-
-    def add_active_sparse_mask(self, active_sparse_mask):
-        self.active_sparse_mask = active_sparse_mask
 
     def to_neuron(self):
 
@@ -649,8 +636,6 @@ class DecoderLayer(torch.nn.Module):
         self.attn_out_weight = maybe_shard_along(self.attn_out_weight, dim=self.attn_out_sharding)
         self.attn_out_scales = maybe_duplicate(self.attn_out_scales)
         self.attn_out_bias = maybe_primary_only(self.attn_out_bias)
-        self.active_sparse_mask = maybe_duplicate(self.active_sparse_mask)
-        self.sparse_mask = maybe_duplicate(self.sparse_mask)
         self.post_attn_ln_weight = maybe_duplicate(self.post_attn_ln_weight)
         self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
         self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
@@ -749,8 +734,6 @@ class DecoderLayer(torch.nn.Module):
             self.mlp_out_weight,
             self.mlp_out_scales,
             self.mlp_out_bias,
-            self.sparse_mask,
-            self.active_sparse_mask,
             self.post_mlp_ln_weight,
             self.post_mlp_ln_bias,
             *self.extra_parameters,
@@ -818,8 +801,6 @@ class DecoderLayer(torch.nn.Module):
             mlp_out_weight,
             mlp_out_scales,
             mlp_out_bias,
-            sparse_mask,
-            active_sparse_mask,
             post_mlp_ln_weight,
             post_mlp_ln_bias,
         ) = hlo_weights
@@ -851,8 +832,6 @@ class DecoderLayer(torch.nn.Module):
             mlp_out_weight,
             mlp_out_scales,
             mlp_out_bias,
-            sparse_mask,
-            active_sparse_mask,
             post_mlp_ln_weight,
             post_mlp_ln_bias,
         ]
@@ -904,15 +883,6 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_min = layer.mlp_out_min
         self.mlp_out_max = layer.mlp_out_max
         self.extra_parameters = layer.extra_parameters
-        # Don't copy the sparse mask since the new layer's mask are already initialized
-        # Copying the mask from an old layer may result in incorrect mask shape
-        # In case this layer shares weights with an existing layer, the sparse masks are not
-        # converted to XLA tensors here, do it
-        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
-        maybe_duplicate = maybe_manipulator.duplicate
-        self.active_sparse_mask = maybe_duplicate(self.active_sparse_mask)
-        self.sparse_mask = maybe_duplicate(self.sparse_mask)
-
 
     def assign_caches(self, layer):
         for batch_size in self.batch_sizes:
