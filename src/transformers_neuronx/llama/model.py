@@ -49,7 +49,7 @@ class LlamaForSampling(base.NeuronModelBase):
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
                 self.context_buckets = sorted(self.context_buckets)
-        self.n_parallel_output_tokens=n_parallel_output_tokens        
+        self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions = self.token_buckets[-1]
 
         if isinstance(batch_size,int):
@@ -60,7 +60,7 @@ class LlamaForSampling(base.NeuronModelBase):
             raise TypeError("batch_size must be list of ints or int type")
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens, 
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
             batch_size=self.batch_sizes, attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
             unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch,
@@ -76,17 +76,17 @@ class LlamaForSampling(base.NeuronModelBase):
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
                     self.decoder_lm_head_for_context[context_length_estimate, batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                        tp_degree, 
-                        [context_length_estimate], 
-                        context_length_estimate, 
-                        batch_size, 
-                        config.attention_head_size, 
+                        tp_degree,
+                        [context_length_estimate],
+                        context_length_estimate,
+                        batch_size,
+                        config.attention_head_size,
                         amp=amp,
                         num_layers=config.num_hidden_layers,
                         n_head=config.num_attention_heads,
                         n_kv_head=config.num_key_value_heads,
                         unroll=context_unroll,
-                        neuron_config=neuron_config, 
+                        neuron_config=neuron_config,
                         allow_pad=self.decoder_lm_head.allow_pad
                     )
                     self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, batch_size])
@@ -139,7 +139,7 @@ class LlamaForSampling(base.NeuronModelBase):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
-                    model = self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                    model = self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                      new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                     # PERF: No latency improvement seen in multi-layer models from executor
                     if self.context_unroll == self.config.num_hidden_layers:
@@ -154,7 +154,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.prefixed_length = prefixed_length
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
         return self._forward(hidden, *rst)
 

@@ -193,7 +193,7 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
     return result_dot
 
 
-def mask(score, mask, tp_degree=None, shard_over_batch=False):
+def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30000):
     """
     Masks the computed attention scores with the attention mask.
 
@@ -205,7 +205,7 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False):
     pred = scribe.pred
 
     # Note: This value can cause NaN issues if it is too large
-    large_neg = dtype.Constant(constant_value=-30000) # Valid for fp32/fp16/bf16
+    large_neg = dtype.Constant(constant_value=constant_value) # Valid for fp32/fp16/bf16
     large_neg_br = dtype[score_sizes].Broadcast(large_neg, dimensions=[])
     if len(mask.sizes) == 2:
         if shard_over_batch:
@@ -230,7 +230,8 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False):
     return score
 
 
-def context(past_scores, active_score, past_values, active_values, n_kv_heads=0, dtype=None, shard_over_batch=False, tp_degree=None):
+def context(past_scores, active_score, past_values, active_values, sparse_mask=None,
+            n_kv_heads=0, dtype=None, shard_over_batch=False, tp_degree=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -242,6 +243,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
 
     If n_kv_heads != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
+    If sparse_mask or active_sparse_mask is not None, use sparse attention on the corresponding values.
     """
 
     if dtype == None:
@@ -287,6 +289,10 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     active_denom = f32[reduce_sizes].Reduce(active_prob, zero, dimensions=[3], to_apply=add_func)
     denom = f32[reduce_sizes].Add(denom, active_denom)
     active_prob = dtype[active_prob.sizes].Convert(active_prob)
+
+    # Apply sparse masks after softmax to help compiler optimization
+    if sparse_mask is not None:
+        past_prob = mask(past_prob, sparse_mask, tp_degree=None, shard_over_batch=False, constant_value=0)
 
     # Ca = Pa @ Va
     # Cp = Pp @ Vp
@@ -334,7 +340,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     return output
 
 
-def context_combined(score, values, n_kv_heads=0, dtype=None, tp_degree=None, shard_over_batch=False):
+def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, tp_degree=None, shard_over_batch=False):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -349,8 +355,12 @@ def context_combined(score, values, n_kv_heads=0, dtype=None, tp_degree=None, sh
 
     If n_kv_heads != 0, uses multi-query, multi-group attention.
     If dtype is None, uses values datatype.
+    If sparse_mask is not None, use sparse attention on the corresponding values.
     """
     probs = hlo.softmax(score)
+    # Apply sparse masks after softmax to help compiler optimization
+    if sparse_mask is not None:
+        probs = mask(probs, sparse_mask, tp_degree=None, shard_over_batch=False, constant_value=0)
 
     n_seqs, n_heads_tp, n_active_tokens, n_positions = probs.sizes
     _, _, n_kv_heads_tp, d_head = values.sizes

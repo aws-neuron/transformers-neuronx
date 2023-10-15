@@ -25,7 +25,8 @@ from transformers import GPT2Config as GPT2ConfigTransformer
 from transformers import GPTJConfig as GPTJConfigTransformer
 from transformers_neuronx import dtypes
 from transformers_neuronx.module import save_pretrained_split
-from transformers_neuronx.config import NeuronConfig, QuantizationConfig, SparseAttnConfig
+from transformers_neuronx.config import NeuronConfig, QuantizationConfig
+from transformers_neuronx.sparse_attn_utils import SparseAttnConfig, BlkSparseAttnConfig, SlidingWindowAttnConfig
 
 def demo(model_name, model_cls, amp_callback):
     parser = argparse.ArgumentParser()
@@ -53,12 +54,15 @@ def demo(model_name, model_cls, amp_callback):
     run_parser.add_argument('--print_latency', action='store_true', help="Print latency for generation of each output token")
     run_parser.add_argument('--quantize', action='store_true', help="Quantize model")
     # Sparse attention configs
-    run_parser.add_argument('--sparse_attn', type=str, choices=[None, 'blk_sparse', 'custom'],
+    run_parser.add_argument('--sparse_attn', type=str, choices=[None, 'blk_sparse', 'custom', 'window'],
                             default=None, help="Use sparse attention or not. ")
+    # Block-sparse configs
     run_parser.add_argument('--blk_size', type=int, default=128, help="Block size in blk-sparse attention")
     run_parser.add_argument('--num_global_blks', type=int, default=0, help="Number of global blocks in blk-sparse attention")
     run_parser.add_argument('--num_local_blks', type=int, default=1, help="Number of local blocks in blk-sparse attention")
     run_parser.add_argument('--num_random_blks', type=int, default=0, help="Number of random blocks in blk-sparse attention")
+    # Window attention configs
+    run_parser.add_argument('--window_size', type=int, default=128, help="Window size for sliding-window attention. ")
     run_parser.add_argument('--context_length_estimate', type=int, default=None, help="Context length estimate.")
     # TODO: args for custom sparse attention not added
 
@@ -100,13 +104,24 @@ def run(args, model_name, model_cls):
     print(f'running {model_cls.__name__}.from_pretrained')
     neuron_config = None
     quant_config = QuantizationConfig(dequant_dtype=args.amp) if args.quantize else None
-    sparse_attn_config = SparseAttnConfig(
-        attn_type=args.sparse_attn, causal=True, blk_size=args.blk_size,
-        num_global_blks=args.num_global_blks, num_local_blks=args.num_local_blks,
-        num_random_blks=args.num_random_blks
-    ) if args.sparse_attn else None
+    sparse_config = None
+    if args.sparse_attn:
+        if args.sparse_attn == "blk_sparse":
+            sparse_attn_config = BlkSparseAttnConfig(
+                blk_size=args.blk_size,
+                num_global_blks=args.num_global_blks,
+                num_local_blks=args.num_local_blks,
+                num_random_blks=args.num_random_blks
+            )
+        elif args.sparse_attn == "window":
+            sparse_attn_config = SlidingWindowAttnConfig(window_size=args.window_size)
+        else:
+            raise NotImplementedError("Interface for other attention patterns not implemented yet!")
+        sparse_config = SparseAttnConfig(
+            attn_type=args.sparse_attn, causal=True, sparse_attn_config=sparse_attn_config,
+            same_mask_per_layer=True)
     if args.quantize or args.sparse_attn:
-        neuron_config = NeuronConfig(quant=quant_config, sparse_attn=sparse_attn_config)
+        neuron_config = NeuronConfig(quant=quant_config, sparse_attn=sparse_config)
     if args.context_length_estimate:
         model = model_cls.from_pretrained(args.load, batch_size=args.batch_size, amp=args.amp,
                                       tp_degree=args.tp_degree, n_positions=args.n_positions,
