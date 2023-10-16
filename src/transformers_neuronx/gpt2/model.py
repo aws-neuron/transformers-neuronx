@@ -140,7 +140,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
         hidden = hidden.transpose(0, 2).contiguous()
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, curr_window_start)
+        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         logits = logits.to(torch.float32)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -203,6 +204,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
+        self.neuron_config = neuron_config
         if unroll is None:
             unroll = config.n_layer
         self.prompt_batch_size = prompt_batch_size
