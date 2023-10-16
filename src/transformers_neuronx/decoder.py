@@ -1188,7 +1188,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         hidden_buffers = list()
         last_token_id_buffers = list()
         for input_buffer in self.input_buffers:
-            hidden_buffer, *_, last_token_id_buffer = input_buffer
+            hidden_buffer, *_, last_token_id_buffer, _ = input_buffer
             hidden_buffers.append(hidden_buffer)
             last_token_id_buffers.append(last_token_id_buffer)
 
