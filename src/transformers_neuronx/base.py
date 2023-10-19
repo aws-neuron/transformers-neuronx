@@ -258,7 +258,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
-        cache_ids, _, _ = args
 
         ### Separating the speculative sampling specific forward functionality for now
         ### TO-DO: Re-factor so each decoder implemnts it's own forward functionality
