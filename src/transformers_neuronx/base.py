@@ -45,6 +45,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         except AttributeError:
             pass
         return False
+   
+   #top level api
+    def enable_speculative_decoder(self,k=4):
+        self.decoder_lm_head_for_speculation=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.program.reorder_cache(reorder_ids)
@@ -231,14 +235,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
-        cache_ids, _, _ = args
 
-        if context_length > 1 and cache_ids[0].item() == 0:
+        if context_length > 1:
             logits = self.context(hidden, *args)
         else:
             logits = self.decoder_lm_head(hidden, *args)
 
-        logits = self._cast_logits(logits)
+        logits = logits.to(torch.float32)
         _,n_active_tokens,_=logits.shape
         if n_active_tokens>1:
             logits = logits[:self.config.vocab_size, -n_active_tokens:, :]

@@ -17,6 +17,7 @@ import os
 import itertools
 import torch
 from transformers_neuronx import base
+from transformers_neuronx import bucket
 from transformers_neuronx import compiler
 from transformers_neuronx import dtypes
 from transformers_neuronx import hlo
@@ -36,7 +37,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 shard_over_batch=False, n_parallel_output_tokens=1):
+                 shard_over_batch=False, n_parallel_output_tokens=1, builder=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -77,6 +78,72 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.return_ranks = -1
         self.need_reorder_cache = False
         self.compiler_artifacts_path = None
+        self.hlo_builder=builder
+
+    def init_context_decoder(self, unroll, buckets, model_obj):
+        decoder_lm_head = {}
+        for context_length_estimate in buckets:
+            for batch_size in self.batch_size:
+                decoder_lm_head[context_length_estimate, batch_size] = DecoderLmHeadForSamplingNoEmbedding(
+                    tp_degree=self.tp_degree, 
+                    n_positions_list=[context_length_estimate], 
+                    n_active_tokens=context_length_estimate, 
+                    batch_size=batch_size, 
+                    attention_head_size=self.attention_head_size, 
+                    amp=self.amp,
+                    num_layers=self.num_layers,
+                    n_head=self.n_head,
+                    n_kv_head=self.n_kv_head,
+                    unroll=unroll,
+                    neuron_config=self.neuron_config, 
+                    allow_pad=self.allow_pad
+                )
+                base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
+        return decoder_lm_head
+        
+
+    def init_token_decoder(self,unroll, buckets, model_obj, n_active_tokens=1):
+        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=self.tp_degree, 
+            n_positions_list=buckets, 
+            n_active_tokens=1, 
+            batch_size=self.batch_size, 
+            attention_head_size=self.attention_head_size, 
+            amp=self.amp,
+            num_layers=self.num_layers,
+            n_head=self.n_head,
+            n_kv_head=self.n_kv_head,
+            unroll=unroll,
+            neuron_config=self.neuron_config, 
+            allow_pad=True, 
+            shard_over_batch=self.shard_over_batch,
+            n_parallel_output_tokens= self.n_parallel_output_tokens
+        )
+        base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
+        decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
+        decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
+        decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
+        return decoder_lm_head
+    
+    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
+        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=self.tp_degree, 
+            n_positions_list=buckets, 
+            n_active_tokens=n_active_tokens, 
+            batch_size=self.batch_size, 
+            attention_head_size=self.attention_head_size, 
+            amp=self.amp,
+            num_layers=self.num_layers,
+            n_head=self.n_head,
+            n_kv_head=self.n_kv_head,
+            unroll=unroll,
+            neuron_config=self.neuron_config, 
+            allow_pad=True, 
+            shard_over_batch=self.shard_over_batch,
+            n_parallel_output_tokens= self.n_parallel_output_tokens
+        )
+        base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
+        return decoder_lm_head
 
     def enable_executor(self, return_ranks=-1):
         self.use_executor = True
@@ -425,6 +492,106 @@ def maybe_transfer_with_static_ring(shape):
     if shape is None:
         return None
     return hlo.transfer_with_static_ring(shape)
+
+### This is a place-holder to indicate what we want this to look like
+### This is not currently utilized anywhere
+### TO-DO: Modify/integrate these to have decoder-specific forward functionality
+class SpeculativeDecoder(torch.nn.Module):
+    def forward(self, hidden, *args):
+        hidden = hidden.transpose(0, -1).contiguous()
+        logits = self.decoder_lm_head(hidden, *args)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, -self.n_parallel_output_tokens:, :]
+        logits = logits.transpose(0, 1)
+        logits=logits.transpose(1, 2)
+        return logits
+
+### This is a place-holder to indicate what we want this to look like
+### This is not currently utilized anywhere
+### TO-DO: Modify/integrate these to have decoder-specific forward functionality
+class ContextDecoder(torch.nn.Module):
+
+    def context(self, hidden, cache_ids, start_ids, last_token_id):
+        """A helper to process context (prompt)
+        1) if there is available context encoding model (infered from self.context_buckets)
+            - when context_length >= estimate, slice the context up to estimate,
+                and call context encoding model
+            - when context_length < estimate, skip and fall back to serial token generation model
+
+            and mark `current` accordingly
+
+        2) process the left over tokens accroding to `current`
+            - if there is no context encoding model, simply do serial token generation for context
+        """
+        context_length = hidden.shape[1]
+        # batch_size is in dim 2 because of the transpose taken in _forward function
+        batch_size = hidden.shape[2]
+
+        if self.is_fid:
+            # Fusion-In-Decoder context encoding
+            fused_context_length = hidden.shape[1]
+            context_length = fused_context_length // self.batch_size
+
+        current = 0
+
+        estimate = bucket.find(self.context_buckets, context_length)
+
+
+        if estimate is not None:
+            hidden_context = hidden
+            cache_context = cache_ids
+
+            # Slice context that when it is too large
+            if context_length > estimate:
+                current = estimate
+                hidden_context = hidden[:, :estimate]
+                cache_context = cache_ids[:estimate]
+
+            # Cannot use context encoding for a context that is too small. This
+            # is because the caller must be aware of the cache-ids/start-ids
+            # used.
+            elif context_length < estimate:
+                raise ValueError(f"context_length ({context_length}) shouldn't be smaller than estimate ({estimate})")
+
+            # Directly pass input to the context network when exactly sized
+            else:
+                current = estimate
+
+            if current == estimate:
+                model = self.decoder_lm_head_for_context[estimate, batch_size]
+                logits = model(hidden_context, cache_context, start_ids, last_token_id)
+
+        for i in range(current, context_length):
+            cache_ids = torch.as_tensor([i], dtype=torch.int32)
+            hidden_slice = hidden[:, i:i+1].contiguous()
+            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id)
+
+        if self.is_fid:
+            logits[:] = float('-inf')
+            logits[self.bos_token_id] = 1.0
+
+        return logits
+
+    def forward(self, hidden, cache_ids=None, start_ids=None, last_token_id=None):
+        hidden = hidden.transpose(0, -1).contiguous()
+        logits = self.context(hidden, cache_ids, start_ids, last_token_id)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, -1, :] 
+        logits = logits.transpose(0, 1)
+        return logits
+
+### This is a place-holder to indicate what we want this to look like
+### This is not currently utilized anywhere
+### TO-DO: Modify/integrate these to have decoder-specific forward functionality
+class TokenDecoder(torch.nn.Module):
+    def forward(self, hidden, *args):
+        hidden = hidden.transpose(0, -1).contiguous()
+        logits = TokenDecoder.forward(hidden, *args)
+        logits = logits.to(torch.float32)
+        logits = logits[:self.config.vocab_size, -1, :] 
+        logits = logits.transpose(0, 1)
+        return logits
+
 
 
 class MaybePadder:
