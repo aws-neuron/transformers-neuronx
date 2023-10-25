@@ -261,6 +261,12 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     batch_size, n_active_tokens, hidden_size = size = hidden.sizes
+
+    # For batch=1 token generation use triton implementation
+    # batch>1/context encoding implementation is in development
+    if batch_size == 1 and n_active_tokens == 1:
+        return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
+
     dtype = hidden.dtype
     scribe = hidden.scribe
     f32 = scribe.f32
