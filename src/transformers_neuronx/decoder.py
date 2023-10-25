@@ -26,6 +26,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.utils import interleave_qkv
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -574,6 +575,19 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_weight = maybe_pad(self.attn_v_weight, dim=1)
                 self.attn_v_bias = maybe_pad(self.attn_v_bias, dim=0)
 
+            if self.neuron_config and self.neuron_config.fuse_qkv:
+                fused_qkv_weight = interleave_qkv(self.attn_q_weight, self.attn_k_weight, self.attn_v_weight, self.tp_degree, dim=1)
+                if self.attn_q_bias is not None:
+                    fused_qkv_bias = interleave_qkv(self.attn_q_bias, self.attn_k_bias, self.attn_v_bias, self.tp_degree, dim=0)
+                else:
+                    fused_qkv_bias = None
+                fused_qkv_scales = None
+                self.attn_k_weight = None
+                self.attn_k_scales = None
+                self.attn_k_bias = None
+                self.attn_v_weight = None
+                self.attn_v_scales = None
+                self.attn_v_bias = None
             self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
 
             # Intermediate MLP layer padding
@@ -606,15 +620,19 @@ class DecoderLayer(torch.nn.Module):
                                                     out_feature_dim = 1 if self.mlp_out_transposed else 0)
 
             if self.neuron_config.quant.quantize_attn:
-                self.attn_q_weight, self.attn_q_scales = \
-                    quantize.maybe_quantize_weights(self.attn_q_weight, self.neuron_config.quant)
-                self.attn_k_weight, self.attn_k_scales = \
-                    quantize.maybe_quantize_weights(self.attn_k_weight, self.neuron_config.quant)
-                self.attn_v_weight, self.attn_v_scales = \
-                    quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
-                self.attn_out_weight, self.attn_out_scales = \
-                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
-                                                    out_feature_dim = 1 if self.attn_out_transposed else 0)
+                if self.neuron_config.fuse_qkv:
+                    fused_qkv_weight, fused_qkv_scales = \
+                        quantize.maybe_quantize_weights(fused_qkv_weight, self.neuron_config.quant)
+                else:
+                    self.attn_q_weight, self.attn_q_scales = \
+                        quantize.maybe_quantize_weights(self.attn_q_weight, self.neuron_config.quant)
+                    self.attn_k_weight, self.attn_k_scales = \
+                        quantize.maybe_quantize_weights(self.attn_k_weight, self.neuron_config.quant)
+                    self.attn_v_weight, self.attn_v_scales = \
+                        quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
+                    self.attn_out_weight, self.attn_out_scales = \
+                        quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
+                                                        out_feature_dim = 1 if self.attn_out_transposed else 0)
 
 
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
@@ -624,9 +642,14 @@ class DecoderLayer(torch.nn.Module):
         maybe_shard_along_and_transform = maybe_manipulator.shard_along_and_transform
         self.pre_attn_ln_weight = maybe_duplicate(self.pre_attn_ln_weight)
         self.pre_attn_ln_bias = maybe_duplicate(self.pre_attn_ln_bias)
-        self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
-        self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
-        self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
+        if self.neuron_config and self.neuron_config.fuse_qkv:
+            self.attn_q_weight = maybe_shard_along(fused_qkv_weight, dim=1)
+            self.attn_q_bias = maybe_shard_along(fused_qkv_bias, dim=0)
+            self.attn_q_scales = maybe_shard_along(fused_qkv_scales, dim=0)
+        else:
+            self.attn_q_weight = maybe_shard_along(self.attn_q_weight, dim=1)
+            self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
+            self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
         self.attn_k_weight = maybe_shard_along(self.attn_k_weight, dim=1)
         self.attn_k_scales = maybe_shard_along(self.attn_k_scales, dim=0)
         self.attn_k_bias = maybe_shard_along(self.attn_k_bias, dim=0)

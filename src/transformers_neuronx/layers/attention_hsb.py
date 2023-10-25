@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 
 def query_key_value(
@@ -41,20 +42,36 @@ def query_key_value(
     hidden_size, n_active_tokens, n_seqs = hidden.sizes
     _, hidden_size_tp = q_weight.sizes
     _, kv_hidden_size_tp = k_weight.sizes
+    fuse_qkv = fuse_qkv = neuron_config and neuron_config.fuse_qkv
+    if fuse_qkv:
+        hidden_size_tp //= FUSED_QKV_TP_FACTOR
+        kv_hidden_size_tp = hidden_size_tp
+    else:
+        _, kv_hidden_size_tp = k_weight.sizes
     n_heads_tp = hidden_size_tp // d_head
     n_kv_heads_tp = kv_hidden_size_tp // d_head
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
 
     hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
 
-    # Q = (hidden @ wQ) + bQ
-    active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
+    if fuse_qkv:
+        # QKV = (hidden @ wQKV) + bQKV
+        active_qkv = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config=neuron_config)
 
-    # K = (hidden @ wK) + bK
-    active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
+        # Split
+        slice_lim = active_qkv.sizes[-1] // FUSED_QKV_TP_FACTOR
+        active_q = hlo.slice_along(active_qkv, -1, slice_lim, start=0)
+        active_k = hlo.slice_along(active_qkv, -1, 2*slice_lim, start=slice_lim)
+        active_v = hlo.slice_along(active_qkv, -1, 3*slice_lim, start=2*slice_lim)
+    else:
+        # Q = (hidden @ wQ) + bQ
+        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
 
-    # V = (hidden @ wV) + bV
-    active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
+        # K = (hidden @ wK) + bK
+        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
+
+        # V = (hidden @ wV) + bV
+        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
 
     if shard_over_batch:
         # shard over batch
