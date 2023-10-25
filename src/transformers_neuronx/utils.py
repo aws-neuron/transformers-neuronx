@@ -126,3 +126,63 @@ def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
         start_ids = None
     input_ids = tok.input_ids
     return input_ids, start_ids
+
+
+def interleave_qkv(q, k, v, tp_degree, dim=1):
+    """
+    Create a merged QKV Tensor with weights arranged for sharding.
+    
+    Args:
+        q(torch.Tensor): Weights/Bias for Q
+        k(torch.Tensor): Weights/Bias for K
+        v(torch.Tensor): Weights/Bias for V
+        tp_degree(int): tp_degree used for sharding
+        dim(int): Dimension to concatenate tensors
+    Returns:
+        tensor: Concatenated QKV tensor with interleaved weights
+    """
+    if q.shape[dim] == k.shape[dim]:
+        size = q.shape[dim]
+        shard_size = q.shape[dim] // tp_degree
+        slices = [slice(None) for _ in q.shape]
+        is_single_dim = len(q.shape) == 1
+        if is_single_dim:
+            tensor = torch.zeros((q.shape[0] * 3), dtype=q.dtype)
+        else:
+            tensor = torch.zeros((q.shape[0], q.shape[1] * 3), dtype=q.dtype)
+        for idx, start in enumerate(range(0, size, shard_size)):    
+            slices[dim] = slice(start, start+shard_size, 1)
+            q_shard = q[tuple(slices)].contiguous()
+            k_shard = k[tuple(slices)].contiguous()
+            v_shard = v[tuple(slices)].contiguous()
+            shard = torch.cat((q_shard, k_shard, v_shard), dim=dim).contiguous()
+            if is_single_dim:
+                tensor[(idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
+            else:
+                tensor[:, (idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
+    else:
+        tensor = torch.zeros((q.shape[0], q.shape[1] + k.shape[1] * 2), dtype=q.dtype)
+        q_shards = []
+        kv_shards = []
+        q_size = q.shape[dim]
+        q_shard_size = q.shape[1] // tp_degree
+        q_slices = [slice(None) for _ in q.shape]
+        for start in range(0, q_size, q_shard_size):
+            q_slices[dim] = slice(start, start + q_shard_size, 1)
+            q_shard = q[tuple(q_slices)].contiguous()    
+            q_shards.append(q_shard)
+
+        kv_size = k.shape[dim]
+        kv_shard_size = k.shape[1] // tp_degree
+        kv_slices = [slice(None) for _ in q.shape]
+        for start in range(0, kv_size, kv_shard_size):    
+            kv_slices[dim] = slice(start, start + kv_shard_size, 1)
+            k_shard = k[tuple(kv_slices)].contiguous()    
+            v_shard = v[tuple(kv_slices)].contiguous()
+            kv_shard = torch.concat((k_shard, v_shard), dim=dim).contiguous()
+            kv_shards.append(kv_shard)
+
+        for idx, (q_shard, kv_shard) in enumerate(zip(q_shards, kv_shards)):
+            shard = torch.cat((q_shard, kv_shard), dim=dim).contiguous()
+            tensor[:, (idx)*shard.shape[1]:(idx+1)*shard.shape[1]] = shard
+    return tensor

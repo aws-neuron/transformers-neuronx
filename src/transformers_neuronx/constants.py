@@ -15,3 +15,6 @@
 
 # Tile size used for the weight transformation
 TILE_SIZE = 128
+
+# Size used to determine fused QKV operation.
+FUSED_QKV_TP_FACTOR = 3

@@ -60,6 +60,7 @@ class NeuronConfig():
         self.sparse_attn = kargs.pop('sparse_attn', None)
         self.quant = kargs.pop('quant', None)
         self.cast_logits_dtype = kargs.pop('cast_logits_dtype', 'float32')
+        self.fuse_qkv = kargs.pop('fuse_qkv', False)
 
 
 class GenerationConfig:
