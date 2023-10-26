@@ -455,18 +455,18 @@ def dot_with_tiled_weight_add(lhs, rhs, bias,
     if bias is None:
         return dot
     bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)    
+    return dtype[lhs_size, rhs_size].Add(dot, bias)
 
 
 def dot_1220_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return dot_with_tiled_weight_add(lhs, rhs, bias, 
+    return dot_with_tiled_weight_add(lhs, rhs, bias,
                                      lhs_contracting_dimensions=[1, 2],
                                      rhs_contracting_dimensions=[2, 0],
                                      bias_dimension=1,
                                      scales=scales, neuron_config=neuron_config)
 
 def dot_0120_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return dot_with_tiled_weight_add(lhs, rhs, bias, 
+    return dot_with_tiled_weight_add(lhs, rhs, bias,
                                      lhs_contracting_dimensions=[0, 1],
                                      rhs_contracting_dimensions=[2, 0],
                                      bias_dimension=1,
@@ -531,7 +531,7 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         assert hidden_size % constants.TILE_SIZE == 0, \
                 f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
                 f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
-        hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens, 
+        hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
         hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
         hidden = dot_0120_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
         hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
@@ -795,6 +795,11 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     triu_sizes = n_active_tokens, n_positions
     int_dtype = position_ids.dtype
     pred = position_ids.scribe.pred
+
+    # Windowed & speculative attention
+    if n_active_tokens > 1 and allow_kv_dot_prefetch:
+        return decoder_attention_mask_window(position_ids, start_ids, n_positions)
+
     if False and batch_size == 1 and n_active_tokens > 1 and n_positions == n_active_tokens:
         position_ids = int_dtype[n_active_tokens].Iota(dimensions=[0])
         start_ids = int_dtype[1].Iota(dimensions=[0])
@@ -1736,8 +1741,30 @@ def full(value, dtype, sizes):
 # https://www.tensorflow.org/xla/operation_semantics#broadcastindim
 def broadcast(tensor, out_dim_size, broadcast_dimensions):
     dtype = tensor.dtype
-    assert len(broadcast_dimensions) == len(tensor.sizes), \
-        f"input operand rank ({len(tensor.sizes)}) doesn't match num of elements in broadcast_dimensions ({broadcast_dimensions})"
+
+    assert len(broadcast_dimensions) == len(tensor.sizes), (
+        f"Input operand rank ({len(tensor.sizes)}) does not match broadcast dimensions ({broadcast_dimensions})"
+    )
+
+    for i, (dim, size) in enumerate(zip(broadcast_dimensions, tensor.sizes)):
+
+        # Broadcast dimension must be within the output shape
+        assert dim < len(out_dim_size), (
+            f"Broadcasting dimension {dim} is out of range of destination size {out_dim_size} (src={tensor.sizes} dst={out_dim_size})"
+        )
+
+        # Sizes of 1 may always be broadcast to any other size
+        if size == 1:
+            continue
+
+        # Broadcast dimension sizes must match when non-1
+        dst = out_dim_size[dim]
+        assert dst == size, (
+            f"Non-1 broadcast source dimension ({i}) of size {size} "
+            f"must match destination dimension ({dim}) of size {dst} "
+            f"(src={tensor.sizes} dst={out_dim_size})"
+        )
+
     output = dtype[out_dim_size].Broadcast(tensor, dimensions=broadcast_dimensions)
     return output
 
@@ -1890,3 +1917,204 @@ def repeat_kv(tensor, n_repeats, repeat_dim):
     else:
         raise RuntimeError(f"invalid repeat_dim ({repeat_dim})")
     return output
+
+
+def _check_binary_arguments(lhs, rhs, dtype=None):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    if dtype is not None:
+        assert lhs.dtype == dtype
+        assert rhs.dtype == dtype
+
+
+def compare(lhs, rhs, direction):
+    pred = lhs.scribe.pred
+    _check_binary_arguments(lhs, rhs)
+    return pred[lhs.sizes].Compare(lhs, rhs, comparison_direction=direction)
+
+
+def less(lhs, rhs):
+    return compare(lhs, rhs, 'LT')
+
+
+def less_equal(lhs, rhs):
+    return compare(lhs, rhs, 'LE')
+
+
+def greater(lhs, rhs):
+    return compare(lhs, rhs, 'GT')
+
+
+def greater_equal(lhs, rhs):
+    return compare(lhs, rhs, 'GE')
+
+
+def logical_and(lhs, rhs):
+    pred = lhs.scribe.pred
+    _check_binary_arguments(lhs, rhs, dtype=pred)
+    return pred[lhs.sizes].And(lhs, rhs)
+
+
+def dtype_maximum(dtype):
+    scribe = dtype.scribe
+    maximums = {
+         scribe.s64: 2 ** 63 - 1,
+         scribe.s32: 2 ** 31 - 1,
+         scribe.s16: 2 ** 15 - 1,
+         scribe.s8:  2 ** 7 - 1,
+         scribe.u64: 2 ** 64,
+         scribe.u32: 2 ** 32,
+         scribe.u16: 2 ** 16,
+         scribe.u8:  2 ** 8,
+         scribe.pred: True,
+    }
+    return maximums.get(dtype, float('inf'))
+
+
+def reduce_min(tensor, dim, keepdim=False):
+
+    dtype = tensor.dtype
+    reduce_shape = list(tensor.sizes)
+    reduce_shape.pop(dim)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Minimum(p0, p1)
+
+    minimum = dtype.Constant(constant_value=dtype_maximum(dtype))
+    value = dtype[reduce_shape].Reduce(tensor, minimum, dimensions=[dim], to_apply=reducer)
+
+    if keepdim:
+        keepdim_shape = list(tensor.sizes)
+        keepdim_shape[dim] = 1
+        value = dtype[keepdim_shape].Reshape(value)
+
+    return value
+
+
+def triangle_mask(dtype, sizes, comparison='GE'):
+    assert len(sizes) == 2, (
+        f"Expected rank 2 triangle mask size but found {sizes}"
+    )
+    pred = dtype.scribe.pred
+    s32 = dtype.scribe.s32
+    a = s32[sizes].Iota(dimensions=[0])
+    b = s32[sizes].Iota(dimensions=[1])
+    result = pred[sizes].Compare(a, b, comparison_direction=comparison)
+    result = cast(result, dtype)
+    return result
+
+
+def triu_mask(dtype, sizes):
+    return triangle_mask(dtype, sizes, 'LE')
+
+
+def tril_mask(dtype, sizes):
+    return triangle_mask(dtype, sizes, 'GE')
+
+
+def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
+    """
+    Creates decomposed prior/active masks for windowed & speculative attention.
+
+    This mask should only be used when computing a number of context tokens
+    in parallel (>1) which may also require looking at the previously computed
+    KV-cache tokens.
+
+    Example:
+
+        # In this example consider a batch of size 1 that is left-padded
+        input_ids = [
+            [-, a, b, c, d, e],
+        ]
+        start_ids = [1]
+
+    Window 1:
+
+        # Consider a window computing the left-most tokens in the sequence
+        cache_ids = [0, 1, 2]
+
+        # The prior tokens can be ignored since the KV-cache should be empty.
+        prior_mask = [
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ]
+        # The active token mask is empty at position 0 due to left padding.
+        active_mask = [
+            [0, 0, 0],
+            [0, 1, 0],
+            [0, 1, 1],
+        ]
+
+    Window 2:
+
+        # In the next window consider computing an arbitrary window within
+        # the sequence
+        cache_ids = [3, 4, 5]
+
+        # Next the prior mask at is empty at position 0 due to left padding.
+        # Unlike the prior iteration, we begin attending to KV-cache
+        # projections since we expect they have been populated.
+        prior_mask = [
+            [0, 1, 1, 0, 0],
+            [0, 1, 1, 0, 0],
+            [0, 1, 1, 0, 0],
+        ]
+
+        # For the current window of tokens, we generate a full triangular mask
+        # since we no longer have any padding tokens to consider.
+        active_mask = [
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 1, 1],
+        ]
+
+    Arguments:
+        cache_ids: The positions to update in the cache.
+        start_ids: The padding offset from the left side.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the size of the bucket.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache
+        active_mask: The attention maks to apply to the active tokens.
+    """
+    scribe = cache_ids.scribe
+    s32 = scribe.s32
+    pred = scribe.pred
+    batch_size, = start_ids.sizes
+    n_active_tokens, = cache_ids.sizes
+
+    cache_ids = cast(cache_ids, s32)
+    start_ids = cast(start_ids, s32)
+
+    # Compute decomposed mask for the prior tokens
+    positions = s32[n_positions].Iota(dimensions=[0])
+    size = batch_size, n_positions
+    positions = broadcast(positions, size, [1])
+    starts = broadcast(start_ids, size, [0])
+    start_mask = greater_equal(positions, starts)
+    minimum_id = reduce_min(cache_ids, 0)
+    minimum_id = broadcast(minimum_id, size, [])
+    end_mask = less(positions, minimum_id)
+    prior_mask = logical_and(start_mask, end_mask)
+    # Final broadcast ensures we use correct path in layers/attention.py:mask
+    size = (batch_size, n_active_tokens, n_positions)
+    prior_mask = broadcast(prior_mask, size, [0, 2])
+
+    # Compute a mask for the active tokens
+    size = batch_size, n_active_tokens, n_active_tokens
+    cache_br = broadcast(cache_ids, size, [2])
+    start_br = broadcast(start_ids, size, [0])
+    start_mask = greater_equal(cache_br, start_br)
+    causal_mask = tril_mask(pred, (n_active_tokens, n_active_tokens))
+    causal_mask = broadcast(causal_mask, size, [1, 2])
+    active_mask = logical_and(causal_mask, start_mask)
+
+    return prior_mask, active_mask
