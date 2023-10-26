@@ -630,9 +630,9 @@ class DecoderLayer(torch.nn.Module):
                         quantize.maybe_quantize_weights(self.attn_k_weight, self.neuron_config.quant)
                     self.attn_v_weight, self.attn_v_scales = \
                         quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
-                    self.attn_out_weight, self.attn_out_scales = \
-                        quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
-                                                        out_feature_dim = 1 if self.attn_out_transposed else 0)
+                self.attn_out_weight, self.attn_out_scales = \
+                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
+                                                    out_feature_dim = 1 if self.attn_out_transposed else 0)
 
 
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree)
