@@ -15,6 +15,7 @@
 from transformers_neuronx import hlo
 from transformers_neuronx import utils
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import constants
 
 
@@ -586,15 +587,22 @@ def output(
     # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
     result = hlo.dot11_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
 
-    # (b * s, h) => (h, s, b)
-    result = hlo.transpose(result, 0, 1)
-    result = dtype[hidden_sizes].Reshape(result)
+    is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
-    if tp_degree == 1:
-        return result
+    if is_bsh:
+        # (b * s, h) => (b, s, h)
+        result = hlo.reshape(result, (n_seqs, n_active_tokens, hidden_size))
+    else:
+        # (b * s, h) => (h, s, b)
+        result = hlo.transpose(result, 0, 1)
+        result = dtype[hidden_sizes].Reshape(result)
 
-    all_reduce_dtype = None
-    if neuron_config:
-        all_reduce_dtype = neuron_config.all_reduce_dtype
-    result = hlo.all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
-    return result
+    if tp_degree != 1:
+        all_reduce_dtype = None
+        if neuron_config:
+            all_reduce_dtype = neuron_config.all_reduce_dtype
+        result = hlo.all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
+
+    # Transpose back to HSB if applicable
+    return hlo.permute(result, (2, 1, 0)) if is_bsh else result
+

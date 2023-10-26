@@ -73,6 +73,9 @@ class NeuronConfig():
         attention_layout (`str`, optional): Layout to be used for attention computation.
             To be selected from `["HSB", "BSH"]`.
              Default: `"HSB"`.
+        collectives_layout (`str`, optional): Layout to be used for collectives within attension HSB.
+            To be selected from `["HSB", "BSH"]`.
+             Default: `"HSB"`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -86,6 +89,7 @@ class NeuronConfig():
             # Force using 2D cache_ids layout for continuous batching.
             self.use_2d_cache_ids = True
         self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
+        self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
