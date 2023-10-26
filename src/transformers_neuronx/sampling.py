@@ -168,7 +168,6 @@ def validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep):
 def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep)
 
-    scores = scores.to(torch.float32)
     input_size = scores.size(dim=-1)
 
     def safe_size(size):
@@ -187,7 +186,7 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
         only on the filtered result from top_k filtering.
         """
         def filter_sorted(sorted_scores):
-            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1), dim=-1)
+            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
             mask = cumulative_probs <= top_p
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
@@ -247,7 +246,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
 
         # sample
-        probs = torch.nn.functional.softmax(top_values, dim=-1)
+        probs = torch.nn.functional.softmax(top_values, dim=-1, dtype=torch.float32)
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
