@@ -23,6 +23,7 @@ import numpy as np
 
 from transformers_neuronx import activations
 from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import utils
 from transformers_neuronx import compiler
 from transformers_neuronx import constants
@@ -559,10 +560,15 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         else:
             # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
             hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
-
-    # (b * s, h) = > (h, s, b)
-    hidden = transpose(hidden, 0, 1)
-    hidden = dtype[hidden_sizes].Reshape(hidden)
+    
+    is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
+    if is_bsh:
+        # (b * s, h) => (b, s, h)
+        hidden = reshape(hidden, (batch_size, n_active_tokens, hidden_size))
+    else:
+        # (b * s, h) = > (h, s, b)
+        hidden = transpose(hidden, 0, 1)
+        hidden = dtype[hidden_sizes].Reshape(hidden)
 
     if tp_degree != 1:
         all_reduce_dtype = None
@@ -570,7 +576,8 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
             all_reduce_dtype = neuron_config.all_reduce_dtype
         hidden = all_reduce_sum(hidden, tp_degree, dtype=all_reduce_dtype)
 
-    return hidden
+    # Transpose back to HSB if applicable
+    return permute(hidden, (2, 1, 0)) if is_bsh else hidden
 
 
 def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
@@ -737,9 +744,15 @@ def gated_mlp(
         # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
         result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
 
-    # (b * s, h) = > (h, s, b)
-    result = transpose(result, 0, 1)
-    result = dtype[hidden_sizes].Reshape(result)
+    is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
+
+    if is_bsh:
+        # (b * s, h) => (b, s, h)
+        result = reshape(result, (batch_size, n_active_tokens, hidden_size))
+    else:
+        # (b * s, h) = > (h, s, b)
+        result = transpose(result, 0, 1)
+        result = dtype[hidden_sizes].Reshape(result)
 
     if tp_degree != 1:
         all_reduce_dtype = None
@@ -747,7 +760,8 @@ def gated_mlp(
             all_reduce_dtype = neuron_config.all_reduce_dtype
         result = all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
 
-    return result
+    # Transpose back to HSB if applicable
+    return permute(result, (2, 1, 0)) if is_bsh else result
 
 
 def u8_decode(dtype, dequant_dtype, weight, min_value, max_value):
