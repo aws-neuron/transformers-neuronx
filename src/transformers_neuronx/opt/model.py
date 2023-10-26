@@ -23,6 +23,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import attention_hsb as attention, transformer
@@ -310,8 +311,14 @@ class OPTForSamplingNoEmbeddingHlo:
               ):
         dtype = hidden.dtype
         ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
-        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == attn_k_weight.sizes[-1], \
-            f"kv cache shape ({attn_k_cache.sizes}) doesn't match kv weight shape ({attn_k_weight.sizes})"
+        if self.neuron_config and self.neuron_config.fuse_qkv:
+            k_weight_shape = attn_q_weight.sizes
+            k_weight_dim = k_weight_shape[-1] // FUSED_QKV_TP_FACTOR
+        else:
+            k_weight_shape = attn_k_weight.sizes
+            k_weight_dim = k_weight_shape[-1]
+        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == k_weight_dim, \
+            f"kv cache shapxe ({attn_k_cache.sizes}) doesn't match kv weight shape ({k_weight_shape})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -371,7 +378,12 @@ class OPTForSamplingNoEmbeddingHlo:
 
         max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
         _, hidden_size_tp = q_weight.sizes
-        _, kv_hidden_size_tp = k_weight.sizes
+        fuse_qkv = neuron_config and neuron_config.fuse_qkv
+        if fuse_qkv:
+            hidden_size_tp //= FUSED_QKV_TP_FACTOR
+            kv_hidden_size_tp = hidden_size_tp
+        else:
+            _, kv_hidden_size_tp = k_weight.sizes
         n_head = hidden_size // d_head
         tp_degree = hidden_size // hidden_size_tp
         n_kv_heads = n_kv_heads_tp * tp_degree
