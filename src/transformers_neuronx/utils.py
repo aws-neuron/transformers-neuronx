@@ -18,6 +18,8 @@ import itertools
 import torch
 import torch.nn.functional as F
 
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
+
 
 def get_closest_pow2_bucket_size(size):
     # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)?
@@ -141,48 +143,44 @@ def interleave_qkv(q, k, v, tp_degree, dim=1):
     Returns:
         tensor: Concatenated QKV tensor with interleaved weights
     """
+    def get_slice_params(tensor, dim, tp_degree):
+        size = tensor.shape[dim]
+        shard_size = size // tp_degree
+        slices = [slice(None) for _ in tensor.shape]
+        return size, shard_size, slices
+
+    def get_shard_tensors(tensors, size, shard_size, slices, dim):
+        for idx, start in enumerate(range(0, size, shard_size)):
+            slices[dim] = slice(start, start+shard_size, 1)
+            shard_tensors = [t[tuple(slices)].contiguous() for t in tensors]
+            yield idx, shard_tensors
+
     if q.shape[dim] == k.shape[dim]:
-        size = q.shape[dim]
-        shard_size = q.shape[dim] // tp_degree
-        slices = [slice(None) for _ in q.shape]
+        size, shard_size, slices = get_slice_params(q, dim, tp_degree)
         is_single_dim = len(q.shape) == 1
         if is_single_dim:
-            tensor = torch.zeros((q.shape[0] * 3), dtype=q.dtype)
+            tensor = torch.zeros((size * FUSED_QKV_TP_FACTOR), dtype=q.dtype)
         else:
-            tensor = torch.zeros((q.shape[0], q.shape[1] * 3), dtype=q.dtype)
-        for idx, start in enumerate(range(0, size, shard_size)):    
-            slices[dim] = slice(start, start+shard_size, 1)
-            q_shard = q[tuple(slices)].contiguous()
-            k_shard = k[tuple(slices)].contiguous()
-            v_shard = v[tuple(slices)].contiguous()
-            shard = torch.cat((q_shard, k_shard, v_shard), dim=dim).contiguous()
+            hidden_dim, interleave_dim = q.shape
+            tensor = torch.zeros((hidden_dim, interleave_dim * FUSED_QKV_TP_FACTOR), dtype=q.dtype)
+        for idx, shard_tensors in get_shard_tensors((q, k, v), size, shard_size, slices, dim):
+            shard = torch.cat(shard_tensors, dim=dim).contiguous()
             if is_single_dim:
                 tensor[(idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
             else:
                 tensor[:, (idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
     else:
-        tensor = torch.zeros((q.shape[0], q.shape[1] + k.shape[1] * 2), dtype=q.dtype)
-        q_shards = []
-        kv_shards = []
-        q_size = q.shape[dim]
-        q_shard_size = q.shape[1] // tp_degree
-        q_slices = [slice(None) for _ in q.shape]
-        for start in range(0, q_size, q_shard_size):
-            q_slices[dim] = slice(start, start + q_shard_size, 1)
-            q_shard = q[tuple(q_slices)].contiguous()    
-            q_shards.append(q_shard)
-
-        kv_size = k.shape[dim]
-        kv_shard_size = k.shape[1] // tp_degree
-        kv_slices = [slice(None) for _ in q.shape]
-        for start in range(0, kv_size, kv_shard_size):    
-            kv_slices[dim] = slice(start, start + kv_shard_size, 1)
-            k_shard = k[tuple(kv_slices)].contiguous()    
-            v_shard = v[tuple(kv_slices)].contiguous()
-            kv_shard = torch.concat((k_shard, v_shard), dim=dim).contiguous()
-            kv_shards.append(kv_shard)
-
-        for idx, (q_shard, kv_shard) in enumerate(zip(q_shards, kv_shards)):
+        q_hidden_dim, q_interleave_dim = q.shape
+        _, kv_interleave_dim = k.shape
+        tensor = torch.zeros((q_hidden_dim, q_interleave_dim + kv_interleave_dim * 2), dtype=q.dtype)
+        q_size, q_shard_size, q_slices = get_slice_params(q, dim, tp_degree)
+        kv_size, kv_shard_size, kv_slices = get_slice_params(k, dim, tp_degree)
+        for idx, ((_, q_shard_tensors), (_, kv_shard_tensors)) in enumerate(zip(
+            get_shard_tensors((q,), q_size, q_shard_size, q_slices, dim),
+            get_shard_tensors((k,v), kv_size, kv_shard_size, kv_slices, dim)
+        )):
+            q_shard = q_shard_tensors[0]
+            kv_shard = torch.concat(kv_shard_tensors, dim=dim).contiguous()
             shard = torch.cat((q_shard, kv_shard), dim=dim).contiguous()
             tensor[:, (idx)*shard.shape[1]:(idx+1)*shard.shape[1]] = shard
     return tensor

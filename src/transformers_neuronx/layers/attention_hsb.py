@@ -41,8 +41,7 @@ def query_key_value(
     dtype = hidden.dtype
     hidden_size, n_active_tokens, n_seqs = hidden.sizes
     _, hidden_size_tp = q_weight.sizes
-    _, kv_hidden_size_tp = k_weight.sizes
-    fuse_qkv = fuse_qkv = neuron_config and neuron_config.fuse_qkv
+    fuse_qkv = neuron_config and neuron_config.fuse_qkv
     if fuse_qkv:
         hidden_size_tp //= FUSED_QKV_TP_FACTOR
         kv_hidden_size_tp = hidden_size_tp
