@@ -28,13 +28,18 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         self.config = config
         self.neuron_config = neuron_config
+        self.use_2d_cache_ids = False
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
+        if self.use_2d_cache_ids:
+            position_sizes = batch_size, n_active_tokens
+            cache_ids = scribe.s32[position_sizes].Parameter(parameter_number=1)  # 2d cache_ids
+        else:
+            cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)  # 1d cache_ids
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
         last_token_id = scribe.s32.Parameter(parameter_number=3)
         pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
