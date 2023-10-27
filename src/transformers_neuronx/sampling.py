@@ -130,7 +130,7 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         topk_values, topk_indices = torch.topk(next_token_scores, top_k)
 
         # sample
-        probs = torch.nn.functional.softmax(topk_values, dim=-1)
+        probs = torch.nn.functional.softmax(topk_values, dim=-1, dtype=torch.float32)
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(topk_indices, 1, inputs_in_topk)
         tokens.append(inputs)
