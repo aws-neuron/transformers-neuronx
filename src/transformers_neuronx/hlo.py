@@ -791,9 +791,16 @@ def transfer_with_static_ring(shape):
 def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
                            allow_kv_dot_prefetch=False, start_mask=True):
     batch_size, = start_ids.sizes
-    n_active_tokens, = position_ids.sizes
-    triu_sizes = n_active_tokens, n_positions
     int_dtype = position_ids.dtype
+    use_2d_cache_ids = len(position_ids.sizes) > 1
+    if use_2d_cache_ids:
+        _, n_active_tokens = position_ids.sizes  # 2d position_ids
+
+        # TODO: fix the following broadcast for 2D position_ids
+        position_ids = int_dtype[n_active_tokens].Iota(dimensions=[0])
+    else:
+        n_active_tokens,  = position_ids.sizes  # 1d position_ids
+    triu_sizes = n_active_tokens, n_positions
     pred = position_ids.scribe.pred
 
     # Windowed & speculative attention
@@ -805,7 +812,9 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
         start_ids = int_dtype[1].Iota(dimensions=[0])
     iota1 = int_dtype[n_positions].Iota(dimensions=[0])
     iota1t = int_dtype[triu_sizes].Broadcast(iota1, dimensions=[1])
+
     position_ids_br = int_dtype[triu_sizes].Broadcast(position_ids, dimensions=[0])
+
     mask_triu = pred[triu_sizes].Compare(iota1t, position_ids_br, comparison_direction=triu_comparison)
     if not start_mask:
         return mask_triu, None
@@ -1897,6 +1906,44 @@ def reshape(tensor, shape):
     src_numel = functools.reduce(operator.mul, tensor.sizes)
     assert dst_numel == src_numel
     return tensor.dtype[shape].Reshape(tensor)
+
+
+def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
+    operand_rank = len(operands.sizes)
+    index_vector_dim = scatter_dims.get("index_vector_dim", [])
+    update_window_dims = scatter_dims.get("update_window_dims", [])
+    inserted_window_dims = scatter_dims.get("inserted_window_dims", [])
+    assert operand_rank == (len(update_window_dims) + len(inserted_window_dims)), \
+        "operand.rank must equal the sum of update_window_dims.size and inserted_window_dims.size"
+    assert operands.dtype == updates.dtype, "inconsistent dtype between operands and updates"
+    scatter_dims_to_operand_dims = scatter_dims.get("scatter_dims_to_operand_dims", [])
+    if index_vector_dim == len(scatter_indices.sizes):
+        # If index_vector_dim is equal to scatter_indices.rank
+        # we implicitly consider scatter_indices to have a trailing 1 dimension.
+        scatter_indices_sizes = list(scatter_indices.sizes) + [1]
+    else:
+        scatter_indices_sizes = list(scatter_indices.sizes)
+    assert len(scatter_dims_to_operand_dims) == scatter_indices_sizes[index_vector_dim], \
+        "scatter_dims_to_operand_dims.size must be equal to scatter_indices.shape.dims[index_vector_dim]"
+    assert len(updates.sizes) == (len(update_window_dims) + len(scatter_indices_sizes) - 1), \
+        "Each updates array must be of rank (update_window_dims.size + scatter_indices.rank - 1)"
+    dtype = updates.dtype
+    updated_sizes = operands.sizes
+    updated = dtype[updated_sizes].Scatter(
+        operands, scatter_indices, updates, scatter_dimension_numbers=scatter_dims, to_apply=to_apply)
+    return updated
+
+
+def sin(tensor):
+    sizes = tensor.sizes
+    dtype = tensor.dtype
+    return dtype[sizes].Sin(tensor)
+
+
+def cos(tensor):
+    sizes = tensor.sizes
+    dtype = tensor.dtype
+    return dtype[sizes].Cos(tensor)
 
 
 def transpose210(tensor):

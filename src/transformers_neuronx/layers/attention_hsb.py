@@ -142,19 +142,69 @@ def query_key_projection(query, key, qk_weight):
 
     return query, key
 
+
 def update_cache(cache, cache_ids, values):
     """
     Cache[I] = X
     """
-    dtype = values.dtype
-    cache_size = cache.sizes
-    scatter_dims = dict(update_window_dims=[1,2,3],
-                        inserted_window_dims=[0],
-                        scatter_dims_to_operand_dims=[0],
-                        index_vector_dim=1)
-    assign_func = hlo.gen_assign_func(dtype)
-    updated = dtype[cache_size].Scatter(
-        cache, cache_ids, values, scatter_dimension_numbers=scatter_dims, to_apply=assign_func)
+    dtype = cache.dtype
+    use_2d_cache_ids = len(cache_ids.sizes) > 1
+    if use_2d_cache_ids:
+        # 2D cache_ids
+        cache_ids = hlo.transpose(cache_ids, 0, 1)
+        assign_func = hlo.gen_assign_func(dtype)
+        n_positions, n_seqs, n_kv_heads, d_head = cache.sizes
+        n_active_tokens, _, _, _  = values.sizes
+
+        # reshape cache, and scatter values in a for loop.
+        # 
+        # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+        #        +---------3-4-----6-7------9-10-----------------
+        # seq 0  |                [A,B]
+        # seq 1  |        [C,D]
+        # seq 2  |                         [E,F]
+        #        +-----------------------------------------------
+        # NOTE: Due to limitation in hlo.scatter, we make cache flatten: (p0 as positions, s0 as sequences)
+        #       (p0, s0), (p0, s1), (p0, s2), (p1, s0), (p1, s1), (p1, s2)
+        #       This means we cannot update the sequence in the cache with one scatter op, without reordering the cache.
+        #
+        # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+        # seq 0         [[6,7],                                  [[A,B],
+        # seq 1          [3,4],                                   [C,D],
+        # seq 2          [9,10]]                                  [E,F]]
+        #
+        kv_hidden_size = n_kv_heads * d_head
+        cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
+        values_r = hlo.reshape(values, [n_active_tokens, n_seqs, kv_hidden_size])
+        for seq_id in range(n_seqs):
+            cache_id = hlo.slice_along(cache_ids, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
+
+            # Since cache is flatten, we need to add an offset to cache_id (aka position_id)
+            cache_id_dtype = cache_id.dtype
+            kv_hidden_size_val = cache_id_dtype.Constant(constant_value=kv_hidden_size)
+            offset = cache_id_dtype[cache_id.sizes].Broadcast(kv_hidden_size_val, dimensions=[])
+            cache_id = cache_id_dtype[cache_id.sizes].Add(cache_id, offset)
+
+            value = hlo.slice_along(values_r, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
+
+            # Assuming n_active_token == 1, due to KV cache layout issue.
+            assert n_active_tokens == 1, "n_active_tokens is expected to be 1 for 2D cache_ids"
+            value_r = hlo.reshape(value, [1, kv_hidden_size])
+
+            scatter_dims = dict(update_window_dims=[1],
+                                inserted_window_dims=[0],
+                                scatter_dims_to_operand_dims=[0],
+                                index_vector_dim=1)
+            cache_r = hlo.scatter(cache_r, cache_id, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
+        updated = cache_r
+    else:
+        # 1D cache_ids
+        scatter_dims = dict(update_window_dims=[1,2,3],
+                            inserted_window_dims=[0],
+                            scatter_dims_to_operand_dims=[0],
+                            index_vector_dim=1)
+        assign_func = hlo.gen_assign_func(dtype)
+        updated = hlo.scatter(cache, cache_ids, values, scatter_dims=scatter_dims, to_apply=assign_func)
     return updated
 
 
