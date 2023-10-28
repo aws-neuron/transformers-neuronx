@@ -32,7 +32,6 @@ class LlamaConfig:
         self.attention_head_size = config.hidden_size // config.num_attention_heads
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.num_attention_heads
-        self.num_key_value_heads = 0 if self.num_key_value_heads == self.num_attention_heads else self.num_key_value_heads
         self.num_hidden_layers = config.num_hidden_layers
         self.vocab_size = config.vocab_size
         self.hidden_act = config.hidden_act
@@ -51,7 +50,11 @@ class LlamaConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
-        # TODO: The shard-over-batch feature is experimental. Uncomment following lines to enable shard-over-batch.
-        # is_multi_query_attn = self.num_key_value_heads < self.num_attention_heads
-        # self.shard_over_batch = is_multi_query_attn and batch_size >= tp_degree and (batch_size % tp_degree == 0)
-        self.shard_over_batch = False
+        is_multi_query_attn = self.num_key_value_heads < self.num_attention_heads
+        if is_multi_query_attn:
+            self.shard_over_batch = batch_size >= tp_degree and (batch_size % tp_degree == 0)
+            if self.num_key_value_heads < tp_degree and not self.shard_over_batch:
+                raise NotImplementedError(f"Not able to shard over head dimension "
+                                          f"when num_key_value_heads ({self.num_key_value_heads}) < tp_degree ({tp_degree})")
+        else:
+            self.shard_over_batch = False    

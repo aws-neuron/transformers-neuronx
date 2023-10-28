@@ -52,7 +52,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config
+            unroll=unroll, neuron_config=neuron_config, shard_over_batch=config.shard_over_batch
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config,
@@ -222,7 +222,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
             batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens
+            unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens, shard_over_batch=config.shard_over_batch
         )
 
 
@@ -269,7 +269,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
                     neuron_config=neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad
+                    allow_pad=self.decoder_lm_head.allow_pad,
+                    shard_over_batch=config.shard_over_batch,
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
