@@ -375,8 +375,6 @@ class OPTForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
 
         hidden_size, n_active_tokens, n_seqs = hidden.sizes
-
-        max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
         _, hidden_size_tp = q_weight.sizes
         fuse_qkv = neuron_config and neuron_config.fuse_qkv
         if fuse_qkv:
@@ -384,10 +382,16 @@ class OPTForSamplingNoEmbeddingHlo:
             kv_hidden_size_tp = hidden_size_tp
         else:
             _, kv_hidden_size_tp = k_weight.sizes
+        _, _, _, d_head = cached_keys.sizes
         n_head = hidden_size // d_head
         tp_degree = hidden_size // hidden_size_tp
-        n_kv_heads = n_kv_heads_tp * tp_degree
 
+        if self.shard_over_batch:
+            max_ctx_plus_n_active_tokens, n_seqs_per_nc, n_kv_heads, d_head = cached_keys.sizes
+        else:
+            max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
+            n_kv_heads = n_kv_heads_tp * tp_degree
+        
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV
