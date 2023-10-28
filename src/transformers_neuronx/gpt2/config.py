@@ -38,10 +38,14 @@ class GPT2HuggingFaceConfig(transformers.GPT2Config):
         self.amp = amp
         self.tp_degree = tp_degree
 
-        # TODO: The shard-over-batch feature is experimental. Uncomment following lines to enable shard-over-batch.
-        # is_multi_query_attn = self.n_kv_head < self.n_head
-        # self.shard_over_batch = is_multi_query_attn and batch_size >= tp_degree and (batch_size % tp_degree == 0)
-        self.shard_over_batch = False
+        is_multi_query_attn = self.n_kv_head < self.n_head
+        if is_multi_query_attn:
+            self.shard_over_batch = batch_size >= tp_degree and (batch_size % tp_degree == 0)
+            if self.n_kv_head < tp_degree and not self.shard_over_batch:
+                raise NotImplementedError(f"Not able to shard over head dimension "
+                                          f"when n_kv_head ({self.n_kv_head}) < tp_degree ({tp_degree})")
+        else:
+            self.shard_over_batch = False    
 
 
 class GPT2Config:
@@ -62,7 +66,11 @@ class GPT2Config:
         self.amp = amp
         self.tp_degree = tp_degree
 
-        # TODO: The shard-over-batch feature is experimental. Uncomment following lines to enable shard-over-batch.
-        # is_multi_query_attn = self.n_kv_head < self.n_head
-        # self.shard_over_batch = is_multi_query_attn and batch_size >= tp_degree and (batch_size % tp_degree == 0)
-        self.shard_over_batch = False
+        is_multi_query_attn = self.n_kv_head < self.n_head
+        if is_multi_query_attn:
+            self.shard_over_batch = batch_size >= tp_degree and (batch_size % tp_degree == 0)
+            if self.n_kv_head < tp_degree and not self.shard_over_batch:
+                raise NotImplementedError(f"Not able to shard over head dimension "
+                                          f"when n_kv_head ({self.n_kv_head}) < tp_degree ({tp_degree})")
+        else:
+            self.shard_over_batch = False    

@@ -74,27 +74,18 @@ def query_key_value(
 
     if shard_over_batch:
         # shard over batch
-        scribe = active_q.scribe
-        s32 = scribe.s32
-        zero = s32.Constant(constant_value=0)
-
-        # split along batch dimension, and concat along head dimension
-        # TODO: Emit all-to-all CC op, instead of allgather+slice
-        full_q = hlo.all_gather(active_q, dim=1, tp_degree=tp_degree)
-        full_k = hlo.all_gather(active_k, dim=1, tp_degree=tp_degree)
-        full_v = hlo.all_gather(active_v, dim=1, tp_degree=tp_degree)
-
         n_seqs_per_nc = n_seqs // tp_degree
-        slice_limit = n_active_tokens * n_seqs_per_nc
-        active_q = hlo.dynamic_slice_along(full_q, dim=0, size=slice_limit, start=zero)
-        active_k = hlo.dynamic_slice_along(full_k, dim=0, size=slice_limit, start=zero)
-        active_v = hlo.dynamic_slice_along(full_v, dim=0, size=slice_limit, start=zero)
-
         n_heads = n_heads_tp * tp_degree
         n_kv_heads = n_heads_tp * tp_degree // (hidden_size_tp // kv_hidden_size_tp)
         n_repeats = n_heads // n_kv_heads
         active_q_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads * n_repeats, d_head
         active_kv_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads, d_head
+
+        # split along batch dimension, and concat along head dimension
+        active_q = hlo.all_to_all(active_q, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+        active_k = hlo.all_to_all(active_k, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+        active_v = hlo.all_to_all(active_v, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+
         active_q = hlo.reshape(active_q, active_q_sizes)
         active_k = hlo.reshape(active_k, active_kv_sizes)
         active_v = hlo.reshape(active_v, active_kv_sizes)
@@ -363,7 +354,6 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     # Ca = Pa @ Va
     # Cp = Pp @ Vp
     # C = Ca + Cp
-    sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
     dot_dims = dict(lhs_contracting_dimensions=[3],
                     lhs_batch_dimensions=[0, 1],
                     rhs_contracting_dimensions=[0],
@@ -391,14 +381,11 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     output = hlo.add(output_dot, active_output_dot)
 
     if shard_over_batch:
-        scribe = output_dot.scribe
-        s32 = scribe.s32
-        zero = s32.Constant(constant_value=0)
-
         # concat along batch dimension and split along head dimension
-        full_output = hlo.all_gather(output, dim=0, tp_degree=tp_degree)
-        output = hlo.dynamic_slice_along(full_output, dim=1, start=zero, size=n_heads_tp)
+        output = hlo.all_to_all(output, split_dim=1, concat_dim=0, tp_degree=tp_degree)
+        denom = hlo.all_to_all(denom, split_dim=1, concat_dim=0, tp_degree=tp_degree)
 
+    sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
     denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
     output = dtype[sizes].Divide(output, denom_br)
     sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
@@ -466,9 +453,7 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
             result = hlo.reshape(result, result_sizes)
 
             # concat along batch dimension and split along head dimension
-            slice_size = n_heads // tp_degree
-            full_result = hlo.all_gather(result, dim=0, tp_degree=tp_degree)
-            result = hlo.dynamic_slice_along(full_result, dim=1, start=zero, size=slice_size)
+            result = hlo.all_to_all(result, split_dim=1, concat_dim=0, tp_degree=tp_degree)
         else:
             result_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
             result = hlo.reshape(result, result_sizes)

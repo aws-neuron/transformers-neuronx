@@ -1031,6 +1031,46 @@ def all_reduce_sum(tensor, tp_degree, dtype=None):
     )
 
 
+def all_to_all(tensor, split_dim, concat_dim, tp_degree):
+    # Add extra reshape (and potentially transpose) before and after all-to-all CC, due to
+    # 1) hlo_to_mlir_hlo would assume split_dim == concat_dim
+    # 2) split_count is taken from first replica_group
+    # 3) we can only split/concat outer most dimension
+    shape = list(tensor.sizes)
+    dtype = tensor.dtype
+    assert (split_dim == 0 and concat_dim == 1) or (split_dim == 1 and concat_dim == 0), \
+        f"invalid input dimensions: split_dim={split_dim}, concat_dim={concat_dim}"
+    assert shape[split_dim] >= tp_degree and shape[split_dim] % tp_degree == 0, \
+        f"invalid split size ({shape[split_dim]}) and tp_degree ({tp_degree})"
+    shape_flat = shape[1:].copy()
+    shape_flat[0] *= shape[0]
+
+    # Assume input_shape = [N,M]
+    # split_dim == 0 and concat_dim == 1, new shape = [M*tp_degree, N/tp_degree]
+    # concat_dim == 0 and split_dim == 1, new shape = [N*tp_degree, M/tp_degree]
+    shape_new = shape.copy()
+    shape_new[split_dim] = shape_new[split_dim] // tp_degree
+    shape_new[concat_dim] *= tp_degree
+    if split_dim == 0:
+        assert concat_dim == 1
+        shape_new[1], shape_new[0] = shape_new[0], shape_new[1]
+
+    if split_dim == 1:
+        assert concat_dim == 0
+        tensor = transpose(tensor, 0, 1)
+    tensor = reshape(tensor, shape_flat)
+    tensor = dtype[shape_flat].AllToAll(
+        tensor,
+        dimensions=[0],
+        replica_groups=[list(range(tp_degree))],
+    )
+    tensor = reshape(tensor, shape_new)
+    if split_dim == 0:
+        assert concat_dim == 1
+        tensor = transpose(tensor, 0, 1)
+    return tensor
+
+
 def squeeze(tensor, dim):
     assert tensor.sizes[dim] == 1
     dtype = tensor.dtype
