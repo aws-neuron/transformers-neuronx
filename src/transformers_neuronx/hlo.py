@@ -1929,6 +1929,16 @@ def add(lhs, rhs):
     return lhs.dtype[lhs.sizes].Add(lhs, rhs)
 
 
+def subtract(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Subtract(lhs, rhs)
+
+
 def divide(lhs, rhs):
     assert lhs.sizes == rhs.sizes, (
         "Tensor Size Mismatch. "
@@ -1937,6 +1947,16 @@ def divide(lhs, rhs):
     )
     assert lhs.dtype == rhs.dtype
     return lhs.dtype[lhs.sizes].Divide(lhs, rhs)
+
+
+def multiply(lhs, rhs):
+    assert lhs.sizes == rhs.sizes, (
+        "Tensor Size Mismatch. "
+        f"LHS shape={lhs.sizes} "
+        f"RHS shape={rhs.sizes}"
+    )
+    assert lhs.dtype == rhs.dtype
+    return lhs.dtype[lhs.sizes].Multiply(lhs, rhs)
 
 
 def reshape(tensor, shape):
@@ -2205,3 +2225,8 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     active_mask = logical_and(causal_mask, start_mask)
 
     return prior_mask, active_mask
+
+
+def exp(tensor):
+    dtype = tensor.dtype
+    return dtype[tensor.sizes].Exp(tensor)
