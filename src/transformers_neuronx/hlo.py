@@ -1008,7 +1008,7 @@ def all_gather(tensor, dim, tp_degree):
     )
 
 
-def all_reduce_sum(tensor, tp_degree, dtype=None):
+def all_reduce_sum(tensor, tp_degree, dtype=None, replica_groups=None):
     scribe = tensor.scribe
 
     if dtype is None:
@@ -1018,6 +1018,9 @@ def all_reduce_sum(tensor, tp_degree, dtype=None):
     else:
         all_reduce_dtype = dtype
 
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+
     def reducer(scribe):
         p0 = all_reduce_dtype.Parameter(parameter_number=0)
         p1 = all_reduce_dtype.Parameter(parameter_number=1)
@@ -1025,7 +1028,7 @@ def all_reduce_sum(tensor, tp_degree, dtype=None):
 
     return all_reduce(
         tensor,
-        replica_groups=[list(range(tp_degree))],
+        replica_groups=replica_groups,
         to_apply=reducer,
         dtype=all_reduce_dtype
     )
@@ -1625,7 +1628,7 @@ def full_like(tensor, value):
     return result
 
 
-def all_reduce_max(tensor, tp_degree=1, dtype=None):
+def all_reduce_max(tensor, tp_degree=1, dtype=None, replica_groups=None):
     scribe = tensor.scribe
 
     if dtype is None:
@@ -1635,6 +1638,9 @@ def all_reduce_max(tensor, tp_degree=1, dtype=None):
     else:
         all_reduce_dtype = dtype
 
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+
     def reducer(scribe):
         p0 = all_reduce_dtype.Parameter(parameter_number=0)
         p1 = all_reduce_dtype.Parameter(parameter_number=1)
@@ -1642,13 +1648,13 @@ def all_reduce_max(tensor, tp_degree=1, dtype=None):
 
     return all_reduce(
         tensor,
-        replica_groups=[list(range(tp_degree))],
+        replica_groups=replica_groups,
         to_apply=reducer,
         dtype=all_reduce_dtype
     )
 
 
-def all_reduce_max_with_indices(tensor, index, tp_degree=1, dtype=None):
+def all_reduce_max_with_indices(tensor, index, tp_degree=1, dtype=None, replica_groups=None):
     """
     Select the maximum value and its associated index across ranks.
 
@@ -1663,7 +1669,7 @@ def all_reduce_max_with_indices(tensor, index, tp_degree=1, dtype=None):
     assert tensor.sizes == index.sizes
 
     # Find maximum value across ranks
-    maximum = all_reduce_max(tensor, tp_degree, dtype=dtype)
+    maximum = all_reduce_max(tensor, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Zero out all rank-local indices which do not correspond global maximum
     mask = pred[size].Compare(tensor, maximum, comparison_direction='EQ')
@@ -1671,7 +1677,7 @@ def all_reduce_max_with_indices(tensor, index, tp_degree=1, dtype=None):
     index = index.dtype[index.sizes].Select(mask, index, zero)
 
     # Reduce masked indices from across ranks (Note: Max instead of sum due to potential duplicate values)
-    index = all_reduce_max(index, tp_degree, dtype=dtype)
+    index = all_reduce_max(index, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     return maximum, index
 
