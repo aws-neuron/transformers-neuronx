@@ -231,8 +231,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
+        cache_ids, _, _ = args
 
-        if context_length > 1:
+        if context_length > 1 and cache_ids[0].item() == 0:
             logits = self.context(hidden, *args)
         else:
             logits = self.decoder_lm_head(hidden, *args)

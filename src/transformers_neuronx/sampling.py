@@ -288,3 +288,13 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )
+
+#TODO Leverage Generation Args data class as input args
+def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
+    top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
+ 
+    # sample
+    probs = torch.nn.functional.softmax(top_values, dim=-1)
+    inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
+    inputs = torch.gather(top_indices, 1, inputs_in_topk)
+    return inputs
