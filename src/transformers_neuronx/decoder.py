@@ -234,7 +234,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             raise ValueError(f'sequence_length={sequence_length} cannot be divided by '
                              f'n_active_tokens={self.n_active_tokens}')
         outputs = None
-        for start in range(0, sequence_length, self.n_active_tokens):
+        slice_loop_var = range(0, sequence_length, self.n_active_tokens)
+        if self.n_parallel_output_tokens > 1:
+            slice_loop_var = [0]
+  
+        
+        for start in slice_loop_var:
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
             for sdim, tensor in zip(self.inputs_sdim, inputs):

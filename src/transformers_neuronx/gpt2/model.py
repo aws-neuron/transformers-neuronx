@@ -396,15 +396,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                       self.neuron_config.sparse_attn and \
                                       self.neuron_config.sparse_attn.skip_masking_decode
         batch_size, context_length = input_ids.shape
-        is_context_encode = context_length > 1
+        
         estimate = bucket.find(self.context_buckets, context_length)
+        last_token_id = torch.as_tensor(0, dtype=torch.int32)
 
-        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
         batch_size, context_length = input_ids.shape
-
-        model=self.decoder_lm_head
-        if is_context_encode:
-            model=self.decoder_lm_head_for_context[estimate, batch_size]
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
@@ -412,6 +408,17 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
+        is_context_encode = context_length > 1 and cache_ids[0].item() == 0
+       
+        model=self.decoder_lm_head
+        if is_context_encode:
+            input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+            batch_size, context_length = input_ids.shape
+            model=self.decoder_lm_head_for_context[estimate, batch_size]
+        
+            if cache_ids.shape!=torch.Size([context_length]): ###To-Do: Fix me so we pad the cache properly
+                cache_ids=utils.pad(cache_ids,0,context_length,left=False)
+        
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
         # Compute the window starting index for specific mask patterns
@@ -427,7 +434,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
         hidden=hidden.transpose(0,2).contiguous()
-        if context_length > 1:
+        if context_length > 1 and cache_ids[0].item() == 0:
             logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         else:
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
