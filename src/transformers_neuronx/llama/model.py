@@ -33,6 +33,8 @@ class LlamaForSampling(base.NeuronModelBase):
                  neuron_config=None, prefixed_length=0, n_parallel_output_tokens=1, **kwargs):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
+        self.context_pre_hook = None
+        self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config
         self.prefixed_length = prefixed_length
@@ -160,7 +162,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):
-
+        if self.context_pre_hook is not None:
+            self.context_pre_hook()
         batch_size, context_length = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
