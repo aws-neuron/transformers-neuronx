@@ -285,6 +285,8 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
     next_token_scores = model(input_ids, None, start_ids)
+    if model.context_hook is not None:
+        model.context_hook()
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )
