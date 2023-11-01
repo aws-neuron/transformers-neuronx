@@ -807,7 +807,7 @@ def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison
     if n_active_tokens > 1 and allow_kv_dot_prefetch:
         return decoder_attention_mask_window(position_ids, start_ids, n_positions)
 
-    if False and batch_size == 1 and n_active_tokens > 1 and n_positions == n_active_tokens:
+    if batch_size == 1 and n_active_tokens > 1 and n_positions == n_active_tokens:
         position_ids = int_dtype[n_active_tokens].Iota(dimensions=[0])
         start_ids = int_dtype[1].Iota(dimensions=[0])
     iota1 = int_dtype[n_positions].Iota(dimensions=[0])
