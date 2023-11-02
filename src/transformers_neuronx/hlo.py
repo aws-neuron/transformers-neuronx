@@ -1423,6 +1423,65 @@ def reduce_mean(tensor, dims, keepdim=False):
     return value
 
 
+def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
+    """
+    Calculate the "global" mean for elements in a group where each group's
+    global_mean = (intermediate_mean0 + intermediate_mean1 + ...) / group_size for intermediate_meani in each group
+
+    Example 1:
+
+        tp_degree = 2
+        replica_groups = [[0, 1]]
+        sharding=(0,)
+        inputs = torch.tensor([
+            [1, 2, 3],  # Rank 0
+            [5, 6, 7],  # Rank 1
+        ])
+        all_reduce_mean on NC 0 = torch.tensor([
+            [3, 4, 5]
+        ])
+
+    Example 2:
+
+        tp_degree = 2
+        replica_groups = [[0], [1]]
+        sharding=(0,)
+        inputs = torch.tensor([
+            [1, 2, 3],  # Rank 0
+            [5, 6, 7],  # Rank 1
+        ])
+        all_reduce_mean on NC 0 = torch.tensor([
+            [1, 2, 3]
+        ])
+    """
+
+    scribe = tensor.scribe
+    size = tensor.sizes
+
+    if dtype is None:
+        all_reduce_dtype = tensor.dtype
+    elif isinstance(dtype, str):
+        all_reduce_dtype = dtypes.to_pyhlo_type(scribe, dtype)
+    else:
+        all_reduce_dtype = dtype
+
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+
+    group_size = len(replica_groups[0])
+    assert all(
+        len(group) == group_size for group in replica_groups
+    ), "All groups must have the same size"
+
+    mean_sum = all_reduce_sum(
+        tensor, tp_degree, dtype=all_reduce_dtype, replica_groups=replica_groups
+    )
+    divisor = full(group_size, all_reduce_dtype, size)
+    global_mean = divide(mean_sum, divisor)
+
+    return global_mean
+
+
 def cumsum(tensor, dim):
 
     scribe = tensor.scribe
