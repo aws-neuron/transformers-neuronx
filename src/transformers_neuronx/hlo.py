@@ -2295,3 +2295,13 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
 def exp(tensor):
     dtype = tensor.dtype
     return dtype[tensor.sizes].Exp(tensor)
+
+
+def sqrt(tensor):
+    dtype = tensor.dtype
+    return dtype[tensor.sizes].Sqrt(tensor)
+
+
+def rsqrt(tensor):
+    dtype = tensor.dtype
+    return dtype[tensor.sizes].Rsqrt(tensor)
