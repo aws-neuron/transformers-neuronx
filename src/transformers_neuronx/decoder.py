@@ -230,15 +230,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
             return self.forward_single(*inputs)
-        if sequence_length % self.n_active_tokens:
-            raise ValueError(f'sequence_length={sequence_length} cannot be divided by '
-                             f'n_active_tokens={self.n_active_tokens}')
+        
         outputs = None
         slice_loop_var = range(0, sequence_length, self.n_active_tokens)
         if self.n_parallel_output_tokens > 1:
             slice_loop_var = [0]
   
-        
         for start in slice_loop_var:
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
@@ -254,13 +251,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # When context_length == m * n_active_tokens, bucket-size of n_active_tokens should be chosen.
             # This is useful for Fusion-In-Decoder case, where 2nd n_active_tokens don't need to attend to
             # 1st n_active_tokens.
-            if max_id - min_id > 1:
-                max_id -= min_id
-                min_id = 0
             bucket_id = self.program.find_bucket_id(max_id)
-            if self.program.find_bucket_id(min_id) != bucket_id:
-                raise ValueError(f'given buckets {self.n_positions_list}, ids ranging from '
-                                 f'{min_id} to {max_id} do not fall into the same bucket')
             if self.use_executor:
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
             else:
