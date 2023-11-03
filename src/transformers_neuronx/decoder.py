@@ -102,7 +102,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         return decoder_lm_head
         
 
-    def init_token_decoder(self,unroll, buckets, model_obj, n_active_tokens=1):
+    def init_token_decoder(self,unroll, buckets, model_obj):
         decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=self.tp_degree, 
             n_positions_list=buckets, 
@@ -116,8 +116,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config, 
             allow_pad=True, 
-            shard_over_batch=self.shard_over_batch,
-            n_parallel_output_tokens= self.n_parallel_output_tokens
+            shard_over_batch=self.shard_over_batch
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
@@ -140,7 +139,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             neuron_config=self.neuron_config, 
             allow_pad=True, 
             shard_over_batch=self.shard_over_batch,
-            n_parallel_output_tokens= self.n_parallel_output_tokens
+            n_parallel_output_tokens= n_active_tokens
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head

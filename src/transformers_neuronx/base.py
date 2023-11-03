@@ -231,22 +231,30 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
              logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
          return logits.to(logits_dtype)
 
-    def _forward(self, hidden, *args):
+    def _forward(self, hidden, *args, **kwargs):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
+        cache_ids, _, _ = args
 
-        if context_length > 1:
+         ### Separating the speculative sampling specific forward functionality for now
+        ### TO-DO: Re-factor so each decoder implemnts it's own forward functionality
+        if "decoder_type" in kwargs:
+            decoder_type=kwargs["decoder_type"]
+        if decoder_type and decoder_type=="speculative":
+            logits=self.decoder_lm_head_for_speculation(hidden, *args)
+            logits = self._cast_logits(logits)
+            _,n_active_tokens,_=logits.shape
+            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
+            logits = logits.transpose(0, 1)
+            return logits
+        if context_length > 1 and cache_ids[0].item() == 0:
             logits = self.context(hidden, *args)
         else:
             logits = self.decoder_lm_head(hidden, *args)
 
-        logits = logits.to(torch.float32)
-        _,n_active_tokens,_=logits.shape
-        if n_active_tokens>1:
-            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
-        else:
-            logits = logits[:self.config.vocab_size, -1, :] 
+        logits = self._cast_logits(logits)
+        logits = logits[:self.config.vocab_size, -1, :] 
         logits = logits.transpose(0, 1)
         return logits
 
