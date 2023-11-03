@@ -1625,6 +1625,26 @@ def dynamic_slice_along(tensor, dim, start, size):
     )
 
 
+def dynamic_update_slice(tensor, update, start_indices):
+
+    assert len(tensor.sizes) == len(update.sizes), (
+        f"Parameter tensor and update must have same dim, get {len(tensor.sizes)} and {len(update.sizes)}"
+    )
+
+    assert len(start_indices) == len(tensor.sizes), (
+        f"Parameter tensor and start_indices must have same dims, get {len(start_indices)} and {tensor.sizes}"
+    )
+
+    assert isinstance(start_indices, list), (
+        f"Parameter 'start_indices' must be an list. Found type={type(start_indices)}"
+    )
+
+    if isinstance(start_indices[0], int):
+        start_indices = [tensor.scribe.u32.Constant(constant_value=i) for i in start_indices]
+
+    return tensor.dtype[tensor.sizes].DynamicUpdateSlice(tensor, update, *start_indices)
+
+
 def pad(tensor, dim, size, value=0):
     rank = len(tensor.sizes)
     dtype = tensor.dtype
