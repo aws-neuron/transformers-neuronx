@@ -74,8 +74,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
         self.decoder_lm_head_for_speculation={}
 
-    def to_neuron(self):
-
+    def load_weights(self):
         # Materialize the embedding to CPU
         self.chkpt_model.model.embed_tokens.materialize()
 
@@ -120,7 +119,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
-        self.decoder_lm_head.enable_executor()
+        self.decoder_lm_head.use_executor = True
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
@@ -129,7 +128,7 @@ class LlamaForSampling(base.NeuronModelBase):
                                                                      new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                     # PERF: No latency improvement seen in multi-layer models from executor
                     if self.context_unroll == self.config.num_hidden_layers:
-                        model.enable_executor()
+                        model.use_executor = True
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
         if self.decoder_lm_head_for_speculation:
