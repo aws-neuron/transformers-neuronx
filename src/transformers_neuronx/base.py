@@ -21,6 +21,7 @@ from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
 from transformers_neuronx.constants import LAYOUT_BSH
+from concurrent.futures import ProcessPoolExecutor
 
 
 # Mainly used to expose top level APIs to the model object for serialization
@@ -36,6 +37,29 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._load_compiled_artifacts(directory)
+    
+    # top level api
+    def compile(self, parallel_degree=None):
+        kernels = self._get_all_kernels()
+        neff_bytes_futures = dict()
+        if parallel_degree is None:
+            parallel_degree = len(kernels)
+        with ProcessPoolExecutor(parallel_degree) as executor:
+            for kernel in kernels:
+                neff_bytes_futures[hash_hlo(kernel.hlo_module)] = executor.submit(kernel.compile)
+            for kernel in kernels:
+                kernel.neff_bytes = neff_bytes_futures[hash_hlo(kernel.hlo_module)].result()
+
+    # top level api
+    def setup(self):
+        for nbs in self.nbs_objs:
+            nbs.setup()
+
+    # TODO: decouple hlo_generation from load weights so compile can be called before it
+    def to_neuron(self):
+        self.load_weights()
+        self.compile()
+        self.setup()
 
     # top level api
     def enable_speculative_decoder(self,speculation_length:Optional[Union[List[int], int]]):
@@ -44,8 +68,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for k in speculation_length:
             self.decoder_lm_head_for_speculation[k]=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
-
-    # simple implementation that doesn't take into account cache and serialization
     def is_compiled(self):
         # First check if the kernels have neffs already
         try:
@@ -55,7 +77,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         except AttributeError:
             pass
         return False
-
 
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.program.reorder_cache(reorder_ids)
@@ -80,8 +101,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if not os.path.isdir(directory):
             raise FileNotFoundError(f'Did not find directory: {directory}.')
 
-        for i, nbs_obj in enumerate(self.nbs_objs):
-            nbs_obj.load_compiler_artifacts_after_build(directory)
+        for nbs_obj in self.nbs_objs:
+            nbs_obj.set_neff_bytes(directory)
 
     def _get_all_kernels(self):
         all_kernels = []
@@ -93,17 +114,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     # To enable serialization, have the model call this
     # function to register all nbs_obj of your model.
-    # The nbs_obj must follow 3 rules:
+    # The nbs_obj must follow 2 rules:
     #   1. The nbs_obj must inherit from NeuronBaseSerializer.
     #   2. Since this class shouldn't be used directly, a nbs_obj.get_all_kernels()
     #      method should be implemented by the child class, which returns a
     #      list of all kernels which have NEFFs.
-    #   3. It must use:
-    #      if nbs_obj.compiler_artifacts_path is not None:
-    #          nbs_obj.set_neff_bytes()
-    #      after its kernels have been created, but before they are compiled
     def register_for_serialization(self, nbs_obj):
-        # check that at least requirement 1 and 2 are met, 3 is hard to check for here
+        # check that requirement 1 and 2 are met.
         assert issubclass(type(nbs_obj), NeuronBaseSerializer), 'The nbs_obj must inheret from NeuronBaseSerializer.'
         assert getattr(nbs_obj, 'get_all_kernels', None) is not None, 'An nbs_obj.get_all_kernels() method should be implemented.'
         temp = getattr(self, 'nbs_objs', [])
@@ -317,14 +334,11 @@ class NeuronBaseSerializer:
                 assert kernel.neff_bytes is not None, "cannot save a model which has not been successfully compiled"
                 f.write(kernel.neff_bytes)
 
-    def load_compiler_artifacts_after_build(self, path):
-        self.compiler_artifacts_path = path
-
-    def set_neff_bytes(self):
+    def set_neff_bytes(self, directory):
         for kernel in self.get_all_kernels():
             hlo_hash = hash_hlo(kernel.hlo_module)
             try:
-                with open(os.path.join(self.compiler_artifacts_path, hlo_hash), 'rb') as f:
+                with open(os.path.join(directory, hlo_hash), 'rb') as f:
                     kernel.neff_bytes = f.read()
             except FileNotFoundError:
                 raise FileNotFoundError(('Could not find a matching NEFF for your HLO in this directory. '

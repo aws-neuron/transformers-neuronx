@@ -98,7 +98,7 @@ class OPTForSampling(base.NeuronModelBase):
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
         ops.init()
         self.chkpt_model.model.decoder.embed_tokens.materialize()
         self.chkpt_model.model.decoder.embed_positions.materialize()
