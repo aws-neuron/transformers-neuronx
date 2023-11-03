@@ -66,7 +66,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()
         self.chkpt_model.transformer.wpe.materialize()
@@ -317,7 +317,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()
         self.chkpt_model.transformer.wpe.materialize()

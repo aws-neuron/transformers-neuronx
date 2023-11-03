@@ -79,7 +79,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.use_executor = False
         self.return_ranks = -1
         self.need_reorder_cache = False
-        self.compiler_artifacts_path = None
         self.hlo_builder=builder
         self.check_gqa_fallback()
 
@@ -209,7 +208,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = True
 
     def enable_executor(self, return_ranks=-1):
-        self.use_executor = True
         self.return_ranks = return_ranks
         self.program.enable_executor()
 
@@ -269,22 +267,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
+        self.ln_lm_head_params = ln_lm_head_params
 
         self.program = self._build_program()
-        # setup_reorder_cache needs to be able to be called before to_neuron()
-        # and after to_neuron for backwards compatability.
-        # If called before to_neuron() this logic will be reached and it will
-        # create the HLO for reorder_cache, check if there is an available NEFF
-        # for deserialization, then compile. If called after, setup_reorder_cache
-        # will be called from the NeuronModelBase without serialization logic.
+        # setup_reorder_cache needs to be able to be called before compilation
+        # and after compilation for backwards compatability.
+        # If called before compilation this logic will be reached and it will
+        # create the HLO for reorder_cache now which can be deserialized or compiled normally.
+        # If called after, setup_reorder_cache will be called from the NeuronModelBase without 
+        # serialization logic and will be compiled normally.
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
-        if self.compiler_artifacts_path is not None:
-            self.set_neff_bytes()
-        self.program.setup(self.layers, ln_lm_head_params)
-        # separate intialization and compilation
-        if self.need_reorder_cache:
-            self.program.setup_reorder_cache_kernels()
 
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
@@ -316,12 +309,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
+        new.ln_lm_head_params = ln_lm_head_params
         new.program = new._build_program()
-        if new.compiler_artifacts_path is not None:
-            new.set_neff_bytes()
-        new.program.setup(new.layers, ln_lm_head_params)
         return new
 
+    def setup(self):
+        self.program.setup(self.layers, self.ln_lm_head_params)
+        if self.need_reorder_cache:
+            self.program.setup_reorder_cache_kernels()
+        if self.use_executor:
+            self.enable_executor()
+            
     def reset(self):
         for layer in self.layers:
             layer.reset()
@@ -1274,14 +1272,6 @@ class DecoderProgram:
     def setup(self, layers, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
         self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
-        # Compile modules in parallel
-        with ProcessPoolExecutor(max_workers=len(self.n_positions_list) * len(self.batch_sizes)) as executor:
-            neff_bytes_futures = dict()
-            for npos_bs_tuple, kernel in self.kernels.items():
-                future = executor.submit(kernel.compile, npos_bs_tuple[0])
-                neff_bytes_futures[npos_bs_tuple] = future
-            for npos_bs_tuple, kernel in self.kernels.items():
-                kernel.neff_bytes = neff_bytes_futures[npos_bs_tuple].result()
         for kernel in self.kernels.values():
             kernel.load(io_ring_cache_size)
 
@@ -1290,7 +1280,6 @@ class DecoderProgram:
         self.reorder_cache_hlo_kernels = [self._create_reoder_cache_kernel(batch_size) for batch_size in self.batch_sizes]
         if also_compile_now:
             self.setup_reorder_cache_kernels()
-
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
@@ -1545,8 +1534,6 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
         self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
 
     def build(self):
-        if self.compiler_artifacts_path is not None:
-            self.set_neff_bytes()
         self.cache_broadcast_kernel.build()
 
     def load(self):

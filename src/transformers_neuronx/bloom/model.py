@@ -91,8 +91,7 @@ class BloomForSampling(base.NeuronModelBase):
                     )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 
-    def to_neuron(self):
-
+    def load_weights(self):
         # Materialize the embedding to CPU
         self.chkpt_model.transformer.word_embeddings.materialize()
         self.chkpt_model.transformer.word_embeddings_layernorm.materialize()
