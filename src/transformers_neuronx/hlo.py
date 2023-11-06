@@ -2320,6 +2320,170 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     return prior_mask, active_mask
 
 
+def decoder_attention_mask_lhs_aligned(cache_ids, n_positions):
+    """
+    Create attention masks for LHS-aligned sequences.
+
+    Args:
+        cache_ids: The 2d positions to update in the cache.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens.
+    """
+    batch_size, n_active_tokens = cache_ids.sizes
+    if n_active_tokens == n_positions:
+        # Context Encoding
+        return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
+    else:
+        # Token generation
+        return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions)
+
+
+def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
+    """
+    Creates a lower triangular mask for LHS-aligned context encoding.
+
+    This mask is static and does not depend on the inputs. During LHS-aligned
+    context encoding, there is a guarantee that each token in a sequence must
+    attend to all prior positions. This is unlike RHS-aligned sequences where
+    batch padding may require that an earlier position must not be attended to.
+
+    Example:
+
+        # A context where the size is equal to the bucket width
+        n_positions = 3
+
+        prior_mask = [
+            [1, 0, 0], # At position 0 attend to self only
+            [1, 1, 0], # At position 1 attend to self and prior
+            [1, 1, 1], # At position 2 attend to self and all prior
+        ]
+        active_mask = None
+
+    Args:
+        cache_ids: The 2d positions to update in the cache.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+    """
+    dtype = cache_ids.scribe.pred
+    batch_size, _ = cache_ids.sizes
+    prior_mask = tril_mask(dtype, (n_positions, n_positions))
+    # Final broadcast ensures we use correct path in layers/attention.py:mask
+    size = batch_size, n_positions, n_positions
+    prior_mask = broadcast(prior_mask, size, [1, 2])
+
+    active_mask = None
+    return prior_mask, active_mask
+
+
+def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions):
+    """
+    Creates decomposed prior/active masks for LHS-aligned token generation.
+
+    Unlike LHS-aligned context encoding, this mask cannot be a completely
+    static because each batch line may need to attend to a different number
+    of prior tokens depending on the current token(s) being computed.
+
+    This function assumes that `cache_ids` are linearly increasing per batch
+    line when `n_active_tokens > 1` (speculative & windowed attention).
+
+    Example: Single Token Generation
+
+        n_positions = 4
+        cache_ids = [
+            [2]
+        ]
+
+        # Attend to all prior positions from the current token (2)
+        prior_mask = [
+            [1, 1, 0, 0]
+        ]
+        # Always attend to the current token
+        active_mask = [
+            [1]
+        ]
+
+    Example: Batched Execution
+
+        n_positions = 4
+        cache_ids = [
+            [3] # Batch 0
+            [1] # Batch 1
+        ]
+
+        # Attend to all prior positions on each batch line
+        prior_mask = [
+            [1, 1, 1, 0] # Batch 0
+            [1, 0, 0, 0] # Batch 1
+        ]
+        # Always attend to the current token on each batch line
+        active_mask = [
+            [1], # Batch 0
+            [1], # Batch 1
+        ]
+
+    Example: Speculative Sampling
+
+        n_positions = 4
+        cache_ids = [
+            [2, 3] # Batch 0
+            [1, 2] # Batch 1
+        ]
+
+        # Attend to all prior positions on each batch line
+        prior_mask = [
+            [1, 1, 0, 0] # Batch 0
+            [1, 0, 0, 0] # Batch 1
+        ]
+        # Use lower triangular mask for each active set of tokens
+        active_mask = [
+            [1, 0],
+            [1, 1]
+        ]
+
+    Args:
+        cache_ids: The 2d positions to update in the cache.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache
+        active_mask: The attention mask to apply to the active tokens.
+    """
+    pred = cache_ids.scribe.pred
+    dtype = cache_ids.dtype
+    batch_size, n_active_tokens = cache_ids.sizes
+
+    # Prior mask
+    if n_active_tokens > 1:
+        # Multi-token speculative sampling & windowed attention
+        cache_ids = reduce_min(cache_ids, dim=1, keepdim=True)
+    size = (batch_size, n_active_tokens, n_positions)
+    positions = dtype[size].Iota(dimensions=[2])
+    cache_ids = unsqueeze(cache_ids, -1)
+    cache_ids = broadcast(cache_ids, size, [0, 1, 2])
+    prior_mask = greater(cache_ids, positions)
+
+    # Active mask
+    if n_active_tokens == 1:
+        # Single token (Always pay attention to self)
+        active_mask = full(1, pred, (batch_size, n_active_tokens))
+    else:
+        # Multi-token speculative sampling & windowed attention
+        causal_mask = tril_mask(pred, (n_active_tokens, n_active_tokens))
+        size = (batch_size, n_active_tokens, n_active_tokens)
+        active_mask = broadcast(causal_mask, size, [1, 2])
+
+    return prior_mask, active_mask
+
+
 def exp(tensor):
     dtype = tensor.dtype
     return dtype[tensor.sizes].Exp(tensor)
