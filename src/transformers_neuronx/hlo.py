@@ -47,6 +47,39 @@ def ax_minus_by(a, x, b, y):
     return ax_by
 
 
+def batch_norm(tensor, norm_size, feature_index, epsilon=1e-5):
+    """
+    Normalizes an array across batch and spatial dimensions.
+
+    For each feature in the feature dimension (`feature_index` is the index
+    for the feature dimension in tensor), the operation calculates the mean
+    and variance across all the other dimensions and uses the mean and variance
+    to normalize each element in tensor.
+
+    Reference: https://www.tensorflow.org/xla/operation_semantics#batchnormtraining
+
+    Arguments:
+        tensor: N dimensional tensor to be normalized.
+        norm_size: Size of the region on which the man and variance are calculated.
+        feature_index: Index to feature dimension in operand.
+        epsilon: Value used in normalization calculation to avoid dividing by 0.
+
+    Returns:
+        bn_tuple: Tuple of (tensor, batch_mean, batch_var), where
+            tensor is the tensor normalized by the mean and variance
+            batch_mean (norm_size) mean that's used to normalize tensor.
+            var (norm_size) var that's used to normalize tensor.
+    """
+    scribe = tensor.scribe
+    dtype = tensor.dtype
+    sizes = tensor.sizes
+    scale = full(1, dtype, norm_size)
+    offset = full(0, dtype, norm_size)
+    shape = scribe.tuple(dtype[sizes], dtype[norm_size], dtype[norm_size])
+    bn_tuple = shape.BatchNormTraining(tensor, scale, offset, epsilon=epsilon, feature_index=feature_index)
+    return bn_tuple
+
+
 def layer_norm(hidden, weight, bias):
     scribe = hidden.scribe
     dtype = hidden.dtype
@@ -56,13 +89,8 @@ def layer_norm(hidden, weight, bias):
     sizes = hidden_size, norm_size
     hidden = dtype[sizes].Reshape(hidden)
     hidden = f32[sizes].Convert(hidden)
-    one = f32.Constant(constant_value=1)
-    scale = f32[norm_size].Broadcast(one, dimensions=[])
-    zero = f32.Constant(constant_value=0)
-    offset = f32[norm_size].Broadcast(zero, dimensions=[])
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=1)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    bn_tuple = batch_norm(hidden, norm_size, feature_index=1)
+    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
     weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
     output = f32[sizes].Multiply(bn_output, weight_br)
     bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
@@ -81,13 +109,8 @@ def layer_norm_bsh(hidden, weight, bias):
     sizes = norm_size, hidden_size
     hidden = dtype[sizes].Reshape(hidden)
     hidden = f32[sizes].Convert(hidden)
-    one = f32.Constant(constant_value=1)
-    scale = f32[norm_size].Broadcast(one, dimensions=[])
-    zero = f32.Constant(constant_value=0)
-    offset = f32[norm_size].Broadcast(zero, dimensions=[])
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=0)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    bn_tuple = batch_norm(hidden, norm_size, feature_index=0)
+    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
     weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
     output = f32[sizes].Multiply(bn_output, weight_br)
     bias_br = f32[sizes].Broadcast(bias, dimensions=[1])
@@ -116,15 +139,10 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
     hidden = cast(hidden, f32)
-    one = f32.Constant(constant_value=1)
-    scale = f32[norm_size].Broadcast(one, dimensions=[])
-    zero = f32.Constant(constant_value=0)
-    offset = f32[norm_size].Broadcast(zero, dimensions=[])
 
     # Calculate norm of each group
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
+    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
 
     # Reshape to (H // g, S, B, g)
     unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
@@ -168,15 +186,10 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
     hidden = cast(hidden, f32)
-    one = f32.Constant(constant_value=1)
-    scale = f32[norm_size].Broadcast(one, dimensions=[])
-    zero = f32.Constant(constant_value=0)
-    offset = f32[norm_size].Broadcast(zero, dimensions=[])
 
     # Calculate norm of each group
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
+    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
 
     # Reshape to (H // g, S, B, g)
     unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
@@ -224,15 +237,10 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     sizes = group_size, n_active_tokens, norm_size
     hidden = reshape(hidden, sizes)
     hidden = cast(hidden, f32)
-    one = f32.Constant(constant_value=1)
-    scale = f32[norm_size].Broadcast(one, dimensions=[])
-    zero = f32.Constant(constant_value=0)
-    offset = f32[norm_size].Broadcast(zero, dimensions=[])
 
     # Calculate norm of each group
-    shape = scribe.tuple(f32[sizes], f32[norm_size], f32[norm_size])
-    bn_tuple = shape.BatchNormTraining(hidden, scale, offset, epsilon=1e-5, feature_index=2)
-    bn_output = f32[sizes].GetTupleElement(bn_tuple, tuple_index=0)
+    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
+    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
 
     # Reshape to (H // g, S, B, g)
     unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
@@ -2305,3 +2313,10 @@ def sqrt(tensor):
 def rsqrt(tensor):
     dtype = tensor.dtype
     return dtype[tensor.sizes].Rsqrt(tensor)
+
+
+def get_tuple_element(tup, tuple_index):
+    element = tup.get_tuple_element(tuple_index)
+    size = element.sizes
+    dtype = element.dtype
+    return dtype[size].GetTupleElement(tup, tuple_index=tuple_index)
