@@ -52,6 +52,22 @@ def build_dense_mask(q_seq_len, k_seq_len, mask, blk_size=128, causal=False):
     return dense_mask
 
 
+def build_sliding_window_mask(q_seq_len, kv_seq_len, window_size, causal=True):
+    """
+    Build a sliding window 2D mask shape {n_active_tokens, n_positions}
+    """ 
+    dense_mask = torch.ones((q_seq_len, kv_seq_len), dtype=torch.bool)
+
+    # In causal mode we only attend to tokens on the left                                         
+    window_size_l, window_size_r = (window_size, 0) if causal \
+        else (window_size // 2, window_size // 2)
+
+    dense_mask = torch.tril(dense_mask, diagonal=window_size_r)
+    dense_mask = torch.triu(dense_mask, diagonal=-window_size_l)
+
+    return dense_mask.detach()
+
+
 @dataclass
 class BlkSparseAttnConfig:
     """ Block-sparse attention specific config """
@@ -122,14 +138,14 @@ class SparseAttnConfig:
 
     def create_sliding_window_mask(self, q_seq_len, kv_seq_len):
         dense_mask = torch.zeros((q_seq_len, kv_seq_len), dtype=torch.bool)
-        # In causal mode we only attend to tokens on the left
         window_size_l, window_size_r = (self.sparse_attn_config.window_size, 0) if self.causal \
             else (self.sparse_attn_config.window_size // 2, self.sparse_attn_config.window_size // 2)
 
         for row in range(q_seq_len):
             start = max(0, row-window_size_l)
-            end = row if self.causal else min(kv_seq_len, row+window_size_r)
+            end = row+1 if self.causal else min(kv_seq_len, row+window_size_r)
             dense_mask[row, start:end] = 1
+
         return dense_mask.detach()
 
     def create_sparse_mask(self, q_seq_len, kv_seq_len, layer_id=0):
