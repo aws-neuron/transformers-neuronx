@@ -239,8 +239,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
          ### Separating the speculative sampling specific forward functionality for now
         ### TO-DO: Re-factor so each decoder implemnts it's own forward functionality
-        if "decoder_type" in kwargs:
-            decoder_type=kwargs["decoder_type"]
+        decoder_type = kwargs["decoder_type"] if "decoder_type" in kwargs else None
         if decoder_type and decoder_type=="speculative":
             logits=self.decoder_lm_head_for_speculation(hidden, *args)
             logits = self._cast_logits(logits)
