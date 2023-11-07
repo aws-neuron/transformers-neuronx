@@ -25,7 +25,7 @@ from transformers import AutoConfig
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
 
 def save_pretrained_split(model, save_directory):
-    model.save_pretrained(save_directory, save_function=save_split, max_shard_size='10000GB')
+    model.save_pretrained(save_directory, save_function=save_split, max_shard_size='10000GB', safe_serialization=False)
 
 
 _KEY_TO_FILENAME_JSON = 'key_to_filename.json'
