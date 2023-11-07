@@ -265,6 +265,9 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         elif streamer:
             streamer.put(token)
 
+        if streamer is not None and hasattr(streamer, 'is_cancelled_func') and streamer.is_cancelled_func():
+            break
+
         if next_len >= sequence_length or done_flags.all():
             break
 
