@@ -51,6 +51,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.batch_size = sorted(batch_size)
         else:
             raise TypeError("batch_size must be list of ints or int type")
+        if neuron_config and neuron_config.continuous_batching:
+            self.batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
+            # Use batch size 1 for parallel context encoding in continuous batching
+            if n_active_tokens > 1:
+                assert len(self.batch_size) == 1 and self.batch_size[-1] == 1, "invalid batch_size for continuous batching"
         self.attention_head_size = attention_head_size  # TODO: rename to size_per_head
         self.n_head = n_head
         self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
@@ -82,8 +87,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def init_context_decoder(self, unroll, buckets, model_obj):
         decoder_lm_head = {}
+        self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         for context_length_estimate in buckets:
-            for batch_size in self.batch_size:
+            for batch_size in self.context_batch_sizes:
                 decoder_lm_head[context_length_estimate, batch_size] = DecoderLmHeadForSamplingNoEmbedding(
                     tp_degree=self.tp_degree, 
                     n_positions_list=[context_length_estimate], 
@@ -143,6 +149,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
+
+    def setup_reorder_cache(self):
+        self.need_reorder_cache = True
 
     def enable_executor(self, return_ranks=-1):
         self.use_executor = True
@@ -232,15 +241,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
                 prefixed_length=self.prefixed_length, n_parallel_output_tokens=self.n_parallel_output_tokens
             )
-        else:
-            if n_positions_list is None:
-                n_positions_list = self.n_positions_list
-            if n_active_tokens is None:
-                n_active_tokens = self.n_active_tokens
-            if batch_size is None:
-                batch_size = self.batch_size
-            if unroll is None:
-                unroll = self.unroll
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
@@ -249,7 +249,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             new_layer = new.new_layer()
             new_layer.assign_parameters(layer)
             if share_caches:
-                new_layer.assign_caches(layer)
+                buckets_from_src = self.neuron_config and self.neuron_config.continuous_batching
+                new_layer.assign_caches(layer, buckets_from_src=buckets_from_src)
             else:
                 new_layer.init_caches()
             new_layer.extra_parameters = layer.extra_parameters
@@ -280,7 +281,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         """
         hidden, cache_ids, *_ = inputs
         batch_size = hidden.shape[2]
-        bucket_id = self.program.find_bucket_id(cache_ids.item())
+        # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
+        if self.neuron_config and self.neuron_config.continuous_batching:
+            bucket_id = 0
+        else:
+            bucket_id = self.program.find_bucket_id(cache_ids.item())
         if self.use_executor:
             return self.program.execute(bucket_id, batch_size, *inputs, return_ranks=self.return_ranks)
         else:
@@ -343,9 +348,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         hlo_modules = dict()
         if self.unroll == self.num_layers:
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
-                hlo_modules[npos,batch_size] = self._hlo_fully_unrolled(npos,batch_size)
+                hlo_modules[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length)
+            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=self.batch_size_for_shared_caches)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
@@ -419,6 +424,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_layers_params(self, param_builder, layers, n_positions, batch_size):
         layers_caches = []
+        if self.batch_size_for_shared_caches:
+            batch_size = self.batch_size_for_shared_caches
         for layer in layers:
             layer_caches = []
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
@@ -893,6 +900,17 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=2))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=2))
 
+    def assign_caches(self, layer, buckets_from_src=False):
+        batch_sizes = self.batch_sizes
+        if buckets_from_src:
+            # In continuous batching, we exclusively use batch_size=1 for parallel context encoding.
+            # But still use all batch_sizes for decoding.
+            batch_sizes = layer.batch_sizes
+        for batch_size in batch_sizes:
+            self.attn_k_cache[batch_size] = layer.attn_k_cache[batch_size]
+            self.attn_v_cache[batch_size] = layer.attn_v_cache[batch_size]
+            self.cache_shape[batch_size] = layer.cache_shape[batch_size]
+
     def all_parameters(self):
         return [
             self.pre_attn_ln_weight,
@@ -1069,13 +1087,6 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_max = layer.mlp_out_max
         self.extra_parameters = layer.extra_parameters
 
-    def assign_caches(self, layer):
-        for batch_size in self.batch_sizes:
-            self.attn_k_cache[batch_size] = layer.attn_k_cache[batch_size]
-            self.attn_v_cache[batch_size] = layer.attn_v_cache[batch_size]
-            self.cache_shape[batch_size] = layer.cache_shape[batch_size]
-
-
 class MaybeParallelTensorManipulator:
 
     def __init__(self, tp_degree):
@@ -1152,11 +1163,12 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0):
+    def __init__(self, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False):
         # Each hlo module corresponds to one npos and one batch_size
         # hlo_modules is a 2D map (i,j) i is npos , j is batch_size
         self.layers = layers
         self.batch_sizes = batch_sizes
+        self.batch_size_for_shared_caches = batch_size_for_shared_caches
         self.n_positions_list = n_positions_list
         self.prefixed_length = prefixed_length
         first_hlo = hlo_modules[self.n_positions_list[0], self.batch_sizes[0]]
@@ -1216,6 +1228,8 @@ class DecoderProgram:
         end = npos
         if self.prefixed_length > 0:
             end = npos + self.prefixed_length
+        if self.batch_size_for_shared_caches:
+            batch_size = self.batch_size_for_shared_caches
         for layer in layers:
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
                 cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
@@ -1292,8 +1306,8 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0):
-        super().__init__(layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length)
+    def __init__(self, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None):
+        super().__init__(layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches)
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
         self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]

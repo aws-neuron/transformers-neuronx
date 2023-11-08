@@ -60,6 +60,7 @@ class LlamaForSampling(base.NeuronModelBase):
             self.batch_sizes = sorted(batch_size)
         else:
             raise TypeError("batch_size must be list of ints or int type")
+        self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
@@ -119,8 +120,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
-                for batch_size in self.batch_sizes:
-                    model = self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                for batch_size in self.context_batch_sizes:
+                    model = self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                      new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                     # PERF: No latency improvement seen in multi-layer models from executor
                     if self.context_unroll == self.config.num_hidden_layers:

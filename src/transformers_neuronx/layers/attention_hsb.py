@@ -134,59 +134,90 @@ def query_key_projection(query, key, qk_weight):
     return query, key
 
 
-def update_cache(cache, cache_ids, values):
+def update_cache(cache, cache_ids, values, start_ids=None):
     """
     Cache[I] = X
     """
     dtype = cache.dtype
+    cache_ids_dtype = cache_ids.dtype
     use_2d_cache_ids = len(cache_ids.sizes) > 1
     if use_2d_cache_ids:
         # 2D cache_ids
         cache_ids = hlo.transpose(cache_ids, 0, 1)
         assign_func = hlo.gen_assign_func(dtype)
         n_positions, n_seqs, n_kv_heads, d_head = cache.sizes
-        n_active_tokens, _, _, _  = values.sizes
+        n_active_tokens, n_active_seqs, _, _  = values.sizes
+        assert cache_ids.sizes[0] == n_active_tokens, \
+            f"inconsistent sizes between cache_ids ({cache_ids.sizes}) and values ({values.sizes})"
 
         # reshape cache, and scatter values in a for loop.
-        # 
-        # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
-        #        +---------3-4-----6-7------9-10-----------------
-        # seq 0  |                [A,B]
-        # seq 1  |        [C,D]
-        # seq 2  |                         [E,F]
-        #        +-----------------------------------------------
+        #
         # NOTE: Due to limitation in hlo.scatter, we make cache flatten: (p0 as positions, s0 as sequences)
         #       (p0, s0), (p0, s1), (p0, s2), (p1, s0), (p1, s1), (p1, s2)
         #       This means we cannot update the sequence in the cache with one scatter op, without reordering the cache.
-        #
-        # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
-        # seq 0         [[6,7],                                  [[A,B],
-        # seq 1          [3,4],                                   [C,D],
-        # seq 2          [9,10]]                                  [E,F]]
-        #
         kv_hidden_size = n_kv_heads * d_head
-        cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
-        values_r = hlo.reshape(values, [n_active_tokens, n_seqs, kv_hidden_size])
-        for seq_id in range(n_seqs):
-            cache_id = hlo.slice_along(cache_ids, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
 
-            # Since cache is flatten, we need to add an offset to cache_id (aka position_id)
-            cache_id_dtype = cache_id.dtype
-            kv_hidden_size_val = cache_id_dtype.Constant(constant_value=kv_hidden_size)
-            offset = cache_id_dtype[cache_id.sizes].Broadcast(kv_hidden_size_val, dimensions=[])
-            cache_id = cache_id_dtype[cache_id.sizes].Add(cache_id, offset)
+        if n_active_tokens == 1 and n_seqs == n_active_seqs:
+            # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+            #        +---------3-4-----6-7------9-10-----------------
+            # seq 0  |                [A,B]
+            # seq 1  |        [C,D]
+            # seq 2  |                         [E,F]
+            #        +-----------------------------------------------
+            # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+            # seq 0         [[6,7],                                  [[A,B],
+            # seq 1          [3,4],                                   [C,D],
+            # seq 2          [9,10]]                                  [E,F]]
+            #
+            cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
+            values_r = hlo.reshape(values, [n_seqs, kv_hidden_size])
+            for seq_id in range(n_seqs):
+                cache_id = hlo.slice_along(cache_ids, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
 
-            value = hlo.slice_along(values_r, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
+                # Since cache is flatten, we need to add an offset to cache_id (aka position_id)
+                batch_offset = hlo.full(n_seqs, cache_ids_dtype, cache_id.sizes)
+                cache_id = cache_ids_dtype[cache_id.sizes].Multiply(cache_id, batch_offset)
+                id_offset = hlo.full(seq_id, cache_ids_dtype, cache_id.sizes)
+                cache_id = cache_ids_dtype[cache_id.sizes].Add(cache_id, id_offset)
 
-            # Assuming n_active_token == 1, due to KV cache layout issue.
-            assert n_active_tokens == 1, "n_active_tokens is expected to be 1 for 2D cache_ids"
-            value_r = hlo.reshape(value, [1, kv_hidden_size])
+                value = hlo.slice_along(values_r, dim=0, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
+
+                scatter_dims = dict(update_window_dims=[1],
+                                    inserted_window_dims=[0],
+                                    scatter_dims_to_operand_dims=[0],
+                                    index_vector_dim=1)
+                cache_r = hlo.scatter(cache_r, cache_id, value, scatter_dims=scatter_dims, to_apply=assign_func)
+
+        elif n_active_tokens == n_positions and n_seqs > n_active_seqs:
+            # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+            #        +-0-1-2-3-4-5-----------------------------------
+            # seq 0  |[x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x]
+            # seq 1  |[A,B,C,D,E,F] <- insert new sequence here
+            # seq 2  |[y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y]
+            #        +-----------------------------------------------
+            # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+            # seq 1         [[0,1,2,3,4,5]]                          [[A,B,C,D,E,F]]
+            cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
+
+            batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
+            start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
+            cache_ids = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
+            cache_ids = cache_ids_dtype[cache_ids.sizes].Add(cache_ids, start_ids_br)
+
+            # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
+            assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
+            value_r = hlo.reshape(values, [n_active_tokens, kv_hidden_size])
 
             scatter_dims = dict(update_window_dims=[1],
                                 inserted_window_dims=[0],
                                 scatter_dims_to_operand_dims=[0],
                                 index_vector_dim=1)
-            cache_r = hlo.scatter(cache_r, cache_id, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            cache_r = hlo.scatter(cache_r, cache_ids, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
+
+        else:
+            raise NotImplementedError(f"Updating 2D cache_ids is not implemented for "
+                                      f"n_active_tokens={n_active_tokens}, n_positions={n_positions}, "
+                                      f"n_seqs={n_seqs}, n_active_seqs={n_active_seqs}.")
         updated = cache_r
     else:
         # 1D cache_ids
@@ -273,7 +304,7 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
             assert n_seqs_per_nc == mask.sizes[0] // tp_degree, f"invalid n_seqs_per_nc ({n_seqs_per_nc}) vs mask_sizes ({mask.sizes})"
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
         # broadcast from [n_seqs, n_active_tokens] to [n_seqs, n_heads, n_active_tokens, n_positions]
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2])
+        mask_br = hlo.broadcast(mask, score_sizes, [0, 2])
     else:
         if shard_over_batch:
             assert isinstance(tp_degree, int), \
@@ -282,7 +313,7 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
             n_seqs_per_nc = score_sizes[0]
             assert n_seqs_per_nc == mask.sizes[0] // tp_degree, f"invalid n_seqs_per_nc ({n_seqs_per_nc}) vs mask_sizes ({mask.sizes})"
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
+        mask_br = hlo.broadcast(mask, score_sizes, [0, 2, 3])
     score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
     return score
 
