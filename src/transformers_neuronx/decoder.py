@@ -51,11 +51,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.batch_size = sorted(batch_size)
         else:
             raise TypeError("batch_size must be list of ints or int type")
-        if neuron_config and neuron_config.continuous_batching:
-            self.batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
-            # Use batch size 1 for parallel context encoding in continuous batching
-            if n_active_tokens > 1:
-                assert len(self.batch_size) == 1 and self.batch_size[-1] == 1, "invalid batch_size for continuous batching"
         self.attention_head_size = attention_head_size  # TODO: rename to size_per_head
         self.n_head = n_head
         self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
@@ -87,7 +82,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def init_context_decoder(self, unroll, buckets, model_obj):
         decoder_lm_head = {}
-        self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
+        self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_size
         for context_length_estimate in buckets:
             for batch_size in self.context_batch_sizes:
                 decoder_lm_head[context_length_estimate, batch_size] = DecoderLmHeadForSamplingNoEmbedding(
@@ -350,7 +345,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
                 hlo_modules[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=self.batch_size_for_shared_caches)
+            batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                if self.neuron_config.continuous_batching else None
+            program = DecoderProgramFullyUnrolled(self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
@@ -424,8 +421,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_layers_params(self, param_builder, layers, n_positions, batch_size):
         layers_caches = []
-        if self.batch_size_for_shared_caches:
-            batch_size = self.batch_size_for_shared_caches
+        if self.neuron_config.continuous_batching:
+            batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
         for layer in layers:
             layer_caches = []
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
