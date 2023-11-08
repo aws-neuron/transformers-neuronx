@@ -39,6 +39,14 @@ class QuantizationConfig:
         # Decide whether the attention layer needs be quantized
         self.quantize_attn = quantize_attn
 
+
+class ContinuousBatchingConfig:
+    """ The config class that contains all continuous batching related settings """
+
+    def __init__(self, batch_size_for_shared_caches):
+        self.batch_size_for_shared_caches = batch_size_for_shared_caches
+
+
 class NeuronConfig():
     """
     Configuration class to store all Neuron related configs.
@@ -54,6 +62,10 @@ class NeuronConfig():
         cast_logits_dtype (`str`, optional): Cast logits to this dtype at the end
             of every forward pass. Must be selected from `["float32", "float16", "bfloat16"]`.
             Default: Upcasts all logits to `float32`.
+        continuous_batching (`ContinuousBatchingConfig`, optional): Continuous
+            batching related configurations. Default: `None`.
+        use_2d_cache_ids (bool, optional): Whether to use 2D layout for cache_ids (aka position_ids).
+            Default: `False`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -61,7 +73,11 @@ class NeuronConfig():
         self.quant = kargs.pop('quant', None)
         self.cast_logits_dtype = kargs.pop('cast_logits_dtype', 'float32')
         self.fuse_qkv = kargs.pop('fuse_qkv', False)
-
+        self.continuous_batching = kargs.pop('continuous_batching', None)
+        self.use_2d_cache_ids = kargs.pop('use_2d_cache_ids', False)
+        if self.continuous_batching:
+            # Force using 2D cache_ids layout for continuous batching.
+            self.use_2d_cache_ids = True
 
 class GenerationConfig:
 

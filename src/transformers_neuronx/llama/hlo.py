@@ -28,14 +28,13 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         self.config = config
         self.neuron_config = neuron_config
-        self.use_2d_cache_ids = False
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        if self.use_2d_cache_ids:
+        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
             position_sizes = batch_size, n_active_tokens
             cache_ids = scribe.s32[position_sizes].Parameter(parameter_number=1)  # 2d cache_ids
         else:
@@ -51,18 +50,25 @@ class LlamaForSamplingNoEmbeddingHlo:
         #       use the split "prefetch" attention layer.
         use_prefetch = n_active_tokens != n_positions
         triu_comparison = 'LT' if use_prefetch else 'LE'
-        mask, active_mask = hlo.decoder_attention_mask(
-            start_ids,
-            cache_ids,
-            n_positions,
-            triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=use_prefetch,
-            start_mask=True,
-        )
-        return (hidden, last_token_id, pos_embed, cache_ids, mask, active_mask), (1, 0, None, None)
+        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
+            # TODO: support lhs_aligned flag and the related attention mask
+            mask, active_mask = hlo.decoder_attention_mask_lhs_aligned(
+                cache_ids,
+                n_positions,
+            )
+        else:
+            mask, active_mask = hlo.decoder_attention_mask(
+                start_ids,
+                cache_ids,
+                n_positions,
+                triu_comparison=triu_comparison,
+                allow_kv_dot_prefetch=use_prefetch,
+                start_mask=True,
+            )
+        return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), (1, 0, None, None)
 
     def layer(
-            self, hidden, last_token_id, pos_embed, cache_ids, mask, active_mask,
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -81,7 +87,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         eps = self.config.rms_norm_eps
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, pos_embed, mask, active_mask,
+            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
@@ -108,7 +114,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def attention(
         self,
-        hidden, cache_ids, pos_embed, mask, active_mask,
+        hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -175,8 +181,13 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             # KCache = K
             # VCache = V
-            updated_keys = key
-            updated_values = value
+            if cached_keys.sizes == key.sizes:
+                updated_keys = key
+                updated_values = value
+            else:
+                # continuous batching
+                updated_keys = attention.update_cache(cached_keys, cache_ids, key, start_ids)
+                updated_values = attention.update_cache(cached_values, cache_ids, value, start_ids)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)

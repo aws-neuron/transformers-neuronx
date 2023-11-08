@@ -206,6 +206,29 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         return input_ids, last_token_id
 
+    def _prepare_for_continuous_batching(self, input_ids, cache_ids=None, seq_ids=None):
+        n_seqs, n_active_tokens = input_ids.shape
+        continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
+
+        if seq_ids is None or not continuous_batching:
+            # static batching
+            return input_ids, cache_ids, None
+
+        # continuous batching
+        batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
+        if n_active_tokens > 1:
+            # context encoding
+            return input_ids, cache_ids, seq_ids
+        # token generation
+        full_input_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype, device="cpu")
+        full_cache_ids = torch.zeros(batch_size, 1, dtype=cache_ids.dtype, device="cpu")
+        for idx, seq_id in enumerate(seq_ids.flatten()):
+            seq_id = seq_id.item()
+            full_input_ids[seq_id, :] = input_ids[idx, :]
+            full_cache_ids[seq_id, :] = cache_ids[idx, :]
+
+        return full_input_ids, full_cache_ids, None
+
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
         # right pad the input_ids if neccessary
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
@@ -237,7 +260,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         _, context_length, _ = hidden.shape
         cache_ids, _, _ = args
 
-         ### Separating the speculative sampling specific forward functionality for now
+        ### Separating the speculative sampling specific forward functionality for now
         ### TO-DO: Re-factor so each decoder implemnts it's own forward functionality
         decoder_type = kwargs["decoder_type"] if "decoder_type" in kwargs else None
         if decoder_type and decoder_type=="speculative":
@@ -247,7 +270,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
             logits = logits.transpose(0, 1)
             return logits
-        if context_length > 1 and cache_ids[0].item() == 0:
+        if context_length > 1 and cache_ids.flatten()[0].item() == 0:
             logits = self.context(hidden, *args)
         else:
             logits = self.decoder_lm_head(hidden, *args)

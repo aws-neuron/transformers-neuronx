@@ -139,6 +139,21 @@ class PretrainedModel(LowMemoryModule):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
+        def _sanity_check(**kwargs):
+            context_length_estimate = kwargs.get("context_length_estimate", None)
+            n_positions = kwargs.get("n_positions", 2048)
+            neuron_config = kwargs.get("neuron_config", None)
+            continuous_batching = neuron_config and neuron_config.continuous_batching
+            if continuous_batching:
+                batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
+                assert batch_size_for_shared_caches == kwargs.get("batch_size"), \
+                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {batch_size} is expected"
+                assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1
+                assert isinstance(n_positions, list) and len(n_positions) == 1
+                assert context_length_estimate == n_positions, \
+                    "To use continuous batching features, context length estimate should equal to n_positions."
+
+        _sanity_check(**kwargs)
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
         state_dict_path = os.path.join(pretrained_model_path, 'pytorch_model.bin')
