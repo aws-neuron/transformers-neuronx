@@ -90,7 +90,8 @@ class OPTForSampling(base.NeuronModelBase):
                                                     n_head=config.num_attention_heads,
                                                     unroll=context_unroll,
                                                     neuron_config=neuron_config,
-                                                    allow_pad=self.decoder_lm_head.allow_pad
+                                                    allow_pad=self.decoder_lm_head.allow_pad,
+                                                    return_all_outputs=False
                                                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[batch_size])
         # Track number of processed tokens for sliding window attention
@@ -338,8 +339,8 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
-        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
+        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs)
 
     def attention(self, hidden, curr_window_start, cache_ids, mask, active_mask,
                   cached_keys, cached_values,

@@ -200,7 +200,7 @@ class GPT2ForHuggingFaceSampling(GPT2ForSampling):
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, n_parallel_output_tokens=1, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -217,7 +217,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.context_buckets = bucket.context_sizes(
             context_length_estimate, self.token_buckets
         )
-        self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions=self.token_buckets[-1]
 
         # TODO: the start_mask needs to be True with left padding for context estimate,
@@ -229,15 +228,14 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, 
-            n_parallel_output_tokens=self.n_parallel_output_tokens,builder=hlo_builder
+            unroll=unroll, neuron_config=neuron_config, builder=hlo_builder
         )
         
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
             batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens, shard_over_batch=config.shard_over_batch
+            unroll=unroll, neuron_config=neuron_config, return_all_outputs=True, shard_over_batch=config.shard_over_batch
         )
 
 
@@ -282,6 +280,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     neuron_config=neuron_config,
                     allow_pad=self.decoder_lm_head.allow_pad,
                     shard_over_batch=config.shard_over_batch,
+                    return_all_outputs=False
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
@@ -296,7 +295,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                         config.n_layer,
                     )
                     self.register_for_serialization(self.broadcaster[context_length_estimate])
-        self.decoder_lm_head_for_speculation=None
+        self.decoder_lm_head_for_speculation={}
         self.context_pre_hook = None
         self.context_hook = None
         # Token counter for sliding window attention
@@ -387,9 +386,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
                 self.reset(context_length_estimate=context_length_estimate)
         if self.decoder_lm_head_for_speculation:
-            model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
-                                                                      new=self.decoder_lm_head_for_speculation)
-            self.decoder_lm_head_for_speculation=model
+            for i,k in enumerate(self.decoder_lm_head_for_speculation):
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                                                                      new=self.decoder_lm_head_for_speculation[k])
+                self.decoder_lm_head_for_speculation[k]=model
 
     def reset(self,context_length_estimate):
         self.decoder_lm_head.reset()
@@ -405,35 +405,30 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             self.tensor_pool.push([inputs_embeds, position_embeds])
         return hidden, start_ids
 
-    def forward(self, input_ids, cache_ids=None, start_ids=None, decoder_type=None):
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Check if sliding window attention is applied
         sliding_window_attn_enabled = self.neuron_config and \
                                       self.neuron_config.sparse_attn and \
                                       self.neuron_config.sparse_attn.skip_masking_decode
         batch_size, context_length = input_ids.shape
-        
+        is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
-        last_token_id = torch.as_tensor(0, dtype=torch.int32)
-
+        
+        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
         batch_size, context_length = input_ids.shape
+  
+        model=self.decoder_lm_head
+        if is_context_encode:
+            model=self.decoder_lm_head_for_context[estimate, batch_size]
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
 
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
-
-        is_context_encode = context_length > 1 and cache_ids[0].item() == 0
        
         model=self.decoder_lm_head
-        if is_context_encode:
-            input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
-            batch_size, context_length = input_ids.shape
-            model=self.decoder_lm_head_for_context[estimate, batch_size]
-        
-            if cache_ids.shape!=torch.Size([context_length]): ###To-Do: Fix me so we pad the cache properly
-                cache_ids=utils.pad(cache_ids,0,context_length,left=False)
-        
+    
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
         # Compute the window starting index for specific mask patterns
@@ -449,15 +444,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
         hidden=hidden.transpose(0,2).contiguous()
-        if decoder_type and decoder_type=="speculative":
-            logits=self.decoder_lm_head_for_speculation(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
-            self.num_processed_tokens += (last_token_id + 1)
-            logits = self._cast_logits(logits)
-            _,n_active_tokens,_=logits.shape
-            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
-            logits = logits.transpose(0, 1)
-            return logits
-        if context_length > 1 and cache_ids[0].item() == 0:
+        if context_length > 1:
             logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         else:
             logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
@@ -473,6 +460,46 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if is_context_encode and not self.share_caches:
             self.broadcaster[estimate].run_broadcast()
 
+        return logits
+
+    def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
+        
+        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+
+        batch_size, context_length = input_ids.shape
+
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
+       
+        if speculation_length is None:
+            model=self.decoder_lm_head
+        else:
+            model=self.decoder_lm_head_for_speculation[speculation_length]
+        hidden, start_ids = self._embedding(model, input_ids, cache_ids,
+                                            start_ids, is_context_encode=False)
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = \
+            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
+            if sliding_window_attn_enabled else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        if start_ids.shape[0] != batch_size:
+            start_ids = start_ids.repeat(batch_size)
+        hidden=hidden.transpose(0,2).contiguous()
+        logits=model(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        self.num_processed_tokens += (last_token_id + 1)
+        logits = self._cast_logits(logits)
+        _,n_active_tokens,_=logits.shape
+        logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
+        logits = logits.transpose(0, 1)
         return logits
 
     @torch.no_grad()
@@ -502,8 +529,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
-            output_scores=output_scores,
-            n_parallel_output_tokens=self.n_parallel_output_tokens,
+            output_scores=output_scores
         )
         if output_scores:
             interleaved, scores = interleaved
