@@ -84,7 +84,8 @@ class BloomForSampling(base.NeuronModelBase):
                         n_head=config.n_head,
                         unroll=context_unroll,
                         neuron_config=neuron_config,
-                        allow_pad=self.decoder_lm_head.allow_pad
+                        allow_pad=self.decoder_lm_head.allow_pad,
+                        return_all_outputs=False
                     )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 

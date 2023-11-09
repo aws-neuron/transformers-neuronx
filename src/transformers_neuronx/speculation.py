@@ -346,7 +346,7 @@ class SpeculativeGenerator:
             # Execute target model with draft tokens
             cache_ids = torch.arange(current, current + draft_ids.shape[1] + 1)  # added length of target predicted token
             input_ids = torch.cat([target_next_id, draft_ids], dim=1)
-            target_new_logits = self.target(input_ids=input_ids, cache_ids=cache_ids, start_ids=start_ids, decoder_type="speculative")    
+            target_new_logits = self.target.speculative_forward(input_ids=input_ids, cache_ids=cache_ids, start_ids=start_ids, speculation_length=self.k)    
             target_new_logits = target_new_logits.squeeze(dim=-1)
  
             # Select which tokens will be used

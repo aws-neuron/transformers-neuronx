@@ -114,11 +114,11 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None, output_scores=False, n_parallel_output_tokens=1):
+                top_k=50, streamer=None, output_scores=False):
     tokens = [input_ids]
     _, start = input_ids.shape
     scores = []
-    for cur_len in range(start, sequence_length, n_parallel_output_tokens):
+    for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 
         # don't sample EOS
@@ -142,7 +142,7 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
             break
 
         # forward pass to get next token
-        cache_ids = torch.arange(cur_len, cur_len+n_parallel_output_tokens, dtype=torch.int32)
+        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
