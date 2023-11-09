@@ -30,7 +30,7 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, prefixed_length=0, n_parallel_output_tokens=1,**kwargs):
+                 neuron_config=None, prefixed_length=0, **kwargs):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.context_pre_hook = None
@@ -50,8 +50,7 @@ class LlamaForSampling(base.NeuronModelBase):
         if prefixed_length:
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
-                self.context_buckets = sorted(self.context_buckets)
-        self.n_parallel_output_tokens=n_parallel_output_tokens        
+                self.context_buckets = sorted(self.context_buckets)       
         self.max_positions = self.token_buckets[-1]
 
         if isinstance(batch_size,int):
@@ -67,11 +66,11 @@ class LlamaForSampling(base.NeuronModelBase):
             attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
             unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch, 
-            n_parallel_output_tokens=self.n_parallel_output_tokens,builder=hlo_builder
+            builder=hlo_builder
         )
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
         self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
-        self.decoder_lm_head_for_speculation=None
+        self.decoder_lm_head_for_speculation={}
 
     def to_neuron(self):
 
@@ -129,9 +128,10 @@ class LlamaForSampling(base.NeuronModelBase):
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
         if self.decoder_lm_head_for_speculation:
-            model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
-                                                                     new=self.decoder_lm_head_for_speculation)
-            self.decoder_lm_head_for_speculation=model
+            for i,k in enumerate(self.decoder_lm_head_for_speculation):
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                                                                      new=self.decoder_lm_head_for_speculation[k])
+                self.decoder_lm_head_for_speculation[k]=model
         
 
     def set_prefixed(self, input_ids):
@@ -141,10 +141,26 @@ class LlamaForSampling(base.NeuronModelBase):
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
 
-    def forward(self, input_ids, cache_ids=None, start_ids=None, decoder_type=None):
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        return self._forward(hidden, *rst, decoder_type=decoder_type)
+        return self._forward(hidden, *rst)
+
+    def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
+        input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
+        hidden = self.chkpt_model.model.embed_tokens(input_ids)
+        hidden = hidden.transpose(0, -1).contiguous()
+
+        if speculation_length is None:
+            model=self.decoder_lm_head
+        else:
+            model=self.decoder_lm_head_for_speculation[speculation_length]
+
+        logits=model(hidden, *args)
+        logits = self._cast_logits(logits)
+        logits = logits[:self.config.vocab_size, -speculation_length:, :]
+        logits = logits.transpose(0, 1)
+        return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):

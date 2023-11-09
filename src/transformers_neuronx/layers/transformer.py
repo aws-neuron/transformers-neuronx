@@ -15,7 +15,7 @@
 from transformers_neuronx import hlo
 
 
-def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
+def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
     """
     Language model head with layer normalization.
 
@@ -39,7 +39,7 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     dtype = hidden.dtype
 
     #Check and perform slicing if needed
-    if n_active_tokens > 1 and n_parallel_output_tokens==1:
+    if not return_all_outputs:
         hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
         n_active_tokens = 1
 
@@ -54,7 +54,7 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     return result
 
 
-def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1, eps=1e-6):
+def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6):
     """
     Language model head with rms normalization.
 
@@ -78,7 +78,7 @@ def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias,
     dtype = hidden.dtype
 
     #Check and perform slicing if needed
-    if n_active_tokens > 1 and n_parallel_output_tokens==1:
+    if not return_all_outputs:
         hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
         n_active_tokens = 1
 

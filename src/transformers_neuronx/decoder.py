@@ -37,7 +37,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 shard_over_batch=False, n_parallel_output_tokens=1, builder=None):
+                 shard_over_batch=False, return_all_outputs=True, builder=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -55,7 +55,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.n_head = n_head
         self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
         self.shard_over_batch = shard_over_batch
-        self.n_parallel_output_tokens=n_parallel_output_tokens
+        self.return_all_outputs=return_all_outputs
         self.amp = amp
         self.num_layers = num_layers
         self.unroll = unroll
@@ -97,7 +97,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     n_kv_head=self.n_kv_head,
                     unroll=unroll,
                     neuron_config=self.neuron_config, 
-                    allow_pad=self.allow_pad
+                    allow_pad=self.allow_pad,
+                    return_all_outputs=False
                 )
                 base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
         return decoder_lm_head
@@ -117,7 +118,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config, 
             allow_pad=True, 
-            shard_over_batch=self.shard_over_batch
+            shard_over_batch=self.shard_over_batch,
+            return_all_outputs=True
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
@@ -140,7 +142,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             neuron_config=self.neuron_config, 
             allow_pad=True, 
             shard_over_batch=self.shard_over_batch,
-            n_parallel_output_tokens= n_active_tokens
+            return_all_outputs=True
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
@@ -234,7 +236,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 self.tp_degree, self.n_positions_list, self.n_active_tokens, self.batch_size, self.attention_head_size,
                 amp=self.amp, num_layers=self.num_layers, n_head=self.n_head, n_kv_head=self.n_kv_head,
                 unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
-                prefixed_length=self.prefixed_length, n_parallel_output_tokens=self.n_parallel_output_tokens
+                prefixed_length=self.prefixed_length, return_all_outputs=self.return_all_outputs
             )
         new.add_inputs_builder(self.inputs_builder)
         new.add_pre_layer_builder(self.pre_layer_builder)
@@ -299,7 +301,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         
         outputs = None
         slice_loop_var = range(0, sequence_length, self.n_active_tokens)
-        if self.n_parallel_output_tokens > 1:
+        if self.n_active_tokens > 1 and self.return_all_outputs:
             slice_loop_var = [0]
   
         for start in slice_loop_var:
@@ -383,7 +385,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
             head_weight = maybe_transfer_with_static_ring(head_weight)
             head_bias = maybe_transfer_with_static_ring(head_bias)
-            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.n_parallel_output_tokens)
+            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
             outputs = [logits, *out_caches]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
@@ -470,7 +472,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
-            return self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.n_parallel_output_tokens)
+            return self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
 
         return compiler.compile_py_func(ln_lm_head)
 
@@ -504,7 +506,7 @@ class SpeculativeDecoder(torch.nn.Module):
         hidden = hidden.transpose(0, -1).contiguous()
         logits = self.decoder_lm_head(hidden, *args)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -self.n_parallel_output_tokens:, :]
+        logits = logits[:self.config.vocab_size, -self.n_active_tokens:, :]
         logits = logits.transpose(0, 1)
         logits=logits.transpose(1, 2)
         return logits

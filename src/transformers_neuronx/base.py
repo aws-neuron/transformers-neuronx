@@ -15,6 +15,7 @@
 
 import os
 import torch
+from typing import Optional, Union, List
 import hashlib
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
@@ -35,6 +36,14 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._load_compiled_artifacts(directory)
 
+    # top level api
+    def enable_speculative_decoder(self,speculation_length:Optional[Union[List[int], int]]):
+        if isinstance(speculation_length, int):
+            speculation_length=[speculation_length]
+        for k in speculation_length:
+            self.decoder_lm_head_for_speculation[k]=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
+
+
     # simple implementation that doesn't take into account cache and serialization
     def is_compiled(self):
         # First check if the kernels have neffs already
@@ -46,10 +55,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             pass
         return False
    
-   #top level api
-    def enable_speculative_decoder(self,k=4):
-        self.decoder_lm_head_for_speculation=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
-
+   
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.program.reorder_cache(reorder_ids)
 
@@ -254,23 +260,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
              logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
          return logits.to(logits_dtype)
 
-    def _forward(self, hidden, *args, **kwargs):
+    def _forward(self, hidden, *args):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
-        cache_ids, _, _ = args
 
-        ### Separating the speculative sampling specific forward functionality for now
-        ### TO-DO: Re-factor so each decoder implemnts it's own forward functionality
-        decoder_type = kwargs["decoder_type"] if "decoder_type" in kwargs else None
-        if decoder_type and decoder_type=="speculative":
-            logits=self.decoder_lm_head_for_speculation(hidden, *args)
-            logits = self._cast_logits(logits)
-            _,n_active_tokens,_=logits.shape
-            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
-            logits = logits.transpose(0, 1)
-            return logits
-        if context_length > 1 and cache_ids.flatten()[0].item() == 0:
+        if context_length > 1:
             logits = self.context(hidden, *args)
         else:
             logits = self.decoder_lm_head(hidden, *args)
