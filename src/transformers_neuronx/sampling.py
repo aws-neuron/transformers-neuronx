@@ -18,6 +18,7 @@ import torch
 import transformers
 
 from transformers_neuronx.config import GenerationConfig
+from transformers_neuronx.stopping_criteria import StoppingCriteriaList
 
 
 @torch.no_grad()
@@ -226,13 +227,15 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
 
 
 def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                      top_k=50, top_p=1.0, temperature=1.0, streamer=None):
+                      top_k=50, top_p=1.0, temperature=1.0, streamer=None, stopping_criteria_list=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     if not isinstance(temperature, float) or not (temperature > 0):
         raise ValueError('temperature has to be a strictly positive float.')
 
-    # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
+    stopping_criteria_list = stopping_criteria_list if stopping_criteria_list is not None else StoppingCriteriaList()
+
+# Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
     tokens = [input_ids]
     _, start = input_ids.shape
@@ -265,10 +268,10 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         elif streamer:
             streamer.put(token)
 
-        if streamer is not None and hasattr(streamer, 'is_cancelled_func') and streamer.is_cancelled_func():
+        if next_len >= sequence_length or done_flags.all():
             break
 
-        if next_len >= sequence_length or done_flags.all():
+        if stopping_criteria_list(input_ids, probs):
             break
 
         # forward pass to get next token
@@ -282,7 +285,8 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
 
 @torch.no_grad()
-def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0, streamer=None):
+def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0,
+                 streamer=None, stopping_criteria_list=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     # populate key/value caches according to the prompt text
@@ -291,7 +295,8 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     if model.context_hook is not None:
         model.context_hook()
     return sample_loop_llama(
-        model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
+        model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature,
+        streamer, stopping_criteria_list
     )
 
 #TODO Leverage Generation Args data class as input args
@@ -303,3 +308,4 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
+
