@@ -170,7 +170,7 @@ class LlamaForSampling(base.NeuronModelBase):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         batch_size, context_length = input_ids.shape
@@ -187,7 +187,8 @@ class LlamaForSampling(base.NeuronModelBase):
         result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
-            top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer
+            top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
+            stopping_criteria_list=stopping_criteria_list
         )
 
         return result
