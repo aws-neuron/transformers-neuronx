@@ -18,3 +18,7 @@ TILE_SIZE = 128
 
 # Size used to determine fused QKV operation.
 FUSED_QKV_TP_FACTOR = 3
+
+# Layout for attention
+LAYOUT_BSH = 'BSH'
+LAYOUT_HSB = 'HSB'
