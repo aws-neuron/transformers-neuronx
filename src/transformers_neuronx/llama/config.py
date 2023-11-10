@@ -53,8 +53,5 @@ class LlamaConfig:
         is_multi_query_attn = self.num_key_value_heads < self.num_attention_heads
         if is_multi_query_attn:
             self.shard_over_batch = batch_size >= tp_degree and (batch_size % tp_degree == 0)
-            if self.num_key_value_heads < tp_degree and not self.shard_over_batch:
-                raise NotImplementedError(f"Not able to shard over head dimension "
-                                          f"when num_key_value_heads ({self.num_key_value_heads}) < tp_degree ({tp_degree})")
         else:
-            self.shard_over_batch = False    
+            self.shard_over_batch = False
