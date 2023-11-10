@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
+from transformers_neuronx import utils
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 
@@ -49,11 +50,24 @@ def query_key_value(
         _, kv_hidden_size_tp = k_weight.sizes
     n_heads_tp = hidden_size_tp // d_head
     n_kv_heads_tp = kv_hidden_size_tp // d_head
-    hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
+    sharded_gqa_kv = kv_hidden_size_tp < d_head
 
-    hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
+    # (h, s, b) => (h, s * b)
+    hidden_r = hlo.reshape(hidden, (hidden_size, n_active_tokens * n_seqs))
 
-    if fuse_qkv:
+    # Sharded KV GQA
+    if sharded_gqa_kv:
+        # Q = (hidden @ wQ) + bQ
+        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
+
+        # K = (hidden @ wK) + bK
+        active_k = _sharded_kv_projection(hidden, k_weight, k_bias, k_scales, neuron_config, d_head, tp_degree)
+
+        # V = (hidden @ wV) + bV
+        active_v = _sharded_kv_projection(hidden, v_weight, v_bias, v_scales, neuron_config, d_head, tp_degree)
+
+    # Fused MHA
+    elif fuse_qkv:
         # QKV = (hidden @ wQKV) + bQKV
         active_qkv = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config=neuron_config)
 
@@ -62,6 +76,8 @@ def query_key_value(
         active_q = hlo.slice_along(active_qkv, -1, slice_lim, start=0)
         active_k = hlo.slice_along(active_qkv, -1, 2*slice_lim, start=slice_lim)
         active_v = hlo.slice_along(active_qkv, -1, 3*slice_lim, start=2*slice_lim)
+
+    # MHA & Non-sharded KV GQA
     else:
         # Q = (hidden @ wQ) + bQ
         active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
@@ -91,14 +107,40 @@ def query_key_value(
         active_v = hlo.reshape(active_v, active_kv_sizes)
     else:
         # shard over head
-        n_repeats = hidden_size_tp // kv_hidden_size_tp
-        active_q_sizes = n_active_tokens, n_seqs, n_kv_heads_tp * n_repeats, d_head
+        active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         active_kv_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, d_head
         active_q = hlo.reshape(active_q, active_q_sizes)
-        active_k = hlo.reshape(active_k, active_kv_sizes)
-        active_v = hlo.reshape(active_v, active_kv_sizes)
+        if not sharded_gqa_kv:
+            active_k = hlo.reshape(active_k, active_kv_sizes)
+            active_v = hlo.reshape(active_v, active_kv_sizes)
 
     return active_q, active_k, active_v
+
+
+def _sharded_kv_projection(hidden, weight, bias, scales, neuron_config, d_head, tp_degree):
+
+    _, hidden_size_tp = weight.sizes
+    group_size = d_head // hidden_size_tp
+    num_groups = tp_degree // group_size
+    n_head = (tp_degree * hidden_size_tp) // d_head
+    num_heads_per_group = n_head // num_groups
+
+    # (h, s, b) => (h, s * b)
+    hidden_size, n_active_tokens, n_seqs = hidden.sizes
+    hidden = hlo.reshape(hidden, (hidden_size, n_active_tokens * n_seqs))
+
+    # O = (hidden @ W) + B
+    # (h, s * b) @ (h, n_head * d_head) contract(0, 0) => (s * b, n_head * d_head)
+    active = hlo.dot00_add1(hidden, weight, bias, scales, neuron_config)
+
+    # Gather portions of the groups together
+    replica_groups = utils.build_replica_groups(num_groups, group_size)
+    active = hlo.all_gather(active, dim=1, tp_degree=tp_degree, replica_groups=replica_groups)
+
+    # (s * b, n_head * d_head) => (s * b, n_head, d_head)
+    active = hlo.reshape(active, (n_active_tokens, n_seqs, num_heads_per_group, d_head))
+
+    return active
 
 
 # TODO: This should be removed and rotate_half should be used instead after GPTNeoX changes.
@@ -252,22 +294,11 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
     NOTE: Since we may pad along head dimension,
           tp_degree argument is required to be an integer for grouped-query attention models.
     """
-
-    dtype = query.dtype
-    scribe = query.scribe
-    pred = scribe.pred
-
-    # Check for multi-query attention
+    # Check for MQA/GQA attention
     if n_kv_heads != 0:
-        if shard_over_batch:
-            _, _, n_heads, _ = query.sizes
-            n_repeats = n_heads // n_kv_heads
-        else:
-            assert isinstance(tp_degree, int), \
-                f"tp_degree ({tp_degree}) is required to be an integer for grouped-query attention models."
-            _, _, n_heads_tp, _ = query.sizes
-            n_heads = n_heads_tp * tp_degree
-            n_repeats = n_heads // n_kv_heads
+        _, _, n_kv_heads_tp, _ = keys.sizes
+        _, _, n_heads_tp, _ = query.sizes
+        n_repeats = n_heads_tp // n_kv_heads_tp
         keys = hlo.repeat_kv(keys, n_repeats=n_repeats, repeat_dim=2)
 
     # Q @ K
@@ -392,10 +423,9 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     denom = dtype[denom.sizes].Convert(denom)
 
     if n_kv_heads != 0:
-        assert isinstance(tp_degree, int), \
-            f"tp_degree ({tp_degree}) is required to be an integer for grouped-query attention."
-        n_heads = n_heads_tp * tp_degree
-        n_repeats = n_heads // n_kv_heads
+        _, n_heads_tp, *_ = past_prob.sizes
+        _, _, n_kv_heads_tp, *_ = past_values.sizes
+        n_repeats = n_heads_tp // n_kv_heads_tp
         # values layout: (n_positions, n_seqs_per_nc, n_kv_heads, d_head) -> repeat_dim=2
         past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
         active_values = hlo.repeat_kv(active_values, n_repeats=n_repeats, repeat_dim=2)

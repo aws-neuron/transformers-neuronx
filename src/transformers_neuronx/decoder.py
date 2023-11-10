@@ -15,6 +15,8 @@
 import pickle
 import os
 import itertools
+import warnings
+
 import torch
 from transformers_neuronx import base
 from transformers_neuronx import bucket
@@ -735,6 +737,34 @@ class DecoderLayer(torch.nn.Module):
 
             self.attn_q_weight = maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = maybe_pad(self.attn_q_bias, dim=0)
+
+            # GQA: Handle incompatibilities between KV heads & tp_degree
+            if (
+                self.n_head != self.n_kv_head
+                and not self.shard_over_batch
+                and self.n_head % self.tp_degree != 0
+            ):
+                ratio = int(self.n_head / self.n_kv_head)
+                warnings.warn(
+                    f'Converting GQA/MQA to standard MHA. '
+                    f'The number of attention heads {self.n_head} is not divisible by {self.tp_degree} '
+                    f'which means the KV heads must be duplicated by a factor of {ratio}.'
+                )
+
+                def repeat(weight):
+                    if weight is None:
+                        return weight
+                    shape = weight.shape[:-1] + (self.n_kv_head, weight.shape[-1] // self.n_kv_head)
+                    weight = weight.view(shape)
+                    weight = torch.repeat_interleave(weight, repeats=ratio, dim=-2)
+                    shape = weight.shape[:-2] + (weight.shape[-1] * weight.shape[-2],)
+                    return weight.view(shape)
+
+                self.attn_k_weight = repeat(self.attn_k_weight)
+                self.attn_v_weight = repeat(self.attn_v_weight)
+                self.attn_k_bias = repeat(self.attn_k_bias)
+                self.attn_v_bias = repeat(self.attn_v_bias)
+                self.n_kv_head = self.n_head
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = maybe_pad(self.attn_k_weight, dim=1)
