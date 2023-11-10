@@ -21,6 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
@@ -144,7 +145,10 @@ class LlamaForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        return self._forward(hidden, *rst)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
+        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
         input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from transformers_neuronx.constants import LAYOUT_HSB
+
 
 class QuantizationConfig:
     """ The config class that contains all quantization related settings """
@@ -66,6 +68,9 @@ class NeuronConfig():
             batching related configurations. Default: `None`.
         use_2d_cache_ids (bool, optional): Whether to use 2D layout for cache_ids (aka position_ids).
             Default: `False`.
+        attention_layout (`str`, optional): Layout to be used for attention computation.
+            To be selected from `["HSB", "BSH"]`.
+             Default: `"HSB"`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -78,6 +83,7 @@ class NeuronConfig():
         if self.continuous_batching:
             # Force using 2D cache_ids layout for continuous batching.
             self.use_2d_cache_ids = True
+        self.attention_layout = kargs.pop('attention_layout', LAYOUT_HSB)
 
 class GenerationConfig:
 
