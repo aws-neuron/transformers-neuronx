@@ -1005,14 +1005,20 @@ def all_reduce(tensor, replica_groups, to_apply, dtype=None):
     return result
 
 
-def all_gather(tensor, dim, tp_degree):
+def all_gather(tensor, dim, tp_degree, replica_groups=None):
     shape = list(tensor.sizes)
-    shape[dim] *= tp_degree
     dtype = tensor.dtype
+
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+        shape[dim] *= tp_degree
+    else:
+        shape[dim] *= len(replica_groups[0])
+
     return dtype[shape].AllGather(
         tensor,
         dimensions=[dim],
-        replica_groups=[list(range(tp_degree))],
+        replica_groups=replica_groups,
     )
 
 
