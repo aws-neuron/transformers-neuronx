@@ -29,7 +29,6 @@ from transformers_neuronx import utils
 from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.utils import interleave_qkv
 
 from concurrent.futures import ProcessPoolExecutor
@@ -271,7 +270,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         for layer in self.layers:
             layer.reset()
 
-    def forward_single(self, *inputs, neuron_config=None):
+    def forward_single(self, *inputs):
         """
         Fast-path forward function which avoids as much overhead as possible.
 
@@ -280,8 +279,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         etc.
         """
         hidden, cache_ids, *_ = inputs
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        batch_size = hidden.shape[2]
         # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.continuous_batching:
             bucket_id = 0
@@ -294,16 +292,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.program.run(bucket_id, batch_size)
             return self.program.logits_device_to_host(batch_size)
 
-    def forward(self, *inputs, neuron_config=None):
+    def forward(self, *inputs):
         hidden, *_ = inputs
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        # batch size is in dim 2 because hidden is now transposed in model.py's forward function.
-        # For BSH, it is in dim 0.
-        batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        # batch size is in dim 2 because hidden is now transposed in model.py's forward function
+        batch_size = hidden.shape[2]
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
-            return self.forward_single(*inputs, neuron_config=neuron_config)
+            return self.forward_single(*inputs)
         
         outputs = None
         slice_loop_var = range(0, sequence_length, self.n_active_tokens)
