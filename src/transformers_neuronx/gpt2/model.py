@@ -27,6 +27,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
@@ -91,18 +92,31 @@ class GPT2ForSampling(base.NeuronModelBase):
                                             c_attn_bias[n_embd:n_embd*2])
                 new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                               c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
+            else:
+                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
                 new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
             else:
-                new_layer.add_mlp_output(
-                    mlp.c_proj.weight.detach().T,
-                    mlp.c_proj.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
+                if is_bsh:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach(),
+                        mlp.c_proj.bias.detach(),
+                        sharding=0,
+                        transposed=True,
+                    )
+                else:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach().T,
+                        mlp.c_proj.bias.detach(),
+                        sharding=1,
+                        transposed=False,
+                    )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -139,9 +153,12 @@ class GPT2ForSampling(base.NeuronModelBase):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
         hidden = hidden.transpose(0, 2).contiguous()
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -320,18 +337,30 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                         c_attn_bias[n_embd:n_embd*2])
             new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                           c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH    
+            if is_bsh:
+                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=False)
+            else:
+                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
                 new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
             else:
-                new_layer.add_mlp_output(
-                    mlp.c_proj.weight.detach().T,
-                    mlp.c_proj.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
+                if is_bsh:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach(),
+                        mlp.c_proj.bias.detach(),
+                        sharding=0,
+                        transposed=False,
+                    )
+                else:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach().T,
+                        mlp.c_proj.bias.detach(),
+                        sharding=1,
+                        transposed=False,
+                    )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -443,11 +472,14 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             task = self.tensor_pool.async_clear()
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)

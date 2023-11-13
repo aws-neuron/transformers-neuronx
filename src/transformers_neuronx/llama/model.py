@@ -21,6 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
@@ -88,7 +89,10 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
-            new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
+            if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+                new_layer.add_attention_output(attn.o_proj.weight.detach().T, None, sharding=0, transposed=True)
+            else:
+                new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
@@ -144,7 +148,10 @@ class LlamaForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        return self._forward(hidden, *rst)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
+        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
         input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  

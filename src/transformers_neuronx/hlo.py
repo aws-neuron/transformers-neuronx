@@ -272,7 +272,9 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
     # For batch=1 token generation use triton implementation
     # batch>1/context encoding implementation is in development
-    if batch_size == 1 and n_active_tokens == 1:
+
+    # TODO: Enable for BSH after compiler verification.
+    if dim != 2 and batch_size == 1 and n_active_tokens == 1:
         return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
 
     dtype = hidden.dtype
@@ -297,7 +299,7 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
         return scaled
 
     weight = cast(weight, f32)
-    weight_br = f32[size].Broadcast(weight, dimensions=[dim])
+    weight_br = broadcast(weight, size, broadcast_dimensions=[dim])
     result = f32[size].Multiply(scaled, weight_br)
     result = cast(result, dtype)
 
@@ -572,7 +574,7 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
 
 
 def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None):
+            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
     # single:
     #   hidden: [b, a, h]
     #   in_weight: [h, 4h]
@@ -652,8 +654,7 @@ def gated_mlp_bsh(
     hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
                                scales=in1_scales, neuron_config=neuron_config)
     hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
-
-    result = dot10_add1(hidden_states, out_weight, out_bias,
+    result = dot11_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
