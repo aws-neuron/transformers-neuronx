@@ -311,6 +311,30 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
 
     return result_dot
 
+def sparse_attn_mask(score, mask, constant_value=-30000):
+    """
+    Masks the computed attention scores with a sparse attention mask. This method
+    has different assumptions to the mask shape from the mask() method below.
+
+    score = masked_fill(score, mask, constant_value)
+    """
+    dtype = score.dtype
+    score_sizes = score.sizes
+
+    # Note: This value can cause NaN issues if it is too large
+    masked_val = hlo.full(constant_value, dtype, score_sizes)
+
+    # We accept two mask shapes: [q_seq_len, kv_seq_len], or [nheads, q_seq_len, kv_seq_len]
+    bs, nheads, q_seq_len, kv_seq_len = score_sizes
+    assert (tuple(mask.sizes) == (q_seq_len, kv_seq_len)) or (tuple(mask.sizes) == (nheads, q_seq_len, kv_seq_len)), \
+        f'Expecting sparse mask shape of ({q_seq_len}, {kv_seq_len}) or ({nheads}, {q_seq_len}, {kv_seq_len}), but got {mask.sizes}!'
+
+    if len(mask.sizes) == 2:
+        mask_br = hlo.broadcast(mask, out_dim_size=score_sizes, broadcast_dimensions=[2, 3])
+    else:
+        mask_br = hlo.broadcast(mask, out_dim_size=score_sizes, broadcast_dimensions=[1, 2, 3])
+    score = dtype[score_sizes].Select(mask_br, score, masked_val)
+    return score
 
 def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30000):
     """
@@ -344,6 +368,7 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
             n_seqs_per_nc = score_sizes[0]
             assert n_seqs_per_nc == mask.sizes[0] // tp_degree, f"invalid n_seqs_per_nc ({n_seqs_per_nc}) vs mask_sizes ({mask.sizes})"
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
+        # broadcast from [n_seqs, n_active_tokens, n_positions] to [n_seqs, n_heads, n_active_tokens, n_positions]
         mask_br = hlo.broadcast(mask, score_sizes, [0, 2, 3])
     score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
     return score
@@ -411,7 +436,7 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
 
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
-        past_prob = mask(past_prob, sparse_mask, tp_degree=None, shard_over_batch=False, constant_value=0)
+        past_prob = sparse_attn_mask(past_prob, sparse_mask, constant_value=0)
 
     # Ca = Pa @ Va
     # Cp = Pp @ Vp
@@ -474,7 +499,7 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
     probs = hlo.softmax(score)
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
-        probs = mask(probs, sparse_mask, tp_degree=None, shard_over_batch=False, constant_value=0)
+        probs = sparse_attn_mask(probs, sparse_mask, constant_value=0)
 
     n_seqs, n_heads_tp, n_active_tokens, n_positions = probs.sizes
     _, _, n_kv_heads_tp, d_head = values.sizes

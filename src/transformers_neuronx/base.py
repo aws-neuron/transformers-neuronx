@@ -54,8 +54,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         except AttributeError:
             pass
         return False
-   
-   
+
+
     def reorder_cache(self, reorder_ids):
         self.decoder_lm_head.program.reorder_cache(reorder_ids)
 
@@ -271,7 +271,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits = self.decoder_lm_head(hidden, *args)
 
         logits = self._cast_logits(logits)
-        logits = logits[:self.config.vocab_size, -1, :] 
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
