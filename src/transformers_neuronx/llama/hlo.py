@@ -15,9 +15,10 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
+from transformers_neuronx.layers import transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.constants import LAYOUT_BSH
 
 
 class LlamaForSamplingNoEmbeddingHlo:
@@ -30,7 +31,10 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        else:
+            hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         head_dim = self.config.attention_head_size
 
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
@@ -85,7 +89,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             out_weight, out_scales,
         ):
         eps = self.config.rms_norm_eps
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
@@ -95,8 +100,10 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias
         )
         hidden = hlo.add(attn_output, hidden)
-        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=0)
-        mlp_hidden = hlo.gated_mlp(
+        mlp_f = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
+        rms_norm_dim = 2 if is_bsh else 0
+        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim)
+        mlp_hidden = mlp_f(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,
@@ -110,7 +117,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps)
+        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
 
     def attention(
         self,
@@ -123,6 +130,11 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
+
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            import transformers_neuronx.layers.attention as attention
+        else:
+            import transformers_neuronx.layers.attention_hsb as attention
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
