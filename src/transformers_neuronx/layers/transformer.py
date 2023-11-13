@@ -13,9 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
+from transformers_neuronx.constants import LAYOUT_BSH
 
 
-def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
+def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
     Language model head with layer normalization.
 
@@ -35,15 +36,19 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
 
     logits = (layer_norm(H) @ W) + B
     """
-    hidden_size, n_active_tokens, batch_size = hidden.sizes
+    is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+    if is_bsh:
+        batch_size, n_active_tokens, hidden_size = hidden.sizes
+    else:
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
 
-    #Check and perform slicing if needed
+    # Check and perform slicing if needed
     if not return_all_outputs:
         hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
         n_active_tokens = 1
 
-    ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+    ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias) if is_bsh else hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
     ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
     logits = hlo.dot00(lm_head_weight, ln_hidden)
     if lm_head_bias is not None:
@@ -54,7 +59,7 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     return result
 
 
-def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6):
+def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6, neuron_config=None):
     """
     Language model head with rms normalization.
 
@@ -74,15 +79,19 @@ def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias,
 
     logits = (rms_norm(H) @ W) + B
     """
-    hidden_size, n_active_tokens, batch_size = hidden.sizes
+    is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+    if is_bsh:
+        batch_size, n_active_tokens, hidden_size = hidden.sizes
+    else:
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
 
-    #Check and perform slicing if needed
+    # Check and perform slicing if needed
     if not return_all_outputs:
         hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
         n_active_tokens = 1
 
-    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, dim=0)
+    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0)
     rms_hidden = dtype[hidden_size, n_active_tokens*batch_size].Reshape(rms_hidden)
     logits = hlo.dot00(lm_head_weight, rms_hidden)
     if lm_head_bias is not None:
