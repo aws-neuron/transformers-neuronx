@@ -50,8 +50,4 @@ class LlamaConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
-        is_multi_query_attn = self.num_key_value_heads < self.num_attention_heads
-        if is_multi_query_attn:
-            self.shard_over_batch = batch_size >= tp_degree and (batch_size % tp_degree == 0)
-        else:
-            self.shard_over_batch = False
+

@@ -50,14 +50,14 @@ class GPT2ForSampling(base.NeuronModelBase):
             unroll = config.n_layer
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
+
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, shard_over_batch=config.shard_over_batch
+            unroll=unroll, neuron_config=neuron_config,
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config,
-                                                   shard_over_batch=config.shard_over_batch)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -97,7 +97,7 @@ class GPT2ForSampling(base.NeuronModelBase):
                 new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
             else:
                 new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
-            
+
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
@@ -247,19 +247,18 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
             unroll=unroll, neuron_config=neuron_config, builder=hlo_builder
         )
-        
+
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
             batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, return_all_outputs=True, shard_over_batch=config.shard_over_batch
+            unroll=unroll, neuron_config=neuron_config, return_all_outputs=True
         )
-
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
         self.register_for_serialization(self.decoder_lm_head)
 
-        
+
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -296,7 +295,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     unroll=context_unroll,
                     neuron_config=neuron_config,
                     allow_pad=self.decoder_lm_head.allow_pad,
-                    shard_over_batch=config.shard_over_batch,
                     return_all_outputs=False
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
@@ -337,7 +335,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                         c_attn_bias[n_embd:n_embd*2])
             new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                           c_attn_bias[n_embd*2:n_embd*3])
-            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH    
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
             if is_bsh:
                 new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=False)
             else:
@@ -416,7 +414,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 self.reset(context_length_estimate=context_length_estimate)
         if self.decoder_lm_head_for_speculation:
             for i,k in enumerate(self.decoder_lm_head_for_speculation):
-                model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                       new=self.decoder_lm_head_for_speculation[k])
                 self.decoder_lm_head_for_speculation[k]=model
 
@@ -442,10 +440,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         batch_size, context_length = input_ids.shape
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
-        
+
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
         batch_size, context_length = input_ids.shape
-  
+
         model=self.decoder_lm_head
         if is_context_encode:
             model=self.decoder_lm_head_for_context[estimate, batch_size]
@@ -455,9 +453,9 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
-       
+
         model=self.decoder_lm_head
-    
+
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
         # Compute the window starting index for specific mask patterns
@@ -499,7 +497,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         sliding_window_attn_enabled = self.neuron_config and \
                                       self.neuron_config.sparse_attn and \
                                       self.neuron_config.sparse_attn.skip_masking_decode
-        
+
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
 
         batch_size, context_length = input_ids.shape
@@ -510,7 +508,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
-       
+
         if speculation_length is None:
             model=self.decoder_lm_head
         else:
