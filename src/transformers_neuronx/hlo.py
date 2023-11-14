@@ -272,9 +272,7 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
     # For batch=1 token generation use triton implementation
     # batch>1/context encoding implementation is in development
-
-    # TODO: Enable for BSH after compiler verification.
-    if dim != 2 and batch_size == 1 and n_active_tokens == 1:
+    if batch_size == 1 and n_active_tokens == 1:
         return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
 
     dtype = hidden.dtype
