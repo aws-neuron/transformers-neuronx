@@ -315,8 +315,8 @@ class OPTForSamplingNoEmbeddingHlo:
               ):
         dtype = hidden.dtype
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        layer_norm_f = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
-        ln_hidden = layer_norm_f(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        layer_norm = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
+        ln_hidden = layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         if self.neuron_config and self.neuron_config.fuse_qkv:
             k_weight_shape = attn_q_weight.sizes
             k_weight_dim = k_weight_shape[-1] // FUSED_QKV_TP_FACTOR
@@ -334,9 +334,9 @@ class OPTForSamplingNoEmbeddingHlo:
             neuron_config=self.neuron_config
         )
         hidden = hlo.add(attn_output, hidden)
-        ln_hidden = layer_norm_f(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_f = hlo.mlp_bsh if is_bsh else hlo.mlp
-        mlp_hidden = mlp_f(
+        ln_hidden = layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp = hlo.mlp_bsh if is_bsh else hlo.mlp
+        mlp_hidden = mlp(
             ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function=self.activation_function, tp_degree=self.tp_degree,
             in_scales=mlp_in_scales, out_scales=mlp_out_scales, neuron_config=self.neuron_config,
