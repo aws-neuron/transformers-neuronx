@@ -100,10 +100,10 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias
         )
         hidden = hlo.add(attn_output, hidden)
-        mlp_f = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
+        gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
         norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim)
-        mlp_hidden = mlp_f(
+        mlp_hidden = gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,

@@ -65,8 +65,8 @@ class BloomForSamplingNoEmbeddingHlo:
 
         dtype = hidden.dtype
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        layer_norm_f = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
-        ln_hidden = layer_norm_f(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        layer_norm = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
+        ln_hidden = layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
             attn_k_cache, attn_v_cache,
@@ -77,9 +77,9 @@ class BloomForSamplingNoEmbeddingHlo:
             neuron_config=self.neuron_config
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        ln_hidden = layer_norm_f(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_f = hlo.mlp_bsh if is_bsh else hlo.mlp
-        mlp_hidden = mlp_f(
+        ln_hidden = layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp = hlo.mlp_bsh if is_bsh else hlo.mlp
+        mlp_hidden = mlp(
             ln_hidden,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function='gelu_new',
