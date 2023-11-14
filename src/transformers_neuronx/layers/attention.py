@@ -43,21 +43,21 @@ def query_key_value(
     n_kv_head = n_kv_head if n_kv_head > 0 else n_head
     dtype = hidden.dtype
     n_seqs, n_active_tokens, hidden_size = hidden.sizes
+    hidden = hlo.transpose210(hidden)
     hidden_size, hidden_size_tp = q_weight.sizes
     _, kv_hidden_size_tp = k_weight.sizes
     n_heads_tp = hidden_size_tp // d_head
-    hidden_r_sizes = n_active_tokens * n_seqs, hidden_size
-
+    hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
     hidden_r = hlo.reshape(hidden, hidden_r_sizes)
 
     # Q = (hidden @ wQ) + bQ
-    active_q = hlo.dot10_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
+    active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
 
     # K = (hidden @ wK) + bK
-    active_k = hlo.dot10_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
+    active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
 
     # V = (hidden @ wV) + bV
-    active_v = hlo.dot10_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
+    active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
 
     if shard_over_batch:
         # shard over batch
@@ -157,7 +157,7 @@ def scale(query, d_head):
     """
     dtype = query.dtype
     scale = dtype.Constant(constant_value=d_head ** 0.5)
-    scale_br = dtype[query.sizes].Broadcast(scale, dimensions=[])
+    scale_br = hlo.broadcast(scale, query.sizes, broadcast_dimensions=[])
     return dtype[query.sizes].Divide(query, scale_br)
 
 
