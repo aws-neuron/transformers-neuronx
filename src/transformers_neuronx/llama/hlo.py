@@ -19,7 +19,7 @@ from transformers_neuronx.layers import transformer, rotary
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH
-
+from transformers_neuronx import constants
 
 class LlamaForSamplingNoEmbeddingHlo:
 
@@ -29,6 +29,14 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         self.config = config
         self.neuron_config = neuron_config
+
+    @property
+    def shard_over_batch(self):
+        # Property access allows fallback configuration to be enabled after construction
+        return (
+            self.neuron_config is not None
+            and self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
+        )
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
@@ -147,13 +155,13 @@ class LlamaForSamplingNoEmbeddingHlo:
             d_head,
             neuron_config=self.neuron_config,
             tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
-            shard_over_batch=self.config.shard_over_batch
+            shard_over_batch=self.shard_over_batch,
         )
 
         # Q = Rotate(Q)
         # K = Rotate(K)
         query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage,
-                                        tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+                                        tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
@@ -163,18 +171,18 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
-            prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
-            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        shard_over_batch=self.config.shard_over_batch)
+                                        shard_over_batch=self.shard_over_batch)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -186,10 +194,10 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
-            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+                                    tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # KCache = K
             # VCache = V

@@ -51,7 +51,7 @@ class LlamaForSampling(base.NeuronModelBase):
         if prefixed_length:
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
-                self.context_buckets = sorted(self.context_buckets)       
+                self.context_buckets = sorted(self.context_buckets)
         self.max_positions = self.token_buckets[-1]
 
         if isinstance(batch_size,int):
@@ -66,7 +66,7 @@ class LlamaForSampling(base.NeuronModelBase):
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch, 
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True,
             builder=hlo_builder
         )
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
@@ -133,10 +133,10 @@ class LlamaForSampling(base.NeuronModelBase):
 
         if self.decoder_lm_head_for_speculation:
             for i,k in enumerate(self.decoder_lm_head_for_speculation):
-                model= self.decoder_lm_head.build_weight_shared(share_caches=True, 
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                       new=self.decoder_lm_head_for_speculation[k])
                 self.decoder_lm_head_for_speculation[k]=model
-        
+
 
     def set_prefixed(self, input_ids):
         self.prefixed_input_ids = input_ids[:, :self.prefixed_length]
@@ -146,7 +146,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.prefixed_length = prefixed_length
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         if is_bsh:
@@ -154,7 +154,7 @@ class LlamaForSampling(base.NeuronModelBase):
         return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)  
+        input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
         hidden = hidden.transpose(0, -1).contiguous()
 

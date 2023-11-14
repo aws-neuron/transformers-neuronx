@@ -40,7 +40,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 shard_over_batch=False, return_all_outputs=True, builder=None):
+                 return_all_outputs=True, builder=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -57,7 +57,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.attention_head_size = attention_head_size  # TODO: rename to size_per_head
         self.n_head = n_head
         self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
-        self.shard_over_batch = shard_over_batch
         self.return_all_outputs=return_all_outputs
         self.amp = amp
         self.num_layers = num_layers
@@ -82,6 +81,58 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = False
         self.compiler_artifacts_path = None
         self.hlo_builder=builder
+        self.check_gqa_fallback()
+
+    def check_gqa_fallback(self):
+        """
+        Check if a fallback mechanism is needed for a user-provided GQA config.
+
+        The initial fallback mechanism will be that no special GQA configuration
+        is used. This will attempt to evenly distribute Q and KV heads to all
+        NeuronCores.
+
+        The second (safest) fallback mechanism will replicate the KV heads to be
+        equal to the number of Q heads. This makes the GQA model look identical
+        to an MHA model.
+        """
+
+        gqa = self.neuron_config.group_query_attention
+        if gqa == constants.GQA.REPLICATED_HEADS:
+            return
+
+        if gqa == constants.GQA.SHARD_OVER_BATCH:
+            success = True
+            for batch_size in self.batch_size:
+                if batch_size % self.tp_degree != 0:
+                    warnings.warn(
+                        f'Cannot enable "{gqa}" when a batch size '
+                        f'({batch_size} in {self.batch_size}) is not evenly '
+                        f'divisible by the tensor parallel degree '
+                        f'({self.tp_degree})'
+                    )
+                    success = False
+                    self.neuron_config.group_query_attention = None
+            if success:
+                return
+
+        if gqa == constants.GQA.ALL_GATHER_HEADS:
+            if self.n_head % self.tp_degree != 0:
+                warnings.warn(
+                    f'Cannot enable "{gqa}" when the number of query '
+                    f'attention heads ({self.n_head}) is not evenly divisible '
+                    f'by the tensor parallel degree ({self.tp_degree})'
+                )
+                self.neuron_config.group_query_attention = None
+            else:
+                return
+
+        if self.n_kv_head % self.tp_degree != 0:
+            warnings.warn(
+                f'KV head replication will be enabled since the number of KV '
+                f'heads ({self.n_kv_head}) is not evenly divisible by the '
+                f'tensor parallel degree ({self.tp_degree})'
+            )
+            self.neuron_config.group_query_attention = constants.GQA.REPLICATED_HEADS
 
     def init_context_decoder(self, unroll, buckets, model_obj):
         decoder_lm_head = {}
@@ -89,39 +140,38 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         for context_length_estimate in buckets:
             for batch_size in self.context_batch_sizes:
                 decoder_lm_head[context_length_estimate, batch_size] = DecoderLmHeadForSamplingNoEmbedding(
-                    tp_degree=self.tp_degree, 
-                    n_positions_list=[context_length_estimate], 
-                    n_active_tokens=context_length_estimate, 
-                    batch_size=batch_size, 
-                    attention_head_size=self.attention_head_size, 
+                    tp_degree=self.tp_degree,
+                    n_positions_list=[context_length_estimate],
+                    n_active_tokens=context_length_estimate,
+                    batch_size=batch_size,
+                    attention_head_size=self.attention_head_size,
                     amp=self.amp,
                     num_layers=self.num_layers,
                     n_head=self.n_head,
                     n_kv_head=self.n_kv_head,
                     unroll=unroll,
-                    neuron_config=self.neuron_config, 
+                    neuron_config=self.neuron_config,
                     allow_pad=self.allow_pad,
                     return_all_outputs=False
                 )
                 base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
         return decoder_lm_head
-        
+
 
     def init_token_decoder(self,unroll, buckets, model_obj):
         decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=self.tp_degree, 
-            n_positions_list=buckets, 
-            n_active_tokens=1, 
-            batch_size=self.batch_size, 
-            attention_head_size=self.attention_head_size, 
+            tp_degree=self.tp_degree,
+            n_positions_list=buckets,
+            n_active_tokens=1,
+            batch_size=self.batch_size,
+            attention_head_size=self.attention_head_size,
             amp=self.amp,
             num_layers=self.num_layers,
             n_head=self.n_head,
             n_kv_head=self.n_kv_head,
             unroll=unroll,
-            neuron_config=self.neuron_config, 
-            allow_pad=True, 
-            shard_over_batch=self.shard_over_batch,
+            neuron_config=self.neuron_config,
+            allow_pad=True,
             return_all_outputs=True
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -129,22 +179,21 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
         decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
         return decoder_lm_head
-    
+
     def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
         decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=self.tp_degree, 
-            n_positions_list=buckets, 
-            n_active_tokens=n_active_tokens, 
-            batch_size=self.batch_size, 
-            attention_head_size=self.attention_head_size, 
+            tp_degree=self.tp_degree,
+            n_positions_list=buckets,
+            n_active_tokens=n_active_tokens,
+            batch_size=self.batch_size,
+            attention_head_size=self.attention_head_size,
             amp=self.amp,
             num_layers=self.num_layers,
             n_head=self.n_head,
             n_kv_head=self.n_kv_head,
             unroll=unroll,
-            neuron_config=self.neuron_config, 
-            allow_pad=True, 
-            shard_over_batch=self.shard_over_batch,
+            neuron_config=self.neuron_config,
+            allow_pad=True,
             return_all_outputs=True
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -177,7 +226,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         *_, n_positions = self.n_positions_list
         layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
                              amp=self.amp, neuron_config=self.neuron_config, allow_pad=self.allow_pad, n_active_tokens=self.n_active_tokens,
-                             n_head=self.n_head, n_kv_head=self.n_kv_head, shard_over_batch=self.shard_over_batch)
+                             n_head=self.n_head, n_kv_head=self.n_kv_head)
         self.layers.append(layer)
         return layer
 
@@ -304,12 +353,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
             return self.forward_single(*inputs, neuron_config=neuron_config)
-        
+
         outputs = None
         slice_loop_var = range(0, sequence_length, self.n_active_tokens)
         if self.n_active_tokens > 1 and self.return_all_outputs:
             slice_loop_var = [0]
-  
+
         for start in slice_loop_var:
             slicing = slice(start, start + self.n_active_tokens)
             input_tensors = []
@@ -587,7 +636,7 @@ class ContextDecoder(torch.nn.Module):
         hidden = hidden.transpose(0, -1).contiguous()
         logits = self.context(hidden, cache_ids, start_ids, last_token_id)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :] 
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
@@ -599,7 +648,7 @@ class TokenDecoder(torch.nn.Module):
         hidden = hidden.transpose(0, -1).contiguous()
         logits = TokenDecoder.forward(hidden, *args)
         logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :] 
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
@@ -617,7 +666,7 @@ class MaybePadder:
 class DecoderLayer(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, n_head, amp,
-                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, shard_over_batch=False):
+                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -674,7 +723,6 @@ class DecoderLayer(torch.nn.Module):
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.extra_parameters = []
         self.allow_pad = allow_pad
-        self.shard_over_batch = shard_over_batch
         self.attn_out_sharding = 0
         self.attn_out_transposed = True
         self.mlp_out_sharding = 0
@@ -742,18 +790,12 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_weight = maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = maybe_pad(self.attn_q_bias, dim=0)
 
-            # GQA: Handle incompatibilities between KV heads & tp_degree
+            # Replication GQA: Handle explicit/implicit configuration
             if (
                 self.n_head != self.n_kv_head
-                and not self.shard_over_batch
-                and self.n_head % self.tp_degree != 0
+                and self.neuron_config.group_query_attention == constants.GQA.REPLICATED_HEADS
             ):
                 ratio = int(self.n_head / self.n_kv_head)
-                warnings.warn(
-                    f'Converting GQA/MQA to standard MHA. '
-                    f'The number of attention heads {self.n_head} is not divisible by {self.tp_degree} '
-                    f'which means the KV heads must be duplicated by a factor of {ratio}.'
-                )
 
                 def repeat(weight):
                     if weight is None:
@@ -908,6 +950,10 @@ class DecoderLayer(torch.nn.Module):
         self.extra_parameters = extras
 
         self.init_caches()
+
+    @property
+    def shard_over_batch(self):
+        return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
     def init_caches(self):
         n_heads_kv_cache = self.n_kv_head

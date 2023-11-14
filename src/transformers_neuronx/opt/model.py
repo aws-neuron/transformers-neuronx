@@ -24,6 +24,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH
+from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
 from transformers_neuronx.layers import transformer
@@ -269,14 +270,18 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None, shard_over_batch=False):
+    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
-        self.shard_over_batch = shard_over_batch
+
+    @property
+    def shard_over_batch(self):
+        # Property access allows fallback configuration to be enabled after construction
+        return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
         if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
@@ -404,7 +409,7 @@ class OPTForSamplingNoEmbeddingHlo:
             import transformers_neuronx.layers.attention as attention
         else:
             import transformers_neuronx.layers.attention_hsb as attention
-        
+
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV

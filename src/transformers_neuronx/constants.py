@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import enum
 
 # Tile size used for the weight transformation
 TILE_SIZE = 128
@@ -22,3 +23,9 @@ FUSED_QKV_TP_FACTOR = 3
 # Layout for attention
 LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
+
+# Group query attention sharding configurations
+class GQA(enum.Enum):
+    SHARD_OVER_BATCH = 'shard-over-batch'
+    ALL_GATHER_HEADS = 'all-gather-heads'
+    REPLICATED_HEADS = 'replicated-heads'

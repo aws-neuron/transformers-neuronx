@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from transformers_neuronx.constants import LAYOUT_HSB
+from transformers_neuronx import constants
 
 
 class QuantizationConfig:
@@ -83,7 +83,11 @@ class NeuronConfig():
         if self.continuous_batching:
             # Force using 2D cache_ids layout for continuous batching.
             self.use_2d_cache_ids = True
-        self.attention_layout = kargs.pop('attention_layout', LAYOUT_HSB)
+        self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
+        self.group_query_attention = kargs.pop('group_query_attention', None)
+        if self.group_query_attention is not None:
+            self.group_query_attention = constants.GQA(self.group_query_attention)
+
 
 class GenerationConfig:
 
