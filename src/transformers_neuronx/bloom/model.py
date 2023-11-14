@@ -22,6 +22,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
@@ -130,11 +131,19 @@ class BloomForSampling(base.NeuronModelBase):
             new_layer.add_attention_key(k, k_bias)
             new_layer.add_attention_value(v, v_bias)
 
-            new_layer.add_attention_output(
-                attn.dense.weight.detach(),
-                attn.dense.bias.detach(),
-                sharding=1,
-            )
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                new_layer.add_attention_output(
+                    attn.dense.weight.detach().T,
+                    attn.dense.bias.detach(),
+                    sharding=0,
+                )
+            else:
+                new_layer.add_attention_output(
+                    attn.dense.weight.detach(),
+                    attn.dense.bias.detach(),
+                    sharding=1,
+                )
             new_layer.add_pre_mlp_layer_norm(
                 layer.post_attention_layernorm.weight.detach(),
                 layer.post_attention_layernorm.bias.detach()
@@ -143,12 +152,20 @@ class BloomForSampling(base.NeuronModelBase):
                 mlp.dense_h_to_4h.weight.detach().T,
                 mlp.dense_h_to_4h.bias.detach()
             )
-            new_layer.add_mlp_output(
-                mlp.dense_4h_to_h.weight.detach(),
-                mlp.dense_4h_to_h.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if is_bsh:
+                new_layer.add_mlp_output(
+                    mlp.dense_4h_to_h.weight.detach().T,
+                    mlp.dense_4h_to_h.bias.detach(),
+                    sharding=0,
+                    transposed=True,
+                )
+            else:
+                new_layer.add_mlp_output(
+                    mlp.dense_4h_to_h.weight.detach(),
+                    mlp.dense_4h_to_h.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
 
@@ -174,7 +191,9 @@ class BloomForSampling(base.NeuronModelBase):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        return self._forward(hidden, *rst)
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            hidden = hidden.permute(2, 1, 0)
+        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         batch_size, *_  = input_ids.shape
