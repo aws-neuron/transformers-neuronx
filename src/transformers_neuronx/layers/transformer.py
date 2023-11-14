@@ -49,6 +49,8 @@ def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head
         n_active_tokens = 1
 
     ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias) if is_bsh else hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
+    if is_bsh:
+        ln_hidden = hlo.transpose210(ln_hidden)
     ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
     logits = hlo.dot00(lm_head_weight, ln_hidden)
     if lm_head_bias is not None:
