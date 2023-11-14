@@ -308,7 +308,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     return output
 
 
-def context_combined(score, values, tp_degree, n_kv_heads=0, dtype=None, sparse_mask=None, shard_over_batch=False):
+def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sparse_mask=None, shard_over_batch=False):
     """
     Compute "context" output from the QK score and value projection.
 

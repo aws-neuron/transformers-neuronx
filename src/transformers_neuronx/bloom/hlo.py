@@ -13,7 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention_hsb as attention, transformer, alibi
+from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.layers import transformer, alibi
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -23,7 +24,10 @@ class BloomForSamplingNoEmbeddingHlo:
         self.neuron_config = neuron_config
 
     def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        else:
+            hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
@@ -60,7 +64,9 @@ class BloomForSamplingNoEmbeddingHlo:
               post_mlp_ln_weight, post_mlp_ln_bias):
 
         dtype = hidden.dtype
-        ln_hidden = hlo.layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        layer_norm_f = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
+        ln_hidden = layer_norm_f(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
             attn_k_cache, attn_v_cache,
@@ -71,8 +77,9 @@ class BloomForSamplingNoEmbeddingHlo:
             neuron_config=self.neuron_config
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        ln_hidden = hlo.layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_hidden = hlo.mlp(
+        ln_hidden = layer_norm_f(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp_f = hlo.mlp_bsh if is_bsh else hlo.mlp
+        mlp_hidden = mlp_f(
             ln_hidden,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function='gelu_new',
@@ -86,7 +93,7 @@ class BloomForSamplingNoEmbeddingHlo:
         return hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs)
+        return transformer.ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, self.neuron_config)
 
     def attention(self,
         hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
@@ -101,6 +108,12 @@ class BloomForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
         dtype = hidden.dtype
         d_head = self.config.hidden_size // self.config.n_head
+
+        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            import transformers_neuronx.layers.attention as attention
+        else:
+            import transformers_neuronx.layers.attention_hsb as attention
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
