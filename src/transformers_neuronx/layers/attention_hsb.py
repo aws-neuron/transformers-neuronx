@@ -15,6 +15,7 @@
 from transformers_neuronx import hlo
 from transformers_neuronx import utils
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
+from transformers_neuronx import constants
 
 
 def query_key_value(
@@ -50,7 +51,12 @@ def query_key_value(
         _, kv_hidden_size_tp = k_weight.sizes
     n_heads_tp = hidden_size_tp // d_head
     n_kv_heads_tp = kv_hidden_size_tp // d_head
-    sharded_gqa_kv = kv_hidden_size_tp < d_head
+
+    sharded_gqa_kv = (
+        kv_hidden_size_tp < d_head
+        and neuron_config is not None
+        and neuron_config.group_query_attention == constants.GQA.ALL_GATHER_HEADS
+    )
 
     # (h, s, b) => (h, s * b)
     hidden_r = hlo.reshape(hidden, (hidden_size, n_active_tokens * n_seqs))
@@ -448,9 +454,14 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     denom = dtype[denom.sizes].Convert(denom)
 
     if n_kv_heads != 0:
-        _, n_heads_tp, *_ = past_prob.sizes
-        _, _, n_kv_heads_tp, *_ = past_values.sizes
-        n_repeats = n_heads_tp // n_kv_heads_tp
+        if shard_over_batch:
+            n_heads = n_heads_tp * tp_degree
+            n_repeats = n_heads // n_kv_heads
+        else:
+            _, n_heads_tp, *_ = past_prob.sizes
+            _, _, n_kv_heads_tp, *_ = past_values.sizes
+            n_repeats = n_heads_tp // n_kv_heads_tp
+
         # values layout: (n_positions, n_seqs_per_nc, n_kv_heads, d_head) -> repeat_dim=2
         past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
         active_values = hlo.repeat_kv(active_values, n_repeats=n_repeats, repeat_dim=2)
