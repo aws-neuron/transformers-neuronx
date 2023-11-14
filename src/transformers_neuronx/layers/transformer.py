@@ -21,15 +21,15 @@ def ln_lm_head(hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm
     Language model head with layer normalization.
 
     Context encoding network: 
-    n_active_tokens will be equal to context_length_estimate and n_parallel_output_tokens will be equal to 1.
+    n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
     In this case we slice the hidden input and compute the next token logits only for the last context token.
 
     Normal token gen network: 
-    n_active_tokens will be 1 and n_parallel_output_tokens will be 1.
+    n_active_tokens will be 1 and return_all_outputs will be True.
     No slicing required. Will return the next token logits for the current active token.
 
-    Speculative sampling token gen network:
-    n_active_tokens and n_parallel_output_tokens will be equal to "k" (k value is passed by user)
+    Speculative network:
+    n_active_tokens will be equal to "k" (k value is passed by user) and return_all_outputs will be True.
     No slicing required. Will return next token logits for "k" active tokens.
 
     Models: GPT2, OPT, GPT-J, GPTNeoX, BLOOM.
@@ -64,15 +64,15 @@ def rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias,
     Language model head with rms normalization.
 
     Context encoding network: 
-    n_active_tokens will be equal to context_length_estimate and n_parallel_output_tokens will be equal to 1.
+    n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
     In this case we slice the hidden input and compute the next token logits only for the last context token.
 
     Normal token gen network: 
-    n_active_tokens will be 1 and n_parallel_output_tokens will be 1.
+    n_active_tokens will be 1 and return_all_outputs will be True.
     No slicing required. Will return the next token logits for the current active token.
 
-    Speculative sampling token gen network:
-    n_active_tokens and n_parallel_output_tokens will be equal to "k" (k value is passed by user)
+    Speculative network:
+    n_active_tokens will be equal to "k" (k value is passed by user) and return_all_outputs will be True.
     No slicing required. Will return next token logits for "k" active tokens.
 
     Models: LLaMa.
