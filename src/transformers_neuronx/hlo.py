@@ -819,7 +819,7 @@ def attention_mask(cache_ids, start_ids, n_positions):
 
     Implementation Notes:
     ---------------------
-    The goal of creating multiple a masks for both the prior state and the
+    The goal of creating multiple masks for both the prior state and the
     active state is to enable the calculation of the attention score
     with fewer data dependencies than a traditional attention mechanism.
 
