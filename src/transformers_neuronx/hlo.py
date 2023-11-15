@@ -1715,9 +1715,7 @@ def _topk(tensor, k):
 def full_like(tensor, value):
     dtype = tensor.dtype
     size = tensor.sizes
-    result = dtype.Constant(constant_value=value)
-    result = dtype[size].Broadcast(result, dimensions=[])
-    return result
+    return full(value, dtype, size)
 
 
 def all_reduce_max(tensor, tp_degree=1, dtype=None, replica_groups=None):
@@ -1778,20 +1776,30 @@ def topk(tensor, dim, k=50, tp_degree=1):
     """
     Get the top-k values and indices along a dimension.
 
+    When using a `tp_degree > 1`, this function assumes that the sharding
+    dimension is the same as the reduction dimension. In this mode, the
+    returned index is transformed into a global index by adding an offset
+    of `tensor.sizes[dim] * rank_id`.
+
     Implementation Notes:
-    ---------------------
-    - The `k` value may not be larger than tensor.shape[dim]. The dimension size
-      may be smaller than anticipated with large tensor parallel degrees.
-    - Top-k instruction may only be invoked on the final dimension.
-    - The input `tensor` size along dimension `dim` must be a multiple of 8
-    - The input `tensor` may not be 1d. The compiler will fail.
+    - The `k` value may not be larger than tensor.shape[dim]. The dimension
+      size may be smaller than anticipated with large tensor parallel degrees.
+    - The Top-k custom call may only be invoked on the final dimension.
+    - The input `tensor` size along dimension `dim` must be a multiple of 8.
+
+    Arguments:
+        tensor: The values to select the top-k from.
+        dim: The dimension along which to select the values from.
+        k: The number of values to select.
+        tp_degree: The number of ranks to collect across.
+
+    Returns:
+        value: The top-k values in the tensor.
+        index: The indices of the top-k values in the tensor.
     """
 
     if k == 1:
         return argmax(tensor, dim, return_values=True, keepdim=True, tp_degree=tp_degree)
-
-    scribe = tensor.scribe
-    f32 = scribe.f32
 
     rank = len(tensor.sizes)
     if dim < 0:
@@ -1815,39 +1823,39 @@ def topk(tensor, dim, k=50, tp_degree=1):
 
     # Heuristic: When tensor sizes are small, gather first
     if k > tensor.sizes[dim] and tp_degree > 1:
-        tensor = all_gather(tensor, dim=1, tp_degree=tp_degree)
+        tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
         tp_degree = 1
 
-    # Initial reduction
+    # Initial reduction to find rank-local top-k
     value, index = _topk(tensor, k)
 
     # Early exit if not doing a tensor parallel computation
     if tp_degree == 1:
         return output(value, index)
 
-    rank_size = f32.Constant(constant_value=tensor.sizes[dim])
-
     # Combine initial reduction from all ranks
     value = all_gather(value, dim=dim, tp_degree=tp_degree)
     index = all_gather(index, dim=dim, tp_degree=tp_degree)
 
-    # Correct index so that it is global. Note: Use f32 computation to avoid compiler issue
+    # Add shard size offset to rank-local index to make it global
     dtype = index.dtype
-    sizes = index.sizes
-    rank_size_br = f32[sizes].Broadcast(rank_size, dimensions=[])
-    k_size = f32.Constant(constant_value=k)
-    k_size_br = f32[sizes].Broadcast(k_size, dimensions=[])
-    iota = f32[sizes].Iota(dimensions=[dim])
-    group_id = f32[sizes].Divide(iota, k_size_br)
-    group_id = f32[sizes].Floor(group_id)
-    offset = f32[sizes].Multiply(group_id, rank_size_br)
-    offset = dtype[sizes].Convert(offset)
-    index = dtype[sizes].Add(index, offset)
+    sizes = list(index.sizes)
+    assert sizes[dim] == tp_degree * k, (
+        f"Expected input dimension {dim} to be size {tp_degree * k} but found {sizes[dim]} (shape={sizes})"
+    )
+    sizes.insert(dim + 1, k)
+    sizes[dim] = tp_degree
+    rank_id = dtype[sizes].Iota(dimensions=[dim])
+    rank_id = reshape(rank_id, index.sizes)
+    shard_size = full(tensor.sizes[dim], dtype, index.sizes)
+    offset = multiply(rank_id, shard_size)
+    offset = cast(offset, dtype)
+    index = add(index, offset)
 
-    # Find the final global index
+    # Final global reduction to find true top-k values
     value, replica_index = _topk(value, k)
 
-    # Get the real indices
+    # Gather global index from the initial offset rank-local index
     index = gather(index, dim, replica_index)
     return output(value, index)
 
@@ -2062,7 +2070,10 @@ def reshape(tensor, shape):
         return tensor
     dst_numel = functools.reduce(operator.mul, shape)
     src_numel = functools.reduce(operator.mul, tensor.sizes)
-    assert dst_numel == src_numel
+    assert dst_numel == src_numel, (
+        f"Shape {tensor.sizes} with {src_numel} elements cannot be reshaped to "
+        f"{shape} with {dst_numel} elements"
+    )
     return tensor.dtype[shape].Reshape(tensor)
 
 
@@ -2102,6 +2113,10 @@ def cos(tensor):
     sizes = tensor.sizes
     dtype = tensor.dtype
     return dtype[sizes].Cos(tensor)
+
+
+def floor(tensor):
+    return tensor.dtype[tensor.sizes].Floor(tensor)
 
 
 def transpose210(tensor):
