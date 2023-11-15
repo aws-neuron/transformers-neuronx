@@ -283,28 +283,13 @@ class OPTForSamplingNoEmbeddingHlo:
         # Property access allows fallback configuration to be enabled after construction
         return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            hidden_sizes = batch_size, n_active_tokens, self.hidden_size
-        else:
-            hidden_sizes = self.hidden_size, n_active_tokens, batch_size
-        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.s32.Parameter(parameter_number=3)
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
-        # For the best perf, we only use kv prefetch in the token generation stage
-        use_prefetch = n_active_tokens != n_positions
-        triu_comparison = 'LT' if use_prefetch else 'LE'
-        mask, active_mask = hlo.decoder_attention_mask(
-            start_ids,
-            cache_ids,
-            n_positions,
-            triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=use_prefetch,
-            start_mask=True
+    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
+        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+            scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
-        return (hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask), (1, 0, None, None, None)
+        curr_window_start = scribe.s32.Parameter(parameter_number=4)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
+        return (hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask), (*dims, None)
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
