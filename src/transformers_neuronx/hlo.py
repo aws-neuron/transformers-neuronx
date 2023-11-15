@@ -795,6 +795,64 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
+def attention_mask(cache_ids, start_ids, n_positions):
+    """
+    Create decomposed prior/active attention masks.
+
+    The attention mask generated depends on the padding/alignment style used
+    and which mode the model is being used for:
+    - Single token generation
+    - Parallel context encoding (prefill)
+    - Speculative decoding
+    - Windowed context encoding (prefill)
+    The required mask(s) will be derived from the input parameters.
+
+    Arguments:
+        cache_ids: The positions to update in the KV cache.
+        start_ids: The padding/batch offset for each batch line.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the size of the bucket.
+
+    Returns:
+        prior_mask: The attention mask to apply to the K/V cache
+        active_mask: The attention mask to apply to the active tokens.
+
+    Implementation Notes:
+    ---------------------
+    The goal of creating multiple a masks for both the prior state and the
+    active state is to enable the calculation of the attention score
+    with fewer data dependencies than a traditional attention mechanism.
+
+    Traditionally the active K/V is inserted (scatter) into the K/V cache prior
+    to computing the attention score/context. This means that the computations
+    have a data dependency on both the large K/V cache and the small active K/V
+    (exactly 1 during auto-regressive token generation).
+
+    Using a decomposed attention calculation is significantly faster
+    since it allows the different portions of the attention to be
+    scheduled more flexibly and does not introduce a data dependency on a
+    relatively slow operation (scatter).
+    """
+    if len(cache_ids.sizes) == 2:
+        # TODO: support lhs_aligned flag and the related attention mask
+        return decoder_attention_mask_lhs_aligned(
+            cache_ids,
+            n_positions,
+        )
+    else:
+        n_active_tokens, = cache_ids.sizes
+        use_prefetch = n_active_tokens != n_positions
+        triu_comparison = 'LT' if use_prefetch else 'LE'
+        return decoder_attention_mask(
+            start_ids,
+            cache_ids,
+            n_positions,
+            triu_comparison=triu_comparison,
+            allow_kv_dot_prefetch=use_prefetch,
+            start_mask=True,
+        )
+
+
 def decoder_attention_mask(start_ids, position_ids, n_positions, triu_comparison='LE',
                            allow_kv_dot_prefetch=False, start_mask=True):
     batch_size, = start_ids.sizes
@@ -2303,7 +2361,7 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
 
     Returns:
         prior_mask: The attention mask to apply to the KV cache
-        active_mask: The attention maks to apply to the active tokens.
+        active_mask: The attention mask to apply to the active tokens.
     """
     scribe = cache_ids.scribe
     s32 = scribe.s32
