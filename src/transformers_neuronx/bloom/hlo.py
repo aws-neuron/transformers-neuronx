@@ -23,29 +23,12 @@ class BloomForSamplingNoEmbeddingHlo:
         self.config = config
         self.neuron_config = neuron_config
 
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
-        else:
-            hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
-        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.s32.Parameter(parameter_number=3)
-        # NOTE: When using token generation network, we generate a mask for the
-        #       past tokens and the current tokens separately. This allows us
-        #       use the split "prefetch" attention layer.
-        token_generation = n_active_tokens == 1
-        triu_comparison = 'LT' if token_generation else 'LE'
-        mask, active_mask = hlo.decoder_attention_mask(
-            start_ids,
-            cache_ids,
-            n_positions,
-            triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=token_generation,
-            start_mask=True
+    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
+        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        return (hidden, last_token_id, cache_ids, mask, active_mask), (1, 0, None, None)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
+        return (hidden, last_token_id, cache_ids, mask, active_mask), dims
 
     def pre_layer(self, hidden, last_token_id, cache_ids, mask, active_mask, slopes):
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)

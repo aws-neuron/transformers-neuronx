@@ -38,46 +38,16 @@ class LlamaForSamplingNoEmbeddingHlo:
             and self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
         )
 
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
-        else:
-            hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
+    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
+        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
+        )
         head_dim = self.config.attention_head_size
-
-        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            position_sizes = batch_size, n_active_tokens
-            cache_ids = scribe.s32[position_sizes].Parameter(parameter_number=1)  # 2d cache_ids
-        else:
-            cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)  # 1d cache_ids
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.s32.Parameter(parameter_number=3)
-        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+        pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
-
-        # NOTE: When using token generation network, we generate a mask for the
-        #       past tokens and the current tokens separately. This allows us
-        #       use the split "prefetch" attention layer.
-        use_prefetch = n_active_tokens != n_positions
-        triu_comparison = 'LT' if use_prefetch else 'LE'
-        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            # TODO: support lhs_aligned flag and the related attention mask
-            mask, active_mask = hlo.decoder_attention_mask_lhs_aligned(
-                cache_ids,
-                n_positions,
-            )
-        else:
-            mask, active_mask = hlo.decoder_attention_mask(
-                start_ids,
-                cache_ids,
-                n_positions,
-                triu_comparison=triu_comparison,
-                allow_kv_dot_prefetch=use_prefetch,
-                start_mask=True,
-            )
-        return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), (1, 0, None, None)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
+        return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), dims
 
     def layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,

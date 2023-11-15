@@ -16,6 +16,68 @@ from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
 
 
+def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_config=None):
+    """
+    Defines the set of required inputs for all decoder models.
+
+    For any model that requires *more* inputs than the required inputs produced
+    by this function, the next parameters must be linearly allocated starting
+    at 4. Additonal parameters must also define their own sequence slice
+    dimensions (See below).
+
+    Args:
+        scribe: The PyHLO scribe object to write operations with.
+        dtype: The data type of the hidden state.
+        batch_size: The active batch size (may differ from cache batch size)
+        n_active_tokens: The number of active tokens to process. During context
+            prefill, this will be larger than 1. During autogregressive
+            token generation this will be exactly equal to 1.
+        hidden_size: The size of the hidden state.
+        neuron_config: Optional configurations.
+
+    Returns:
+        hidden: The hidden state (Assumed to be embedded on CPU)
+        cache_ids: The positions to update in the KV cache. This is 1d when
+            using RHS-alignment since all batch lines update the same
+            places in the KV cache. This is 2d when LHS-alignment since
+            each batch line can update a different offset in the KV cache.
+        start_ids: The offset into each batch line. When using
+            LHS-alignment, this indicates the start offset. When using
+            RHS-alignment, this indicates the batch line to update.
+        last_token_id: An integer index (along the sequence dimenson) which
+            indicates which is the last token. This is used in the language
+            model head to slice the hidden state.
+        sequence_slice_dimensions: The dimension of each input tensor which can
+            be sliced during token generation.
+    """
+    s32 = scribe.s32
+
+    if neuron_config and neuron_config.attention_layout == LAYOUT_BSH:
+        hidden_sizes = batch_size, n_active_tokens, hidden_size
+    else:
+        hidden_sizes = hidden_size, n_active_tokens, batch_size
+
+    hidden = dtype[hidden_sizes].Parameter(parameter_number=0)
+    cache_2d = neuron_config and neuron_config.use_2d_cache_ids
+    if cache_2d:
+        position_sizes = batch_size, n_active_tokens
+        cache_ids = s32[position_sizes].Parameter(parameter_number=1)   # 2d cache_ids
+    else:
+        cache_ids = s32[n_active_tokens].Parameter(parameter_number=1)  # 1d cache_ids
+
+    start_ids = s32[batch_size].Parameter(parameter_number=2)
+    last_token_id = s32.Parameter(parameter_number=3)
+
+    sequence_slice_dimensions = (
+        1,                     # hidden        | In both HSB/BSH the sequence dim is 1
+        1 if cache_2d else 0,  # cache_ids     | Sequence dim varies based on alignment
+        None,                  # start_ids     | Offset is per batch, no slicing required
+        None                   # last_token_id | Scalar, no slicing required
+    )
+
+    return hidden, cache_ids, start_ids, last_token_id, sequence_slice_dimensions
+
+
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
     Language model head with layer normalization.
