@@ -95,8 +95,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         equal to the number of Q heads. This makes the GQA model look identical
         to an MHA model.
         """
-
         gqa = self.neuron_config.group_query_attention
+
+        # MHA Early exit - This avoids emitting irrelevant GQA warnings
+        if gqa is None and self.n_head == self.n_kv_head:
+            return
+
         if gqa == constants.GQA.REPLICATED_HEADS:
             return
 
