@@ -268,11 +268,16 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
-    batch_size, n_active_tokens, hidden_size = size = hidden.sizes
+    size = hidden.sizes
+    batch_dims = list(range(len(size)))
+    batch_dims.pop(dim)
+    batch_shapes = list(size)
+    batch_shapes.pop(dim)
 
-    # For batch=1 token generation use triton implementation
-    # batch>1/context encoding implementation is in development
-    if batch_size == 1 and n_active_tokens == 1:
+    # For batch == 1, token generation use triton implementation. The batch > 1
+    # context encoding implementation is in development
+    num_tokens = functools.reduce(operator.mul, batch_shapes, 1)
+    if num_tokens == 1:
         return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
 
     dtype = hidden.dtype
@@ -281,24 +286,21 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
     hidden = cast(hidden, f32)
 
-    # PERF: Is it better to use BatchNormTraining operation here?
-    square = f32[hidden.sizes].Multiply(hidden, hidden)
+    square = multiply(hidden, hidden)
     variance = reduce_mean(square, dim)
-    eps = f32.Constant(constant_value=eps)
-    eps_br = f32[variance.sizes].Broadcast(eps, dimensions=[])
-    mean_eps = f32[variance.sizes].Add(variance, eps_br)
-    rsqrt = f32[variance.sizes].Rsqrt(mean_eps)
-    dims = [idx for idx in range(len(hidden.sizes)) if idx != dim]
-    rsqrt_br = f32[size].Broadcast(rsqrt, dimensions=dims)
-    scaled = f32[size].Multiply(hidden, rsqrt_br)
+    eps = full(eps, f32, batch_shapes)
+    mean_eps = add(variance, eps)
+    mean_rsqrt = rsqrt(mean_eps)
+    rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
+    scaled = multiply(hidden, rsqrt_br)
 
     if weight is None:
         scaled = cast(scaled, dtype)
         return scaled
 
     weight = cast(weight, f32)
-    weight_br = broadcast(weight, size, broadcast_dimensions=[dim])
-    result = f32[size].Multiply(scaled, weight_br)
+    weight_br = broadcast(weight, size, [dim])
+    result = multiply(scaled, weight_br)
     result = cast(result, dtype)
 
     return result
