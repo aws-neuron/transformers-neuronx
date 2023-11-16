@@ -64,6 +64,7 @@ setup(
             'opt_demo=transformers_neuronx.opt.demo:main',
             'opt_gen_random_pretrained=transformers_neuronx.opt.gen_random_pretrained:main',
             'gen_randn_hlo_snapshot=transformers_neuronx.tools.gen_hlo_snapshot:main_randn',
+            'ckpt_converter=transformers_neuronx.tools.ckpt_converter:ckpt_converter',
         ],
     },
     install_requires=[
