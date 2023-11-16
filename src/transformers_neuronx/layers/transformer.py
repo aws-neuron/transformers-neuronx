@@ -168,7 +168,6 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     vocab_size, _ = logits.sizes
     result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
 
-
     if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
         result = hlo.all_gather(result, 0, tp_degree)
 

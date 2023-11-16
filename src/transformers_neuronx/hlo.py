@@ -2545,8 +2545,7 @@ def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions):
         cache_ids = reduce_min(cache_ids, dim=1, keepdim=True)
     size = (batch_size, n_active_tokens, n_positions)
     positions = dtype[size].Iota(dimensions=[2])
-    cache_ids = unsqueeze(cache_ids, -1)
-    cache_ids = broadcast(cache_ids, size, [0, 1, 2])
+    cache_ids = broadcast(cache_ids, size, [0, 1])
     prior_mask = greater(cache_ids, positions)
 
     # Active mask

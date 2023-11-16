@@ -153,7 +153,9 @@ class LlamaForSampling(base.NeuronModelBase):
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         if is_bsh:
             hidden = hidden.permute(2, 1, 0)
-        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        logits = self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        logits = self._postprocess(logits, start_ids=start_ids)
+        return logits
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
         input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)

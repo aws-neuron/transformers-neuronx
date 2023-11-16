@@ -249,8 +249,10 @@ def update_cache(cache, cache_ids, values, start_ids=None):
 
             batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
             start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
-            cache_ids = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
-            cache_ids = cache_ids_dtype[cache_ids.sizes].Add(cache_ids, start_ids_br)
+
+            indices = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[0])
+            indices = cache_ids_dtype[cache_ids.sizes].Multiply(indices, batch_size_br)
+            indices = cache_ids_dtype[cache_ids.sizes].Add(indices, start_ids_br)
 
             # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
             assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
@@ -260,7 +262,7 @@ def update_cache(cache, cache_ids, values, start_ids=None):
                                 inserted_window_dims=[0],
                                 scatter_dims_to_operand_dims=[0],
                                 index_vector_dim=1)
-            cache_r = hlo.scatter(cache_r, cache_ids, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            cache_r = hlo.scatter(cache_r, indices, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
         else:
             raise NotImplementedError(f"Updating 2D cache_ids is not implemented for "

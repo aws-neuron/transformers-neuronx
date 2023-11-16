@@ -225,9 +225,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         # continuous batching
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
-        if n_active_tokens > 1:
+        if n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0:
             # context encoding
-            return input_ids, cache_ids, seq_ids
+            n_positions = self.context_buckets[-1]
+            cache_ids_pad = torch.zeros(1, n_positions, dtype=cache_ids.dtype, device='cpu')
+            cache_ids_pad[:, :n_active_tokens] = cache_ids[:, :n_active_tokens]
+            return input_ids, cache_ids_pad, seq_ids
+
         # token generation
         full_input_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype, device="cpu")
         full_cache_ids = torch.zeros(batch_size, 1, dtype=cache_ids.dtype, device="cpu")
@@ -239,6 +243,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return full_input_ids, full_cache_ids, None
 
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
+        # enable dynamic batch size feature for continuous batching
+        input_ids, cache_ids, start_ids = self._prepare_for_continuous_batching(input_ids, cache_ids, start_ids)
+
         # right pad the input_ids if neccessary
         input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
 
@@ -255,6 +262,25 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             cache_ids += self.prefixed_length
 
         return input_ids, cache_ids, start_ids, last_token_id
+
+    def _postprocess(self, logits, start_ids=None):
+        if start_ids is None:
+            return logits
+
+        running_batch_size, n_embed = logits.shape
+        input_batch_size = start_ids.shape[0]
+        if running_batch_size == input_batch_size:
+            # context encoding (aka prefill)
+            return logits
+
+        # token generation (aka decoding)
+        seq_ids = start_ids.flatten().tolist()
+        assert input_batch_size == len(seq_ids), f"expected seq_ids to be {input_batch_size} in length, but seq_ids={seq_ids}"
+        new_logits = torch.zeros(input_batch_size, n_embed, dtype=logits.dtype, device=logits.device)
+        for idx, seq_id in enumerate(seq_ids):
+            new_logits[idx, :] = logits[seq_id, :]
+
+        return new_logits
 
     def _cast_logits(self, logits):
          # Cast logits to float32 or the dtype specified in the neuron config
