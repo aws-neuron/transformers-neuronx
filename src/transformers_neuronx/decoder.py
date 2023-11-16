@@ -97,9 +97,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         """
         gqa = self.neuron_config.group_query_attention
 
-        # MHA Early exit - This avoids emitting irrelevant GQA warnings
-        if gqa is None and self.n_head == self.n_kv_head:
-            return
+        if gqa is None:
+            # MHA Early exit - This avoids emitting irrelevant GQA warnings
+            if self.n_head == self.n_kv_head:
+                return
+            self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
 
         if gqa == constants.GQA.REPLICATED_HEADS:
             return
@@ -115,7 +117,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                         f'({self.tp_degree})'
                     )
                     success = False
-                    self.neuron_config.group_query_attention = None
+                    self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
             if success:
                 return
 
@@ -126,7 +128,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     f'attention heads ({self.n_head}) is not evenly divisible '
                     f'by the tensor parallel degree ({self.tp_degree})'
                 )
-                self.neuron_config.group_query_attention = None
+                self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
             else:
                 return
 
