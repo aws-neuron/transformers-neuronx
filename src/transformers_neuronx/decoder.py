@@ -787,7 +787,7 @@ class DecoderLayer(torch.nn.Module):
         # If we allow padding then we need to pad non-sharded QKV weight dimensions
         if self.allow_pad:
             # Hidden size padding
-            hidden_size, _ = self.attn_q_weight.shape
+            _, hidden_size = self.attn_q_weight.shape
             n_heads = hidden_size // self.attention_head_size
             n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
             hidden_size_padded = n_heads_padded * self.attention_head_size
