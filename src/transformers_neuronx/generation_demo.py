@@ -23,10 +23,13 @@ import neuronxcc
 import math
 import shutil
 import logging
+import os, psutil
+
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 from transformers import AutoConfig
 from transformers_neuronx import dtypes
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.module import save_pretrained_split
 # TODO: make it one-shot import
 from transformers_neuronx.gpt2.model import GPT2ForSampling, GPT2ForSamplingWithContextBroadcasting
@@ -181,6 +184,10 @@ def benchmark(
     return metrics
 
 def main():
+
+    us = psutil.Process(os.getpid())
+    print(us.cmdline())
+
     parser = argparse.ArgumentParser()
     amp_choices = ['f32', 'f16', 'bf16']
     floatx_floaty_combinations = list(itertools.product(amp_choices, amp_choices))
@@ -209,6 +216,8 @@ def main():
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
+
+    run_parser.add_argument('--gqa', type=str, default=None)
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
@@ -463,13 +472,14 @@ def run(args, hf_model_name, model_cls):
                 os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
                 print(f"Set snapshot path {snapshot_path}, dump_path: {dump_path}")
 
+            neuron_config = NeuronConfig(group_query_attention=args.gqa)
 
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                                unroll=args.unroll, context_length_estimate=args.context_length_estimate)
+                                                unroll=args.unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
