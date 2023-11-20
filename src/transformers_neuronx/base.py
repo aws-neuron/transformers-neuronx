@@ -129,7 +129,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         Other arguments that are required by the model are contained in `rest`.
         """
         context_length = hidden.shape[1]
-        # batch_size is in dim 2 because of the transpose taken in _forward function. 
+        # batch_size is in dim 2 because of the transpose taken in _forward function.
         # For BSH, it is dim 0.
         is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
         batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
@@ -221,7 +221,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         if seq_ids is None or not continuous_batching:
             # static batching
-            return input_ids, cache_ids, None
+            return input_ids, cache_ids, seq_ids
 
         # continuous batching
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
@@ -293,7 +293,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         hidden = hidden.transpose(0, -1).contiguous()
 
         _, context_length, _ = hidden.shape
-        
+
         if context_length > 1:
             logits = self.context(hidden, *args, neuron_config=neuron_config)
         else:
