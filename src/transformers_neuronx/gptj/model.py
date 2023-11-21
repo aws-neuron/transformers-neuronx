@@ -315,7 +315,7 @@ class GPTJLnLmHead:
         # Pad the lm_head_weight and lm_head_bias if vocab_size % tp_degree != 0
         lm_head_weight = self.lm_head.weight.detach().T
         _, vocab_size = lm_head_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = shard_along(lm_head_weight, dim=1)
         lm_head_bias = self.lm_head.bias.detach()

@@ -30,7 +30,7 @@ from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.utils import interleave_qkv
+from transformers_neuronx.utils import interleave_qkv, get_pad_size
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -121,13 +121,28 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 return
 
         if gqa == constants.GQA.ALL_GATHER_HEADS:
-            if self.n_head % self.tp_degree != 0:
+            if (self.n_kv_head * self.attention_head_size) % self.tp_degree != 0:
                 warnings.warn(
-                    f'Cannot enable "{gqa}" when the number of query '
-                    f'attention heads ({self.n_head}) is not evenly divisible '
+                    f'Cannot enable "{gqa}" when the hidden size of KV '
+                    f'({self.n_kv_head} x {self.attention_head_size}) is not evenly divisible '
                     f'by the tensor parallel degree ({self.tp_degree})'
                 )
                 self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
+
+            if self.n_head % self.tp_degree != 0:
+                # try pad on n_head, if pad_size could be evenly disible by n_kv_head,
+                # then we can evenly distribute same number of padding q_head to each k/v head
+                pad_size = utils.get_pad_size(self.n_head, self.tp_degree)
+
+                if pad_size % self.n_kv_head == 0:
+                    return
+                else:
+                    warnings.warn(
+                        f'Cannot enable "{gqa}" when the number of padding {pad_size} need for query '
+                        f'attention heads ({self.n_head}) with the tensor parallel degree ({self.tp_degree}) '
+                        f'is not divisible by KV heads ({self.n_kv_head})'
+                    )
+                    self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
             else:
                 return
 
@@ -259,7 +274,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         _, vocab_size = self.lm_head_weight.shape
         # Pad vocab size such that it can be divided by the following factor
         divisor = int(os.environ.get('NEURON_VOCAB_PAD_DIVISOR', str(self.tp_degree)))
-        vocab_pad = utils.pad_vocab_size(vocab_size, divisor)
+        vocab_pad = utils.get_pad_size(vocab_size, divisor)
         lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
         ln_lm_head_params = [*self.pre_layer_parameters, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
@@ -657,15 +672,40 @@ class TokenDecoder(torch.nn.Module):
         return logits
 
 
-
 class MaybePadder:
 
-    def __init__(self, size) -> None:
+    def __init__(self, size, padding="end", split_size=None, interleaved_factor=None) -> None:
+        self.split_size = split_size
         self.size = size
+        self.padding = padding
+        self.interleaved_factor = interleaved_factor
 
     def __call__(self, weight, dim):
-        return utils.pad(weight, dim, self.size)
+        if self.padding == "end":
+            return utils.pad(weight, dim, self.size, left=False)
+        else:
+            if weight is None:
+                return weight
+            assert self.padding == "interleaved", f"Invalid padding mode {self.padding}"
+            assert self.interleaved_factor, f"interleaved_factor is not provided"
+            # when split_size is set, we first split the target weight at dim
+            # into (split_size x ?), for example, to do interleaved padding on of KV weight
+            # we first need to reshape it into (hidden, num_kv_head, d_head)
+            # and then apply interleaved padding on num_kv_head
+            weight_shapes = list(weight.shape)
 
+            padded_shape = weight_shapes.copy()
+            padded_shape[dim] = self.size
+
+            new_size = self.size
+            if self.split_size:
+                assert weight_shapes[dim] % self.split_size == 0, f"shape on dim_{dim} {weight_shapes[dim]} cannot be evenly divisible by provided split_size {self.split_size}"
+                new_shape = weight_shapes[:dim] + [self.split_size] + [weight_shapes[dim] // self.split_size] + weight_shapes[dim+1:]
+                weight = weight.view(new_shape)
+                new_size = self.size // (weight_shapes[dim] // self.split_size)
+            res = utils.pad_interleaved(weight, dim, new_size,
+                weight.shape[dim]//self.interleaved_factor, (new_size-weight.shape[dim])//self.interleaved_factor)
+            return res.view(padded_shape)
 
 class DecoderLayer(torch.nn.Module):
 
@@ -789,11 +829,14 @@ class DecoderLayer(torch.nn.Module):
             n_heads = hidden_size // self.attention_head_size
             n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
             hidden_size_padded = n_heads_padded * self.attention_head_size
-            maybe_pad = MaybePadder(hidden_size_padded)
-
+            if self.neuron_config.group_query_attention == constants.GQA.ALL_GATHER_HEADS:
+                maybe_pad = MaybePadder(hidden_size_padded,
+                                        padding="interleaved",
+                                        split_size=n_heads, interleaved_factor=self.n_kv_head)
+            else:
+                maybe_pad = MaybePadder(hidden_size_padded)
             self.attn_q_weight = maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = maybe_pad(self.attn_q_bias, dim=0)
-
             # Replication GQA: Handle explicit/implicit configuration
             if (
                 self.n_head != self.n_kv_head
@@ -837,7 +880,6 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_scales = None
                 self.attn_v_bias = None
             self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
-
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
                 _, intermediate_size = self.mlp_in_weight.shape

@@ -77,7 +77,7 @@ class DecoderLmHeadTopKForSamplingNoEmbedding(torch.nn.Module):
         self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
         self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
         _, vocab_size = self.lm_head_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
         ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
