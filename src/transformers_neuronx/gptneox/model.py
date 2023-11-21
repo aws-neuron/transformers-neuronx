@@ -400,7 +400,7 @@ class GPTNeoXLnLmHead:
         # Pad the lm_head_weight if vocab_size % tp_degree != 0
         embed_out_weight = self.embed_out.weight.detach().T
         _, vocab_size = embed_out_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         embed_out_weight = torch.nn.functional.pad(embed_out_weight, (0, vocab_pad, 0, 0))
         self.embed_out_weight = shard_along(embed_out_weight, dim=1)
         self.embed_out.nullify()
