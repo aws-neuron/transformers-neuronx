@@ -188,7 +188,15 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
         """
         def filter_sorted(sorted_scores):
             cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
-            mask = cumulative_probs <= top_p
+            mask = cumulative_probs < top_p
+
+            # Per the original paper (https://arxiv.org/pdf/1904.09751.pdf, page 4 bottom), this filter include the minimal 
+            # subset of tokens (in descending sorted order of scores) with cumulative probability >= top_p. This means that 
+            # we need an extra token, in addition to those filtered by above logic (cumulative_probs < top_p). We do this by 
+            # inserting a True column and the head of the mask (therefore shifting the rest of mask to the right by one),
+            # and dropping the last column of the mask.
+            mask = torch.concat((torch.ones([mask.shape[0], 1], dtype=torch.bool), mask[:, :-1]), axis=-1)
+            
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
             sorted_scores = sorted_scores[:, :n_to_keep]
