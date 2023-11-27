@@ -351,7 +351,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                         mlp.c_proj.weight.detach(),
                         mlp.c_proj.bias.detach(),
                         sharding=0,
-                        transposed=False,
+                        transposed=True,
                     )
                 else:
                     new_layer.add_mlp_output(
