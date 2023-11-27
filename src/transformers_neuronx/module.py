@@ -18,6 +18,7 @@ import re
 import warnings
 
 import torch
+from safetensors import safe_open
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
 
@@ -137,16 +138,32 @@ class LowMemoryLazyLinear(torch.nn.LazyLinear, LowMemoryModule): ...
 
 class PretrainedModel(LowMemoryModule):
 
+    @staticmethod
+    def _safeload(state_dict_path):
+        state_dict = {}
+        with safe_open(state_dict_path, framework="pt") as f:
+            for k in f.keys():
+                state_dict[k] = f.get_tensor(k)
+        return state_dict
+
     @classmethod
     def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
         state_dict_path = os.path.join(pretrained_model_path, 'pytorch_model.bin')
-        if os.path.isdir(state_dict_path):
+        state_dict_safetensor_path = os.path.join(pretrained_model_path, 'model.safetensors')
+
+        if os.path.isfile(state_dict_safetensor_path):
+            state_dict = PretrainedModel._safeload(state_dict_safetensor_path)
+            model.load_state_dict_low_memory(state_dict)
+        elif os.path.isdir(state_dict_path):
             model.load_state_dict_dir(state_dict_path)
-        else:
+        elif os.path.isfile(state_dict_path):
             state_dict = torch.load(state_dict_path)
             model.load_state_dict_low_memory(state_dict)
+        else:
+            raise FileNotFoundError(f"Can not find model.safetensors or pytorch_model.bin in {pretrained_model_path}")
+
         return model
 
 
