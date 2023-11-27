@@ -14,9 +14,9 @@
 # ==============================================================================
 
 import numpy as np
-from neuronxcc.thor import program_id, affine_range
-from neuronxcc.thor.ops import load, store, arange
-from neuronxcc.thor.isa import reduce_free, activation
+from neuronxcc.nki import program_id, affine_range
+from neuronxcc.nki.ops import load, store, arange
+from neuronxcc.nki.isa import reduce_free, activation
 
 def softmax_inlined_single_tile(a_ptr, b_ptr):
     ix = arange(0, 128)[:, None]
