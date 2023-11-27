@@ -18,50 +18,50 @@ import torch
 import base64
 import numpy as np
 from transformers_neuronx import compiler
-from neuronxcc.thor import decltensor, trace
+from neuronxcc.nki import decltensor, trace
 
-def thor_call(func, *args, **kwargs):
+def nki_call(func, *args, **kwargs):
     """ 
-    This function applies Thor kernel function (func) to inputs (*args) in PyHLO.
+    This function applies NKI kernel function (func) to inputs (*args) in PyHLO.
     
     Args:
-        func: Thor kernel function
+        func: NKI kernel function
         args: inputs of func
         kwargs:
             kernel_attrs (kernel attributes)
-            grid (grid used in Thor kernel function)
-            output_HloShapes (HloShapes of outputs of Thor kernel)
+            grid (grid used in NKI kernel function)
+            output_HloShapes (HloShapes of outputs of NKI kernel)
 
 
     Example:
-        def mixed_pyhlo_thor(x, y):
+        def mixed_pyhlo_nki(x, y):
             h = x.dtype[x.sizes].Multiply(x, x)
-            o = thor_call(add_kernel, h, y, grid=32, output_HloShapes=x.dtype[x.sizes])
+            o = nki_call(add_kernel, h, y, grid=32, output_HloShapes=x.dtype[x.sizes])
             return o        
     """
     
     kernel_attrs = kwargs.pop("kernel_attrs", ())
     grid = kwargs.pop("grid", None)   
-    return ThorHloKernel(func, grid, kernel_attrs)(*args, **kwargs)
+    return NkiHloKernel(func, grid, kernel_attrs)(*args, **kwargs)
 
 
-class ThorHloKernel:
+class NkiHloKernel:
     """
     This class lowers a user defined compiler kernel to PyHLO op.
 
-    This is the FAL binding for the Thor API for compiler to program Neuron Device directly.
+    This is the FAL binding for the NKI API for compiler to program Neuron Device directly.
 
     Parameters:
         func: the function of the baremetal kernel defition
         grid: launch grid configuration
         kernel_attrs: List[str], string attribute to control code injection point in compiler
 
-    There are 2 steps to use a thor kernel:
-        1) Define Thor kernel
-        2) Use Thor kernel within PyHLO by thor_call
+    There are 2 steps to use a NKI kernel:
+        1) Define NKI kernel
+        2) Use NKI kernel within PyHLO by nki_call
 
     Example:
-        # 1) Define Thor Kernel
+        # 1) Define NKI Kernel
 
         def add_subtract_kernel(a_ptr, b_ptr, c_ptr, d_ptr):
             ix = arange(128)[:, None]
@@ -84,11 +84,11 @@ class ThorHloKernel:
                 store(c_ptr, value=c)
                 store(d_ptr, value=d)   
 
-        # 2) Use Thor kernel by thor_call:
+        # 2) Use NKI kernel by nki_call:
 
-            def mixed_pyhlo_thor(x, y):
+            def mixed_pyhlo_nki(x, y):
                 h = x.dtype[x.sizes].Multiply(x, x)
-                o = thor_call(add_subtract_kernel, h, y, grid=32, output_HloShapes=[y.dtype[y.sizes], y.dtype[y.sizes]])
+                o = nki_call(add_subtract_kernel, h, y, grid=32, output_HloShapes=[y.dtype[y.sizes], y.dtype[y.sizes]])
                 return o
 
     """
@@ -129,7 +129,7 @@ class ThorHloKernel:
 
     def __call__(self, *args, output_HloShapes=None):        
         if output_HloShapes is None: 
-           raise ValueError("output_shape should be set in ThorHloKernel !")
+           raise ValueError("output_shape should be set in NkiHloKernel !")
         if not isinstance(output_HloShapes, (list, tuple)):
             output_HloShapes = [output_HloShapes]
         get_shape = lambda hloShape: tuple([d for d in hloShape.shape_proto.dimensions])
