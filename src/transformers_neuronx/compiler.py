@@ -59,9 +59,29 @@ def build_parallel_kernel(hlo_module, tp_degree):
     kernel.build()
     return kernel
 
+
+def get_compiler_flags() -> str:
+
+    user_flags = os.environ.get('NEURON_CC_FLAGS', '').strip()
+
+    default_flags = {
+        '--model-type': 'transformer',
+        '--auto-cast': 'none',
+    }
+
+    # Set default flag where there is no user-provided value
+    flags = [user_flags] if user_flags else []
+    for key, value in default_flags.items():
+        if key not in user_flags:
+            flags.append(f'{key}={value}')
+
+    # Reformat list of flags to joined string
+    return ' '.join(flags)
+
+
 def compile_hlo_module(hlo_module, tag=None):
-    flags = os.environ.get('NEURON_CC_FLAGS', '')
-    flags += ' --model-type=transformer'
+
+    flags = get_compiler_flags()
     module_flag_hash = get_hash_module(hlo_module, flags)
     module_hash = get_hash_module(hlo_module, None)
 
