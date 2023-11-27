@@ -603,10 +603,23 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-    hidden = dot10_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
-    hidden = getattr(activations, activation_function)(hidden)
-    hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
-    hidden = dtype[hidden_sizes].Reshape(hidden)
+
+    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+        assert hidden_size % constants.TILE_SIZE == 0, \
+                f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+        hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = reshape(hidden, hidden_tiled_sizes)
+        hidden = dot_1220_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = reshape(hidden, hidden_tiled_sizes)
+        hidden = getattr(activations, activation_function)(hidden)
+        hidden = dot_1220_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+    else:
+        hidden = dot10_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden = getattr(activations, activation_function)(hidden)
+        hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+    hidden = reshape(hidden, hidden_sizes)
     if tp_degree == 1:
         return hidden
     all_reduce_dtype = None
