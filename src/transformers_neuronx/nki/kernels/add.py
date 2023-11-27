@@ -14,14 +14,14 @@
 # ==============================================================================
 
 import numpy as np
-from neuronxcc.thor import program_id, affine_range
-from neuronxcc.thor.ops import load, store, arange
-from neuronxcc.thor.isa import reduce_free, activation
+from neuronxcc.nki import program_id, affine_range
+from neuronxcc.nki.ops import load, store, arange
+from neuronxcc.nki.isa import reduce_free, activation
 
-def add_subtract_kernel(a_ptr, b_ptr, c_ptr, d_ptr):
+def add_kernel(a_ptr, b_ptr, c_ptr):
     """
-    This Thor kernel generates both a+b and a-b
-    """
+    This NKI kernel generates a+b
+    """    
     ix = arange(128)[:, None]
     iy = arange(512)[None, :]
     tile_size = 128 * 512
@@ -33,11 +33,8 @@ def add_subtract_kernel(a_ptr, b_ptr, c_ptr, d_ptr):
         mask = offset < n_elements
         a_ptr = a_ptr + offset
         b_ptr = b_ptr + offset
-        c_ptr = c_ptr + offset
-        d_ptr = d_ptr + offset
+        c_ptr = c_ptr + offset    
         a = load(a_ptr)
         b = load(b_ptr)
         c = a + b
-        d = a - b
         store(c_ptr, value=c)
-        store(d_ptr, value=d)   
