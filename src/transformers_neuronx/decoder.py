@@ -1574,15 +1574,19 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
         cache_broadcast_hlo_module = compiler.compile_py_func(cache_broadcast_impl)
         self.cache_broadcast_kernel = compiler.ParallelKernel(cache_broadcast_hlo_module, tp_degree)
         self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
+        self._source_caches = None
+        self._target_caches = None
 
-    def build(self):
-        self.cache_broadcast_kernel.build()
+    def set_source_caches(self, source_caches):
+        self._source_caches = source_caches
 
-    def load(self):
+    def set_target_caches(self, target_caches):
+        self._target_caches = target_caches
+
+    def setup(self):
+        assert self._source_caches is not None and self._target_caches is not None, "need to call set_source_caches and set_target_caches"
         self.cache_broadcast_kernel.load()
-
-    def setup(self, source_caches, target_caches):
-        self.cache_broadcast_memory.setup(source_caches, target_caches)
+        self.cache_broadcast_memory.setup(self._source_caches, self._target_caches)
 
     def run_broadcast(self):
         self.cache_broadcast_kernel(self.cache_broadcast_memory)
