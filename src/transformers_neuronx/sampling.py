@@ -166,6 +166,11 @@ def validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep):
         raise ValueError('min_tokens_to_keep has to be a non-negative int.')
 
 
+def validate_no_repeat_ngram_size(ngram_size):
+    if ngram_size and (not isinstance(ngram_size, int) or ngram_size <= 0):
+        raise ValueError(f"`ngram_size` has to be a strictly positive integer, but is {ngram_size}")
+
+
 def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, min_tokens_to_keep)
 
@@ -234,8 +239,52 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
     return filter_by_top_p(filter_by_top_k()[1])
 
 
+def _get_ngrams(ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int):
+    # Copied from huggingface logits_process.py
+    # Initialize an empty list of dictionaries, one for each hypothesis (index) in the range of num_hypos
+    generated_ngrams = [{} for _ in range(num_hypos)]
+    for idx in range(num_hypos):
+        gen_tokens = prev_input_ids[idx].tolist()
+        generated_ngram = generated_ngrams[idx]
+        # Loop through each n-gram of size ngram_size in the list of tokens (gen_tokens)
+        for ngram in zip(*[gen_tokens[i:] for i in range(ngram_size)]):
+            prev_ngram_tuple = tuple(ngram[:-1])
+            generated_ngram[prev_ngram_tuple] = generated_ngram.get(prev_ngram_tuple, []) + [ngram[-1]]
+    return generated_ngrams
+
+
+def _get_generated_ngrams(banned_ngrams, prev_input_ids, ngram_size, cur_len):
+    # Copied from huggingface logits_process.py
+    # Before decoding the next token, prevent decoding of ngrams that have already appeared
+    start_idx = cur_len + 1 - ngram_size
+    ngram_idx = tuple(prev_input_ids[start_idx:cur_len].tolist())
+    return banned_ngrams.get(ngram_idx, [])
+
+
+def _calc_banned_ngram_tokens(ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int, cur_len: int):
+    # Copied from huggingface logits_process.py
+    # Copied from fairseq for no_repeat_ngram in beam_search
+    if cur_len + 1 < ngram_size:
+        # return no banned tokens if we haven't generated no_repeat_ngram_size tokens yet
+        return [[] for _ in range(num_hypos)]
+    generated_ngrams = _get_ngrams(ngram_size, prev_input_ids, num_hypos)
+    banned_tokens = [
+        _get_generated_ngrams(generated_ngrams[hypo_idx], prev_input_ids[hypo_idx], ngram_size, cur_len)
+        for hypo_idx in range(num_hypos)
+    ]
+    return banned_tokens
+
+
+def filter_ngrams(ngram_size, input_ids, next_token_scores, cur_len):
+    num_batch_hypotheses = next_token_scores.shape[0]
+    banned_batch_tokens = _calc_banned_ngram_tokens(ngram_size, input_ids, num_batch_hypotheses, cur_len)
+    for i, banned_tokens in enumerate(banned_batch_tokens):
+        next_token_scores[i, banned_tokens] = -float("inf")
+    return next_token_scores
+
+
 def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                      top_k=50, top_p=1.0, temperature=1.0, streamer=None, stopping_criteria_list=None):
+                      top_k=50, top_p=1.0, temperature=1.0, streamer=None, stopping_criteria_list=None, ngram_size=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     if not isinstance(temperature, float) or not (temperature > 0):
@@ -249,6 +298,10 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     _, start = input_ids.shape
 
     for cur_len in range(start, sequence_length):
+
+        if ngram_size:
+            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, cur_len)
+
         next_len = cur_len + 1
 
         if temperature != 1.0:
@@ -294,7 +347,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
 @torch.no_grad()
 def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0,
-                 streamer=None, stopping_criteria_list=None):
+                 streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     # populate key/value caches according to the prompt text
@@ -304,7 +357,7 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
         model.context_hook()
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature,
-        streamer, stopping_criteria_list
+        streamer, stopping_criteria_list, ngram_size=no_repeat_ngram_size
     )
 
 #TODO Leverage Generation Args data class as input args
