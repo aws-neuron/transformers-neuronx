@@ -1,5 +1,5 @@
 # Copyright Amazon Web Services and its Affiliates. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -381,33 +381,32 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             for i, context_length_estimate in enumerate(self.context_buckets):
                 model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
                                                                     new=self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
-                source_caches = []
-                for layer in model.layers:
-                    source_caches.append(layer.attn_k_cache[model.batch_size[bs_idx]])
-                    source_caches.append(layer.attn_v_cache[model.batch_size[bs_idx]])
-                manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
-                target_caches = []
-                for layer in self.decoder_lm_head.layers:
-                    attn_k_cache = manipulator.slice_on_nc(
-                        layer.attn_k_cache[batch_size],
-                        0,
-                        start=0,
-                        end=context_length_estimate,
-                        step=1,
-                    )
-                    attn_v_cache = manipulator.slice_on_nc(
-                        layer.attn_v_cache[batch_size],
-                        0,
-                        start=0,
-                        end=context_length_estimate,
-                        step=1,
-                    )
-                    target_caches.append(attn_k_cache)
-                    target_caches.append(attn_v_cache)
                 if not self.share_caches:
-                    self.broadcaster[context_length_estimate].build()
-                    self.broadcaster[context_length_estimate].load()
-                    self.broadcaster[context_length_estimate].setup(source_caches, target_caches)
+                    source_caches = []
+                    for layer in model.layers:
+                        source_caches.append(layer.attn_k_cache[model.batch_size[bs_idx]])
+                        source_caches.append(layer.attn_v_cache[model.batch_size[bs_idx]])
+                    manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
+                    target_caches = []
+                    for layer in self.decoder_lm_head.layers:
+                        attn_k_cache = manipulator.slice_on_nc(
+                            layer.attn_k_cache[batch_size],
+                            0,
+                            start=0,
+                            end=context_length_estimate,
+                            step=1,
+                        )
+                        attn_v_cache = manipulator.slice_on_nc(
+                            layer.attn_v_cache[batch_size],
+                            0,
+                            start=0,
+                            end=context_length_estimate,
+                            step=1,
+                        )
+                        target_caches.append(attn_k_cache)
+                        target_caches.append(attn_v_cache)
+                    self.broadcaster[context_length_estimate].set_source_caches(source_caches)
+                    self.broadcaster[context_length_estimate].set_target_caches(target_caches)
                 self.tensor_pool = tensor_pool.TensorPool()
                 # We need to reset once, since there might be NaN initially in KVcache.
                 # This is done right after weight loading which is shared for different generation methods.
