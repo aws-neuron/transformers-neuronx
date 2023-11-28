@@ -445,6 +445,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         batch_size, context_length = input_ids.shape
 
         model=self.decoder_lm_head
+
         if is_context_encode:
             model=self.decoder_lm_head_for_context[estimate, batch_size]
 
@@ -453,8 +454,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
-
-        model=self.decoder_lm_head
 
         hidden, start_ids = self._embedding(model, input_ids, cache_ids,
                                             start_ids, is_context_encode)
