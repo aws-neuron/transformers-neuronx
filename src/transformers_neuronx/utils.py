@@ -247,3 +247,4 @@ def build_replica_groups(num_groups, group_size):
         for group in range(num_groups)
     ]
     return replica_groups
+
