@@ -219,22 +219,20 @@ def update_cache(cache, cache_ids, values, start_ids=None):
             #
             cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
             values_r = hlo.reshape(values, [n_seqs, kv_hidden_size])
-            for seq_id in range(n_seqs):
-                cache_id = hlo.slice_along(cache_ids, dim=1, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
 
-                # Since cache is flatten, we need to add an offset to cache_id (aka position_id)
-                batch_offset = hlo.full(n_seqs, cache_ids_dtype, cache_id.sizes)
-                cache_id = cache_ids_dtype[cache_id.sizes].Multiply(cache_id, batch_offset)
-                id_offset = hlo.full(seq_id, cache_ids_dtype, cache_id.sizes)
-                cache_id = cache_ids_dtype[cache_id.sizes].Add(cache_id, id_offset)
+            # [6,3,9] -> [(0,6),(1,3),(2,9)] -> [6*3,3*3+1,9*3+2] -> [18,10,29]
+            # cache_ids * n_seqs + iota
+            batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
+            indices = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
+            offset = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[1])
+            indices = cache_ids_dtype[cache_ids.sizes].Add(indices, offset)
+            indices = hlo.transpose(indices, 0, 1)
 
-                value = hlo.slice_along(values_r, dim=0, limit=(seq_id+1)*n_active_tokens, start=seq_id*n_active_tokens)
-
-                scatter_dims = dict(update_window_dims=[1],
-                                    inserted_window_dims=[0],
-                                    scatter_dims_to_operand_dims=[0],
-                                    index_vector_dim=1)
-                cache_r = hlo.scatter(cache_r, cache_id, value, scatter_dims=scatter_dims, to_apply=assign_func)
+            scatter_dims = dict(update_window_dims=[1],
+                                inserted_window_dims=[0],
+                                scatter_dims_to_operand_dims=[0],
+                                index_vector_dim=1)
+            cache_r = hlo.scatter(cache_r, indices, values_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
         elif n_active_tokens == n_positions and n_seqs > n_active_seqs:
             # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
