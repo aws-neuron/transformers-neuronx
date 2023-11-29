@@ -24,6 +24,7 @@ from textwrap import dedent
 import torch
 import logging
 import json
+import math
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -217,6 +218,7 @@ class Kernel:
 
     def __init__(self, hlo_module, neff_bytes, metaneff, tp_degree):
         self.hlo_module = hlo_module
+        logging.debug(f"Total input tensor size of the module (per rank): {get_input_tensor_size(self.hlo_module)} bytes")
         self.neff_bytes = neff_bytes
         metaneff_bytes = metaneff.SerializeToString()
         model_cls = torch.classes.neuron.Model
@@ -522,6 +524,18 @@ def gen_randn_inputs(hlo_module, std=0.01, int_func=torch.zeros, treat_as_int=No
             tensor = int_func(shape, dtype=dtype)
         inputs.append(tensor)
     return inputs
+
+def get_input_tensor_size(hlo_module):
+    total_bytes = 0
+    dtype_converter = DataTypeConverter()
+    for _, param in enumerate(hlo_module.host_program_shape.parameters):
+        dtype = dtype_converter.hlo2torch(param.element_type)
+        if dtype.is_floating_point:
+            num_bytes = math.prod(param.dimensions) * torch.finfo(dtype).bits / 8
+        else:
+            num_bytes = math.prod(param.dimensions) * torch.iinfo(dtype).bits / 8
+        total_bytes += num_bytes
+    return total_bytes
 
 def gen_zero_output_from_shape(input):
     shape_proto = input.shape_proto
