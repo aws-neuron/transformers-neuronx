@@ -289,7 +289,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         # and after compilation for backwards compatability.
         # If called before compilation this logic will be reached and it will
         # create the HLO for reorder_cache now which can be deserialized or compiled normally.
-        # If called after, setup_reorder_cache will be called from the NeuronModelBase without 
+        # If called after, setup_reorder_cache will be called from the NeuronModelBase without
         # serialization logic and will be compiled normally.
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
@@ -334,7 +334,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.program.setup_reorder_cache_kernels()
         if self.use_executor:
             self.enable_executor()
-            
+
     def reset(self):
         for layer in self.layers:
             layer.reset()
@@ -1507,7 +1507,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         hidden_buffers = list()
         last_token_id_buffers = list()
         for input_buffer in self.input_buffers:
-            hidden_buffer, *_, last_token_id_buffer, _ = input_buffer
+            hidden_buffer, _, _, last_token_id_buffer, *_ = input_buffer
             hidden_buffers.append(hidden_buffer)
             last_token_id_buffers.append(last_token_id_buffer)
 
