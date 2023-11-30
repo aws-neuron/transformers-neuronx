@@ -244,9 +244,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
         if n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0:
             # context encoding
+            n_active_seqs, n_active_tokens = input_ids.shape
             n_positions = self.context_buckets[-1]
-            cache_ids_pad = torch.zeros(1, n_positions, dtype=cache_ids.dtype, device='cpu')
-            cache_ids_pad[:, :n_active_tokens] = cache_ids[:, :n_active_tokens]
+            assert n_active_seqs == cache_ids.shape[0], f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]})"
+            assert n_active_tokens <= n_positions, f"invalid input prompt length ({n_active_tokens} <= {n_positions})"
+            cache_ids_pad = torch.zeros(n_active_seqs, n_positions, dtype=cache_ids.dtype, device='cpu')
+            for seq_id in range(n_active_seqs):
+                cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
 
         # token generation
@@ -288,6 +292,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         input_batch_size = start_ids.shape[0]
         if running_batch_size == input_batch_size:
             # context encoding (aka prefill)
+            # NOTE: logits are returned directly, since dynamic batching is handled in _context_dynamic_batching
             return logits
 
         # token generation (aka decoding)
@@ -300,19 +305,54 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return new_logits
 
     def _cast_logits(self, logits):
-         # Cast logits to float32 or the dtype specified in the neuron config
-         logits_dtype = torch.float32
-         if self.neuron_config:
-             logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
-         return logits.to(logits_dtype)
+        # Cast logits to float32 or the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        return logits.to(logits_dtype)
+
+    def _context_dynamic_batching(self, hidden, *args, neuron_config=None):
+        # Taking HSB layout
+        _, context_length, input_batch_size = hidden.shape
+        assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
+
+        running_batch_size = self.context_batch_sizes[-1]
+        if input_batch_size > running_batch_size:
+            assert input_batch_size % running_batch_size == 0, \
+                "input batch size ({input_batch_size}) not divisible by running batch size ({running_batch_size})"
+            n_iters = input_batch_size // running_batch_size
+            all_logits = []
+            cache_ids, start_ids, _ = args
+            for iter_id in range(n_iters):
+                # Assuming HSB layout
+                start_idx = iter_id*running_batch_size
+                end_idx = (iter_id+1)*running_batch_size
+                hidden_per_batch = hidden[:, :, start_idx:end_idx]
+                cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
+                start_ids_per_batch = start_ids[start_idx:end_idx]
+                last_token_id = cache_ids_per_batch.max()
+                logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
+                                                start_ids_per_batch, last_token_id, neuron_config=neuron_config)
+                all_logits.append(logits_per_batch)
+            logits = torch.cat(all_logits, dim=2)
+        else:
+            assert input_batch_size == running_batch_size, \
+                "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"
+            logits = self.context(hidden, *args, neuron_config=neuron_config)
+        return logits
 
     def _forward(self, hidden, *args, neuron_config=None):
         hidden = hidden.transpose(0, -1).contiguous()
 
+        # Taking HSB layout
         _, context_length, _ = hidden.shape
 
         if context_length > 1:
-            logits = self.context(hidden, *args, neuron_config=neuron_config)
+            continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
+            if continuous_batching:
+                logits = self._context_dynamic_batching(hidden, *args, neuron_config=neuron_config)
+            else:
+                logits = self.context(hidden, *args, neuron_config=neuron_config)
         else:
             logits = self.decoder_lm_head(hidden, *args, neuron_config=neuron_config)
 
