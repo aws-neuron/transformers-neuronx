@@ -277,7 +277,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         vocab_pad = utils.get_pad_size(vocab_size, divisor)
         lm_head_weight = torch.nn.functional.pad(self.lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = manipulator.shard_along(lm_head_weight, dim=1)
-        ln_lm_head_params = [*self.pre_layer_parameters, self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
+        ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight]
         ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
@@ -320,7 +320,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
         new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
-        ln_lm_head_params = [*new.pre_layer_parameters, new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
+        ln_lm_head_params = [new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
         ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
@@ -329,7 +329,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         return new
 
     def setup(self):
-        self.program.setup(self.layers, self.ln_lm_head_params)
+        self.program.setup(self.layers, self.pre_layer_parameters, self.ln_lm_head_params)
         if self.need_reorder_cache:
             self.program.setup_reorder_cache_kernels()
         if self.use_executor:
@@ -1311,7 +1311,7 @@ class DecoderProgram:
         self.tp_degree = tp_degree
         self.need_reorder_cache = False
 
-    def setup(self, layers, ln_lm_head_params, io_ring_cache_size=1):
+    def setup(self, layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
         self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
         for kernel in self.kernels.values():
@@ -1436,14 +1436,15 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         for npos,batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
             self.memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
 
-    def setup(self, layers, ln_lm_head_params):
-        super().setup(layers, ln_lm_head_params)
+    def setup(self, layers, pre_layer_params, ln_lm_head_params):
+        super().setup(layers, pre_layer_params, ln_lm_head_params)
         # Setup the memory with input and output buffers
         for bs_idx, batch_size in enumerate(self.batch_sizes):
             for npos in self.n_positions_list:
                 input_tensors = [*self.input_buffers[bs_idx]]
                 output_tensors = [self.logits_buffer[bs_idx]]
                 self._fill_io_tensors(input_tensors, output_tensors, layers, npos, batch_size)
+                input_tensors.extend(pre_layer_params)
                 input_tensors.extend(ln_lm_head_params)
                 self.memories[npos,batch_size].setup(input_tensors, output_tensors)
 
@@ -1502,8 +1503,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
         self.layer_executors = list()
         self.lm_head_executors = list()
 
-    def setup(self, layers, ln_lm_head_params):
-        super().setup(layers, ln_lm_head_params, io_ring_cache_size=len(self.multi_layers_memories))
+    def setup(self, layers, pre_layer_params, ln_lm_head_params):
+        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=len(self.multi_layers_memories))
         hidden_buffers = list()
         last_token_id_buffers = list()
         for input_buffer in self.input_buffers:
@@ -1521,6 +1522,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
                     input_tensors = [*self.input_buffers[bs_idx]]
                     output_tensors = [hidden_buffers[bs_idx]]
                     self._fill_io_tensors(input_tensors, output_tensors, multi_layer, npos, batch_size)
+                    input_tensors.extend(pre_layer_params)
                     multi_layer_memory[npos,batch_size].setup(input_tensors, output_tensors)
 
         for head_idx in range(0,len(self.ln_lm_head_kernels)):
