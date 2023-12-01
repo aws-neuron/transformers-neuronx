@@ -1,7 +1,7 @@
 import torch
 import transformers
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from transformers_neuronx import base
 from transformers_neuronx import sampling
@@ -62,10 +62,10 @@ class DraftProvider:
         Args:
             input_ids (`torch.Tensor` of shape `(batch_size, sequence_length)`):
                 Either context input ids (prompt) or the next input id from where it needs to start generating tokens.
-            
+
             k (int):
                 The number of speculative tokens to generate.
-            
+
             cache_ids (`torch.Tensor` of shape `(sequence_length)`):
                 The positions in the KV cache that should be updated. KV Cache positions start from 0.
 
@@ -117,11 +117,11 @@ class DefaultTokenAcceptor(TokenAcceptor):
         k = draft_token_len  # number of speculated tokens
         draft_probabilities = torch.softmax(draft_scores, dim=-1)
         target_probabilities = torch.softmax(target_scores, dim=-1)
- 
+
         draft_ids = draft_ids[0]
- 
+
         for i in range(k):
-            draft_token_id = draft_ids[i]  
+            draft_token_id = draft_ids[i]
 
             target_prob_i = target_probabilities[i][draft_token_id]
             draft_prob_i = draft_probabilities[i][draft_token_id]
@@ -133,7 +133,7 @@ class DefaultTokenAcceptor(TokenAcceptor):
                 # Accepted
                 accepted_tokens = torch.cat([accepted_tokens, torch.as_tensor([draft_token_id], dtype=torch.int32)])
                 accepted_token_count += 1
- 
+
             else:  # Rejection
                 # Get the non-overlap target probabilities from draft,
                 # as overlap tokens are already validated as part of acceptance logic.
@@ -144,7 +144,7 @@ class DefaultTokenAcceptor(TokenAcceptor):
                 accepted_token_count += 1
                 all_accepted = False
                 break
- 
+
         # Step 4: if all draft tokens were accepted, sample a final token
         if all_accepted:
             accepted_tokens = torch.cat([accepted_tokens, torch.as_tensor([torch.multinomial(target_probabilities[-1], num_samples=1, replacement=True)])])
@@ -161,7 +161,7 @@ class DraftModelForSpeculation(DraftProvider):
     def __init__(self, model, **kwargs) -> None:
         self.model = model
         self.kwargs = kwargs
- 
+
     def _context_block(self, input_ids, start_ids):
         """
         Run context encoding network of the given model.
@@ -173,13 +173,13 @@ class DraftModelForSpeculation(DraftProvider):
         Returns:
             token: predicted next token
             score: predicted token score
-        """ 
+        """
 
-        _, start = input_ids.shape  
+        _, start = input_ids.shape
         next_token_scores = self.model(input_ids, None, start_ids)
         inputs = torch.argmax(next_token_scores, dim=1, keepdim=True)
         return inputs, next_token_scores
- 
+
     def __call__(
             self,
             input_ids: torch.Tensor,
@@ -188,8 +188,8 @@ class DraftModelForSpeculation(DraftProvider):
             start_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Perform standard auto-regressive token generation using the draft model, to speculate k-tokens. 
- 
+        Perform standard auto-regressive token generation using the draft model, to speculate k-tokens.
+
         Args:
             input_ids: Either context, next token, or draft tokens. shape=(batch, seqlen)
             k: The number of speculative tokens
@@ -203,10 +203,10 @@ class DraftModelForSpeculation(DraftProvider):
         start_len = 0
         if cache_ids:
             start_len = cache_ids.item()
-        
+
         if start_len == 0:  # run context network as cache_id location starts from 0.
             return self._context_block(input_ids, start_ids)
- 
+
         k_token_ids = torch.as_tensor([], dtype=torch.int32)
         next_token_scores = self.model(input_ids, cache_ids, start_ids)
         k_next_scores = torch.zeros((0, next_token_scores.shape[-1]))
@@ -225,7 +225,7 @@ class DraftModelForSpeculation(DraftProvider):
                 break
             cache_ids = torch.as_tensor([next_len], dtype=torch.int32)
             next_token_scores = self.model(inputs, cache_ids, start_ids)
- 
+
         return k_token_ids, k_next_scores
 
 
@@ -233,7 +233,7 @@ class SpeculativeGenerator:
 
     def __init__(
         self,
-        draft: DraftProvider,
+        draft: Union[DraftProvider, base.NeuronModelBase],
         target: base.NeuronModelBase,
         k: int = 4,
         acceptor: Optional[TokenAcceptor] = None
@@ -242,7 +242,7 @@ class SpeculativeGenerator:
         Implementation of DeepMind paper (https://arxiv.org/pdf/2302.01318.pdf) speculative sampling loop.
 
         In this implementation, Draft provider speculates (k-tokens, k-next_scores).
-        The last predicted token by the target model + the k tokens predicted by the draft model are passed to the 
+        The last predicted token by the target model + the k tokens predicted by the draft model are passed to the
         speculative decoder in the target model to get k+1 token scores.
         The TokenAcceptor then takes k-next_scores from the draft model and
         k+1 token scores from the target model to return the accepted tokens.
@@ -260,6 +260,8 @@ class SpeculativeGenerator:
                 TokenAcceptor that accepts the draft predicted tokens based on draft and target scores.
                 This is default to DeepMind paper Token acceptor implementation.
         """
+        if isinstance(draft, base.NeuronModelBase):
+            draft = DraftModelForSpeculation(draft)
         self.draft = draft
         self.target = target
         self.k = k
@@ -274,9 +276,9 @@ class SpeculativeGenerator:
         streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
     ):
         """
-        Speculative sampling loop: 
-        This is where the draft model speculates tokens and target model verifies them 
-        using an acceptance/rejection criteria. This happens in a loop either till 
+        Speculative sampling loop:
+        This is where the draft model speculates tokens and target model verifies them
+        using an acceptance/rejection criteria. This happens in a loop either till
         end of sequence generation length or early stop is detected (based on eos_token_id).
 
         Args:
@@ -316,10 +318,10 @@ class SpeculativeGenerator:
             early_stop = True
 
         tokens: list[torch.Tensor] = [input_ids, target_next_id]
-        
+
         current = start
         while True:
- 
+
             if early_stop:
                 done_flags |= (target_next_id == eos_token)
                 if batch_size > 1:  # Avoid writing tokens to completed sequences
@@ -328,12 +330,12 @@ class SpeculativeGenerator:
                     break
 
             draft_cache_id = torch.tensor([current], dtype=torch.int32)
- 
+
             # returns auto-regressive k - 1 speculated tokens (as one token was already predicted by target)
             # draft_ids is of shape: (bs, k-1)
             # draft_next_scores has k-1 scores and of shape: (k-1, vocab)
             draft_ids, draft_next_scores = self.draft(target_next_id, self.k - 1, draft_cache_id, None)
-            
+
             # Execute target model with draft tokens
             cache_ids = torch.arange(current, current + draft_ids.shape[1] + 1)  # added length of target predicted token
             input_ids = torch.cat([target_next_id, draft_ids], dim=1)
@@ -370,8 +372,8 @@ class SpeculativeGenerator:
             # accepted_tokens = 2 means, 1 draft token accepted
             # accepted_tokens = K means, all draft tokens accepted + target model predicted token
             target_next_id = torch.unsqueeze(torch.tensor([accepted_tokens[-1]]), 0)  # get last token as accepted token
- 
+
         if streamer:
             streamer.end()
- 
+
         return torch.cat(tokens, dim=-1)
