@@ -15,6 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
+from transformers_neuronx import constants
 from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.config import NeuronConfig
@@ -30,55 +31,21 @@ class MistralForSamplingNoEmbeddingHlo:
         self.config = config
         self.neuron_config = neuron_config
 
-    @property
-    def shard_over_batch(self):
-        # Property access allows fallback configuration to be enabled after construction
-        return (
-            self.neuron_config is not None
-            and self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
+
+    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
+
+        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
-        else:
-            hidden_sizes = self.config.hidden_size, n_active_tokens, batch_size
-        head_dim = self.config.attention_head_size
-
-        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            position_sizes = batch_size, n_active_tokens
-            cache_ids = scribe.s32[position_sizes].Parameter(parameter_number=1)  # 2d cache_ids
-        else:
-            cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)  # 1d cache_ids
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-        last_token_id = scribe.s32.Parameter(parameter_number=3)
         curr_window_start = scribe.s32.Parameter(parameter_number=4)
-        pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+
+        head_dim = self.config.attention_head_size
+        pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
 
-        # NOTE: When using token generation network, we generate a mask for the
-        #       past tokens and the current tokens separately. This allows us
-        #       use the split "prefetch" attention layer.
-        use_prefetch = n_active_tokens != n_positions
-        triu_comparison = 'LT' if use_prefetch else 'LE'
-        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            # TODO: support lhs_aligned flag and the related attention mask
-            mask, active_mask = hlo.decoder_attention_mask_lhs_aligned(
-                cache_ids,
-                n_positions,
-            )
-        else:
-            mask, active_mask = hlo.decoder_attention_mask(
-                start_ids,
-                cache_ids,
-                n_positions,
-                triu_comparison=triu_comparison,
-                allow_kv_dot_prefetch=use_prefetch,
-                start_mask=True,
-            )
-        return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (1, 0, None, None, None)
+        return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
 
     def layer(
             self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
@@ -152,9 +119,14 @@ class MistralForSamplingNoEmbeddingHlo:
         assert (n_active_tokens == 1) or (n_active_tokens == n_positions), \
             "Only supporting decode mode (q_seq_len=1) or self-attention mode (q_seq_len=k_seq_len)!"
 
+        shard_over_batch = (
+            self.neuron_config is not None
+            and self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
+        )
+
         # Don't generate mask if q_seq_len = 1 (decode)
         if n_active_tokens == 1:
-            sparse_mask = None 
+            sparse_mask = None
         else:
             # Generate sliding-window mask
             sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
@@ -179,13 +151,13 @@ class MistralForSamplingNoEmbeddingHlo:
             d_head,
             neuron_config=self.neuron_config,
             tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
-            shard_over_batch=self.shard_over_batch
+            shard_over_batch=shard_over_batch
         )
 
         # Q = Rotate(Q)
         # K = Rotate(K)
         query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage,
-                                        tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                        tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
@@ -207,18 +179,18 @@ class MistralForSamplingNoEmbeddingHlo:
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, shard_over_batch=shard_over_batch)
+            prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, shard_over_batch=shard_over_batch)
+            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, useful_cached_values, value, sparse_mask=sparse_mask,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        shard_over_batch=self.shard_over_batch)
+                                        shard_over_batch=shard_over_batch)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -230,11 +202,11 @@ class MistralForSamplingNoEmbeddingHlo:
 
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                    tp_degree=tp_degree, shard_over_batch=shard_over_batch)
+            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
             score = attention.sparse_attn_mask(score, sparse_mask)
             context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                                 tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
             # KCache = K
             # VCache = V
