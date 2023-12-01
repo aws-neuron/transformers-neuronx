@@ -72,7 +72,7 @@ class MistralForSampling(base.NeuronModelBase):
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
 
         # Materialize the embedding to CPU
         self.chkpt_model.model.embed_tokens.materialize()
@@ -118,7 +118,7 @@ class MistralForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
-        self.decoder_lm_head.enable_executor()
+        self.decoder_lm_head.use_executor = True
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
@@ -127,11 +127,10 @@ class MistralForSampling(base.NeuronModelBase):
                                                                      new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                     # PERF: No latency improvement seen in multi-layer models from executor
                     if self.context_unroll == self.config.num_hidden_layers:
-                        model.enable_executor()
+                        model.use_executor = True
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
-
-    def forward(self, input_ids, cache_ids=None, start_ids=None):        
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
         curr_window_start = max(0, self.num_processed_tokens - self.config.window_size)
@@ -146,7 +145,7 @@ class MistralForSampling(base.NeuronModelBase):
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
         self.num_processed_tokens += (last_token_id+1)
-        return logits   
+        return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
@@ -156,7 +155,7 @@ class MistralForSampling(base.NeuronModelBase):
         batch_size, context_length = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
-        
+
         result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
