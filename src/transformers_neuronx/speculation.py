@@ -139,7 +139,7 @@ class DefaultTokenAcceptor(TokenAcceptor):
                 # as overlap tokens are already validated as part of acceptance logic.
                 # So, sample only from non-overlap distribution from target probability space.
                 prob_diff = target_probabilities[i] - draft_probabilities[i]
-                prob_diff = np.where(prob_diff > 0, prob_diff, 0)
+                prob_diff = torch.where(prob_diff > 0, prob_diff, 0.)
                 accepted_tokens = torch.cat([accepted_tokens, torch.as_tensor([torch.multinomial(prob_diff, num_samples=1, replacement=True)])])
                 accepted_token_count += 1
                 all_accepted = False
