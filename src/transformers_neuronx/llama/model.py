@@ -38,7 +38,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_pre_hook = None
         self.context_hook = None
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         self.prefixed_length = prefixed_length
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
@@ -62,12 +62,12 @@ class LlamaForSampling(base.NeuronModelBase):
         else:
             raise TypeError("batch_size must be list of ints or int type")
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
-        hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
+        hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True,
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
