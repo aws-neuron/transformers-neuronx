@@ -261,7 +261,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             full_input_ids[seq_id, :] = input_ids[idx, :]
             full_cache_ids[seq_id, :] = cache_ids[idx, :]
 
-        return full_input_ids, full_cache_ids, None
+        return full_input_ids, full_cache_ids, seq_ids
 
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
         # enable dynamic batch size feature for continuous batching
@@ -322,7 +322,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 "input batch size ({input_batch_size}) not divisible by running batch size ({running_batch_size})"
             n_iters = input_batch_size // running_batch_size
             all_logits = []
-            cache_ids, start_ids, _ = args
+            cache_ids, start_ids = args[0], args[1]
             for iter_id in range(n_iters):
                 # Assuming HSB layout
                 start_idx = iter_id*running_batch_size

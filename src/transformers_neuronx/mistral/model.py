@@ -142,6 +142,7 @@ class MistralForSampling(base.NeuronModelBase):
         if is_bsh:
             hidden = hidden.permute(2, 1, 0)
         logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+        logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
         self.num_processed_tokens += (last_token_id+1)
