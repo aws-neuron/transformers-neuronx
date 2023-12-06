@@ -499,23 +499,32 @@ class ParallelKernel:
         return Executor(self, memory, inputs, outputs)
 
     def profile_start(self, profile_dir):
-        if not os.path.exists(profile_dir):
+        self.profile_dir = profile_dir
+        if os.path.exists(profile_dir):
             os.makedirs(profile_dir, exist_ok=True)
+
         ntff_prefix = os.path.join(profile_dir,self.hlo_module.name)
-        # Creates numbered NTFF files
+        # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
         self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
 
-    def profile_stop(self, profile_dir):
+    def profile_stop(self):
+        assert self.profile_dir and os.path.exists(self.profile_dir), \
+            "profile directory missing on profile_stop"
+        assert self.ntff_paths, "No NTFF paths - was profile_start called?"
         ops.parallel_profile_stop(self.ntff_paths)
+
         # Save NEFF file
-        neff_filename = os.path.join(profile_dir,f"{self.hlo_module.name}.neff")
+        neff_filename = os.path.join(self.profile_dir,
+                                    f"{self.hlo_module.name}.neff")
         with open(neff_filename, "wb") as f:
             f.write(self.neff_bytes)
-        ntff_tar_path = os.path.join(profile_dir, f'{self.hlo_module.name}.ntff.tar')
+
+        ntff_tar_path = os.path.join(self.profile_dir,
+                                     f'{self.hlo_module.name}.profile.tar')
         with tarfile.open(ntff_tar_path, 'w|') as fp:
             fp.add(neff_filename)
-            for idx, ntff_path in enumerate(self.ntff_paths):
-                fp.add(ntff_path, f'profile_rank_{idx}.ntff')        
+            for ntff_path in self.ntff_paths:
+                fp.add(ntff_path)
 
 
 def gen_zero_input(hlo_module, index):
