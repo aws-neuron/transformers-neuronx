@@ -24,6 +24,8 @@ from transformers_neuronx import module
 from transformers_neuronx.constants import LAYOUT_BSH
 from concurrent.futures import ProcessPoolExecutor
 
+from .compiler import ParallelKernel
+
 
 # Mainly used to expose top level APIs to the model object for serialization
 class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
@@ -394,6 +396,20 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def serialization_enabled(self):
         return getattr(self, 'nbs_objs', None) is not None
+
+    def profile_start(self, profile_dir):
+        kernels = self._get_all_kernels()
+
+        for kernel in kernels:
+            if isinstance(kernel, ParallelKernel):
+                kernel.profile_start(profile_dir)
+
+    def profile_stop(self):
+        kernels = self._get_all_kernels()
+
+        for kernel in kernels:
+            if isinstance(kernel, ParallelKernel):
+                kernel.profile_stop()
 
 # Base class for all "Serializable Objects"
 class NeuronBaseSerializer:
