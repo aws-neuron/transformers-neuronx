@@ -338,7 +338,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                           c_attn_bias[n_embd*2:n_embd*3])
             is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
             if is_bsh:
-                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=False)
+                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
             else:
                 new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
