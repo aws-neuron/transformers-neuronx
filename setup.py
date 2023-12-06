@@ -69,6 +69,7 @@ setup(
     },
     install_requires=[
         'accelerate',
+        'safetensors',
         'torch-neuronx',
         'transformers',
     ],
