@@ -145,6 +145,13 @@ class GPTJForSampling(module.PretrainedModel):
         pos_embd[:dim, :dim] = sincos
         return pos_embd
 
+	def _cast_logits(self, logits):
+         # Cast logits to float32 or the dtype specified in the neuron config
+         logits_dtype = torch.float32
+         if self.neuron_config:
+             logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+         return logits.to(logits_dtype)
+
 
 class GPTJBuffers:
 
