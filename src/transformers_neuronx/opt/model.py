@@ -33,7 +33,7 @@ from transformers_neuronx.layers import transformer
 class OPTForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp=None, tp_degree=2, n_positions=2048,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=NeuronConfig(), **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, **kwargs):
         if amp is None:
             amp = dtypes.to_amp(config.torch_dtype)
         else:
@@ -42,7 +42,7 @@ class OPTForSampling(base.NeuronModelBase):
         # Build model in Python, result in self.chkpt_model
         super().__init__(OPTCheckpointCompatible, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
 
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = n_positions

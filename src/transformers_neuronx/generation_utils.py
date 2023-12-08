@@ -9,11 +9,11 @@ An adapter class for HuggingFace Generation API compatibility.
 
 It requires model to have a forward interface as:
 
-    forward(input_ids: Tensor(batch_size, seq_len), cache_ids: Tensor(seq_len), 
+    forward(input_ids: Tensor(batch_size, seq_len), cache_ids: Tensor(seq_len),
         start_ids: Optional[Tensor(batch_size)])) -> Tensor(batch_size, vocab_size)
 """
 class HuggingFaceGenerationModelAdapter(PreTrainedModel):
-    
+
     def __init__(self, config, model):
         super().__init__(config)
         self.model = model
@@ -25,12 +25,15 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
 
     def forward(self, input_ids, cache_ids, start_ids=None, output_hidden_states=False, output_attentions=False,
             attention_mask=None, return_dict=False):
-        
+
         if  output_hidden_states or output_attentions or attention_mask is not None:
             warnings.warn("Warning: These arguments are not used by forward(): \
                 (output_hidden_states, output_attentions, attention_mask)")
 
-        out_logits = self.model(input_ids, cache_ids, start_ids)
+        if self.model.neuron_config.is_pp():
+            out_logits = self.model.pp_forward(input_ids, cache_ids, start_ids)
+        else:
+            out_logits = self.model(input_ids, cache_ids, start_ids)
 
         out_logits = out_logits[:, None, :]
         if return_dict:
@@ -38,7 +41,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
                 [("logits", out_logits), ("past_key_values", tuple())],
             )
         return (out_logits,)
-    
+
     # keep the generation stateless
     def generate(self, *args, **kwargs):
         self.reset_generation()
@@ -65,10 +68,10 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         if self.cur_len > 0:
             input_ids = input_ids[:, -1:]
             cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
-        
+
         # no need to prepare cache_ids for parallel context encoding here as forward will pad input_ids and generate legalized cache_ids
-        
-        self.cur_len += input_ids.shape[-1] 
+
+        self.cur_len += input_ids.shape[-1]
         model_inputs = {
             "input_ids": input_ids,
             "cache_ids": cache_ids,

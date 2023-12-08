@@ -103,12 +103,20 @@ class ParallelTensorManipulator:
         shard_size = size // self.tp_degree
         slices = [slice(None) for _ in tensor.shape]
         tensors = []
-        slice_start = self.rank_id * self.local_tp_degree * shard_size
-        slice_end = (self.rank_id + 1) * self.local_tp_degree * shard_size
-        for start in range(slice_start, slice_end, shard_size):
-            slices[dim] = slice(start, start+shard_size, 1)
-            shard = tensor[tuple(slices)].contiguous()
-            tensors.append(shard)
+        if self.local_tp_degree != self.tp_degree: # for multi-instance tp
+            slice_start = self.rank_id * self.local_tp_degree * shard_size
+            slice_end = (self.rank_id + 1) * self.local_tp_degree * shard_size
+            for start in range(slice_start, slice_end, shard_size):
+                slices[dim] = slice(start, start+shard_size, 1)
+                shard = tensor[tuple(slices)].contiguous()
+                tensors.append(shard)
+        else:
+            slice_start = 0
+            slice_end = size
+            for start in range(slice_start, slice_end, shard_size):
+                slices[dim] = slice(start, start+shard_size, 1)
+                shard = tensor[tuple(slices)].contiguous()
+                tensors.append(shard)
         if len(tensors) != self.local_tp_degree:
             raise ValueError(
                 f'Weight with shape {tensor.shape} cannot be sharded along dimension {dim}. '
