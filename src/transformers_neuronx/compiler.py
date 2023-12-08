@@ -213,6 +213,8 @@ class DataTypeConverter:
     def torch2hlo(self, torch_dtype):
         return self.torch2hlo_mapping[torch_dtype]
 
+def primitive2name(element_type):
+    return xla_data_pb2.PrimitiveType.Name(element_type).lower()
 
 class Kernel:
 
@@ -392,7 +394,7 @@ def io_ring_cache_context(size):
     For optimal performance, this cache should be configured to be equal to the
     number *unique* sets of weights used per NEFF:
     - For a fully unrolled network the cache size should be 1 since it has
-      exactly 1 set of weights (all weights for all layers).
+    exactly 1 set of weights (all weights for all layers).
     - For a multi-layer network (partial unroll), the cache size should equal
       `n_layers / unroll` since the neff will be be executed that many times
       with a different set of unique weights.
@@ -426,6 +428,8 @@ class ParallelKernel:
         self.tag = tag
         self.g_device_count = g_device_count
         self.memories = []
+        self.total_input_tensors_size = get_total_input_tensors_size(self.hlo_module)
+        logging.debug(f"Total input tensor size of the module (per rank): {self.total_input_tensors_size / (10**9)} G, whole (all ranks): {self.total_input_tensors_size * tp_degree / (10**9)} G")
 
     def build_memory(self):
         memory = ParallelMemory(self.hlo_module, self.tp_degree)
@@ -447,6 +451,7 @@ class ParallelKernel:
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         with io_ring_cache_context(io_ring_cache_size):
             logging.debug(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
+            print(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
             self.model.load()
 
     def snapshot_path(self):
@@ -480,6 +485,7 @@ class ParallelKernel:
         ParallelKernel.hlo_snapshot_iter += 1
 
     def __call__(self, memory):
+        logging.debug(f"running {self.hlo_module.name}")
         if self.snapshot is not None:
             if self.snapshot_steps is None or ParallelKernel.hlo_snapshot_iter in self.snapshot_steps:
                 self.snapshot_enter(memory.input_tensors)
@@ -553,6 +559,18 @@ def get_debug_outputs(program, bucket_id=0):
     debug_names = program.debugger.get_names() if hasattr(program, "debugger") else []
     return debug_tensors, debug_names
 
+def get_total_input_tensors_size(hlo_module):
+    total_bytes = 0
+    dtype_converter = DataTypeConverter()
+    for _, param in enumerate(hlo_module.host_program_shape.parameters):
+        dtype = dtype_converter.hlo2torch(param.element_type)
+        if dtype.is_floating_point:
+            num_bytes = math.prod(param.dimensions) * torch.finfo(dtype).bits / 8
+        else:
+            num_bytes = math.prod(param.dimensions) * torch.iinfo(dtype).bits / 8
+        total_bytes += num_bytes
+    return total_bytes
+
 class HLOKernel:
     def __init__(self, hlo_program, tp, start_g_nc_id=0, g_nc_count=None):
         self.hlo_program = hlo_program
@@ -585,8 +603,11 @@ class HLOKernel:
             nc_output_buffers = []
             for o in cpu_output_buffers:
                 nc_output_buffers.append(self.manipulator.duplicate(o))
+        if len(nc_input_buffers) == 0:
+            cpu_input_buffers = gen_zero_inputs(self.hlo_module)
+            for i in cpu_input_buffers:
+                nc_input_buffers.append(self.manipulator.duplicate(i))
         self.memories.setup(nc_input_buffers, nc_output_buffers) # Segmentation fault (core dumped)
 
     def run(self):
-        logging.debug(f"running {self.hlo_module.name}")
         self.kernel(self.memories)

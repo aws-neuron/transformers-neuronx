@@ -16,6 +16,7 @@ import pickle
 import os
 import itertools
 import warnings
+import logging
 
 import torch
 from transformers_neuronx import base
@@ -71,6 +72,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.inputs_sdim = None
         self.inputs_builder = None
         self.layer_builder = None
+        self.ln_lm_head_params = []
         self.ln_lm_head_builder = None
         self.program = None
         self.pre_layer_parameters = []
@@ -360,14 +362,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         else:
             self.program.inputs_host_to_device(inputs, batch_size)
             self.program.run(bucket_id, batch_size)
-            return self.program.logits_device_to_host(batch_size)
+            return self.program.maybe_logits_device_to_host(batch_size)
 
     def forward(self, *inputs, neuron_config=None):
         hidden, cache_ids, start_ids, *_ = inputs
         batch_size, = start_ids.shape
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
-        if sequence_length == 1:
+        if sequence_length == 1 and not self.neuron_config.is_pp():
             return self.forward_single(*inputs, neuron_config=neuron_config)
 
         outputs = None
@@ -394,10 +396,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
             else:
                 self.program.inputs_host_to_device(input_tensors, batch_size)
+                self.program.maybe_receive_hidden(bucket_id, batch_size)
                 self.program.run(bucket_id, batch_size)
+                self.program.maybe_send_hidden(bucket_id, batch_size)
 
         if not self.use_executor:
-            outputs = self.program.logits_device_to_host(batch_size)
+            self.program.maybe_send_logits(bucket_id, batch_size)
+            self.program.maybe_receive_logits(bucket_id, batch_size)
+            outputs = self.program.maybe_logits_device_to_host(batch_size)
         return outputs
 
     def embed_positions_ids(self, position_ids, start_ids=None, batch_size=None):
@@ -413,7 +419,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _build_program(self):
         hlo_modules = dict()
-        if self.unroll == self.num_layers:
+        # for pipeline parallel: only do FullyUnrolled when there is valid ln_lm_head
+        if self.unroll == self.num_layers and self.neuron_config.is_valid_lm_head() and not self.neuron_config.is_pp():
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
                 hlo_modules[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
             num_inputs = len(self.inputs_sdim)
@@ -425,12 +432,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
                 hlo_modules[npos,batch_size] = self._hlo_multi_layer(npos,batch_size)
-
             ln_lm_head_hlo_modules = [self._hlo_ln_lm_head(batch_size) for batch_size in self.batch_size]
             num_inputs = len(self.inputs_sdim)
-            program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
-                                                self.num_layers, self.unroll, self.tp_degree,
-                                                self.n_positions_list, self.batch_size, self.prefixed_length)
+            if self.neuron_config.is_pp():
+                program = PipelineParallelProgram(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+                                                    self.num_layers, self.unroll, self.tp_degree,
+                                                    self.n_positions_list, self.batch_size, self.prefixed_length)
+                program.init_pp_sync_programs()
+            else:
+                program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+                                                    self.num_layers, self.unroll, self.tp_degree,
+                                                    self.n_positions_list, self.batch_size, self.prefixed_length)
 
         return program
 
@@ -1300,7 +1312,7 @@ class DecoderProgram:
         self.input_buffers = [[compiler.gen_zero_input(hlo,idx) for idx in range(num_inputs)] for hlo in hlos_for_input]
         self.kernels = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), tp_degree, tag=f"{npos}-{batch_size}")
+            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=f"{npos}-{batch_size}")
         # self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
@@ -1309,7 +1321,8 @@ class DecoderProgram:
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
-        self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
+        if self.logits_buffer:
+            self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
         for kernel in self.kernels.values():
             kernel.load(io_ring_cache_size)
 
@@ -1333,12 +1346,16 @@ class DecoderProgram:
     def run(self, bucket_id):
         raise NotImplementedError(DecoderProgram)
 
-    def logits_device_to_host(self, batch_size):
+    def maybe_logits_device_to_host(self, batch_size):
         idx = self.batch_sizes.index(batch_size)
-        if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
-            return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+        if self.logits_buffer:
+            if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
+                return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+            else:
+                return ops.parallel_cpu(self.logits_buffer[idx])[0]
         else:
-            return ops.parallel_cpu(self.logits_buffer[idx])[0]
+            return None
+
 
     def _fill_io_tensors(self, input_tensors, output_tensors, layers, npos, batch_size):
         end = npos
@@ -1493,7 +1510,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
         self.unroll = unroll
 
-        self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), tp_degree) for hm in ln_lm_head_hlo_modules]
+        self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree)) for hm in ln_lm_head_hlo_modules]
         self.layer_executors = list()
         self.lm_head_executors = list()
 
@@ -1529,17 +1546,19 @@ class DecoderProgramMultiLayer(DecoderProgram):
                     input_tensors.extend(pre_layer_params)
                     multi_layer_memory[npos,batch_size].setup(input_tensors, output_tensors)
 
-        for head_idx in range(0,len(self.ln_lm_head_kernels)):
-            self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], [self.logits_buffer[head_idx]])
-            self.ln_lm_head_kernels[head_idx].build()
-            self.ln_lm_head_kernels[head_idx].load()
+        if self.neuron_config.is_valid_lm_head():
+            for head_idx in range(0,len(self.ln_lm_head_kernels)):
+                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], [self.logits_buffer[head_idx]])
+                self.ln_lm_head_kernels[head_idx].build()
+                self.ln_lm_head_kernels[head_idx].load()
 
     def run(self, bucket_id, batch_size):
         npos = self.n_positions_list[bucket_id]
         for memories in self.multi_layers_memories:
             self.kernels[npos,batch_size](memories[npos,batch_size])
         bs_idx = self.batch_sizes.index(batch_size)
-        self.ln_lm_head_kernels[bs_idx](self.ln_lm_head_memories[bs_idx])
+        if self.neuron_config.is_valid_lm_head():
+            self.ln_lm_head_kernels[bs_idx](self.ln_lm_head_memories[bs_idx])
 
     def enable_executor(self):
         for layer_memories in self.multi_layers_memories:
@@ -1563,13 +1582,131 @@ class DecoderProgramMultiLayer(DecoderProgram):
     def get_kernels(self):
         all_kernels = super().get_kernels()
         # Head kernel
-        for kernel in self.ln_lm_head_kernels:
-            all_kernels.append(kernel)
+        if self.neuron_config.is_valid_lm_head():
+            for kernel in self.ln_lm_head_kernels:
+                all_kernels.append(kernel)
         # only true when reorder_cache called before to_neuron
         if self.need_reorder_cache:
             for hlo_kernel in self.reorder_cache_hlo_kernels:
                 all_kernels.append(hlo_kernel.kernel)
         return all_kernels
+
+
+def sync_tensor_program(sizes, element_dtype, replica_groups):
+
+    def _sync_tensor_program(scribe):
+            dtype = scribe.get_dtype(element_dtype)
+            tensor = dtype[sizes].Parameter(parameter_number=0)
+            add_func = hlo.gen_add_func(dtype)
+            tensor = dtype[sizes].AllReduce(tensor, replica_groups=replica_groups, to_apply=add_func)
+            return tensor
+
+    return _sync_tensor_program
+
+
+class PipelineParallelProgram(DecoderProgramMultiLayer):
+
+
+    def init_pp_sync_programs(self):
+
+        self.send_hidden_kernels = {}
+        self.recv_hidden_kernels = {}
+
+        self.send_logits_kernels = {}
+        self.recv_logits_kernels = {}
+
+        def replica_groups_helper(src_rank_id, dst_rank_id, tp):
+            return [list(sorted([src_rank_id*tp+i, dst_rank_id*tp+i])) for i in range(tp)]
+
+        for batch_idx, batch_size in enumerate(self.batch_sizes):
+
+            for (npos, b), kernel in self.kernels.items():
+                if b == batch_size:
+                    break
+
+            hidden = kernel.hlo_module.host_program_shape.parameters[0]
+
+            hidden_sizes = hidden.dimensions
+            hidden_dtype = compiler.primitive2name(hidden.element_type)
+
+            logits = self.ln_lm_head_hlo_modules[batch_idx].host_program_shape.result
+
+            logits_sizes = logits.dimensions
+            logits_dtype = compiler.primitive2name(logits.element_type)
+
+            if self.neuron_config.first_rank():
+                # setup send hidden
+                send_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, self.neuron_config.rank_id+1, self.tp_degree))
+                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                # setup receive logits
+                recv_logits_hlo = sync_tensor_program(logits_sizes, logits_dtype, replica_groups=replica_groups_helper(self.neuron_config.pp_stages-1, self.neuron_config.rank_id, self.tp_degree))
+                self.recv_logits_kernels[batch_size] = compiler.HLOKernel(recv_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+
+            elif self.neuron_config.last_rank():
+                # setup receive hidden
+                recv_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id-1, self.neuron_config.rank_id, self.tp_degree))
+                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                # setup send logits
+                send_logits_hlo = sync_tensor_program(logits_sizes, logits_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, 0, self.tp_degree))
+                self.send_logits_kernels[batch_size] = compiler.HLOKernel(send_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+            else:
+                # setup receive hidden
+                # setup send hidden
+                pass
+
+    def setup(self, layers, ln_lm_head_params):
+        super().setup(layers, ln_lm_head_params)
+        self.setup_pp_sync_programs()
+
+
+    def get_pp_sync_kernels(self):
+        get_kernels = lambda x: list(x.values())
+        return get_kernels(self.send_hidden_kernels) + get_kernels(self.recv_hidden_kernels) + get_kernels(self.send_logits_kernels) + get_kernels(self.recv_logits_kernels)
+
+    def setup_pp_sync_programs(self):
+
+        for batch_idx, batch_size in enumerate(self.batch_sizes):
+            if self.neuron_config.first_rank():
+                # setup send hidden, only send from last layer group
+                for (npos, batch), memory in self.multi_layers_memories[-1].items():
+                    if batch == batch_size:
+                        self.send_hidden_kernels[batch_size].setup([memory.output_tensors[0]], [])
+                # setup recv logits, only recv at first layer group
+                self.recv_logits_kernels[batch_size].setup([], [self.logits_buffer[batch_idx]])
+            elif self.neuron_config.last_rank():
+                # setup receive hidden, only recv at first layer group
+                for (npos, batch), memory in self.multi_layers_memories[0].items():
+                    if batch == batch_size:
+                        self.recv_hidden_kernels[batch_size].setup([], [memory.input_tensors[0]])
+                # setup send logits
+                self.send_logits_kernels[batch_size].setup([self.logits_buffer[batch_idx]], [])
+            else:
+                pass
+
+
+        for kernel in self.get_pp_sync_kernels():
+            kernel.build()
+            kernel.load()
+
+    def maybe_send_hidden(self, bucket_id, batch_size):
+        if not self.neuron_config.last_rank():
+            logging.debug("Running send_hidden")
+            self.send_hidden_kernels[batch_size].run()
+
+    def maybe_receive_hidden(self, bucket_id, batch_size):
+        if not self.neuron_config.first_rank():
+            logging.debug("Running recev_hidden")
+            self.recv_hidden_kernels[batch_size].run()
+
+    def maybe_receive_logits(self, bucket_id, batch_size):
+        if self.neuron_config.first_rank():
+            logging.debug("Running receiv_logits")
+            self.recv_logits_kernels[batch_size].run()
+
+    def maybe_send_logits(self, bucket_id, batch_size):
+        if self.neuron_config.last_rank():
+            logging.debug("Running send_logits")
+            self.send_logits_kernels[batch_size].run()
 
 class FastCacheBroadcaster(base.NeuronBaseSerializer):
 

@@ -23,6 +23,7 @@ import neuronxcc
 import math
 import shutil
 import logging
+# logging.basicConfig(level=logging.DEBUG)
 import os, psutil
 
 from transformers import AutoModelForCausalLM
@@ -41,8 +42,11 @@ from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 
-def dump(dump_dir, dump_file_name, data):
-    os.makedirs(dump_dir, exist_ok=True)
+def dump(dump_file_name, data, dump_dir=None):
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+    else:
+        dump_dir = ""
     torch.save(data, os.path.join(dump_dir, dump_file_name))
 
 
@@ -219,7 +223,6 @@ def main():
     run_parser.add_argument('--gqa', type=str, default=None)
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
-    run_parser.add_argument('--old', action='store_true') # FIXME: debug
     # generation configuration
     # TODO: could we simply make unparsed arguments as generation configuration?
     run_parser.add_argument('--beam', type=int, default=1)
@@ -240,17 +243,19 @@ def main():
         "I'm not going to tell you how I learned to code, or how much I've learned. " \
         "But I will tell the story of my first programming experience, and how it changed my life.")
     run_parser.add_argument('--prompt_len', type=int, default=None)
-    # neuron_utils utils
+    # neuron utils
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
     run_parser.add_argument('--to_s3', default=None)
-    # dump logits
+    # dump outputs
+    run_parser.add_argument('--dump_output', type=str, default=None)
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
     run_parser.add_argument('--dump_logits_limit', type=int, default=1)
     # benchmark
     run_parser.add_argument('--benchmark', action='store_true', default=None)
     # suffix
     run_parser.add_argument('--suffix', type=str, default=None)
+    run_parser.add_argument('--no_output', action='store_true', help="Useful for large sequence length (like 128k), we don't want to print it to stdout but we should dump to some output folder instead")
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -479,6 +484,7 @@ def run(args, hf_model_name, model_cls):
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
                                                 unroll=args.unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
+
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
@@ -560,11 +566,16 @@ def run(args, hf_model_name, model_cls):
                 dump_logits_limit = len(outputs.scores)
             assert dump_logits_limit <= len(outputs.scores), f"dump_logits_limit {args.dump_logits_limit} exceeds length of generated tokens {len(outputs.scores)}"
             for i in range(dump_logits_limit):
-                dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
+                dump(f"{i}.pt", outputs.scores[i], dump_dir=dump_logits_dir)
 
-        print('generated_sequence=', outputs.sequences)
+        if args.no_output:
+            print('generated_sequence=', outputs.sequences)
+
+        if args.dump_output:
+            dump(args.dump_output, outputs.sequences)
         outputs_sentences = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
-        print(outputs_sentences)
+        if args.no_output:
+            print(outputs_sentences)
 
     finally:
 

@@ -36,11 +36,11 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=NeuronConfig(), **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
