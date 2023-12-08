@@ -13,8 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+import math
 import torch_neuronx  # registers torch.ops.neuron
 
+
+nc_total_tensor_size = 0
 
 def init():
     return torch.ops.neuron._init_neuron()
@@ -46,6 +49,10 @@ def execute(model, inputs):
 
 
 def parallel_to_nc(tensors):
+    global nc_total_tensor_size
+    first_rank_tensors = tensors[0]
+    nc_total_tensor_size += math.prod(first_rank_tensors.shape)
+    print(f"nc_total_tensor_size: {nc_total_tensor_size / (10**9)}B")
     return torch.ops.neuron._parallel_to_neuron(tensors)
 
 

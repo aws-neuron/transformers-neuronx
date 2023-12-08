@@ -39,13 +39,14 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        self.neuron_config.auto_layer_partition(config.num_hidden_layers)
         self.prefixed_length = prefixed_length
         if context_unroll is None:
-            context_unroll = config.num_hidden_layers
+            context_unroll = self.neuron_config.valid_layers()
         self.context_unroll = context_unroll
 
         if unroll is None:
-            unroll = config.num_hidden_layers
+            unroll = self.neuron_config.valid_layers()
         self.unroll=unroll
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
@@ -66,7 +67,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
-            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
+            num_layers=self.neuron_config.valid_layers(), n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
             unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
@@ -80,7 +81,9 @@ class LlamaForSampling(base.NeuronModelBase):
 
         ops.init()
 
-        for layer in self.chkpt_model.model.layers:
+        for layer_id, layer in enumerate(self.chkpt_model.model.layers):
+            if not self.neuron_config.is_valid_layer(layer_id):
+                continue
             layer.materialize()
             attn = layer.self_attn
             mlp = layer.mlp
@@ -110,6 +113,11 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.to_neuron()
             layer.nullify()
 
+        # For pipeline parallel, we need to load ln and lm_head for now even the pipeline stage doesn't has ln and lm_head, because
+        # 1) we need the ln_lm_head hlo for pp0 to get the logits shape and dtype
+        # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
+        # 3) to get ln_lm_head hlo, we need to do weight loading and sharding
+        # 4) this will introduce extra memory allocation, but ln_lm_head i/o tensor is much smaller and we can get rid of it when we can construct hlo in init
         ln_f = self.chkpt_model.model.norm
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), None)
@@ -120,8 +128,11 @@ class LlamaForSampling(base.NeuronModelBase):
         if self.neuron_config.on_device_embedding:
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
+
         self.decoder_lm_head.to_neuron()
-        self.decoder_lm_head.use_executor = True
+        # Pipeline parallel deosn't support executor right now
+        if not self.neuron_config.is_pp():
+            self.decoder_lm_head.use_executor = True
 
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
@@ -129,7 +140,8 @@ class LlamaForSampling(base.NeuronModelBase):
                     model = self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                      new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
                     # PERF: No latency improvement seen in multi-layer models from executor
-                    if self.context_unroll == self.config.num_hidden_layers:
+                    # Pipeline parallel deosn't support executor right now
+                    if self.context_unroll == self.config.num_hidden_layers and not self.neuron_config.is_pp():
                         model.use_executor = True
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 

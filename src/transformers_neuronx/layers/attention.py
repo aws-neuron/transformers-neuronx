@@ -59,7 +59,7 @@ def query_key_value(
     if fuse_qkv:
         # QKV = (hidden @ wQKV) + bQKV
         active_qkv = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config=neuron_config)
-    
+
         # Split
         slice_lim = active_qkv.sizes[-1] // FUSED_QKV_TP_FACTOR
         active_q = hlo.slice_along(active_qkv, -1, slice_lim, start=0)
@@ -408,7 +408,7 @@ def output(
     O = (C @ wO) + bO
     """
     dtype = context.dtype
-    n_seqs, n_active_tokens, n_heads_tp, d_head = context.sizes 
+    n_seqs, n_active_tokens, n_heads_tp, d_head = context.sizes
     _, hidden_size = out_weight.sizes
     hidden_sizes = n_seqs, n_active_tokens, hidden_size
 
@@ -417,11 +417,4 @@ def output(
     result = hlo.dot10_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
-    if tp_degree == 1:
-        return result
-
-    all_reduce_dtype = None
-    if neuron_config:
-        all_reduce_dtype = neuron_config.all_reduce_dtype
-    result = hlo.all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
-    return result
+    return hlo.all_reduce_helper(hlo.all_reduce_sum, result, tp_degree, neuron_config=neuron_config)

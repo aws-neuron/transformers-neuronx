@@ -34,11 +34,11 @@ class BloomForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
-                 unroll=None, neuron_config=NeuronConfig(), **kwargs):
+                 unroll=None, neuron_config=None, **kwargs):
         config = BloomConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(BloomForCausalLM, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
 
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:
