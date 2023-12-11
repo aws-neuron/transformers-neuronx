@@ -198,7 +198,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
-                logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                if self.neuron_config.log_softmax_scores:
+                    logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                else:
+                    logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
 
 
 
@@ -221,7 +224,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             hidden_slice = hidden[:, current:current+estimate].contiguous()
             cache_ids = torch.as_tensor([i for i in range(current, current+estimate)], dtype=torch.int32)
             last_token_id = torch.as_tensor(estimate - 1)
-            logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+            if self.neuron_config.log_softmax_scores:
+                logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+            else:
+                logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
 
             current += estimate
 
@@ -229,6 +235,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits[:] = float('-inf')
             logits[self.bos_token_id] = 1.0
 
+        if self.neuron_config.log_softmax_scores:
+            return logits, scores
         return logits
 
     def _prepare_for_par_ctx_rhs_padding(self, input_ids):

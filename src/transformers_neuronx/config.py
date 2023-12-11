@@ -80,6 +80,8 @@ class NeuronConfig():
             Default: `"HSB"`.
         on_device_embedding (bool, optional): Whether to use on-device embedding for sampling.
             Default: `False`.
+        log_softmax_scores: (`bool`, optional): Return log-softmax scores along with logits.
+            Default: False
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -94,6 +96,7 @@ class NeuronConfig():
             self.use_2d_cache_ids = True
         self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
         self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
+        self.log_softmax_scores = kargs.pop('log_softmax_scores', False)
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
