@@ -263,6 +263,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        if self.neuron_config and self.neuron_config.log_softmax_scores:
+            self.decoder_lm_head.add_post_layer_builder(hlo_builder.post_layer)
 
         n_embd = self.config.n_embd
         d_head = n_embd // config.n_head
@@ -470,25 +472,36 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        log_softmax_scores = self.neuron_config and self.neuron_config.log_softmax_scores
         if is_bsh:
             hidden = hidden.permute(2, 1, 0)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            if log_softmax_scores:
+                logits, scores = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            else:
+                logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            if log_softmax_scores:
+                logits, scores = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            else:
+                logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
+        if log_softmax_scores:
+            scores = scores[:self.config.vocab_size, -1, :]
+            scores = scores.transpose(0, 1)
         if is_context_encode:
             task.wait()
             self.tensor_pool.push(hidden)
         if is_context_encode and not self.share_caches:
             self.broadcaster[estimate].run_broadcast()
-
+        if log_softmax_scores:
+            return logits, scores
         return logits
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
@@ -544,10 +557,17 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 f"batch_size={batch_size} and runtime_batch_size={runtime_batch_size}"
             )
 
-        next_token_scores = self.forward(input_ids, start_ids=start_ids)
+        log_softmax = self.neuron_config and self.neuron_config.log_softmax_scores
+        if log_softmax:
+            next_token_scores, log_softmax_scores = self.forward(input_ids, start_ids=start_ids)
+        else:
+            next_token_scores = self.forward(input_ids, start_ids=start_ids)
+            log_softmax_scores = None
         repeat_factor = batch_size // runtime_batch_size
         input_ids = input_ids.repeat([repeat_factor, 1])
         next_token_scores = next_token_scores.repeat([repeat_factor, 1])
+        if log_softmax:
+            log_softmax_scores = log_softmax_scores.repeat([repeat_factor, 1])
         if self.context_hook is not None:
             self.context_hook()
         interleaved = sampling.sample_loop(
@@ -558,14 +578,21 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
-            output_scores=output_scores
+            output_scores=output_scores,
+            neuron_config=self.neuron_config,
+            log_softmax_scores=log_softmax_scores,
         )
         if output_scores:
-            interleaved, scores = interleaved
+            if log_softmax:
+                interleaved, scores, log_softmax_scores = interleaved    
+            else:
+                interleaved, scores = interleaved
         interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
         interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
 
         if output_scores:
+            if log_softmax:
+                return interleaved, scores, log_softmax_scores
             return interleaved, scores
         return interleaved
 
