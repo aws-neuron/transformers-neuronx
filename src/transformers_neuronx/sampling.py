@@ -115,10 +115,12 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None, output_scores=False):
+                top_k=50, streamer=None, output_scores=False, neuron_config=None, log_softmax_scores=None):
+    log_softmax = neuron_config and neuron_config.log_softmax_scores
     tokens = [input_ids]
     _, start = input_ids.shape
     scores = []
+    ls_scores = []
     for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 
@@ -128,6 +130,8 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         # Remove all tokens with a probability less than the last token of the top-k
         if output_scores:
             scores.append(next_token_scores)
+            if log_softmax:
+                ls_scores.append(log_softmax_scores)
         topk_values, topk_indices = torch.topk(next_token_scores, top_k)
 
         # sample
@@ -144,12 +148,17 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
 
         # forward pass to get next token
         cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-        next_token_scores = model(inputs, cache_ids, start_ids)
+        if log_softmax:
+            next_token_scores, log_softmax_scores =  model(inputs, cache_ids, start_ids)
+        else:
+            next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
         streamer.end()
 
     if output_scores:
+        if log_softmax:
+            return torch.cat(tokens, dim=-1), scores, ls_scores
         return torch.cat(tokens, dim=-1), scores
 
     return torch.cat(tokens, dim=-1)

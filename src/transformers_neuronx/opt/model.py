@@ -341,6 +341,12 @@ class OPTForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         return transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
 
+    def post_layer(self, logits):
+        if self.neuron_config.log_softmax_scores:
+            scores = hlo.log_softmax(logits, tp_degree=self.tp_degree, dim=0)
+            return logits, scores
+        return logits
+
     def attention(self, hidden, curr_window_start, cache_ids, mask, active_mask,
                   cached_keys, cached_values,
                   q_weight, q_scales, q_bias,

@@ -263,6 +263,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def add_ln_lm_head_builder(self, ln_lm_head_builder):
         self.ln_lm_head_builder = ln_lm_head_builder
 
+    def add_post_layer_builder(self, builder):
+        self.post_layer_builder = builder
+
     def new_layer(self):
         *_, n_positions = self.n_positions_list
         layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
@@ -330,6 +333,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
+        if self.neuron_config.log_softmax_scores:
+            new.add_post_layer_builder(self.post_layer_builder)
         for layer in self.layers:
             new_layer = new.new_layer()
             new_layer.assign_parameters(layer)
@@ -485,7 +490,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             head_weight = maybe_transfer_with_static_ring(head_weight)
             head_bias = maybe_transfer_with_static_ring(head_bias)
             logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
-            outputs = [logits, *out_caches]
+            if self.neuron_config.log_softmax_scores:
+                logits, scores = self._hlo_post_layer(logits)
+                outputs = [logits, scores, *out_caches]
+            else:
+                outputs = [logits, *out_caches]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
@@ -571,9 +580,18 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
-            return self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
+            logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
+            if self.neuron_config.log_softmax_scores:
+                logits, scores = self._hlo_post_layer(logits)
+                outputs = [logits, scores]
+                root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
+                return scribe.tuple(*root_shapes).Tuple(*outputs)
+            return logits
 
         return compiler.compile_py_func(ln_lm_head)
+    
+    def _hlo_post_layer(self, logits):
+        return self.post_layer_builder(logits)
 
     # Mainly used for serialization purposes.
     # Defines how to access all the kernels.
@@ -1339,7 +1357,10 @@ class DecoderProgram:
     def setup(self, layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
         if self.logits_buffer:
-            self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
+            if self.neuron_config.log_softmax_scores:
+                self.logits_buffer = [[self.manipulator.duplicate(buf) for buf in logits_buffer_batch_size] for logits_buffer_batch_size in self.logits_buffer]
+            else:
+                self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
         for kernel in self.kernels.values():
             kernel.load(io_ring_cache_size)
 
@@ -1367,7 +1388,10 @@ class DecoderProgram:
         idx = self.batch_sizes.index(batch_size)
         if self.logits_buffer:
             if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
-                return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+                if self.neuron_config.log_softmax_scores:
+                    return [self.manipulator.unshard_along(val, dim=0) for val in self.logits_buffer[idx]]
+                else:
+                    return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
             else:
                 return ops.parallel_cpu(self.logits_buffer[idx])[0]
         else:
@@ -1460,7 +1484,11 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches)
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
-        self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]
+        if self.neuron_config.log_softmax_scores:
+            self.logits_buffer = [[compiler.gen_zero_output(hlo, 0), compiler.gen_zero_output(hlo, 1)] for hlo in hlos_for_input]
+        else:
+            self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]
+        self.memories = dict()
         self.executors = dict()
 
 
@@ -1475,7 +1503,10 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         for bs_idx, batch_size in enumerate(self.batch_sizes):
             for npos in self.n_positions_list:
                 input_tensors = [*self.input_buffers[bs_idx]]
-                output_tensors = [self.logits_buffer[bs_idx]]
+                if self.neuron_config.log_softmax_scores:
+                    output_tensors = [*self.logits_buffer[bs_idx]]
+                else:
+                    output_tensors = [self.logits_buffer[bs_idx]]
                 self._fill_io_tensors(input_tensors, output_tensors, layers, npos, batch_size)
                 input_tensors.extend(pre_layer_params)
                 input_tensors.extend(ln_lm_head_params)
@@ -1524,7 +1555,10 @@ class DecoderProgramMultiLayer(DecoderProgram):
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
         self.num_layers = num_layers
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
-        self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
+        if self.neuron_config.log_softmax_scores:
+            self.logits_buffer = [[compiler.gen_zero_output(hm, 0), compiler.gen_zero_output(hm, 1)] for hm in ln_lm_head_hlo_modules]
+        else:
+            self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
         self.unroll = unroll
         self.ln_lm_head_hlo_modules = ln_lm_head_hlo_modules
 
@@ -1566,7 +1600,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
         if self.neuron_config.is_valid_lm_head():
             for head_idx in range(0,len(self.ln_lm_head_kernels)):
-                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], [self.logits_buffer[head_idx]])
+                output_tensors = [*self.logits_buffer[head_idx]] if self.neuron_config.log_softmax_scores else [self.logits_buffer[head_idx]]
+                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], output_tensors)
                 self.ln_lm_head_kernels[head_idx].build()
                 self.ln_lm_head_kernels[head_idx].load()
 
