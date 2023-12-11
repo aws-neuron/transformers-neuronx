@@ -149,6 +149,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         # batch_size is in dim 2 because of the transpose taken in _forward function.
         # For BSH, it is dim 0.
         is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+        log_softmax_scores = neuron_config and neuron_config.log_softmax_scores
         batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
 
         if self.is_fid:
@@ -183,17 +184,25 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
-                logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                if log_softmax_scores:
+                    logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                else:
+                    logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
 
         for i in range(current, context_length):
             cache_ids = torch.as_tensor([i], dtype=torch.int32)
             hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+            if log_softmax_scores:
+                logits, scores = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+            else:
+                logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
 
         if self.is_fid:
             logits[:] = float('-inf')
             logits[self.bos_token_id] = 1.0
 
+        if log_softmax_scores:
+            return logits, scores
         return logits
 
     def _prepare_for_par_ctx_rhs_padding(self, input_ids):
