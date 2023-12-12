@@ -151,6 +151,7 @@ def benchmark(
     num_inference_per_iter = len(latency_list) // iterations
     context_encoding_latency_list = latency_list[::int(num_inference_per_iter)]
 
+    total_context_encoding_latency = sum(context_encoding_latency_list) * 1000
 
     # Compute metrics
     boundaries = [0, 50, 90, 95, 99, 100]
@@ -160,9 +161,7 @@ def benchmark(
         percentiles[name] = percentile(latencies, boundary)
     duration = end - begin
     inferences = len(latencies) * args.batch_size
-    throughput = inferences / duration
-    mean_latency = sum(latencies) / len(latencies)
-
+    mean_e2e_token_gen_latency = (sum(latencies) - total_context_encoding_latency) / len(latencies)
 
     # Metrics
     metrics = {
@@ -175,9 +174,9 @@ def benchmark(
         "batches": len(latencies),
         "inferences": inferences,
         "total_duration_seconds": duration,
-        "mean_context_encoding_latency": sum(context_encoding_latency_list) / len(context_encoding_latency_list),
-        "output_token_throughput": (inferences * (output_length - context_length)) / duration,
-        "mean_output_token_latency": mean_latency / (output_length - context_length),
+        "mean_context_encoding_latency": 1000* sum(context_encoding_latency_list) / len(context_encoding_latency_list),
+        "e2e_output_token_throughput": (inferences * (output_length - context_length)) / duration,
+        "mean_output_token_latency": mean_e2e_token_gen_latency / (output_length - context_length),
     }
 
     print(metrics)
