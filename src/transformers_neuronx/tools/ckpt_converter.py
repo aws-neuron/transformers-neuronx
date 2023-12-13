@@ -44,7 +44,7 @@ HELP_DOC_STR = """
     Note: only validated for Llama architecture
 """
 
-def convert(input_dir, output_dir, num_layers):
+def convert(input_dir, output_dir, num_layers, init_std=1.0):
     os.makedirs(output_dir, exist_ok=True)
 
     with open(os.path.join(input_dir, "config.json")) as f:
@@ -106,7 +106,7 @@ def convert(input_dir, output_dir, num_layers):
         empty_json = {
             'torch_dtype': "float32",
             'shape': tensor_shape,
-            'init_std': 1.0,
+            'init_std': init_std,
         }
 
         with open(os.path.join(dst_bin_dir, dst_file), 'w') as f:
@@ -143,12 +143,13 @@ def ckpt_converter():
     parser.add_argument('input_dir', type=str)
     parser.add_argument('output_dir', type=str)
     parser.add_argument('num_layers', type=int)
+    parser.add_argument('--init_std', type=float, default=1.0)
 
 
     args = parser.parse_args()
 
     start = time.time()
-    convert(args.input_dir, args.output_dir, args.num_layers)
+    convert(args.input_dir, args.output_dir, args.num_layers, args.init_std)
 
     print(f"convert done after {time.time() - start}s")
 
