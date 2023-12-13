@@ -411,7 +411,7 @@ def io_ring_cache_context(size):
 
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
@@ -423,20 +423,21 @@ class ParallelKernel:
         self.g_start_device_id = g_start_device_id
         if g_device_count is None:
             g_device_count = tp_degree
+        self.tag = tag
         self.g_device_count = g_device_count
 
     def build_memory(self):
         return ParallelMemory(self.hlo_module, self.tp_degree)
 
-    def compile(self, tag=None):
-        self.build(tag=tag)
+    def compile(self):
+        self.build()
         return self.neff_bytes
 
-    def build(self, tag=None):
+    def build(self):
         # Avoid rebuilding NEFF. This path occurs during deserialization
         if self.neff_bytes is not None:
             return
-        self.neff_bytes = compile_hlo_module(self.hlo_module, tag)
+        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag)
 
     def load(self, io_ring_cache_size=1):
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
