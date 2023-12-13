@@ -394,7 +394,7 @@ def io_ring_cache_context(size):
     For optimal performance, this cache should be configured to be equal to the
     number *unique* sets of weights used per NEFF:
     - For a fully unrolled network the cache size should be 1 since it has
-    exactly 1 set of weights (all weights for all layers).
+      exactly 1 set of weights (all weights for all layers).
     - For a multi-layer network (partial unroll), the cache size should equal
       `n_layers / unroll` since the neff will be be executed that many times
       with a different set of unique weights.
@@ -451,7 +451,6 @@ class ParallelKernel:
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         with io_ring_cache_context(io_ring_cache_size):
             logging.debug(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
-            print(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
             self.model.load()
 
     def snapshot_path(self):
@@ -534,18 +533,6 @@ def gen_randn_inputs(hlo_module, std=0.01, int_func=torch.zeros, treat_as_int=No
             tensor = int_func(shape, dtype=dtype)
         inputs.append(tensor)
     return inputs
-
-def get_input_tensor_size(hlo_module):
-    total_bytes = 0
-    dtype_converter = DataTypeConverter()
-    for _, param in enumerate(hlo_module.host_program_shape.parameters):
-        dtype = dtype_converter.hlo2torch(param.element_type)
-        if dtype.is_floating_point:
-            num_bytes = math.prod(param.dimensions) * torch.finfo(dtype).bits / 8
-        else:
-            num_bytes = math.prod(param.dimensions) * torch.iinfo(dtype).bits / 8
-        total_bytes += num_bytes
-    return total_bytes
 
 def gen_zero_output_from_shape(input):
     shape_proto = input.shape_proto

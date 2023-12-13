@@ -15,6 +15,7 @@
 
 import os
 import torch
+import logging
 from typing import Optional, Union, List
 import hashlib
 from transformers_neuronx import bucket
@@ -52,6 +53,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     # top level api
     def setup(self):
+        if self.neuron_config and self.neuron_config.is_pp():
+            import torch.distributed as dist
+            logging.debug(f"Try to init process group, rank id {self.neuron_config.rank_id}, world size {self.neuron_config.pp_stages}")
+            dist.init_process_group("gloo", init_method=f"tcp://{os.getenv('CPU_COMM_ID', '127.0.0.1:9999')}",
+                    rank=self.neuron_config.rank_id, world_size=self.neuron_config.pp_stages)
         for nbs in self.nbs_objs:
             nbs.setup()
 
