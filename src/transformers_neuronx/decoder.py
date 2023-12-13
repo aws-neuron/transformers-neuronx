@@ -369,7 +369,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         batch_size, = start_ids.shape
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
-        if sequence_length == 1 and not self.neuron_config.is_pp():
+        if sequence_length == 1:
             return self.forward_single(*inputs, neuron_config=neuron_config)
 
         outputs = None
@@ -396,14 +396,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
             else:
                 self.program.inputs_host_to_device(input_tensors, batch_size)
-                self.program.maybe_receive_hidden(bucket_id, batch_size)
                 self.program.run(bucket_id, batch_size)
-                self.program.maybe_send_hidden(bucket_id, batch_size)
 
         if not self.use_executor:
-            self.program.maybe_send_logits(bucket_id, batch_size)
-            self.program.maybe_receive_logits(bucket_id, batch_size)
             outputs = self.program.maybe_logits_device_to_host(batch_size)
+
         return outputs
 
     def embed_positions_ids(self, position_ids, start_ids=None, batch_size=None):
@@ -1651,11 +1648,15 @@ class PipelineParallelProgram(DecoderProgramMultiLayer):
                 self.send_logits_kernels[batch_size] = compiler.HLOKernel(send_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
             else:
                 # setup receive hidden
+                recv_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id-1, self.neuron_config.rank_id, self.tp_degree))
+                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
                 # setup send hidden
+                send_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, self.neuron_config.rank_id+1, self.tp_degree))
+                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
                 pass
 
-    def setup(self, layers, ln_lm_head_params):
-        super().setup(layers, ln_lm_head_params)
+    def setup(self, layers, pre_layer_parameters, ln_lm_head_params):
+        super().setup(layers, pre_layer_parameters, ln_lm_head_params)
         self.setup_pp_sync_programs()
 
 
@@ -1681,12 +1682,26 @@ class PipelineParallelProgram(DecoderProgramMultiLayer):
                 # setup send logits
                 self.send_logits_kernels[batch_size].setup([self.logits_buffer[batch_idx]], [])
             else:
-                pass
+                # setup receive hidden, only recv at first layer group
+                for (npos, batch), memory in self.multi_layers_memories[0].items():
+                    if batch == batch_size:
+                        self.recv_hidden_kernels[batch_size].setup([], [memory.input_tensors[0]])
+                # set up send hidden, only send from last layer group
+                for (npos, batch), memory in self.multi_layers_memories[-1].items():
+                    if batch == batch_size:
+                        self.send_hidden_kernels[batch_size].setup([memory.output_tensors[0]], [])
 
 
         for kernel in self.get_pp_sync_kernels():
             kernel.build()
             kernel.load()
+
+    def run(self, bucket_id, batch_size):
+        self.maybe_receive_hidden(bucket_id, batch_size)
+        super().run(bucket_id, batch_size)
+        self.maybe_send_hidden(bucket_id, batch_size)
+        self.maybe_send_logits(bucket_id, batch_size)
+        self.maybe_receive_logits(bucket_id, batch_size)
 
     def maybe_send_hidden(self, bucket_id, batch_size):
         if not self.neuron_config.last_rank():

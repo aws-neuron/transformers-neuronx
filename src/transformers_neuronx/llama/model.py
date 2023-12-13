@@ -39,14 +39,16 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
-        self.neuron_config.auto_layer_partition(config.num_hidden_layers)
+
+        self.layers_after_partition = self.neuron_config.auto_layer_partition(config.num_hidden_layers)
         self.prefixed_length = prefixed_length
+
         if context_unroll is None:
-            context_unroll = self.neuron_config.valid_layers()
+            context_unroll = len(self.layers_after_partition)
         self.context_unroll = context_unroll
 
         if unroll is None:
-            unroll = self.neuron_config.valid_layers()
+            unroll = len(self.layers_after_partition)
         self.unroll=unroll
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
@@ -67,7 +69,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
-            num_layers=self.neuron_config.valid_layers(), n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
+            num_layers=len(self.layers_after_partition), n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
             unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
@@ -82,7 +84,7 @@ class LlamaForSampling(base.NeuronModelBase):
         ops.init()
 
         for layer_id, layer in enumerate(self.chkpt_model.model.layers):
-            if not self.neuron_config.is_valid_layer(layer_id):
+            if layer_id not in self.layers_after_partition:
                 continue
             layer.materialize()
             attn = layer.self_attn
@@ -113,7 +115,7 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.to_neuron()
             layer.nullify()
 
-        # For pipeline parallel, we need to load ln and lm_head for now even the pipeline stage doesn't has ln and lm_head, because
+        # For pipeline parallel, we need to load ln and lm_head for now even if the pipeline stage doesn't compute the, because
         # 1) we need the ln_lm_head hlo for pp0 to get the logits shape and dtype
         # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
         # 3) to get ln_lm_head hlo, we need to do weight loading and sharding

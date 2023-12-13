@@ -21,6 +21,17 @@ import torch.nn.functional as F
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 
+def parse_dtype_replica_groups(neuron_config, tp_degree):
+    dtype = None
+    replica_groups = None
+
+    if neuron_config:
+        dtype = neuron_config.all_reduce_dtype
+        replica_groups=neuron_config.get_replica_groups(tp_degree)
+
+    return dtype, replica_groups
+
+
 def get_closest_pow2_bucket_size(size):
     # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)?
     # Elapsed time for these 2 cases:

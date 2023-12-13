@@ -14,6 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import parallel
+from transformers_neuronx import utils
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 def query_key_value(
@@ -417,4 +418,5 @@ def output(
     result = hlo.dot10_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
-    return hlo.all_reduce_helper(hlo.all_reduce_sum, result, tp_degree, neuron_config=neuron_config)
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    return hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
