@@ -570,7 +570,8 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         hidden = transpose(hidden, 0, 1)
         hidden = dtype[hidden_sizes].Reshape(hidden)
 
-    hidden = all_reduce_helper(all_reduce_sum, hidden, tp_degree, neuron_config=neuron_config)
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
     # Transpose back to HSB if applicable
     return permute(hidden, (2, 1, 0)) if is_bsh else hidden
 
@@ -615,7 +616,9 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
         hidden = getattr(activations, activation_function)(hidden)
         hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
     hidden = reshape(hidden, hidden_sizes)
-    return all_reduce_helper(all_reduce_sum, hidden, tp_degree, neuron_config=neuron_config)
+
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    return all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
 
 def gated_mlp_bsh(
@@ -667,7 +670,8 @@ def gated_mlp_bsh(
                         scales=out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
-    return all_reduce_helper(all_reduce_sum, result, tp_degree, neuron_config=neuron_config)
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    return all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
 
 def gated_mlp(
@@ -750,7 +754,8 @@ def gated_mlp(
         result = transpose(result, 0, 1)
         result = dtype[hidden_sizes].Reshape(result)
 
-    res = all_reduce_helper(all_reduce_sum, result, tp_degree, neuron_config=neuron_config)
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return permute(result, (2, 1, 0)) if is_bsh else result
@@ -1087,21 +1092,11 @@ def all_gather(tensor, dim, tp_degree, replica_groups=None):
     )
 
 
-def all_reduce_helper(all_reduce_func, tensor, tp_degree, neuron_config=None):
-    assert all_reduce_func in [all_reduce_sum, all_reduce_mean, all_reduce_max], f"invalid all_reduce_func {all_reduce_func.__name__}, has to be one of (sum, mean, max)"
+def all_reduce_sum(tensor, tp_degree, dtype=None, replica_groups=None):
 
     if tp_degree == 1:
         return tensor
 
-    if neuron_config:
-        return all_reduce_func(tensor,
-                              tp_degree,
-                              dtype=neuron_config.all_reduce_dtype,
-                              replica_groups=neuron_config.get_replica_groups(tp_degree))
-
-    return all_reduce_func(tensor, tp_degree)
-
-def all_reduce_sum(tensor, tp_degree, dtype=None, replica_groups=None):
     scribe = tensor.scribe
 
     if dtype is None:
@@ -1549,6 +1544,9 @@ def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
         ])
     """
 
+    if tp_degree == 1:
+        return tensor
+
     scribe = tensor.scribe
     size = tensor.sizes
 
@@ -1800,6 +1798,10 @@ def full_like(tensor, value):
 
 
 def all_reduce_max(tensor, tp_degree=1, dtype=None, replica_groups=None):
+    if tp_degree == 1:
+        return tensor
+
+
     scribe = tensor.scribe
 
     if dtype is None:

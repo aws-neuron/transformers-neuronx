@@ -597,7 +597,8 @@ def output(
         result = hlo.transpose(result, 0, 1)
         result = dtype[hidden_sizes].Reshape(result)
 
-    result = hlo.all_reduce_helper(hlo.all_reduce_sum, result, tp_degree, neuron_config=neuron_config)
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    result = hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return hlo.permute(result, (2, 1, 0)) if is_bsh else result

@@ -16,6 +16,7 @@ from transformers_neuronx import constants
 
 
 import os
+import math
 import logging
 
 class QuantizationConfig:
@@ -51,21 +52,6 @@ class ContinuousBatchingConfig:
     def __init__(self, batch_size_for_shared_caches):
         self.batch_size_for_shared_caches = batch_size_for_shared_caches
 
-
-class PipelineParallelConfig:
-
-    def __init__(self, pp_stages) -> None:
-        self.layer_partition = {}
-
-        self.pp_stages = pp_stages
-
-    def auto_layer_partition(self, num_layers):
-        num_layers_per_stage = num_layers // self.pp_stages
-
-        for i in range(self.pp_stages):
-            self.layer_partition[i] = [l for l in range(i*num_layers_per_stage, min((i+1)*num_layers_per_stage, num_layers))]
-
-        logging.debug(f"auto_layer_partition: {self.layer_partition}")
 
 class NeuronConfig():
     """
@@ -124,31 +110,34 @@ class NeuronConfig():
             self.local_tp = int(self.local_tp)
 
         self.dist = None
-        self.pp_config = None
-        if self.pp_stages > 1:
-            self.pp_config = PipelineParallelConfig(self.pp_stages)
-            import torch.distributed as dist
-            print(f"Try to init process group, rank id {self.rank_id}, world size {self.pp_config.pp_stages}")
-            dist.init_process_group("gloo", init_method=f"tcp://{os.getenv('CPU_COMM_ID', '127.0.0.1:9999')}",
-                        rank=self.rank_id, world_size=self.pp_config.pp_stages)
+
+        self.layer_partition = {}
 
     def is_valid_layer(self, layer_id):
-        if self.pp_config is None:
+        if not self.is_pp():
             return True
-        return layer_id in self.pp_config.layer_partition[self.rank_id]
+        return layer_id in self.layer_partition[self.rank_id]
 
     def is_pp(self):
         return self.pp_stages > 1
 
     def auto_layer_partition(self, num_layers):
         self.num_layers = num_layers
-        if self.pp_config is None:
-            return
-        self.pp_config.auto_layer_partition(num_layers)
+        if not self.is_pp():
+            return list(range(self.num_layers))
+
+        num_layers_per_stage = math.ceil(num_layers / self.pp_stages)
+
+        for i in range(self.pp_stages):
+            self.layer_partition[i] = [l for l in range(i*num_layers_per_stage, min((i+1)*num_layers_per_stage, num_layers))]
+
+        logging.debug(f"auto_layer_partition: {self.layer_partition}")
+
+        return self.layer_partition[self.rank_id]
 
     def valid_layers(self):
-        if self.pp_config:
-            return len(self.pp_config.layer_partition[self.rank_id])
+        if self.is_pp():
+            return len(self.layer_partition[self.rank_id])
         else:
             return self.num_layers
 
@@ -167,7 +156,7 @@ class NeuronConfig():
         return self.pp_stages * tp_degree
 
     def get_replica_groups(self, tp_degree):
-        if self.pp_config:
+        if self.is_pp():
             return [list(range(self.rank_id*tp_degree, (self.rank_id+1)*tp_degree))]
 
         return [list(range(tp_degree))]
