@@ -425,9 +425,12 @@ class ParallelKernel:
             g_device_count = tp_degree
         self.tag = tag
         self.g_device_count = g_device_count
+        self.memories = []
 
     def build_memory(self):
-        return ParallelMemory(self.hlo_module, self.tp_degree)
+        memory = ParallelMemory(self.hlo_module, self.tp_degree)
+        self.memories.append(memory)
+        return memory
 
     def compile(self):
         self.build()
