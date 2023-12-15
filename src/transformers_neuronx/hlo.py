@@ -1320,7 +1320,7 @@ def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
         return value, index
     return index
 
-def _embedding(weight, index):
+def _embedding(weight, index, dtype=None):
     """
     Performs embedding on a single partition
     """
@@ -1329,11 +1329,12 @@ def _embedding(weight, index):
     )
 
     n_embedding, embedding_dim = weight.sizes
-    dtype = weight.dtype
+    if dtype is None:
+        dtype = weight.dtype
 
     # Linearize index tensor to gather from 0th dimension
     n_index = functools.reduce(operator.mul, index.sizes, 1)
-    linear_index = index.dtype[n_index].Reshape(index)
+    linear_index = reshape(index, n_index)
 
     # Gather
     result = dtype[n_index, embedding_dim].Gather(
@@ -1349,10 +1350,10 @@ def _embedding(weight, index):
     )
 
     # Reshape embedding tensor to look like the original index shape
-    return dtype[(*index.sizes, embedding_dim)].Reshape(result)
+    return reshape(result, (*index.sizes, embedding_dim))
 
 
-def embedding(weight, index, tp_degree=1, dim=1):
+def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
     """
     An embedding operation analogous to torch.nn.Embedding
 
@@ -1384,7 +1385,7 @@ def embedding(weight, index, tp_degree=1, dim=1):
         offset = index.dtype[index.sizes].Remainder(index, const_br)
 
     # Replica-local embedding
-    result = _embedding(weight, offset)
+    result = _embedding(weight, offset, dtype)
 
     # Case 1: Early exit if not combining results from multiple replicas
     if tp_degree == 1:
@@ -2153,6 +2154,8 @@ def multiply(lhs, rhs):
 
 
 def reshape(tensor, shape):
+    if isinstance(shape, int):
+        shape = [shape]
     if shape == tensor.sizes:
         return tensor
     dst_numel = functools.reduce(operator.mul, shape)

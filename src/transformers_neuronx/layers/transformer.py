@@ -52,12 +52,19 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     """
     s32 = scribe.s32
 
-    if neuron_config and neuron_config.attention_layout == LAYOUT_BSH:
-        hidden_sizes = batch_size, n_active_tokens, hidden_size
+    if neuron_config and neuron_config.on_device_embedding:
+        hidden_sizes = batch_size, n_active_tokens
     else:
-        hidden_sizes = hidden_size, n_active_tokens, batch_size
+        if neuron_config and neuron_config.attention_layout == LAYOUT_BSH:
+            hidden_sizes = batch_size, n_active_tokens, hidden_size
+        else:
+            hidden_sizes = hidden_size, n_active_tokens, batch_size
 
-    hidden = dtype[hidden_sizes].Parameter(parameter_number=0)
+    hidden = (
+        s32[hidden_sizes].Parameter(parameter_number=0) if neuron_config and neuron_config.on_device_embedding
+        else 
+        dtype[hidden_sizes].Parameter(parameter_number=0)
+    )
     cache_2d = neuron_config and neuron_config.use_2d_cache_ids
     if cache_2d:
         position_sizes = batch_size, n_active_tokens

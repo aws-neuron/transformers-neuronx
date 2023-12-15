@@ -146,10 +146,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         Other arguments that are required by the model are contained in `rest`.
         """
         context_length = hidden.shape[1]
-        # batch_size is in dim 2 because of the transpose taken in _forward function.
-        # For BSH, it is dim 0.
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        batch_size, = start_ids.shape
 
         if self.is_fid:
             # Fusion-In-Decoder context encoding
@@ -342,10 +339,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return logits
 
     def _forward(self, hidden, *args, neuron_config=None):
-        hidden = hidden.transpose(0, -1).contiguous()
-
         # Taking HSB layout
-        _, context_length, _ = hidden.shape
+        _, context_length, *_ = hidden.shape
+        if not self.neuron_config.on_device_embedding:
+            hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             continuous_batching = self.neuron_config and self.neuron_config.continuous_batching

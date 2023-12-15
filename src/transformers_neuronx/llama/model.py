@@ -117,6 +117,8 @@ class LlamaForSampling(base.NeuronModelBase):
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        if self.neuron_config.on_device_embedding:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         self.decoder_lm_head.use_executor = True
@@ -148,11 +150,13 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            hidden = hidden.permute(2, 1, 0)
-        logits = self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        if self.neuron_config.on_device_embedding:
+            logits = self._forward(input_ids, *rst, neuron_config=self.neuron_config)
+        else:
+            hidden = self.chkpt_model.model.embed_tokens(input_ids)
+            if self.neuron_config.attention_layout == LAYOUT_BSH:
+                hidden = hidden.permute(2, 1, 0)
+            logits = self._forward(hidden, *rst, neuron_config=self.neuron_config)
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 

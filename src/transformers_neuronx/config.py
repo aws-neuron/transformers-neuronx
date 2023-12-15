@@ -72,10 +72,12 @@ class NeuronConfig():
             Default: `False`.
         attention_layout (`str`, optional): Layout to be used for attention computation.
             To be selected from `["HSB", "BSH"]`.
-             Default: `"HSB"`.
+            Default: `"HSB"`.
         collectives_layout (`str`, optional): Layout to be used for collectives within attension HSB.
             To be selected from `["HSB", "BSH"]`.
-             Default: `"HSB"`.
+            Default: `"HSB"`.
+        on_device_embedding (bool, optional): Whether to use on-device embedding for sampling.
+            Default: `False`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -93,6 +95,7 @@ class NeuronConfig():
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
+        self.on_device_embedding = kargs.pop('on_device_embedding', False)
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
 
