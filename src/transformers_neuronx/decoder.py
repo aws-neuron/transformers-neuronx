@@ -1427,13 +1427,16 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
         self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]
-        self.memories = dict()
         self.executors = dict()
-        for npos,batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-            self.memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
+
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params):
         super().setup(layers, pre_layer_params, ln_lm_head_params)
+
+        self.memories = dict()
+        for npos,batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
+            self.memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
+
         # Setup the memory with input and output buffers
         for bs_idx, batch_size in enumerate(self.batch_sizes):
             for npos in self.n_positions_list:
@@ -1485,22 +1488,27 @@ class DecoderProgramMultiLayer(DecoderProgram):
         super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
+        self.num_layers = num_layers
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
         self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
         self.unroll = unroll
-        self.multi_layers_memories = []
-        for _ in range(num_layers // unroll):
-            memories = dict()
-            for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-                memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
-            self.multi_layers_memories.append(memories)
+
         self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), tp_degree) for hm in ln_lm_head_hlo_modules]
-        self.ln_lm_head_memories = [ln_lm_head_kernel.build_memory() for ln_lm_head_kernel in self.ln_lm_head_kernels]
         self.layer_executors = list()
         self.lm_head_executors = list()
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params):
-        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=len(self.multi_layers_memories))
+        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_layers // self.unroll)
+
+        self.multi_layers_memories = []
+        for _ in range(self.num_layers // self.unroll):
+            memories = dict()
+            for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
+                memories[npos,batch_size] = self.kernels[npos,batch_size].build_memory()
+            self.multi_layers_memories.append(memories)
+
+        self.ln_lm_head_memories = [ln_lm_head_kernel.build_memory() for ln_lm_head_kernel in self.ln_lm_head_kernels]
+
         hidden_buffers = list()
         last_token_id_buffers = list()
         for input_buffer in self.input_buffers:
@@ -1571,7 +1579,6 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
                                                    n_heads_tp, d_head, amp, n_layer)
         cache_broadcast_hlo_module = compiler.compile_py_func(cache_broadcast_impl)
         self.cache_broadcast_kernel = compiler.ParallelKernel(cache_broadcast_hlo_module, tp_degree)
-        self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
         self._source_caches = None
         self._target_caches = None
 
@@ -1583,6 +1590,7 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
 
     def setup(self):
         assert self._source_caches is not None and self._target_caches is not None, "need to call set_source_caches and set_target_caches"
+        self.cache_broadcast_memory = self.cache_broadcast_kernel.build_memory()
         self.cache_broadcast_kernel.load()
         self.cache_broadcast_memory.setup(self._source_caches, self._target_caches)
 
