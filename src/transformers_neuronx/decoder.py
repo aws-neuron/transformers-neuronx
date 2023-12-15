@@ -196,6 +196,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
+        if self.neuron_config.on_device_embedding:
+            decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
         decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
         decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
         return decoder_lm_head
@@ -347,9 +349,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         sequence length of 1. This allows us to avoid checking buckets, slicing,
         etc.
         """
-        hidden, cache_ids, *_ = inputs
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        _, cache_ids, start_ids, *_ = inputs
+        batch_size, = start_ids.shape
         # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.continuous_batching:
             bucket_id = 0
@@ -363,11 +364,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             return self.program.logits_device_to_host(batch_size)
 
     def forward(self, *inputs, neuron_config=None):
-        hidden, *_ = inputs
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        # batch size is in dim 2 because hidden is now transposed in model.py's forward function.
-        # For BSH, it is in dim 0.
-        batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        hidden, cache_ids, start_ids, *_ = inputs
+        batch_size, = start_ids.shape
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
@@ -387,7 +385,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     slices[sdim] = slicing
                     tensor = tensor[tuple(slices)].contiguous()
                 input_tensors.append(tensor)
-            _, cache_ids, *_ = input_tensors
             max_id = cache_ids.max().item()
             min_id = cache_ids.min().item()
             # When context_length == m * n_active_tokens, bucket-size of n_active_tokens should be chosen.
