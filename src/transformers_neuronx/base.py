@@ -397,19 +397,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def serialization_enabled(self):
         return getattr(self, 'nbs_objs', None) is not None
 
-    def profile_start(self, profile_dir):
+    def profile(self, profile_dir):
         kernels = self._get_all_kernels()
 
         for kernel in kernels:
             if isinstance(kernel, ParallelKernel):
-                kernel.profile_start(profile_dir)
-
-    def profile_stop(self):
-        kernels = self._get_all_kernels()
-
-        for kernel in kernels:
-            if isinstance(kernel, ParallelKernel):
-                kernel.profile_stop()
+                kernel.profile(profile_dir)
 
 # Base class for all "Serializable Objects"
 class NeuronBaseSerializer:

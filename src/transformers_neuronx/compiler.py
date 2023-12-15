@@ -498,28 +498,27 @@ class ParallelKernel:
     def build_executor(self, memory, inputs, outputs):
         return Executor(self, memory, inputs, outputs)
 
-    def profile_start(self, profile_dir):
-        self.profile_dir = profile_dir
-        if os.path.exists(profile_dir):
+    def profile(self, profile_dir):
+        if not os.path.exists(profile_dir):
             os.makedirs(profile_dir, exist_ok=True)
 
         ntff_prefix = os.path.join(profile_dir,self.hlo_module.name)
+
         # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
         self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
 
-    def profile_stop(self):
-        assert self.profile_dir and os.path.exists(self.profile_dir), \
-            "profile directory missing on profile_stop"
-        assert self.ntff_paths, "No NTFF paths - was profile_start called?"
+        # Single inference on the initial allocated memory
+        self(self.memories[0])
+
         ops.parallel_profile_stop(self.ntff_paths)
 
         # Save NEFF file
-        neff_filename = os.path.join(self.profile_dir,
+        neff_filename = os.path.join(profile_dir,
                                     f"{self.hlo_module.name}.neff")
         with open(neff_filename, "wb") as f:
             f.write(self.neff_bytes)
 
-        ntff_tar_path = os.path.join(self.profile_dir,
+        ntff_tar_path = os.path.join(profile_dir,
                                      f'{self.hlo_module.name}.profile.tar')
         with tarfile.open(ntff_tar_path, 'w|') as fp:
             fp.add(neff_filename)
