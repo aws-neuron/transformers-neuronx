@@ -32,7 +32,7 @@ class MistralForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, **kwargs):
+                 neuron_config=NeuronConfig(), **kwargs):
         config = MistralConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(MistralForCausalLM, config)
         self.context_pre_hook = None
