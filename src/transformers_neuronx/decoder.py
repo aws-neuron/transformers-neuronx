@@ -196,8 +196,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
-        if self.neuron_config.on_device_embedding:
-            decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
+        decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
         decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
         decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
         return decoder_lm_head

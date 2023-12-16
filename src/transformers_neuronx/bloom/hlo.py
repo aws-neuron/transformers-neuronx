@@ -30,8 +30,24 @@ class BloomForSamplingNoEmbeddingHlo:
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
         return (hidden, last_token_id, cache_ids, mask, active_mask), dims
 
-    def pre_layer(self, hidden, last_token_id, cache_ids, mask, active_mask, slopes):
+    def embedding(self, input_ids, word_embeddings, ln_weight, ln_bias):
+        dtype = getattr(input_ids.scribe, self.config.amp)
+        hidden = hlo.embedding(word_embeddings, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
+        if self.config.hidden_size % self.config.tp_degree != 0:
+            hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
+        is_bsh = self.neuron_config.attention_layout == LAYOUT_BSH
+        if not is_bsh:
+            hidden = hlo.transpose210(hidden)
+        return hlo.layer_norm_bsh(hidden, ln_weight, ln_bias) if is_bsh \
+               else hlo.layer_norm(hidden, ln_weight, ln_bias)
+
+    def pre_layer(self, hidden, last_token_id, cache_ids, mask, active_mask, *pre_layer_weights):
+        slopes, *rest = pre_layer_weights
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
+
+        if self.neuron_config.on_device_embedding:
+            hidden = self.embedding(hidden, *rest)
+
         return hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
     def layer(self, hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,

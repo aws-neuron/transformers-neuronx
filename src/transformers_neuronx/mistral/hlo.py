@@ -47,6 +47,9 @@ class MistralForSamplingNoEmbeddingHlo:
 
         return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
 
+    def pre_layer(self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask):
+        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
+
     def layer(
             self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
             attn_k_cache, attn_v_cache,

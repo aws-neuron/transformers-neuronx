@@ -49,15 +49,18 @@ class LlamaForSamplingNoEmbeddingHlo:
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
         return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), dims
 
-    def pre_layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
-        dtype = getattr(hidden.scribe, self.config.amp)
-        hidden = hlo.embedding(embed_weight, hidden, tp_degree=self.config.tp_degree, dtype=dtype)
-
+    def embedding(self, input_ids, embed_weight):
+        dtype = getattr(input_ids.scribe, self.config.amp)
+        hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
             hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
-        
+        return hidden
+
+    def pre_layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
+        if self.neuron_config.on_device_embedding:
+            hidden = self.embedding(hidden, *pre_layer_weights)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(

@@ -179,6 +179,10 @@ class BloomForSampling(base.NeuronModelBase):
         lm_head.nullify()
         slopes = alibi.build_slopes(self.config.n_head)
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
+        if self.neuron_config.on_device_embedding:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings.weight, sharding=1, allow_pad=True)
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.weight)
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.bias)
         self.decoder_lm_head.to_neuron()
 
         if self.context_buckets:
@@ -189,6 +193,10 @@ class BloomForSampling(base.NeuronModelBase):
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+
+        if self.neuron_config.on_device_embedding:
+            return self._forward(input_ids, *rst, neuron_config=self.neuron_config)
+
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
         if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
