@@ -2610,25 +2610,3 @@ def get_tuple_element(tup, tuple_index):
     size = element.sizes
     dtype = element.dtype
     return dtype[size].GetTupleElement(tup, tuple_index=tuple_index)
-
-def log_softmax(scores, tp_degree=1, dim=None):
-    rank = len(scores.sizes)
-    if dim is None:
-        dim = rank - 1
-    dtype = scores.dtype
-    br_dims = [di for di in range(rank) if di != dim]
-    reduce_sizes = [scores.sizes[di] for di in br_dims]
-    const_min = dtype.Constant(constant_value=float('-inf'))
-    max_func = gen_max_func(dtype)
-    reductions = dtype[reduce_sizes].Reduce(scores, const_min, dimensions=[dim], to_apply=max_func)
-    global_reductions = all_gather(reductions, dim, tp_degree)
-    global_max = reduce_max(global_reductions, dim, keepdim=True)
-    br_reduce_max = broadcast(global_max, scores.sizes, broadcast_dimensions=br_dims)
-    sub = subtract(scores, br_reduce_max)
-    exp_score = exp(sub)
-    exp_score = all_gather(exp_score, dim, tp_degree=tp_degree)
-    exp_score_max = reduce_sum(exp_score, dim)
-    log = dtype[exp_score_max.sizes].Log(exp_score_max)
-    br_log = broadcast(log, scores.sizes, broadcast_dimensions=br_dims)
-    out = subtract(scores, br_log)
-    return out

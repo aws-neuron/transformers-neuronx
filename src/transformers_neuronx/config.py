@@ -72,12 +72,10 @@ class NeuronConfig():
             Default: `False`.
         attention_layout (`str`, optional): Layout to be used for attention computation.
             To be selected from `["HSB", "BSH"]`.
-            Default: `"HSB"`.
+             Default: `"HSB"`.
         collectives_layout (`str`, optional): Layout to be used for collectives within attension HSB.
             To be selected from `["HSB", "BSH"]`.
-            Default: `"HSB"`.
-        log_softmax_scores: (`bool`, optional): Return log-softmax scores along with logits.
-            Default: False
+             Default: `"HSB"`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -92,7 +90,6 @@ class NeuronConfig():
             self.use_2d_cache_ids = True
         self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
         self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
-        self.log_softmax_scores = kargs.pop('log_softmax_scores', False)
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
