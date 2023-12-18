@@ -503,7 +503,7 @@ class ParallelKernel:
             os.makedirs(profile_dir, exist_ok=True)
 
         tagged_hlo = (f"{self.tag}-" if self.tag else "") + self.hlo_module.name
-        ntff_prefix = os.path.join(profile_dir,self.tagged_hlo)
+        ntff_prefix = os.path.join(profile_dir,tagged_hlo)
 
         # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
         self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
