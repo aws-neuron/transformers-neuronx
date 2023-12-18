@@ -21,10 +21,9 @@ import hashlib
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
+from transformers_neuronx.compiler import ParallelKernel
 from transformers_neuronx.constants import LAYOUT_BSH
 from concurrent.futures import ProcessPoolExecutor
-
-from .compiler import ParallelKernel
 
 
 # Mainly used to expose top level APIs to the model object for serialization
