@@ -508,6 +508,10 @@ class ParallelKernel:
         self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
 
         # Single inference on the initial allocated memory
+        for t in self.memories[0].input_tensors:
+            zero = torch.zeros(t.shape, dtype=t.dtype)
+            zeros = [zero] * self.tp_degree
+            ops.parallel_write(t, zeros)
         self(self.memories[0])
 
         ops.parallel_profile_stop(self.ntff_paths)
