@@ -502,7 +502,8 @@ class ParallelKernel:
         if not os.path.exists(profile_dir):
             os.makedirs(profile_dir, exist_ok=True)
 
-        ntff_prefix = os.path.join(profile_dir,self.hlo_module.name)
+        tagged_hlo = (f"{self.tag}-" if self.tag else "") + self.hlo_module.name
+        ntff_prefix = os.path.join(profile_dir,self.tagged_hlo)
 
         # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
         self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
@@ -518,12 +519,12 @@ class ParallelKernel:
 
         # Save NEFF file
         neff_filename = os.path.join(profile_dir,
-                                    f"{self.hlo_module.name}.neff")
+                                    f"{tagged_hlo}.neff")
         with open(neff_filename, "wb") as f:
             f.write(self.neff_bytes)
 
         ntff_tar_path = os.path.join(profile_dir,
-                                     f'{self.hlo_module.name}.profile.tar')
+                                     f'{tagged_hlo}.profile.tar')
         with tarfile.open(ntff_tar_path, 'w|') as fp:
             fp.add(neff_filename)
             for ntff_path in self.ntff_paths:
