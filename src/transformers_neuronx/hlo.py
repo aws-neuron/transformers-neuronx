@@ -2651,6 +2651,7 @@ def get_tuple_element(tup, tuple_index):
     dtype = element.dtype
     return dtype[size].GetTupleElement(tup, tuple_index=tuple_index)
 
+
 def log_softmax(scores, tp_degree=1, dim=None):
     rank = len(scores.sizes)
     if dim is None:
@@ -2672,3 +2673,15 @@ def log_softmax(scores, tp_degree=1, dim=None):
     br_log = broadcast(log, scores.sizes, broadcast_dimensions=br_dims)
     out = subtract(scores, br_log)
     return out
+
+
+# https://www.tensorflow.org/xla/operation_semantics#select
+def masked_select(mask, true_tensor, false_tensor):
+    dtype = true_tensor.dtype
+    assert mask.dtype == mask.scribe.pred, "Mask must be a boolean tensor."
+    assert dtype == false_tensor.dtype
+    assert mask.sizes == true_tensor.sizes == false_tensor.sizes, (
+        "Tensor size mismatch."
+        f"mask shape={len(mask.sizes)}, true_tensor shape={len(true_tensor.sizes)}, false_tensor shape={len(false_tensor.sizes)}"
+    )
+    return dtype[mask.sizes].Select(mask, true_tensor, false_tensor)
