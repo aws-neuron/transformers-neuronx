@@ -38,8 +38,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     # top level api
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
-        self._load_compiled_artifacts(directory)
-
+        self._compiled_artifacts_directory = directory
+    
     # top level api
     def compile(self, parallel_degree=None):
         kernels = self._get_all_kernels()
@@ -65,7 +65,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     # TODO: decouple hlo_generation from load weights so compile can be called before it
     def to_neuron(self):
         self.load_weights()
-        self.compile()
+        if hasattr(self, "_compiled_artifacts_directory"):
+            self._load_compiled_artifacts(self._compiled_artifacts_directory)
+        else:
+            self.compile()
         self.setup()
 
     # top level api
