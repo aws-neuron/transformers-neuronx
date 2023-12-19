@@ -62,10 +62,10 @@ class BloomForSampling(base.NeuronModelBase):
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True
         )
         self.register_for_serialization(self.decoder_lm_head)
-        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
+        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
@@ -85,7 +85,7 @@ class BloomForSampling(base.NeuronModelBase):
                         num_layers=config.n_layer,
                         n_head=config.n_head,
                         unroll=context_unroll,
-                        neuron_config=neuron_config,
+                        neuron_config=self.neuron_config,
                         allow_pad=self.decoder_lm_head.allow_pad,
                         return_all_outputs=False
                     )
