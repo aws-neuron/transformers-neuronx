@@ -14,6 +14,7 @@
 # ==============================================================================
 import torch
 import math
+import warnings
 
 from transformers_neuronx import decoder
 from transformers_neuronx import module
@@ -22,7 +23,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
@@ -47,7 +48,9 @@ class BloomForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.n_layer
+        self.unroll = unroll
 
+        self.validate_on_device_embedding(self.config.n_layer, self.unroll, self.context_unroll)
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.max_positions = self.token_buckets[-1]
@@ -193,16 +196,13 @@ class BloomForSampling(base.NeuronModelBase):
                     self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-
-        if self.neuron_config.on_device_embedding:
-            return self._forward(input_ids, *rst, neuron_config=self.neuron_config)
-
-        hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
-        hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            hidden = hidden.permute(2, 1, 0)
-        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.transformer.word_embeddings(inputs)
+            inputs = self.chkpt_model.transformer.word_embeddings_layernorm(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        return self._forward(inputs, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         batch_size, *_  = input_ids.shape

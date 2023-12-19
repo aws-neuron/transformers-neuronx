@@ -23,7 +23,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
-from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
@@ -277,10 +277,11 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, start_mask=True, neuron_config=None):
+    def __init__(self, tp_degree, hidden_size, activation_function, amp=None, start_mask=True, neuron_config=None):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
+        self.amp = amp
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
@@ -296,9 +297,37 @@ class OPTForSamplingNoEmbeddingHlo:
         )
         curr_window_start = scribe.s32.Parameter(parameter_number=4)
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask), (*dims, None)
+        return (hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask), (*dims, None)
 
-    def layer(self, hidden, last_token_id, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
+    def embed_positions_ids(self, position_ids, start_ids):
+        batch_size, = start_ids.sizes
+        position_ids = hlo.unsqueeze(position_ids, dim=0)
+        position_ids = hlo.broadcast(position_ids, out_dim_size=(batch_size, position_ids.sizes[-1]), broadcast_dimensions=(0,1))
+        start_ids = hlo.unsqueeze(start_ids, dim=1)
+        start_ids = hlo.broadcast(start_ids, out_dim_size=(batch_size, position_ids.sizes[-1]), broadcast_dimensions=(0,1))
+        position_ids = hlo.subtract(position_ids, start_ids)
+        zero = hlo.full(value=0, dtype=position_ids.dtype, sizes=(position_ids.sizes))
+        mask = hlo.less(position_ids, zero)
+        return hlo.masked_select(mask, zero, position_ids)
+
+    def embedding(self, input_ids, cache_ids, start_ids, wte, wpe):
+        dtype = getattr(input_ids.scribe, self.amp)
+        inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
+        position_ids = self.embed_positions_ids(cache_ids, start_ids)
+        position_embeds = hlo.embedding(wpe, position_ids, tp_degree=self.tp_degree, dtype=dtype)
+        hidden = hlo.add(inputs_embeds, position_embeds)
+        if self.hidden_size % self.tp_degree != 0:
+            hidden = hlo.slice_along(hidden, dim=-1, limit=self.hidden_size, start=0)
+        if self.neuron_config.attention_layout == LAYOUT_HSB:
+            hidden = hlo.transpose210(hidden)
+        return hidden    
+
+    def pre_layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
+        if self.neuron_config.on_device_embedding:
+            hidden = self.embedding(hidden, cache_ids, start_ids, *pre_layer_weights)
+        return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask
+
+    def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,

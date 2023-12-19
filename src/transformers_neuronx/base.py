@@ -16,8 +16,9 @@
 import os
 import torch
 import logging
-from typing import Optional, Union, List
 import hashlib
+import warnings
+from typing import Optional, Union, List
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
@@ -86,6 +87,22 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             self.decoder_lm_head_for_window_context[k]=self.decoder_param_set.init_window_context_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
 
+    def validate_on_device_embedding(self, n_layer, unroll, context_unroll=None):
+        if not self.neuron_config.on_device_embedding:
+            return
+        if unroll != n_layer:
+            warnings.warn(
+                f"On-device embedding cannot be enabled when unroll({unroll}) "
+                f"is not equal to number of layers({n_layer})"
+            )
+            self.neuron_config.on_device_embedding = False
+        if context_unroll is not None and context_unroll != n_layer:
+            warnings.warn(
+                f"On-device embedding cannot be enabled when context_unroll({context_unroll}) "
+                f"is not equal to number of layers({n_layer})"
+            )
+            self.neuron_config.on_device_embedding = False
+
     def is_compiled(self):
         # First check if the kernels have neffs already
         try:
@@ -149,7 +166,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def context(self, hidden, cache_ids, start_ids, last_token_id, *rest, neuron_config=None):
+    def context(self, hidden, cache_ids, start_ids, last_token_id, *rest):
         """A helper to process context (prompt)
         1) if there is available context encoding model (infered from self.context_buckets)
             - when context_length >= estimate, slice the context up to estimate,
@@ -199,9 +216,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
                 if self.neuron_config.log_softmax_scores:
-                    logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                    logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
                 else:
-                    logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                    logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
 
 
 
@@ -218,16 +235,16 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 for i in range(current, context_length):
                     cache_ids = torch.as_tensor([i], dtype=torch.int32)
                     hidden_slice = hidden[:, i:i+1].contiguous()
-                    logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                    logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest)
                 break
 
             hidden_slice = hidden[:, current:current+estimate].contiguous()
             cache_ids = torch.as_tensor([i for i in range(current, current+estimate)], dtype=torch.int32)
             last_token_id = torch.as_tensor(estimate - 1)
             if self.neuron_config.log_softmax_scores:
-                logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
             else:
-                logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
 
             current += estimate
 
@@ -354,10 +371,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
         return logits.to(logits_dtype)
 
-    def _context_dynamic_batching(self, hidden, *args, neuron_config=None):
-        from transformers_neuronx.constants import LAYOUT_BSH
-
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+    def _context_dynamic_batching(self, hidden, *args):
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         input_batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
@@ -380,28 +395,26 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id = cache_ids_per_batch.max()
                 logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
-                                                start_ids_per_batch, last_token_id, neuron_config=neuron_config)
+                                                start_ids_per_batch, last_token_id)
                 all_logits.append(logits_per_batch)
             logits = torch.cat(all_logits, dim=2)
         else:
             assert input_batch_size == running_batch_size, \
                 "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"
-            logits = self.context(hidden, *args, neuron_config=neuron_config)
+            logits = self.context(hidden, *args)
         return logits
 
-    def _forward(self, hidden, *args, neuron_config=None):
+    def _forward(self, hidden, *args):
         _, context_length, *_ = hidden.shape
-        if not self.neuron_config.on_device_embedding:
-            hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
             if continuous_batching:
-                logits = self._context_dynamic_batching(hidden, *args, neuron_config=neuron_config)
+                logits = self._context_dynamic_batching(hidden, *args)
             else:
-                logits = self.context(hidden, *args, neuron_config=neuron_config)
+                logits = self.context(hidden, *args)
         else:
-            logits = self.decoder_lm_head(hidden, *args, neuron_config=neuron_config)
+            logits = self.decoder_lm_head(hidden, *args)
 
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]

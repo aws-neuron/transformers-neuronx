@@ -371,7 +371,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         for layer in self.layers:
             layer.reset()
 
-    def forward_single(self, *inputs, neuron_config=None):
+    def forward_single(self, *inputs):
         """
         Fast-path forward function which avoids as much overhead as possible.
 
@@ -394,13 +394,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.program.run(bucket_id, batch_size)
             return self.program.maybe_logits_device_to_host(batch_size)
 
-    def forward(self, *inputs, neuron_config=None):
+    def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
         batch_size, = start_ids.shape
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
-            return self.forward_single(*inputs, neuron_config=neuron_config)
+            return self.forward_single(*inputs)
 
         outputs = None
         slice_loop_var = range(0, sequence_length, self.n_active_tokens)
@@ -455,6 +455,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 if self.neuron_config.continuous_batching else None
             program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
         else:
+            on_device_embedding = self.neuron_config.on_device_embedding
+            if on_device_embedding:
+                warnings.warn("Multi-layer decoders do not support on-device embedding. Embeddings will be computed on CPU.")
+                self.neuron_config.on_device_embedding = False
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
@@ -470,7 +474,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
                                                     self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
-
+            if on_device_embedding:
+                self.neuron_config.on_device_embedding = True
         return program
 
     def _hlo_fully_unrolled(self, n_positions, batch_size):
