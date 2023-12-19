@@ -1506,6 +1506,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
         self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
         self.unroll = unroll
+        self.ln_lm_head_hlo_modules = ln_lm_head_hlo_modules
 
         self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree)) for hm in ln_lm_head_hlo_modules]
         self.layer_executors = list()
