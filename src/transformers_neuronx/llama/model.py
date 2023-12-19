@@ -21,7 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
@@ -50,6 +50,8 @@ class LlamaForSampling(base.NeuronModelBase):
         if unroll is None:
             unroll = len(self.layers_after_partition)
         self.unroll=unroll
+
+        self.validate_on_device_embedding(self.config.num_hidden_layers, self.unroll, self.context_unroll)
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.window_context_buckets = []
@@ -170,29 +172,36 @@ class LlamaForSampling(base.NeuronModelBase):
         self.prefixed_length = prefixed_length
 
 
+    def _compute_logits(self, input_ids, *rst):
+        hidden = self.chkpt_model.model.embed_tokens(input_ids)
+        if self.neuron_config.attention_layout == LAYOUT_HSB:
+            hidden = hidden.transpose(0, -1).contiguous()
+        return self._forward(hidden, *rst)
+
+
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        if self.neuron_config.on_device_embedding:
-            logits = self._forward(input_ids, *rst, neuron_config=self.neuron_config)
-        else:
-            hidden = self.chkpt_model.model.embed_tokens(input_ids)
-            if self.neuron_config.attention_layout == LAYOUT_BSH:
-                hidden = hidden.permute(2, 1, 0)
-            logits = self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 
+
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        hidden = hidden.transpose(0, -1).contiguous()
+        inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
         if speculation_length is None:
             model=self.decoder_lm_head
         else:
             model=self.decoder_lm_head_for_speculation[speculation_length]
 
-        logits=model(hidden, *args)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            inputs = inputs.transpose(0, -1).contiguous()
+        logits = model(inputs, *args)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
