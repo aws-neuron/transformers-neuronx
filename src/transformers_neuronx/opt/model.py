@@ -65,13 +65,13 @@ class OPTForSampling(base.NeuronModelBase):
             tp_degree, n_positions_list, 1, # n_active_tokens
             self.batch_sizes, attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
-            unroll=unroll, neuron_config=neuron_config
+            unroll=unroll, neuron_config=self.neuron_config
         )
         self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
                                                    config.activation_function, start_mask,
-                                                   neuron_config=neuron_config)
+                                                   neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -90,7 +90,7 @@ class OPTForSampling(base.NeuronModelBase):
                                                     num_layers=config.num_hidden_layers,
                                                     n_head=config.num_attention_heads,
                                                     unroll=context_unroll,
-                                                    neuron_config=neuron_config,
+                                                    neuron_config=self.neuron_config,
                                                     allow_pad=self.decoder_lm_head.allow_pad,
                                                     return_all_outputs=False
                                                 )
