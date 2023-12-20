@@ -1,6 +1,5 @@
 import torch
 import transformers
-import numpy as np
 from typing import Optional, Tuple, Union
 
 from transformers_neuronx import base
@@ -95,9 +94,9 @@ class DraftProvider:
                                   f" classes inheriting this class can be called.")
 
 
-class DefaultTokenAcceptor(TokenAcceptor):
+class ReferenceTokenAcceptor(TokenAcceptor):
     """
-    Standard Implementation of Token Acceptor defined as per the DeepMind paper: https://arxiv.org/pdf/2302.01318.pdf
+    Reference Implementation of TokenAcceptor defined as per the DeepMind paper: https://arxiv.org/pdf/2302.01318.pdf
     """
     def __call__(
             self,
@@ -129,7 +128,8 @@ class DefaultTokenAcceptor(TokenAcceptor):
             # Accepted the token if:
             # case-1: Target probability >= Draft probability
             # case-2: Random sampling where sampled value < (Target/Draft probability).
-            if np.random.random() < min(1, target_prob_i / draft_prob_i):
+            random = torch.rand((1,)).item()
+            if random < min(1, target_prob_i / draft_prob_i):
                 # Accepted
                 accepted_tokens = torch.cat([accepted_tokens, torch.as_tensor([draft_token_id], dtype=torch.int32)])
                 accepted_token_count += 1
@@ -150,7 +150,50 @@ class DefaultTokenAcceptor(TokenAcceptor):
             accepted_tokens = torch.cat([accepted_tokens, torch.as_tensor([torch.multinomial(target_probabilities[-1], num_samples=1, replacement=True)])])
             accepted_token_count += 1
 
-        return accepted_tokens
+        return accepted_tokens.view(1, -1)
+
+
+class DefaultTokenAcceptor(TokenAcceptor):
+    """
+    Optimized TokenAcceptor based on original DeepMind paper: https://arxiv.org/pdf/2302.01318.pdf
+    """
+    def __call__(
+            self,
+            draft_ids: torch.Tensor,
+            draft_scores: torch.Tensor,
+            target_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        draft_token_len, draft_vocab = draft_scores.shape
+        target_token_len, target_vocab = target_scores.shape
+        assert draft_vocab == target_vocab  # vocab size should be same
+        assert draft_token_len + 1 == target_token_len  # target should includes additional token predicted
+
+        draft_probabilities = torch.softmax(draft_scores, dim=-1)
+        target_probabilities = torch.softmax(target_scores, dim=-1)
+        index = draft_ids.view(-1, 1)
+        target_probs = torch.gather(target_probabilities[:-1], 1, index)
+        draft_probs = torch.gather(draft_probabilities, 1, index)
+
+        random = torch.rand(draft_probs.shape)
+        ratio = torch.clamp(target_probs / draft_probs, max=1.0)
+        accepted = torch.less(random, ratio)
+
+        # Minimum will return the first occurance of 0 or False (i.e. rejection)
+        minimum = torch.min(accepted.view(torch.uint8), dim=0)
+        value = minimum.values.item()
+        index = minimum.indices.item()
+
+        def sample(probs):
+            return torch.multinomial(probs, num_samples=1, replacement=True)
+
+        if value != 0: # If we didn't get a rejection this means all drafts were accepted
+            next_token = sample(target_probabilities[-1:])
+            return torch.cat((draft_ids, next_token), dim=1)
+        else:
+            prob_diff = target_probabilities[index:index + 1] - draft_probabilities[index: index + 1]
+            prob_diff = torch.clamp(prob_diff, min=0.0)
+            next_token = sample(prob_diff)
+            return torch.cat((draft_ids[:, :index], next_token), dim=1)
 
 
 class DraftModelForSpeculation(DraftProvider):
@@ -174,8 +217,6 @@ class DraftModelForSpeculation(DraftProvider):
             token: predicted next token
             score: predicted token score
         """
-
-        _, start = input_ids.shape
         next_token_scores = self.model(input_ids, None, start_ids)
         inputs = torch.argmax(next_token_scores, dim=1, keepdim=True)
         return inputs, next_token_scores
@@ -207,26 +248,32 @@ class DraftModelForSpeculation(DraftProvider):
         if start_len == 0:  # run context network as cache_id location starts from 0.
             return self._context_block(input_ids, start_ids)
 
-        k_token_ids = torch.as_tensor([], dtype=torch.int32)
         next_token_scores = self.model(input_ids, cache_ids, start_ids)
-        k_next_scores = torch.zeros((0, next_token_scores.shape[-1]))
+
+        scores = []
+        tokens = []
 
         # Speculate k tokens in auto regressive mode.
         for cur_len in range(start_len, start_len + k):
             next_len = cur_len + 1
-            k_next_scores = torch.cat([k_next_scores, next_token_scores], dim=0)
-            # TODO: Update values from p/k/temp/stop using topk
             topk_values, topk_indices = torch.topk(next_token_scores, k=1)
             probs = torch.nn.functional.softmax(topk_values, dim=-1)
             inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
             inputs = torch.gather(topk_indices, 1, inputs_in_topk)
-            k_token_ids = torch.cat([k_token_ids, inputs], dim=1)
-            if next_len > start_len + k:
+
+            scores.append(next_token_scores)
+            tokens.append(inputs)
+
+            if next_len >= start_len + k:
                 break
+
             cache_ids = torch.as_tensor([next_len], dtype=torch.int32)
             next_token_scores = self.model(inputs, cache_ids, start_ids)
 
-        return k_token_ids, k_next_scores
+        return (
+            torch.cat(tokens, dim=1),
+            torch.cat(scores, dim=0)
+        )
 
 
 class SpeculativeGenerator:
@@ -347,11 +394,18 @@ class SpeculativeGenerator:
 
             # Select which tokens will be used
             accepted_tokens = self.acceptor(draft_ids, draft_next_scores, target_next_scores)
-            if sequence_length - len(tokens) < self.k:
-                accepted_tokens = accepted_tokens[:sequence_length - len(tokens)]
 
-            for token in accepted_tokens:
-                token = torch.unsqueeze(torch.as_tensor([token], dtype=torch.int32), dim=-1)
+            # NOTE: Required for backwards compatibility since the Acceptor did not return batched inputs
+            if accepted_tokens.dim() != 2:
+                accepted_tokens = accepted_tokens.view(1, -1)
+
+            _, num_accepted = accepted_tokens.shape
+            if sequence_length - num_accepted < self.k:
+                accepted_tokens = accepted_tokens[:, :sequence_length - len(tokens)]
+
+            for index in range(num_accepted):
+                token = accepted_tokens[:, index:index + 1]
+
                 # Update done flags.
                 if early_stop:
                     done_flags |= (token == eos_token)
@@ -371,7 +425,7 @@ class SpeculativeGenerator:
             # accepted_tokens = 1 means, no draft token accepted
             # accepted_tokens = 2 means, 1 draft token accepted
             # accepted_tokens = K means, all draft tokens accepted + target model predicted token
-            target_next_id = torch.unsqueeze(torch.tensor([accepted_tokens[-1]]), 0)  # get last token as accepted token
+            target_next_id = accepted_tokens[:, -1:]
 
         if streamer:
             streamer.end()
