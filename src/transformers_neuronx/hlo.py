@@ -1122,7 +1122,7 @@ def all_reduce_sum(tensor, tp_degree, dtype=None, replica_groups=None):
     )
 
 
-def all_to_all(tensor, split_dim, concat_dim, tp_degree):
+def _all_to_all(tensor, split_dim, concat_dim, tp_degree):
     # Add extra reshape (and potentially transpose) before and after all-to-all CC, due to
     # 1) hlo_to_mlir_hlo would assume split_dim == concat_dim
     # 2) split_count is taken from first replica_group
@@ -1159,6 +1159,17 @@ def all_to_all(tensor, split_dim, concat_dim, tp_degree):
     if split_dim == 0:
         assert concat_dim == 1
         tensor = transpose(tensor, 0, 1)
+    return tensor
+
+
+def all_to_all(tensor, split_dim, concat_dim, tp_degree):
+    # Handle the case when split_dim==0 and concat_dim=0
+    if split_dim == 0 and concat_dim == 0:
+        tensor = hlo.unsqueeze(tensor, dim=0)
+        tensor = _all_to_all(tensor, split_dim=1, concat_dim=0, tp_degree=tp_degree)
+        tensor = hlo.squeeze(tensor, dim=1)
+    else:
+        tensor = _all_to_all(tensor, split_dim, concat_dim, tp_degree)
     return tensor
 
 
@@ -2240,6 +2251,10 @@ def compare(lhs, rhs, direction):
     pred = lhs.scribe.pred
     _check_binary_arguments(lhs, rhs)
     return pred[lhs.sizes].Compare(lhs, rhs, comparison_direction=direction)
+
+
+def equal(lhs, rhs):
+    return compare(lhs, rhs, 'EQ')
 
 
 def less(lhs, rhs):

@@ -96,7 +96,7 @@ class ParallelTensorManipulator:
         return [tensor for ordinal in range(self.local_tp_degree)]
 
     def duplicate(self, tensor):
-        return ops.parallel_to_nc([tensor for ordinal in range(self.local_tp_degree)])
+        return ops.parallel_to_nc([tensor.contiguous() for ordinal in range(self.local_tp_degree)])
 
     def shard_along_on_cpu(self, tensor, dim):
         size = tensor.shape[dim]
