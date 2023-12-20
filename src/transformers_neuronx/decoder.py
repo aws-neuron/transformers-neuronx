@@ -355,6 +355,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.continuous_batching:
             bucket_id = 0
+            batch_size, _ = cache_ids.shape
         else:
             bucket_id = self.program.find_bucket_id(cache_ids.item())
         if self.use_executor:
