@@ -55,10 +55,10 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config,
+            unroll=unroll, neuron_config=self.neuron_config,
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -222,7 +222,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         if unroll is None:
             unroll = config.n_layer
         self.unroll=unroll
@@ -241,19 +241,19 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # need to fix this after having right padding
         start_mask = True
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
-                                                   neuron_config=neuron_config)
+                                                   neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, builder=hlo_builder
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
         )
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
             batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, return_all_outputs=True
+            unroll=unroll, neuron_config=self.neuron_config, return_all_outputs=True
         )
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
@@ -294,7 +294,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     n_head=config.n_head,
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
-                    neuron_config=neuron_config,
+                    neuron_config=self.neuron_config,
                     allow_pad=self.decoder_lm_head.allow_pad,
                     return_all_outputs=False
                 )

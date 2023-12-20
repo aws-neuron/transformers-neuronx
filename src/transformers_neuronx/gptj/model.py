@@ -20,6 +20,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
@@ -32,14 +33,14 @@ class GPTJForSampling(module.PretrainedModel):
         super().__init__()
         config = GPTJConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
             max_allowed_sequence_length = config.n_ctx
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
-        if neuron_config and neuron_config.quant:
+        if self.neuron_config.quant:
             raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is None:
             unroll = config.n_layer
