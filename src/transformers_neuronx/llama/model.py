@@ -26,11 +26,11 @@ from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
 
 
-class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class LlamaForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, prefixed_length=0, **kwargs):
+                 neuron_config=None, prefixed_length=0, n_parallel_output_tokens=1, **kwargs):
         config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.config = config
@@ -49,34 +49,47 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
                 self.context_buckets = sorted(self.context_buckets)
-                
+        self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions = self.token_buckets[-1]
 
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
+
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, config.attention_head_size, amp,
-            config.num_hidden_layers, unroll, neuron_config=neuron_config, allow_pad=True,
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
+            batch_size=self.batch_sizes, attention_head_size=config.attention_head_size, amp=amp,
+            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True, shard_over_batch=config.shard_over_batch,
+            n_parallel_output_tokens= self.n_parallel_output_tokens
         )
+        self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                for batch_size in self.batch_sizes:
+                    self.decoder_lm_head_for_context[context_length_estimate, batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                        tp_degree,
+                        [context_length_estimate],
+                        context_length_estimate,
+                        batch_size,
+                        config.attention_head_size,
+                        amp=amp,
+                        num_layers=config.num_hidden_layers,
+                        n_head=config.num_attention_heads,
+                        n_kv_head=config.num_key_value_heads,
+                        unroll=context_unroll,
+                        neuron_config=neuron_config,
+                        allow_pad=self.decoder_lm_head.allow_pad
+                    )
+                    self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, batch_size])
 
     def to_neuron(self):
 
@@ -98,9 +111,16 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
-            new_layer.add_parameter(mlp.gate_proj.weight.T, sharding=1, allow_pad=True, allow_quantize=True)
-            new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1, allow_pad=True, allow_quantize=True)
-            new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True, allow_quantize=True, out_feature_dim=0)
+            new_layer.add_parameter(mlp.gate_proj.weight.T, sharding=1, allow_pad=True,
+                                    allow_quantize=True, allow_transform=True)
+            new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1, allow_pad=True,
+                                    allow_quantize=True, allow_transform=True)
+            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+                new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
+                                        allow_quantize=True, allow_transform=True)
+            else:
+                new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True,
+                                        allow_quantize=True, out_feature_dim=0)
 
             new_layer.to_neuron()
             layer.nullify()
@@ -117,57 +137,14 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.enable_executor()
 
         if self.context_buckets:
-            self.decoder_lm_head_for_context = {}
             for context_length_estimate in self.context_buckets:
-                model = self.decoder_lm_head.build_weight_shared(
-                    n_positions_list=[context_length_estimate],
-                    n_active_tokens=context_length_estimate,
-                    unroll=self.context_unroll,
-                    share_caches=True,
-                )
-                # PERF: No latency improvement seen in multi-layer models from executor
-                if self.context_unroll == self.config.num_hidden_layers:
-                    model.enable_executor()
-                self.decoder_lm_head_for_context[context_length_estimate] = model
-
-    def reset(self):
-        self.decoder_lm_head.reset()
-
-    def context(self, hidden, cache_ids, start_ids):
-        context_length = hidden.shape[1]
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context that when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-                logits = model(hidden_context, cache_context, start_ids)
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        return logits
+                for batch_size in self.batch_sizes:
+                    model = self.decoder_lm_head.build_weight_shared(share_caches=True,
+                                                                     new=self.decoder_lm_head_for_context[context_length_estimate, batch_size])
+                    # PERF: No latency improvement seen in multi-layer models from executor
+                    if self.context_unroll == self.config.num_hidden_layers:
+                        model.enable_executor()
+                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
     def set_prefixed(self, input_ids):
         self.prefixed_input_ids = input_ids[:, :self.prefixed_length]
@@ -177,38 +154,16 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.prefixed_length = prefixed_length
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-
-        batch_size, context_length = input_ids.shape
-        if start_ids is None:
-            start_ids = torch.zeros(batch_size, dtype=torch.int32)
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
-        if self.prefixed_length:
-            cache_ids += self.prefixed_length
-
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        hidden = hidden.transpose(0, -1).contiguous()
-
-        if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids)
-        else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
-
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
-        return logits
+        return self._forward(hidden, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None):
 
-        # To enable optimized context encoding network, we must pad
-        # up to the context length estimate or we will not correctly
-        # select the final context logits (See: layers/transformer.py).
-        # This also means we need to shift the start_ids over to correct
-        # for padding.
-        offset = 0
         batch_size, context_length = input_ids.shape
+        if batch_size not in self.batch_sizes:
+            raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
         prefixed_length = self.prefixed_length
         if context_length < prefixed_length:
             self.prefixed_length = 0
@@ -216,18 +171,6 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             input_ids = input_ids[:, prefixed_length:]
             context_length -= prefixed_length
             sequence_length -= prefixed_length
-        estimate = bucket.find(self.context_buckets, context_length)
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if not prefixed_length:
-                    if start_ids is None:
-                        start_ids = torch.zeros(batch_size, dtype=torch.int32)
-                    start_ids += offset
-                sequence_length += offset
-                # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.max_positions)
 
         result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
@@ -235,84 +178,23 @@ class LlamaForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer
         )
 
-        if offset != 0:
-            result = result[:, offset:]
         return result
 
 class FIDLlamaForSampling(LlamaForSampling):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, **kwargs):
+                 neuron_config=None, reorder_cache=False, **kwargs):
         # Force batch_size=1 in NEFF
         super().__init__(config, n_positions=n_positions, batch_size=1, amp=amp,
                         tp_degree=tp_degree, context_length_estimate=context_length_estimate,
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
-                        **kwargs)
-        self.batch_size = batch_size
+                        reorder_cache=False, **kwargs)
+        assert len(self.decoder_lm_head.batch_size) == 1, "FIDLlamaForSampling does not support compilation for \
+            multiple batch sizes"
+        self.batch_size = self.decoder_lm_head.batch_size[0]
         self.bos_token_id = self.config.bos_token_id
 
-    def context(self, hidden, cache_ids, start_ids):
-        # Fusion-In-Decoder context encoding
-        fused_context_length = hidden.shape[1]
-        context_length = fused_context_length // self.batch_size
-
-        current = 0
-        estimate = bucket.find(self.context_buckets, context_length)
-
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate]
-
-                # Run each context separately in-place
-                for j in range(self.batch_size):
-                    single_context_slice = slice(j * context_length, (j+1) * context_length)
-                    logits = model(hidden_context[:, single_context_slice, :], cache_context[single_context_slice], start_ids)
-
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        logits[:] = float('-inf')
-        logits[self.bos_token_id] = 1.0
-        return logits
-
-    def _save_compiled_artifacts(self, directory):
-        if os.path.isfile(directory):
-            raise FileExistsError(
-                f'Artifacts should be saved to a directory. '
-                f'Found existing file: {directory}'
-            )
-        os.makedirs(directory, exist_ok=True)
-        self.decoder_lm_head.save_compiler_artifacts(os.path.join(directory, 'neuron-program.pkl'))
-
-    def _load_compiled_artifacts(self, directory):
-        if not os.path.isdir(directory):
-            raise FileNotFoundError(f'Did not find directory: {directory}')
-        program_filename = os.path.join(directory, 'neuron-program.pkl')
-        if os.path.exists(program_filename):
-            self.decoder_lm_head.load_compiler_artifacts_after_build(program_filename)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         """ Sample function
@@ -337,17 +219,6 @@ class FIDLlamaForSampling(LlamaForSampling):
         if batch_size * estimate >= sequence_length:
             raise ValueError(f"sequence_length [{sequence_length}] should be larger than fused input context estimates [{estimate} x {batch_size}]")
 
-        if estimate:
-            if context_length < estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if start_ids is None:
-                    start_ids = torch.zeros(fused_batch_size, dtype=torch.int32)
-                start_ids += offset
-                sequence_length += offset
-                # Sequence length cannot be greater than n_positions
-                sequence_length = min(sequence_length, self.max_positions)
-                context_length = estimate
 
         # Flatten input_ids
         context_length = batch_size * context_length
@@ -357,7 +228,4 @@ class FIDLlamaForSampling(LlamaForSampling):
         result = sampling.sample_llama(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
-        if offset != 0:
-            # Offset by offset * batch_size
-            result = result[:, context_length:]
         return result

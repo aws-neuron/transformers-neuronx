@@ -12,42 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Optional
+
 import torch
+import transformers
+
+from transformers_neuronx.config import GenerationConfig
 
 
 @torch.no_grad()
 def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False):
     # populate key/value caches according to the prompt text
-    _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
                        eos_token_id, top_k, streamer, output_scores=output_scores)
 
 
 @torch.no_grad()
-def sample_tokens(model, input_ids, start_ids=None, sequence_length=128):
+def sample_tokens(
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        start_ids: Optional[torch.Tensor] = None,
+        *,
+        sequence_length: int = 128,
+        config: Optional[GenerationConfig] = None,
+        streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+    ):
     """
     A sampling loop for a model that emits selected tokens.
 
     This sampling loop should be used when the token selection is built into
     the model itself.
     """
-    _, start = input_ids.shape
+    batch_size, start = input_ids.shape
 
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_tokens = model(input_ids, cache_ids, start_ids)
+    # Populate the KV cache with prompt
+    next_tokens = model(input_ids, None, start_ids)
 
     cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
 
+    # Use a default config if none is provided
+    if config is None:
+        config = GenerationConfig()
+
+    early_stop = False
+    if config.eos_token_id is not None:
+        done_flags = torch.full((batch_size, 1), False)
+        eos_token = torch.tensor(config.eos_token_id, dtype=torch.int32)
+        early_stop = True
+
+    # Generate loop
     for current, cache_id in zip(range(start + 1, sequence_length + 1), cache_ids):
 
+        if early_stop:
+            done_flags |= (next_tokens == eos_token)
+            if batch_size > 1:  # Avoid writing tokens to completed sequnces
+                next_tokens[done_flags] = eos_token
+
         tokens.append(next_tokens)
+
+        if streamer:
+            streamer.put(next_tokens)
+
+        if early_stop:
+            if done_flags.all():
+                break
+
         if current >= sequence_length:
             break
 
         next_tokens = model(next_tokens, cache_id, start_ids)
+
+    if streamer:
+        streamer.end()
 
     return torch.cat(tokens, dim=-1)
 
@@ -59,8 +97,7 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
     This is useful as a reference implementation for on-device greedy sampling.
     """
     _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
 
     tokens = [input_ids]
     for cur_len in range(start, sequence_length):
@@ -77,11 +114,11 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None, output_scores=False):
+                top_k=50, streamer=None, output_scores=False, n_parallel_output_tokens=1):
     tokens = [input_ids]
     _, start = input_ids.shape
     scores = []
-    for cur_len in range(start, sequence_length):
+    for cur_len in range(start, sequence_length, n_parallel_output_tokens):
         next_len = cur_len + 1
 
         # don't sample EOS
@@ -105,7 +142,7 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
             break
 
         # forward pass to get next token
-        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        cache_ids = torch.arange(cur_len, cur_len+n_parallel_output_tokens, dtype=torch.int32)
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
@@ -149,7 +186,7 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
         only on the filtered result from top_k filtering.
         """
         def filter_sorted(sorted_scores):
-            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1), dim=-1)
+            cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
             mask = cumulative_probs <= top_p
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
@@ -209,7 +246,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
 
         # sample
-        probs = torch.nn.functional.softmax(top_values, dim=-1)
+        probs = torch.nn.functional.softmax(top_values, dim=-1, dtype=torch.float32)
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
@@ -247,8 +284,7 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
 
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
-    cache_ids = torch.arange(start, dtype=torch.int32)
-    next_token_scores = model(input_ids, cache_ids, start_ids)
+    next_token_scores = model(input_ids, None, start_ids)
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature, streamer
     )

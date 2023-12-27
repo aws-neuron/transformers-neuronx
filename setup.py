@@ -50,15 +50,14 @@ setup(
     ],
     keywords='aws neuron neuronx transformers',
     packages=PEP420PackageFinder.find(where='src'),
-    package_data={
-        'transformers_neuronx': [
-            'LICENSE',
-        ],
-    },
+    url='https://github.com/aws-neuron/transformers-neuronx',
+    maintainer='Amazon Web Services, Inc.',
+    description='Transformers Neuron for Trn1 and Inf2 is a software package that enables PyTorch users to perform large language model (LLM) inference on second-generation Neuron hardware',
+    license='Apache License',
+    license_files = ('LICENSE',),
     entry_points = {
         'console_scripts': [
             'generation_demo=transformers_neuronx.generation_demo:main',
-            'gpt2_generation_demo=transformers_neuronx.gpt2.generation_demo:main',
             'gpt2_demo=transformers_neuronx.gpt2.demo:main',
             'gptj_demo=transformers_neuronx.gptj.demo:main',
             'gptneox_demo=transformers_neuronx.gptneox.demo:main',

@@ -20,6 +20,7 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
+from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
@@ -27,7 +28,7 @@ from transformers_neuronx.bloom.modules import BloomForCausalLM
 from transformers_neuronx.bloom.hlo import BloomForSamplingNoEmbeddingHlo
 
 
-class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronModelBase):
+class BloomForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None,
@@ -44,18 +45,48 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
 
         if unroll is None:
             unroll = config.n_layer
-        self.n_positions_list = utils.power_of_two_bucket_sizes(32, n_positions)
+
+        self.token_buckets = bucket.token_sizes(n_positions)
+        self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
+
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
 
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.n_positions_list, 1, batch_size, config.attention_head_size, amp,
-            config.n_layer, unroll, neuron_config=neuron_config, allow_pad=True
+            tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head,
+            unroll=unroll, neuron_config=neuron_config, allow_pad=True
         )
+        self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = None
+
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                for batch_size in self.batch_sizes:
+                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                        tp_degree,
+                        [context_length_estimate],
+                        context_length_estimate,
+                        batch_size,
+                        config.attention_head_size,
+                        amp=amp,
+                        num_layers=config.n_layer,
+                        n_head=config.n_head,
+                        unroll=context_unroll,
+                        neuron_config=neuron_config,
+                        allow_pad=self.decoder_lm_head.allow_pad
+                    )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 
     def to_neuron(self):
 
@@ -112,8 +143,10 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
                 mlp.dense_h_to_4h.bias.detach()
             )
             new_layer.add_mlp_output(
-                mlp.dense_4h_to_h.weight.detach().T,
-                mlp.dense_4h_to_h.bias.detach()
+                mlp.dense_4h_to_h.weight.detach(),
+                mlp.dense_4h_to_h.bias.detach(),
+                sharding=1,
+                transposed=False,
             )
             new_layer.to_neuron()
             layer.nullify()
@@ -130,93 +163,23 @@ class BloomForSampling(module.WrappingCheckpointCompatibleModel, base.NeuronMode
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
         self.decoder_lm_head.to_neuron()
 
-        if self.context_length_estimate is not None:
-            self.decoder_lm_head_for_context = self.decoder_lm_head.build_weight_shared(
-                n_positions_list=[self.context_length_estimate],
-                n_active_tokens=self.context_length_estimate,
-                unroll=self.context_unroll,
-                share_caches=True,
-            )
-
-    def reset(self):
-        self.decoder_lm_head.reset()
-
-    def context(self, hidden, cache_ids, start_ids):
-        context_length = hidden.shape[1]
-        current = 0
-        estimate = self.context_length_estimate
-        if estimate is not None:
-            hidden_context = hidden
-            cache_context = cache_ids
-
-            # Slice context that when it is too large
-            if context_length > estimate:
-                current = estimate
-                hidden_context = hidden[:, :estimate]
-                cache_context = cache_ids[:estimate]
-
-            # Cannot use context encoding for a context that is too small. This
-            # is because the caller must be aware of the cache-ids/start-ids
-            # used.
-            elif context_length < estimate:
-                current = 0
-
-            # Directly pass input to the context network when exactly sized
-            else:
-                current = estimate
-
-            if current == estimate:
-                logits = self.decoder_lm_head_for_context(hidden_context, cache_context, start_ids)
-
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids)
-
-        return logits
+        if self.context_buckets:
+            for context_length_estimate in self.context_buckets:
+                for batch_size in self.batch_sizes:
+                    model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate, batch_size], share_caches=True)
+                    self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-
-        batch_size, context_length = input_ids.shape
-        if start_ids is None:
-            start_ids = torch.zeros(batch_size, dtype=torch.int32)
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
-
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        hidden = hidden.transpose(0, -1).contiguous()
-
-        if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids)
-        else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids)
-
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
-        return logits
+        return self._forward(hidden, *rst)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-
-        # To enable optimized context encoding network, we must pad
-        # up to the context length estimate or we will not correctly
-        # select the final context logits (See: layers/transformer.py).
-        # This also means we need to shift the start_ids over to correct
-        # for padding.
-        offset = 0
-        if self.context_length_estimate:
-            batch_size, context_length = input_ids.shape
-            estimate = self.context_length_estimate
-            if context_length < self.context_length_estimate:
-                input_ids = utils.pad(input_ids, 1, estimate, left=True)
-                offset = estimate - context_length
-                if start_ids is None:
-                    start_ids = torch.zeros(batch_size, dtype=torch.int32)
-                start_ids += offset
-                sequence_length += offset
+        batch_size, *_  = input_ids.shape
+        if batch_size not in self.batch_sizes:
+            raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
         result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k)
-
-        return result[:, offset:]
+        return result

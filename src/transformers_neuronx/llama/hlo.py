@@ -36,6 +36,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
         cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
         start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+        last_token_id = scribe.s32.Parameter(parameter_number=3)
         pos_embed = rotary.hlo_rotary_embedding(hidden_dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
@@ -43,20 +44,20 @@ class LlamaForSamplingNoEmbeddingHlo:
         # NOTE: When using token generation network, we generate a mask for the
         #       past tokens and the current tokens separately. This allows us
         #       use the split "prefetch" attention layer.
-        token_generation = n_active_tokens == 1
-        triu_comparison = 'LT' if token_generation else 'LE'
+        use_prefetch = n_active_tokens != n_positions
+        triu_comparison = 'LT' if use_prefetch else 'LE'
         mask, active_mask = hlo.decoder_attention_mask(
             start_ids,
             cache_ids,
             n_positions,
             triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=token_generation,
+            allow_kv_dot_prefetch=use_prefetch,
             start_mask=True,
         )
-        return (hidden, pos_embed, cache_ids, mask, active_mask), (1, 0, None)
+        return (hidden, last_token_id, pos_embed, cache_ids, mask, active_mask), (1, 0, None, None)
 
     def layer(
-            self, hidden, pos_embed, cache_ids, mask, active_mask,
+            self, hidden, last_token_id, pos_embed, cache_ids, mask, active_mask,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -67,7 +68,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             pre_mlp_ln_weight, pre_mlp_ln_bias,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
-            sparse_mask, active_sparse_mask,
             post_mlp_ln_weight, post_mlp_ln_bias,
             in0_weight, in0_scales,
             in1_weight, in1_scales,
@@ -98,8 +98,8 @@ class LlamaForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, rms_weight, unused_bias, lm_head_weight, lm_head_bias):
-        return transformer.rms_lm_head(hidden, rms_weight, lm_head_weight, lm_head_bias, eps=self.config.rms_norm_eps)
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, n_parallel_output_tokens=1):
+        return transformer.rms_lm_head(hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, n_parallel_output_tokens, eps=self.config.rms_norm_eps)
 
     def attention(
         self,
@@ -123,11 +123,14 @@ class LlamaForSamplingNoEmbeddingHlo:
             v_weight, v_scales, v_bias,
             d_head,
             neuron_config=self.neuron_config,
+            tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
+            shard_over_batch=self.config.shard_over_batch
         )
 
         # Q = Rotate(Q)
         # K = Rotate(K)
-        query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage)
+        query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage,
+                                        tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
 
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
@@ -136,15 +139,19 @@ class LlamaForSamplingNoEmbeddingHlo:
         if active_mask is not None:
 
             # Sp = Q @ Kp
-            prior_scores = attention.score(query, cached_keys)
-            prior_scores = attention.mask(prior_scores, mask)
+            prior_scores = attention.score(query, cached_keys, n_kv_heads=self.config.num_key_value_heads,
+                                           tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+            prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
 
             # Sa = Q @ Ka
-            active_score = attention.score(query, key)
-            active_score = attention.mask(active_score, active_mask)
+            active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
+                                           tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+            active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values, value)
+            context = attention.context(prior_scores, active_score, cached_values, value,
+                                        n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
+                                        shard_over_batch=self.config.shard_over_batch)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -155,9 +162,11 @@ class LlamaForSamplingNoEmbeddingHlo:
         else:
 
             # S = Q @ K
-            score = attention.score(query, key)
-            score = attention.mask(score, mask)
-            context = attention.context_combined(score, value)
+            score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
+                                    tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
+            context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
+                                                 tp_degree=tp_degree, shard_over_batch=self.config.shard_over_batch)
 
             # KCache = K
             # VCache = V

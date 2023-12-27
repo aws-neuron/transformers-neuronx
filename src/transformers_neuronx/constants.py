@@ -12,35 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import torch
 
+# Tile size used for the weight transformation
+TILE_SIZE = 128
 
-def to_torch_dtype(dtype):
-    mapping = {
-        'f32': torch.float32,
-        'f16': torch.float16,
-        'bf16': torch.bfloat16,
-        's8': torch.int8,
-    }
-    return mapping[dtype]
-
-
-def to_amp(dtype):
-    mapping = {
-        torch.float32: 'f32',
-        torch.float16: 'f16',
-        torch.bfloat16: 'bf16',
-    }
-    return mapping[dtype]
-
-
-def to_pyhlo_type(scribe, dtype):
-    """
-    Map a torch dtype to the corresponding scribe dtype object.
-    """
-    mapping = {
-        "float32": scribe.f32,
-        "float16": scribe.f16,
-        "bfloat16": scribe.bf16,
-    }
-    return mapping[dtype]
+# Size used to determine fused QKV operation.
+FUSED_QKV_TP_FACTOR = 3

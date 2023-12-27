@@ -22,13 +22,12 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx import base
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
 
 
-class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
+class GPTNeoXForSampling(module.PretrainedModel):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
                  unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
@@ -79,10 +78,11 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
-
+        batch_size, context_length = input_ids.shape
         if start_ids is None:
             start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
-
+        if cache_offset is None:
+            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -103,7 +103,11 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
                     print(f"Var name: {name}\nTensor:\n{tensor}")
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
+        # Cast logits to float32 or the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        logits = logits.to(logits_dtype)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
@@ -122,12 +126,10 @@ class GPTNeoXForSampling(module.PretrainedModel, base.NeuronModelBase):
         pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, offset=last_offset)
         pos_embd = pos_embd.unsqueeze(0)
         pos_embd = pos_embd.to(pos_embd_buffer.dtype)
-        hidden = self.manipulator.duplicate_on_cpu(hidden)
-        pos_embd = self.manipulator.duplicate_on_cpu(pos_embd)
-        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        start_ids = self.manipulator.duplicate_on_cpu(start_ids)
         for in_buffer, in_tensor in zip(input_buffers, [hidden, pos_embd, cache_offset, start_ids]):
-            ops.parallel_write(in_buffer, in_tensor)
+            in_tensor = in_tensor.to(in_buffer.dtype)
+            duplicated_tensor = self.manipulator.duplicate_on_cpu(in_tensor)
+            ops.parallel_write(in_buffer, duplicated_tensor)
         return program.run(bucket_id)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
@@ -212,7 +214,7 @@ class GPTNeoXBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    return next(idx for idx, val in enumerate(values) if val >= target + 1)
 
 
 class GPTNeoXTransformer(module.LowMemoryModule):
