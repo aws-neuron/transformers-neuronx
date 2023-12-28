@@ -252,6 +252,8 @@ def main():
     run_parser.add_argument('--benchmark', action='store_true', default=None)
     # suffix
     run_parser.add_argument('--suffix', type=str, default=None)
+    # profile
+    run_parser.add_argument('--profile', action='store_true')
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -542,6 +544,9 @@ def run(args, hf_model_name, model_cls):
 
             if args.dump_logits:
                 generation_config['output_scores'] = True
+
+            if args.profile:
+                neuron_model.profile(f"profile_{suffix}")
 
             print("running HuggingFace Generation API, generation_config:\n", generation_config)
 
