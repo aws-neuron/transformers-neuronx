@@ -216,6 +216,7 @@ def main():
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
+    run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
 
     run_parser.add_argument('--gqa', type=str, default=None)
     # simple_sample
@@ -482,6 +483,10 @@ def run(args, hf_model_name, model_cls):
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
                                                 unroll=args.unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
+                if args.window_context_length_estimate is not None:
+                    neuron_model.enable_window_context_decoder(args.window_context_length_estimate, args.unroll)
+
+
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
