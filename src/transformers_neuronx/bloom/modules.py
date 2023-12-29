@@ -26,6 +26,9 @@ class BloomForCausalLM(module.PretrainedModel):
         self.transformer = BloomModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
+    def get_tied_parameter_paths(self):
+        return [('transformer.word_embeddings.weight', 'lm_head.weight')]
+
 
 class BloomModel(module.LowMemoryModule):
 
