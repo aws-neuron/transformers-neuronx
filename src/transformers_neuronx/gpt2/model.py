@@ -591,6 +591,9 @@ class GPT2Transformer(module.LowMemoryModule):
             self.h.append(GPT2Block(config))
         self.ln_f = module.LowMemoryLayerNorm(config.n_embd)
 
+    def get_tied_parameter_paths(self):
+        return [('transformer.wte.weight', 'lm_head.weight')]
+
 
 class GPT2Block(module.LowMemoryModule):
 
