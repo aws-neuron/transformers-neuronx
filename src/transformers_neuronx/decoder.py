@@ -222,6 +222,25 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
 
+    def init_window_context_decoder(self, unroll, buckets, model_obj, n_active_tokens):
+        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=self.tp_degree,
+            n_positions_list=buckets,
+            n_active_tokens=n_active_tokens,
+            batch_size=self.batch_size,
+            attention_head_size=self.attention_head_size,
+            amp=self.amp,
+            num_layers=self.num_layers,
+            n_head=self.n_head,
+            n_kv_head=self.n_kv_head,
+            unroll=unroll,
+            neuron_config=self.neuron_config,
+            allow_pad=True,
+            return_all_outputs=False
+        )
+        base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
+        return decoder_lm_head
+
     def setup_reorder_cache(self):
         self.need_reorder_cache = True
 

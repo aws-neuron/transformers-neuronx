@@ -39,7 +39,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._compiled_artifacts_directory = directory
-    
+
     # top level api
     def compile(self, parallel_degree=None):
         kernels = self._get_all_kernels()
@@ -77,6 +77,14 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             speculation_length=[speculation_length]
         for k in speculation_length:
             self.decoder_lm_head_for_speculation[k]=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
+
+    def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll):
+        if isinstance(window_context_length, int):
+            window_context_length=[window_context_length]
+        self.window_context_buckets = bucket.context_sizes(window_context_length, self.token_buckets)
+        for k in self.window_context_buckets:
+            self.decoder_lm_head_for_window_context[k]=self.decoder_param_set.init_window_context_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
+
 
     def is_compiled(self):
         # First check if the kernels have neffs already
@@ -192,10 +200,30 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
                 logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
 
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+
+
+        # process the leftovers context
+        while current < context_length - 1:
+            # find the optimal "window"
+            estimate = None
+            if hasattr(self, "window_context_buckets"):
+                estimate = bucket.find(self.window_context_buckets, context_length - current)
+
+            # when the leftovers is smaller than estimate, fall back to single token generation
+            # TODO: can we pad?
+            if estimate is None or context_length - current < estimate:
+                for i in range(current, context_length):
+                    cache_ids = torch.as_tensor([i], dtype=torch.int32)
+                    hidden_slice = hidden[:, i:i+1].contiguous()
+                    logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                break
+
+            hidden_slice = hidden[:, current:current+estimate].contiguous()
+            cache_ids = torch.as_tensor([i for i in range(current, current+estimate)], dtype=torch.int32)
+            last_token_id = torch.as_tensor(estimate - 1)
+            logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+
+            current += estimate
 
         if self.is_fid:
             logits[:] = float('-inf')
