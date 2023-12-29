@@ -22,6 +22,7 @@ import torch
 from safetensors import safe_open
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
+from transformers.utils import hub
 
 # Disable lazy module warning since torch-neuronx version is pinned
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
@@ -252,6 +253,66 @@ class LowMemoryEmbedding(torch.nn.Embedding, LowMemoryModule):
         pass
 
 
+def maybe_download_weights(path_or_repo_id, **kwargs):
+    """
+    Get the local path to weights or download them from the huggingface hub.
+
+    This function makes two assumptions on behalf of the user. First it
+    will prioritize the local directory and second it will prioritize
+    safetensors checkpoints if they exist.
+
+    This function does not handle remote code downloading since the assumption
+    is that the model code must be implemented in transformers-neuronx.
+
+    Args:
+        path_or_repo_id: The model repository name or the local checkpoint
+            path (i.e. `bigscience/bloom-560m` or `/home/ubuntu/example`)
+
+    Kwargs:
+        kwargs: Passed to `cached_file` in order to allow downloads with
+            specific authorization/branches/etc.
+
+    Returns
+        directory: The local directory containing the checkpoint.
+    """
+
+    # If we have a local checkpoint, ignore remote downloading
+    if os.path.isdir(path_or_repo_id):
+        return path_or_repo_id
+
+    # Search for checkpoints in order of fastest loads
+    filename = None
+    checkpoint = None
+    for checkpoint in [
+        _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
+        _SAFETENSORS_MODEL_FILENAME,
+        _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
+        _PYTORCH_MODEL_BIN_FILENAME,
+    ]:
+        # Ignore errors since only one format may exist
+        filename = hub.cached_file(path_or_repo_id, checkpoint, _raise_exceptions_for_missing_entries=False, **kwargs)
+        if filename:
+            break
+
+    if not filename:
+        # Note: Error type matches transformers `from_pretrained` convention
+        raise EnvironmentError(
+            f'Could not find a checkpoint for {path_or_repo_id} in a '
+            f'supported format (safetensors model or pytorch binary model)'
+        )
+
+    # Download shards if we originally found an index
+    if checkpoint in [
+        _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
+        _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
+    ]:
+        # Do not ignore errors since we should have a sharded checkpoint
+        hub.get_checkpoint_shard_files(path_or_repo_id, filename, **kwargs)
+
+    # Return parent directory of the downloaded files
+    return os.path.dirname(filename)
+
+
 class PretrainedModel(LowMemoryModule):
 
     @classmethod
@@ -275,6 +336,7 @@ class PretrainedModel(LowMemoryModule):
         _sanity_check(**kwargs)
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
+        pretrained_model_path = maybe_download_weights(pretrained_model_path, **kwargs)
         model.load_state_dict_dir(pretrained_model_path)
         return model
 
