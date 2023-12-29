@@ -52,6 +52,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.unroll=unroll
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.window_context_buckets = []
         if prefixed_length:
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
@@ -75,7 +76,8 @@ class LlamaForSampling(base.NeuronModelBase):
         )
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
         self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
-        self.decoder_lm_head_for_speculation={}
+        self.decoder_lm_head_for_speculation = {}
+        self.decoder_lm_head_for_window_context = {}
 
     def load_weights(self):
         # Materialize the embedding to CPU
@@ -152,6 +154,12 @@ class LlamaForSampling(base.NeuronModelBase):
                 model= self.decoder_lm_head.build_weight_shared(share_caches=True,
                                                                       new=self.decoder_lm_head_for_speculation[k])
                 self.decoder_lm_head_for_speculation[k]=model
+
+        if self.decoder_lm_head_for_window_context:
+            for i,k in enumerate(self.decoder_lm_head_for_window_context):
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True,
+                                                                      new=self.decoder_lm_head_for_window_context[k])
+                self.decoder_lm_head_for_window_context[k]=model
 
 
     def set_prefixed(self, input_ids):
