@@ -14,7 +14,6 @@
 # ==============================================================================
 import torch
 import math
-import warnings
 
 from transformers_neuronx import decoder
 from transformers_neuronx import module
@@ -23,7 +22,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
@@ -41,9 +40,6 @@ class BloomForSampling(base.NeuronModelBase):
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
 
-        if self.neuron_config.on_device_generation:
-            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
-
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:
             context_unroll = config.n_layer
@@ -51,20 +47,49 @@ class BloomForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.n_layer
-        self.unroll = unroll
 
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
-        self.batch_sizes = bucket.batch_sizes(batch_size)
+        self.max_positions = self.token_buckets[-1]
 
-        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
-        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
-            attention_head_size=config.attention_head_size, amp=amp,num_layers=config.n_layer, n_head=config.n_head,
-            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True, builder=hlo_builder
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
+
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head,
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True
         )
-        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
-        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
+        self.register_for_serialization(self.decoder_lm_head)
+        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+
+        if self.context_buckets:
+            self.decoder_lm_head_for_context = {}
+            for context_length_estimate in self.context_buckets:
+                for batch_size in self.batch_sizes:
+                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                        tp_degree,
+                        [context_length_estimate],
+                        context_length_estimate,
+                        batch_size,
+                        config.attention_head_size,
+                        amp=amp,
+                        num_layers=config.n_layer,
+                        n_head=config.n_head,
+                        unroll=context_unroll,
+                        neuron_config=self.neuron_config,
+                        allow_pad=self.decoder_lm_head.allow_pad,
+                        return_all_outputs=False
+                    )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 
     def load_weights(self):
         # Materialize the embedding to CPU
@@ -167,23 +192,22 @@ class BloomForSampling(base.NeuronModelBase):
                     self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        if not self.neuron_config.on_device_embedding:
-            inputs = self.chkpt_model.transformer.word_embeddings(inputs)
-            inputs = self.chkpt_model.transformer.word_embeddings_layernorm(inputs)
-            if self.neuron_config.attention_layout == LAYOUT_HSB:
-                inputs = inputs.transpose(0, -1).contiguous()
-        return self._forward(inputs, *rst)
+        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+
+        if self.neuron_config.on_device_embedding:
+            return self._forward(input_ids, *rst, neuron_config=self.neuron_config)
+
+        hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
+        hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            hidden = hidden.permute(2, 1, 0)
+        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         batch_size, *_  = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
-        if self.neuron_config.on_device_generation:
-            result = sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
-                                            config=self.neuron_config.on_device_generation)
-        else:
-            result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                            eos_token_id=self.config.eos_token_id, top_k=top_k)
+        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
         return result

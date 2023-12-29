@@ -26,12 +26,6 @@ class MistralForCausalLM(module.PretrainedModel):
         self.model = MistralModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
-    def get_tied_parameters(self):
-        return [(self.model.embed_tokens.weight, self.lm_head.weight)]
-
-    def get_base_model(self):
-        return self.model
-
 
 class MistralModel(module.LowMemoryModule):
 

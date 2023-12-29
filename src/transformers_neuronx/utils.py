@@ -71,8 +71,7 @@ def pad_sizes(shape, dims, sizes, left=False):
     rhs = [0] * len(shape)
     side = lhs if left else rhs
     for dim, size in zip(dims, sizes):
-        # Don't truncate tensor if the current size exceeds the "padded size"
-        side[dim] = max(0, size - shape[dim])
+        side[dim] = size - shape[dim]
     sizes = tuple(itertools.chain(*zip(reversed(lhs), reversed(rhs))))
     if sum(sizes) == 0:
         return None

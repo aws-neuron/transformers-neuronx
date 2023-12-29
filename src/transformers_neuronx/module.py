@@ -16,14 +16,12 @@ import json
 import os
 import re
 import warnings
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import torch
 from safetensors import safe_open
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
-from transformers.utils import hub
-from transformers_neuronx import constants
 
 # Disable lazy module warning since torch-neuronx version is pinned
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
@@ -126,41 +124,27 @@ class LowMemoryModule(torch.nn.Module):
                         param.materialize(input_param.shape)
                     param.copy_(input_param)
 
-    def _load_state(self, state_dict_dir, key_to_filename, prefix=''):
+    def _get_ties_mapping(self):
+        mapping = {}
+        for first, second in self.get_tied_parameter_paths():
+            mapping[first] = second
+            mapping[second] = first
+        return mapping
+
+    def _load_from_state_dict_dir(self, state_dict_dir, key_to_filename, prefix=''):
+        state_dict_dir = os.path.realpath(state_dict_dir)
+        ties = self._get_ties_mapping()
         local_state = {k: v for k, v in self.named_parameters() if v is not None}
-        complete = True
         for key, param in local_state.items():
             key = prefix + key
+            # If the key is not present but it has a tie, attept to use the tie
+            if key not in key_to_filename:
+                key = ties.get(key, '')
+
             if key in key_to_filename:
                 path = os.path.join(state_dict_dir, key_to_filename[key])
                 param._file_path = path
                 param._global_key = key
-            else:
-                complete = False
-        return complete
-
-    def _load_from_state_dict_dir(self, state_dict_dir, key_to_filename, prefix=''):
-        state_dict_dir = os.path.realpath(state_dict_dir)
-
-        # Load global weights
-        complete = self._load_state(state_dict_dir, key_to_filename, prefix)
-
-        # Check for ties and base model prefixes if initial weight load was incomplete
-        if not complete:
-            # Load base model weights
-            base = self.get_base_model()
-            if base:
-                base._load_state(state_dict_dir, key_to_filename, prefix)
-
-            # Load tied weights
-            def load_tie(src, dst):
-                if hasattr(src, '_file_path') and not hasattr(dst, '_file_path'):
-                    dst._file_path = src._file_path
-                    dst._global_key = src._global_key
-
-            for first, second in self.get_tied_parameters():
-                load_tie(first, second)
-                load_tie(second, first)
 
     def load_pytorch_model_bin(self, state_dict_dir):
         """
@@ -211,59 +195,19 @@ class LowMemoryModule(torch.nn.Module):
             key_to_filename = json.load(f)
         self._load_from_state_dict_dir(weight_directory, key_to_filename)
 
-    def get_tied_parameters(self) -> List[Tuple[torch.nn.Parameter, torch.nn.Parameter]]:
+    def get_tied_parameter_paths(self):
         """
         Get parameter path pairs whose weights are identical.
 
         Note that this is only necessary for safetensors models because at
-        serialization time, `transformers` does not save duplicate/identical
-        weights to the "model.safetensors" file. Instead they save only one
+        serialization time `transformers` does not save tensors which are
+        identical to the "model.safetensors" file. Instead they save only one
         weight and then check which parameters are tied according to the
         parameter structure at load time. Since we do not load the original
         parameter structure, we need an alternative method of determining
         "ties".
-
-        Tie handling reference:
-        https://github.com/huggingface/transformers/blob/v4.36.2/src/transformers/modeling_utils.py#L3884-L3925
-
-        Tie parameter resolution reference:
-        https://github.com/huggingface/accelerate/blob/v0.26.0/src/accelerate/utils/modeling.py#L530-L585
         """
         return []
-
-    def get_base_model(self) -> Optional['LowMemoryModule']:
-        """
-        Get the base pretrained transformer model.
-
-        This information is necessary to load some checkpoint variants.
-
-        The `base_model_prefix` was introduced very early into the
-        `transformers` repository history:
-        https://github.com/huggingface/transformers/commit/4d47f4985dfb09237b6e11b5eafb0b1935f8c634
-
-        The base model prefix allows the pretrained transformer submodule
-        weights to be used for the full generative model by reusing the
-        embedding weight for the language model head. In most models, the
-        language model head is the only difference between the underlying
-        pretrained transformer and the full generative model.
-
-        In practice, this means that some checkpoints exclude the base model
-        prefix string from all serialized weight paths. Instead
-        the checkpoint path names begin from a submodule within the complete
-        module heirarchy. When a model is known to support a base model prefix,
-        we must check if any "missing" weights would otherwise be found in the
-        checkpoint if the base model prefix is removed from the expected full
-        module path.
-
-        For example, the following checkpoint paths would be interchangable with
-        a base model prefix of "transformer":
-        - transformer.layer[0].attention.q_proj.weight
-        -             layer[0].attention.q_proj.weight
-
-        Prefix handling reference:
-        https://github.com/huggingface/transformers/blob/v4.36.2/src/transformers/modeling_utils.py#L3853-L3882
-        """
-        return None
 
 class LowMemoryModuleList(torch.nn.ModuleList, LowMemoryModule): ...
 class LowMemoryLazyLinear(torch.nn.LazyLinear, LowMemoryModule): ...
@@ -308,75 +252,6 @@ class LowMemoryEmbedding(torch.nn.Embedding, LowMemoryModule):
         pass
 
 
-def maybe_download_weights(path_or_repo_id, safe_serialization=True, **kwargs):
-    """
-    Get the local path to weights or download them from the huggingface hub.
-
-    This function makes two assumptions on behalf of the user. First it
-    will prioritize the local directory and second it will prioritize
-    safetensors checkpoints if they exist.
-
-    This function does not handle remote code downloading since the assumption
-    is that the model code must be implemented in transformers-neuronx.
-
-    Args:
-        path_or_repo_id: The model repository name or the local checkpoint
-            path (i.e. `bigscience/bloom-560m` or `/home/ubuntu/example`)
-
-    Kwargs:
-        safe_serialization: Allow/Prohibit safetensor checkpoints.
-        kwargs: Passed to `cached_file` in order to allow downloads with
-            specific authorization/branches/etc.
-
-    Returns
-        directory: The local directory containing the checkpoint.
-    """
-
-    # If we have a local checkpoint, ignore remote downloading
-    if os.path.isdir(path_or_repo_id):
-        return path_or_repo_id
-
-    checkpoints = [
-        _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
-        _SAFETENSORS_MODEL_FILENAME,
-        _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
-        _PYTORCH_MODEL_BIN_FILENAME,
-    ]
-
-    if not safe_serialization:
-        checkpoints = [
-            _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
-            _PYTORCH_MODEL_BIN_FILENAME,
-        ]
-
-    # Search for checkpoints in order of fastest loads
-    filename = None
-    checkpoint = None
-    for checkpoint in checkpoints:
-        # Ignore errors since only one format may exist
-        filename = hub.cached_file(path_or_repo_id, checkpoint, _raise_exceptions_for_missing_entries=False, **kwargs)
-        if filename:
-            break
-
-    if not filename:
-        # Note: Error type matches transformers `from_pretrained` convention
-        raise EnvironmentError(
-            f'Could not find a checkpoint for {path_or_repo_id} in a '
-            f'supported format (safetensors model or pytorch binary model)'
-        )
-
-    # Download shards if we originally found an index
-    if checkpoint in [
-        _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
-        _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
-    ]:
-        # Do not ignore errors since we should have a sharded checkpoint
-        hub.get_checkpoint_shard_files(path_or_repo_id, filename, **kwargs)
-
-    # Return parent directory of the downloaded files
-    return os.path.dirname(filename)
-
-
 class PretrainedModel(LowMemoryModule):
 
     @classmethod
@@ -396,16 +271,10 @@ class PretrainedModel(LowMemoryModule):
                 assert isinstance(n_positions, list) and len(n_positions) == 1
                 assert context_length_estimate == n_positions, \
                     "To use continuous batching features, context length estimate should equal to n_positions."
-            else:
-                bsh_cache_layout = False
-                if neuron_config is not None:
-                    bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
-                assert not bsh_cache_layout, "BSH cache layout can only be configured with continuous batching."
 
         _sanity_check(**kwargs)
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
-        pretrained_model_path = maybe_download_weights(pretrained_model_path, **kwargs)
         model.load_state_dict_dir(pretrained_model_path)
         return model
 

@@ -256,7 +256,10 @@ class DraftModelForSpeculation(DraftProvider):
         # Speculate k tokens in auto regressive mode.
         for cur_len in range(start_len, start_len + k):
             next_len = cur_len + 1
-            inputs = torch.argmax(next_token_scores, keepdim=True, dim=1)
+            topk_values, topk_indices = torch.topk(next_token_scores, k=1)
+            probs = torch.nn.functional.softmax(topk_values, dim=-1)
+            inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
+            inputs = torch.gather(topk_indices, 1, inputs_in_topk)
 
             scores.append(next_token_scores)
             tokens.append(inputs)
@@ -378,7 +381,7 @@ class SpeculativeGenerator:
             # returns auto-regressive k - 1 speculated tokens (as one token was already predicted by target)
             # draft_ids is of shape: (bs, k-1)
             # draft_next_scores has k-1 scores and of shape: (k-1, vocab)
-            draft_ids, draft_next_scores = self.draft(target_next_id, self.k - 1, draft_cache_id, start_ids)
+            draft_ids, draft_next_scores = self.draft(target_next_id, self.k - 1, draft_cache_id, None)
 
             # Execute target model with draft tokens
             cache_ids = torch.arange(current, current + draft_ids.shape[1] + 1)  # added length of target predicted token
@@ -423,19 +426,6 @@ class SpeculativeGenerator:
             # accepted_tokens = 2 means, 1 draft token accepted
             # accepted_tokens = K means, all draft tokens accepted + target model predicted token
             target_next_id = accepted_tokens[:, -1:]
-
-            # If we accepted all tokens then we need to insert the last draft
-            # token into the KV cache since it was generated but never executed
-            if num_accepted == self.k:
-                self.draft(accepted_tokens[:, -2:-1], 1, torch.tensor([current - 1]), start_ids)
-            
-            # Boundary condition: When number of leftover tokens to be generated is less than k, 
-            # we use the target model to auto-regressively generate the remaining tokens
-            if current >= sequence_length - 1 - self.k:
-                target_cache_id = torch.tensor([current], dtype=torch.int32)
-                sampled_tokens=self.target.sample(target_next_id, sequence_length=sequence_length, cache_ids=target_cache_id, top_k=1)
-                tokens.append(sampled_tokens[:, 1:]) # remove duplicate token of target_next_id
-                break
 
         if streamer:
             streamer.end()

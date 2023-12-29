@@ -80,11 +80,6 @@ class NeuronConfig():
             Default: `"HSB"`.
         on_device_embedding (bool, optional): Whether to use on-device embedding for sampling.
             Default: `False`.
-        log_softmax_scores: (`bool`, optional): Return log-softmax scores along with logits.
-            Default: False
-        on_device_generation (GenerationConfig, optional): Generation related configurations.
-            Used to set configurations to sample on device.
-            Default: `None`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -98,15 +93,11 @@ class NeuronConfig():
             # Force using 2D cache_ids layout for continuous batching.
             self.use_2d_cache_ids = True
         self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
-        self.cache_layout = kargs.pop('cache_layout', constants.LAYOUT_SBH)
         self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
-        self.log_softmax_scores = kargs.pop('log_softmax_scores', False)
         self.group_query_attention = kargs.pop('group_query_attention', None)
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
         self.on_device_embedding = kargs.pop('on_device_embedding', False)
-        self.on_device_generation = kargs.pop('on_device_generation', None)
-        assert len(kargs)==0, f"unexpected arguments: {kargs}"
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
 

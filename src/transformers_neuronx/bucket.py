@@ -73,24 +73,6 @@ def context_sizes(
     raise NotImplementedError(f'Prompt bucket config {buckets_or_size} not supported')
 
 
-def batch_sizes(batch_size: Union[List[int], int]) -> List[int]:
-    """
-    Format the user-specified batch size buckets for all model variants.
-
-    Arguments:
-        batch_size: The batch size(s) to construct models for.
-
-    Returns
-        batch_sizes: The formatted list of batch sizes.
-    """
-    if isinstance(batch_size, int):
-        return [batch_size]
-    elif isinstance(batch_size, list):
-        return sorted(batch_size)
-    else:
-        raise TypeError("batch_size must be list of ints or int type")
-
-
 def find(buckets: Optional[List[int]], size: int) -> Optional[int]:
     """
     Find the smallest bucket with that fits the given `size` input.

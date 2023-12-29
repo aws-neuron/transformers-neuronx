@@ -27,7 +27,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
@@ -36,14 +36,11 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None,
-                 tag=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
-        if self.neuron_config.on_device_generation:
-            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
@@ -52,24 +49,22 @@ class GPT2ForSampling(base.NeuronModelBase):
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
         if unroll is None:
             unroll = config.n_layer
-        self.token_buckets = bucket.token_sizes(config.n_positions)
+        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
 
-        start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
-                                                   self.config.eos_token_id, amp, start_mask, 
-                                                   neuron_config=self.neuron_config)
-
-        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, tag=tag, builder=hlo_builder,
+            unroll=unroll, neuron_config=self.neuron_config,
         )
-        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self)
-
+        start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=self.neuron_config)
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
+        self.register_for_serialization(self.decoder_lm_head)
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
-        self.tag = tag
 
     def load_weights(self):
         ops.init()
@@ -130,9 +125,6 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
-        if self.neuron_config.on_device_embedding:
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.wte.weight, sharding=1, allow_pad=True)
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.wpe.weight, sharding=1, allow_pad=True)
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
@@ -158,20 +150,16 @@ class GPT2ForSampling(base.NeuronModelBase):
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        inputs_embeds = self.chkpt_model.transformer.wte(input_ids)
+        position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+        position_embeds = self.chkpt_model.transformer.wpe(position_ids)
+        hidden = inputs_embeds + position_embeds
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
+        hidden = hidden.transpose(0, 2).contiguous()
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
-        
-        if not self.neuron_config.on_device_embedding:
-            input_ids = self.chkpt_model.transformer.wte(input_ids)
-            position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
-            position_embeds = self.chkpt_model.transformer.wpe(position_ids)
-            input_ids = input_ids + position_embeds
-            if self.neuron_config.attention_layout == LAYOUT_HSB:
-                input_ids = input_ids.transpose(0, 2).contiguous()
-        logits = self.decoder_lm_head(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
-
-        if self.neuron_config.on_device_generation:
-            return logits
-
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -180,11 +168,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
-                                          config=self.neuron_config.on_device_generation)
-        else:
-            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+        return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
     def beam_search(self, input_ids, num_beams, sequence_length, start_ids=None):
@@ -234,13 +218,11 @@ class GPT2ForHuggingFaceSampling(GPT2ForSampling):
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=NeuronConfig(), reorder_cache=False, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
-        if self.neuron_config.on_device_generation:
-            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         if unroll is None:
             unroll = config.n_layer
         self.unroll=unroll
@@ -254,33 +236,33 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             context_length_estimate, self.token_buckets
         )
         self.max_positions=self.token_buckets[-1]
-        self.return_ranks = -1 if not self.neuron_config.on_device_generation else 1
 
         # TODO: the start_mask needs to be True with left padding for context estimate,
         # need to fix this after having right padding
         start_mask = True
-
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
-                                                   eos_token_id=self.config.eos_token_id,
-                                                   amp=amp,
-                                                   start_mask=start_mask,
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
                                                    neuron_config=self.neuron_config)
-
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder,
-            prompt_batch_size=self.prompt_batch_size
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
         )
 
-        self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets,
-                                                                                      model_obj=self)
-        self.decoder_lm_head=self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
+            batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=self.neuron_config, return_all_outputs=True
+        )
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
-        if self.neuron_config.log_softmax_scores:
-            self.decoder_lm_head.add_post_layer_builder(hlo_builder.post_layer)
+        self.register_for_serialization(self.decoder_lm_head)
+
+
+        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
+        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
 
         n_embd = self.config.n_embd
         d_head = n_embd // config.n_head
@@ -295,8 +277,28 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # Only share caches when we don't generate multiple suggestions
         self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size[bs_idx]
         if self.context_buckets:
+            self.decoder_lm_head_for_context={}
             self.broadcaster={}
             for context_length_estimate in self.context_buckets:
+                # todo - GPT2 does not support compilation for multiple batch sizes. However context decoding in base.py/context
+                # is common across all models, to satisfy the indexing mechanism, add 'batch_size' to the key
+                # note the batch size for decoder_lm_head_for_context is the self.prompt_batch_size
+                self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
+                    tp_degree,
+                    [context_length_estimate],
+                    context_length_estimate,
+                    self.prompt_batch_size,
+                    attention_head_size,
+                    amp=amp,
+                    num_layers=config.n_layer,
+                    n_head=config.n_head,
+                    n_kv_head=config.n_kv_head,
+                    unroll=context_unroll,
+                    neuron_config=self.neuron_config,
+                    allow_pad=self.decoder_lm_head.allow_pad,
+                    return_all_outputs=False
+                )
+                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
                     self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
                         context_length_estimate,
@@ -365,9 +367,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
-        if self.neuron_config.on_device_embedding:
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.wte.weight, sharding=1, allow_pad=True)
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.wpe.weight, sharding=1, allow_pad=True)
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
@@ -442,13 +441,13 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
 
-        inputs, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
-        batch_size, context_length = inputs.shape
+        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+        batch_size, context_length = input_ids.shape
 
-        model = self.decoder_lm_head
+        model=self.decoder_lm_head
 
         if is_context_encode:
-            model = self.decoder_lm_head_for_context[estimate, batch_size]
+            model=self.decoder_lm_head_for_context[estimate, batch_size]
 
         if start_ids is None:
             start_ids = torch.zeros(batch_size, dtype=torch.int32)
@@ -456,58 +455,40 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
 
+        hidden, start_ids = self._embedding(model, input_ids, cache_ids,
+                                            start_ids, is_context_encode)
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-
-        if start_ids.shape[0] != batch_size:
-            start_ids = start_ids.repeat(batch_size)
-
         if is_context_encode:
             # The big tensor destruction is slow in CPU. Use asynchronous clear
             # to parallel the tensor free with the context encoding execution.
             task = self.tensor_pool.async_clear()
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
-
-        if not self.neuron_config.on_device_embedding:
-            inputs, start_ids = self._embedding(model, inputs, cache_ids, start_ids, is_context_encode)
-            if self.neuron_config.attention_layout == LAYOUT_HSB:
-                inputs = inputs.transpose(0,2).contiguous()
-
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
+        hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            if self.neuron_config.log_softmax_scores:
-                logits, scores = logits, scores = self.context(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
-            else:
-                logits = self.context(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         else:
-            if self.neuron_config.log_softmax_scores:
-                logits, scores = self.decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
-            else:
-                logits = self.decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
-
-        if self.neuron_config.on_device_generation is not None:
-            return logits
-
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
-        if self.neuron_config.log_softmax_scores:
-            scores = scores[:self.config.vocab_size, -1, :]
-            scores = scores.transpose(0, 1)
         if is_context_encode:
             task.wait()
-            self.tensor_pool.push(inputs)
+            self.tensor_pool.push(hidden)
         if is_context_encode and not self.share_caches:
             self.broadcaster[estimate].run_broadcast()
-        if self.neuron_config.log_softmax_scores:
-            return logits, scores
+
         return logits
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
@@ -517,6 +498,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                       self.neuron_config.sparse_attn.skip_masking_decode
 
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
+
         batch_size, context_length = input_ids.shape
 
         if start_ids is None:
@@ -530,7 +512,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             model=self.decoder_lm_head
         else:
             model=self.decoder_lm_head_for_speculation[speculation_length]
-
+        hidden, start_ids = self._embedding(model, input_ids, cache_ids,
+                                            start_ids, is_context_encode=False)
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
         curr_window_start = \
@@ -539,26 +522,17 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
-
-        if not self.neuron_config.on_device_embedding:
-            input_ids, start_ids = self._embedding(model, input_ids, cache_ids, start_ids, is_context_encode=False)
-            if self.neuron_config.attention_layout == LAYOUT_HSB:
-                input_ids = input_ids.transpose(0,2).contiguous()
-        logits = model(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
+        hidden=hidden.transpose(0,2).contiguous()
+        logits=model(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
-        _, n_active_tokens, _ = logits.shape
+        _,n_active_tokens,_=logits.shape
         logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
         logits = logits.transpose(0, 1)
         return logits
 
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, output_scores=False, **kwargs):
-
-        if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
-                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
-
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, output_scores=False):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         runtime_batch_size, context_length = input_ids.shape
@@ -570,17 +544,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 f"batch_size={batch_size} and runtime_batch_size={runtime_batch_size}"
             )
 
-        log_softmax = self.neuron_config and self.neuron_config.log_softmax_scores
-        if log_softmax:
-            next_token_scores, log_softmax_scores = self.forward(input_ids, cache_ids=cache_ids,start_ids=start_ids)
-        else:
-            next_token_scores = self.forward(input_ids, cache_ids=cache_ids, start_ids=start_ids)
-            log_softmax_scores = None
+        next_token_scores = self.forward(input_ids, start_ids=start_ids)
         repeat_factor = batch_size // runtime_batch_size
         input_ids = input_ids.repeat([repeat_factor, 1])
         next_token_scores = next_token_scores.repeat([repeat_factor, 1])
-        if log_softmax:
-            log_softmax_scores = log_softmax_scores.repeat([repeat_factor, 1])
         if self.context_hook is not None:
             self.context_hook()
         interleaved = sampling.sample_loop(
@@ -591,27 +558,14 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
-            output_scores=output_scores,
-            neuron_config=self.neuron_config,
-            log_softmax_scores=log_softmax_scores,
-            cache_ids=cache_ids,
+            output_scores=output_scores
         )
         if output_scores:
-            if log_softmax:
-                interleaved, scores, log_softmax_scores = interleaved
-            else:
-                interleaved, scores = interleaved
-
-        # When we pass cache_ids explicitly to sample, we are not using sample to generate
-        # all tokens but just a subset of the tokens (For example: To generate leftover tokens
-        # autoregressively in speculative sampling). Assuming batch_size = runtime_batch_size = 1
-        if not cache_ids:
-            interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
-            interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
+            interleaved, scores = interleaved
+        interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
+        interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
 
         if output_scores:
-            if log_softmax:
-                return interleaved, scores, log_softmax_scores
             return interleaved, scores
         return interleaved
 
@@ -625,12 +579,6 @@ class GPT2CheckpointCompatible(module.PretrainedModel):
         self.transformer = GPT2Transformer(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
-    def get_tied_parameters(self):
-        return [(self.transformer.wte.weight, self.lm_head.weight)]
-
-    def get_base_model(self):
-        return self.transformer
-
 
 class GPT2Transformer(module.LowMemoryModule):
 
@@ -642,6 +590,9 @@ class GPT2Transformer(module.LowMemoryModule):
         for _ in range(config.n_layer):
             self.h.append(GPT2Block(config))
         self.ln_f = module.LowMemoryLayerNorm(config.n_embd)
+
+    def get_tied_parameter_paths(self):
+        return [('transformer.wte.weight', 'lm_head.weight')]
 
 
 class GPT2Block(module.LowMemoryModule):

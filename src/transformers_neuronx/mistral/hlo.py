@@ -16,10 +16,10 @@ from typing import Optional
 
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary, generation
+from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.sparse_attn_utils import build_sliding_window_mask
 
 class MistralForSamplingNoEmbeddingHlo:
@@ -44,16 +44,11 @@ class MistralForSamplingNoEmbeddingHlo:
                                                 base=self.config.rope_theta,
                                                 interpolation_factor=self.config.position_interpolation_factor)
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
+
         return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
 
-    def embedding(self, input_ids, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
-        dtype = getattr(input_ids.scribe, self.config.amp)
-        hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
-        if self.config.hidden_size % self.config.tp_degree != 0:
-            hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
-        if self.neuron_config.attention_layout == LAYOUT_HSB:
-            hidden = hlo.transpose210(hidden)
-        return hidden
+    def pre_layer(self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask):
+        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
             self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
@@ -100,14 +95,8 @@ class MistralForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
-        logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
-        if self.neuron_config.on_device_generation is not None:
-            return generation.generate(logits, logits_indices,
-                                       config=self.neuron_config.on_device_generation,
-                                       tp_degree=self.config.tp_degree,
-                                       eos_token_id=self.config.eos_token_id)
-        return logits
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
+        return transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
 
     def attention(
         self,
@@ -142,12 +131,9 @@ class MistralForSamplingNoEmbeddingHlo:
         if n_active_tokens == 1:
             sparse_mask = None
         else:
-            if self.config.window_size:
-                # Generate sliding-window mask
-                sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
-                sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
-            else:
-                sparse_mask = None
+            # Generate sliding-window mask
+            sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
+            sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
 
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -156,7 +142,6 @@ class MistralForSamplingNoEmbeddingHlo:
             import transformers_neuronx.layers.attention as attention
         else:
             import transformers_neuronx.layers.attention_hsb as attention
-        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -180,13 +165,6 @@ class MistralForSamplingNoEmbeddingHlo:
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
 
-        # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
-        bsh_cache_layout = False
-        if self.neuron_config is not None:
-            bsh_cache_layout = self.neuron_config.cache_layout == constants.LAYOUT_BSH
-        if bsh_cache_layout:
-            query, key, value = attention_utils.transpose_qkv(query, key, value)
-
         # Single Token Generation ("Prefetch"-style)
         if active_mask is not None:
             # When using window attention, directly slice the KV cache
@@ -197,49 +175,51 @@ class MistralForSamplingNoEmbeddingHlo:
             useful_cached_values = cached_values
             useful_mask = mask
 
-            if self.config.window_size:
-                if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
-                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
+            if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
+                useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
+                useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
+                useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
+                                           tp_degree=tp_degree, shard_over_batch=shard_over_batch)
             prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
+                                           tp_degree=tp_degree, shard_over_batch=shard_over_batch)
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, useful_cached_values, value, sparse_mask=sparse_mask,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        neuron_config=self.neuron_config)
+                                        shard_over_batch=shard_over_batch)
 
-            # KCache[I], VCache[I] = K, V
-            updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
-                                                                           key, value, start_ids, neuron_config=self.neuron_config)
+            # KCache[I] = K
+            # VCache[I] = V
+            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+            updated_values = attention.update_cache(cached_values, cache_ids, value)
 
         # Multi-Token Context Encoding
         else:
 
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
+                                    tp_degree=tp_degree, shard_over_batch=shard_over_batch)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
-            if self.config.window_size:
-                score = attention.sparse_attn_mask(score, sparse_mask)
+            score = attention.sparse_attn_mask(score, sparse_mask)
             context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
+                                                 tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
-            # KCache, VCache = K, V
+            # KCache = K
+            # VCache = V
             if cached_keys.sizes == key.sizes:
-                updated_keys, updated_values = key, value
+                updated_keys = key
+                updated_values = value
             else:
-                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
-                                                                               key, value, start_ids, neuron_config=self.neuron_config)
+                # continuous batching
+                updated_keys = attention.update_cache(cached_keys, cache_ids, key, start_ids)
+                updated_values = attention.update_cache(cached_values, cache_ids, value, start_ids)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)

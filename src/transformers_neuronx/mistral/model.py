@@ -21,7 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.mistral.modules import MistralForCausalLM
@@ -39,20 +39,24 @@ class MistralForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
-        if self.neuron_config.on_device_generation:
-            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
 
         if unroll is None:
             unroll = config.num_hidden_layers
-        self.unroll=unroll
 
+        self.unroll=unroll
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
 
-        self.batch_sizes = bucket.batch_sizes(batch_size)
+        if isinstance(batch_size,int):
+            self.batch_sizes = [batch_size]
+        elif isinstance(batch_size,list):
+            self.batch_sizes = sorted(batch_size)
+        else:
+            raise TypeError("batch_size must be list of ints or int type")
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = MistralForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -62,8 +66,8 @@ class MistralForSampling(base.NeuronModelBase):
             unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
-        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
-        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
+        self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
+        self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
 
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
@@ -112,10 +116,7 @@ class MistralForSampling(base.NeuronModelBase):
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
-        if self.neuron_config.on_device_embedding:
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
-
         self.decoder_lm_head.to_neuron()
         self.decoder_lm_head.use_executor = True
 
@@ -132,14 +133,15 @@ class MistralForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
-        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
+        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size)
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        if not self.neuron_config.on_device_embedding:
-            inputs = self.chkpt_model.model.embed_tokens(inputs)
-            if self.neuron_config.attention_layout == LAYOUT_HSB:
-                inputs = inputs.transpose(0, -1).contiguous()
-        logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+
+        input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        hidden = self.chkpt_model.model.embed_tokens(input_ids)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
+        logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
@@ -148,10 +150,6 @@ class MistralForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
-
-        if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
-                                            config=self.neuron_config.on_device_generation)
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()

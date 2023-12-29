@@ -61,12 +61,6 @@ class GPTNeoXForSampling(module.PretrainedModel):
         self.init_program = program.DoNothingDecoder()
         self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
 
-    def get_tied_parameters(self):
-        return [(self.gpt_neox.embed_in.weight, self.embed_out.weight)]
-
-    def get_base_model(self):
-        return self.gpt_neox
-
     def to_neuron(self):
         ops.init()
         config = self.config

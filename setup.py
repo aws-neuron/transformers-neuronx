@@ -71,7 +71,7 @@ setup(
         'accelerate',
         'safetensors',
         'torch-neuronx',
-        'transformers>=4.36',
+        'transformers',
     ],
     python_requires='>=3.7',
     package_dir={'': 'src'},

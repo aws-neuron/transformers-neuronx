@@ -36,17 +36,16 @@ class AEMLlamaForSampling(LlamaForSampling):
                         tp_degree=tp_degree, context_length_estimate=context_length_estimate,
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
                         **kwargs)
-        self.max_positions = self.token_buckets[-1]
         self.aem_models = aem_models
 
     def run_aems(hidden):
         # Run AEM LLMs in parallel  <<---------------
         return hidden
-
+    
     def lmhead(hidden):
         # Run LLM HEAD  <<---------------
         return hidden
-
+        
     def forward(self, input_ids, cache_ids=None, start_ids=None):
 
         batch_size, context_length = input_ids.shape
