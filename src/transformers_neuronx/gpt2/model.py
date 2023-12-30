@@ -579,6 +579,9 @@ class GPT2CheckpointCompatible(module.PretrainedModel):
         self.transformer = GPT2Transformer(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
+    def get_tied_parameter_paths(self):
+        return [('transformer.wte.weight', 'lm_head.weight')]
+
 
 class GPT2Transformer(module.LowMemoryModule):
 
@@ -590,9 +593,6 @@ class GPT2Transformer(module.LowMemoryModule):
         for _ in range(config.n_layer):
             self.h.append(GPT2Block(config))
         self.ln_f = module.LowMemoryLayerNorm(config.n_embd)
-
-    def get_tied_parameter_paths(self):
-        return [('transformer.wte.weight', 'lm_head.weight')]
 
 
 class GPT2Block(module.LowMemoryModule):
