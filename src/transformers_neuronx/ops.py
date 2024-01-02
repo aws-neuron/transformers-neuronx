@@ -72,3 +72,11 @@ def profile_start(model, ntff):
 
 def profile_stop(ntff):
     return torch.ops.neuron._profile_stop_neuron(ntff)
+
+
+def parallel_profile_start(model, ntff_prefix):
+    return torch.ops.neuron._parallel_profile_start_neuron(model, ntff_prefix)
+
+
+def parallel_profile_stop(ntff_files):
+    return torch.ops.neuron._parallel_profile_stop_neuron(ntff_files)

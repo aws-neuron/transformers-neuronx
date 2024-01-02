@@ -18,6 +18,7 @@ import re
 import warnings
 
 import torch
+from safetensors import safe_open
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
 
@@ -25,7 +26,7 @@ from transformers import AutoConfig
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
 
 def save_pretrained_split(model, save_directory):
-    model.save_pretrained(save_directory, save_function=save_split, max_shard_size='10000GB')
+    model.save_pretrained(save_directory, save_function=save_split, max_shard_size='10000GB', safe_serialization=False)
 
 
 _KEY_TO_FILENAME_JSON = 'key_to_filename.json'
@@ -60,6 +61,7 @@ class LowMemoryModule(torch.nn.Module):
                 if param._file_path.endswith('.empty_json'):
                     with open(param._file_path) as fp:
                         empty_json = json.load(fp)
+                    torch.manual_seed(0)
                     input_param = empty_json.get('init_std', 1.0) * torch.randn(empty_json['shape'])
                     dtype = getattr(torch, empty_json['torch_dtype'])
                     input_param = input_param.to(dtype)
@@ -139,14 +141,46 @@ class PretrainedModel(LowMemoryModule):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, *model_args, **kwargs):
+
+        def _sanity_check(**kwargs):
+            context_length_estimate = kwargs.get("context_length_estimate", None)
+            n_positions = kwargs.get("n_positions", 2048)
+            neuron_config = kwargs.get("neuron_config", None)
+            continuous_batching = neuron_config and neuron_config.continuous_batching
+            if continuous_batching:
+                batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
+                expected_batch_size = kwargs.get("batch_size")
+                assert batch_size_for_shared_caches == expected_batch_size, \
+                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"
+                assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1
+                assert isinstance(n_positions, list) and len(n_positions) == 1
+                assert context_length_estimate == n_positions, \
+                    "To use continuous batching features, context length estimate should equal to n_positions."
+
+        def _safetensor_load(state_dict_path):
+            state_dict = {}
+            with safe_open(state_dict_path, framework="pt") as f:
+                for k in f.keys():
+                    state_dict[k] = f.get_tensor(k)
+            return state_dict
+
+        _sanity_check(**kwargs)
         config = AutoConfig.from_pretrained(pretrained_model_path)
         model = cls(config, *model_args, **kwargs)
         state_dict_path = os.path.join(pretrained_model_path, 'pytorch_model.bin')
-        if os.path.isdir(state_dict_path):
+        state_dict_safetensor_path = os.path.join(pretrained_model_path, 'model.safetensors')
+
+        if os.path.isfile(state_dict_safetensor_path):
+            state_dict = _safetensor_load(state_dict_safetensor_path)
+            model.load_state_dict_low_memory(state_dict)
+        elif os.path.isdir(state_dict_path):
             model.load_state_dict_dir(state_dict_path)
-        else:
+        elif os.path.isfile(state_dict_path):
             state_dict = torch.load(state_dict_path)
             model.load_state_dict_low_memory(state_dict)
+        else:
+            raise FileNotFoundError(f"Can not find model.safetensors or pytorch_model.bin in {pretrained_model_path}")
+
         return model
 
 

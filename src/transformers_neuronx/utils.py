@@ -21,6 +21,17 @@ import torch.nn.functional as F
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 
+def parse_dtype_replica_groups(neuron_config, tp_degree):
+    dtype = None
+    replica_groups = None
+
+    if neuron_config:
+        dtype = neuron_config.all_reduce_dtype
+        replica_groups=neuron_config.get_replica_groups(tp_degree)
+
+    return dtype, replica_groups
+
+
 def get_closest_pow2_bucket_size(size):
     # Lets assume bucket-size = n where 2^k < n < 2^(k+1), should we use 2^k or 2^(k+1)?
     # Elapsed time for these 2 cases:
@@ -67,6 +78,46 @@ def pad_sizes(shape, dims, sizes, left=False):
     return sizes
 
 
+def pad_interleaved(tensor, dim, size, source_len_per_group, pad_len_per_group):
+    """
+    Pad the selected `dim` of `tensor`, up to `size`. Put zeros interleavedly base on `source_len_per_group`
+    and `pad_len_per_group`
+
+        [
+            # group i # ? ... x source_len_per_group ... ?, 0, ... x pad_len_per_group ... , 0]
+        ]
+
+    For example:
+        pad_interleaved([1,2,3]], dim=0, size=9, source_len_per_group=1, pad_len_per_group=2)
+        each group becomes [?, 0, 0], with number of group as 3, we have
+        result: [1, 0, 0, 2, 0, 0, 3, 0, 0]
+    """
+    assert isinstance(dim, int), "pad_interleaved now only supports single dim"
+
+    assert isinstance(size, int), "pad_interleaved now only supports single dim of size"
+
+    padded_shape = list(tensor.shape)
+
+    padded_shape[dim] = size
+
+    padded_tensor = torch.zeros(padded_shape, dtype=tensor.dtype)
+
+    num_groups = size // (source_len_per_group + pad_len_per_group)
+
+    src_indices = [slice(0, None) for _ in range(len(padded_shape))]
+    target_indices = [slice(0, None, None) for _ in range(len(padded_shape))]
+    s_src = 0
+    s_target = 0
+    for _ in range(num_groups):
+        target_indices[dim] = slice(s_target, s_target+source_len_per_group)
+        src_indices[dim] = slice(s_src, s_src+source_len_per_group)
+        padded_tensor[target_indices] = tensor[src_indices]
+        s_src += source_len_per_group
+        s_target += (source_len_per_group + pad_len_per_group)
+
+    return padded_tensor
+
+
 def pad(tensor, dims, sizes, left=False):
     if tensor is None:
         return tensor
@@ -82,7 +133,7 @@ def round_up_to_divisor(value, divisor):
     return math.ceil(value / divisor) * divisor
 
 
-def pad_vocab_size(vocab_size, divisor):
+def get_pad_size(vocab_size, divisor):
     return ((vocab_size // divisor + 1) * divisor - vocab_size) % divisor
 
 
@@ -133,7 +184,7 @@ def batch_tokenize(tokenizer_left_padded, input_texts, pad_token=None):
 def interleave_qkv(q, k, v, tp_degree, dim=1):
     """
     Create a merged QKV Tensor with weights arranged for sharding.
-    
+
     Args:
         q(torch.Tensor): Weights/Bias for Q
         k(torch.Tensor): Weights/Bias for K
@@ -184,3 +235,27 @@ def interleave_qkv(q, k, v, tp_degree, dim=1):
             shard = torch.cat((q_shard, kv_shard), dim=dim).contiguous()
             tensor[:, (idx)*shard.shape[1]:(idx+1)*shard.shape[1]] = shard
     return tensor
+
+
+def build_replica_groups(num_groups, group_size):
+    """
+    Construct replica_groups to handle "intra-group" reduce operations.
+
+    Each nested list represents the ids of the cores within the same group.
+
+    Examples:
+
+        group_size = 2
+        num_groups = 3
+        replica_groups = [[0, 1], [2, 3], [4, 5]]
+
+        group_size = 3
+        num_groups = 2
+        replica_groups = [[0, 1, 2], [3, 4, 5]]
+    """
+    replica_groups = [
+        [nc for nc in range(group_size * group, group_size * group + group_size)]
+        for group in range(num_groups)
+    ]
+    return replica_groups
+

@@ -24,6 +24,7 @@ from textwrap import dedent
 import torch
 import logging
 import json
+import math
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -59,9 +60,29 @@ def build_parallel_kernel(hlo_module, tp_degree):
     kernel.build()
     return kernel
 
+
+def get_compiler_flags() -> str:
+
+    user_flags = os.environ.get('NEURON_CC_FLAGS', '').strip()
+
+    default_flags = {
+        '--model-type': 'transformer',
+        '--auto-cast': 'none',
+    }
+
+    # Set default flag where there is no user-provided value
+    flags = [user_flags] if user_flags else []
+    for key, value in default_flags.items():
+        if key not in user_flags:
+            flags.append(f'{key}={value}')
+
+    # Reformat list of flags to joined string
+    return ' '.join(flags)
+
+
 def compile_hlo_module(hlo_module, tag=None):
-    flags = os.environ.get('NEURON_CC_FLAGS', '')
-    flags += ' --model-type=transformer'
+
+    flags = get_compiler_flags()
     module_flag_hash = get_hash_module(hlo_module, flags)
     module_hash = get_hash_module(hlo_module, None)
 
@@ -192,11 +213,14 @@ class DataTypeConverter:
     def torch2hlo(self, torch_dtype):
         return self.torch2hlo_mapping[torch_dtype]
 
+def primitive2name(element_type):
+    return xla_data_pb2.PrimitiveType.Name(element_type).lower()
 
 class Kernel:
 
     def __init__(self, hlo_module, neff_bytes, metaneff, tp_degree):
         self.hlo_module = hlo_module
+        logging.debug(f"Total input tensor size of the module (per rank): {get_input_tensor_size(self.hlo_module)} bytes")
         self.neff_bytes = neff_bytes
         metaneff_bytes = metaneff.SerializeToString()
         model_cls = torch.classes.neuron.Model
@@ -389,7 +413,7 @@ def io_ring_cache_context(size):
 
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
@@ -401,25 +425,32 @@ class ParallelKernel:
         self.g_start_device_id = g_start_device_id
         if g_device_count is None:
             g_device_count = tp_degree
+        self.tag = tag
         self.g_device_count = g_device_count
+        self.memories = []
+        self.total_input_tensors_size = get_total_input_tensors_size(self.hlo_module)
+        logging.debug(f"Total input tensor size of the module (per rank): {self.total_input_tensors_size / (10**9)} G, whole (all ranks): {self.total_input_tensors_size * tp_degree / (10**9)} G")
 
     def build_memory(self):
-        return ParallelMemory(self.hlo_module, self.tp_degree)
+        memory = ParallelMemory(self.hlo_module, self.tp_degree)
+        self.memories.append(memory)
+        return memory
 
-    def compile(self, tag=None):
-        self.build(tag=tag)
+    def compile(self):
+        self.build()
         return self.neff_bytes
 
-    def build(self, tag=None):
+    def build(self):
         # Avoid rebuilding NEFF. This path occurs during deserialization
         if self.neff_bytes is not None:
             return
-        self.neff_bytes = compile_hlo_module(self.hlo_module, tag)
+        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag)
 
     def load(self, io_ring_cache_size=1):
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
         self.model = torch.classes.neuron.ParallelModel(self.neff_bytes, self.tp_degree, self.g_start_device_id, self.g_device_count)
         with io_ring_cache_context(io_ring_cache_size):
+            logging.debug(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
             self.model.load()
 
     def snapshot_path(self):
@@ -453,6 +484,7 @@ class ParallelKernel:
         ParallelKernel.hlo_snapshot_iter += 1
 
     def __call__(self, memory):
+        logging.debug(f"running {self.hlo_module.name}")
         if self.snapshot is not None:
             if self.snapshot_steps is None or ParallelKernel.hlo_snapshot_iter in self.snapshot_steps:
                 self.snapshot_enter(memory.input_tensors)
@@ -465,6 +497,38 @@ class ParallelKernel:
 
     def build_executor(self, memory, inputs, outputs):
         return Executor(self, memory, inputs, outputs)
+
+    def profile(self, profile_dir):
+        if not os.path.exists(profile_dir):
+            os.makedirs(profile_dir, exist_ok=True)
+
+        tagged_hlo = (f"{self.tag}-" if self.tag else "") + self.hlo_module.name
+        ntff_prefix = os.path.join(profile_dir,tagged_hlo)
+
+        # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
+        self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
+
+        # Single inference on the initial allocated memory
+        for t in self.memories[0].input_tensors:
+            zero = torch.zeros(t.shape, dtype=t.dtype)
+            zeros = [zero] * self.tp_degree
+            ops.parallel_write(t, zeros)
+        self(self.memories[0])
+
+        ops.parallel_profile_stop(self.ntff_paths)
+
+        # Save NEFF file
+        neff_filename = os.path.join(profile_dir,
+                                    f"{tagged_hlo}.neff")
+        with open(neff_filename, "wb") as f:
+            f.write(self.neff_bytes)
+
+        ntff_tar_path = os.path.join(profile_dir,
+                                     f'{tagged_hlo}.profile.tar')
+        with tarfile.open(ntff_tar_path, 'w|') as fp:
+            fp.add(neff_filename)
+            for ntff_path in self.ntff_paths:
+                fp.add(ntff_path)
 
 
 def gen_zero_input(hlo_module, index):
@@ -514,6 +578,18 @@ def get_debug_outputs(program, bucket_id=0):
     debug_names = program.debugger.get_names() if hasattr(program, "debugger") else []
     return debug_tensors, debug_names
 
+def get_total_input_tensors_size(hlo_module):
+    total_bytes = 0
+    dtype_converter = DataTypeConverter()
+    for _, param in enumerate(hlo_module.host_program_shape.parameters):
+        dtype = dtype_converter.hlo2torch(param.element_type)
+        if dtype.is_floating_point:
+            num_bytes = math.prod(param.dimensions) * torch.finfo(dtype).bits / 8
+        else:
+            num_bytes = math.prod(param.dimensions) * torch.iinfo(dtype).bits / 8
+        total_bytes += num_bytes
+    return total_bytes
+
 class HLOKernel:
     def __init__(self, hlo_program, tp, start_g_nc_id=0, g_nc_count=None):
         self.hlo_program = hlo_program
@@ -546,8 +622,11 @@ class HLOKernel:
             nc_output_buffers = []
             for o in cpu_output_buffers:
                 nc_output_buffers.append(self.manipulator.duplicate(o))
+        if len(nc_input_buffers) == 0:
+            cpu_input_buffers = gen_zero_inputs(self.hlo_module)
+            for i in cpu_input_buffers:
+                nc_input_buffers.append(self.manipulator.duplicate(i))
         self.memories.setup(nc_input_buffers, nc_output_buffers) # Segmentation fault (core dumped)
 
     def run(self):
-        logging.debug(f"running {self.hlo_module.name}")
         self.kernel(self.memories)

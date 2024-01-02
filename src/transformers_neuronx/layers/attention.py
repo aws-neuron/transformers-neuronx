@@ -14,7 +14,8 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import parallel
-
+from transformers_neuronx import utils
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 
 def query_key_value(
     hidden,
@@ -22,10 +23,11 @@ def query_key_value(
     k_weight, k_scales, k_bias,
     v_weight, v_scales, v_bias,
     d_head,
-    n_head=None,
+    tp_degree=None,
     neuron_config=None,
-    n_kv_head=0,
     shard_over_batch=False,
+    n_head=None,
+    n_kv_head=0,
 ):
     """
     Self-attention input projections.
@@ -42,22 +44,37 @@ def query_key_value(
     n_kv_head = n_kv_head if n_kv_head > 0 else n_head
     dtype = hidden.dtype
     n_seqs, n_active_tokens, hidden_size = hidden.sizes
-    hidden = dtype[hidden_size,n_active_tokens,n_seqs].Transpose(hidden, dimensions=[2, 1, 0])
+    hidden = hlo.transpose210(hidden)
     hidden_size, hidden_size_tp = q_weight.sizes
-    _, kv_hidden_size_tp = k_weight.sizes
+    fuse_qkv = neuron_config and neuron_config.fuse_qkv
+    if fuse_qkv:
+        hidden_size_tp //= FUSED_QKV_TP_FACTOR
+        kv_hidden_size_tp = hidden_size_tp
+    else:
+        _, kv_hidden_size_tp = k_weight.sizes
     n_heads_tp = hidden_size_tp // d_head
+
     hidden_r_sizes = hidden_size, n_active_tokens * n_seqs
+    hidden_r = hlo.reshape(hidden, hidden_r_sizes)
 
-    hidden_r = dtype[hidden_r_sizes].Reshape(hidden)
+    if fuse_qkv:
+        # QKV = (hidden @ wQKV) + bQKV
+        active_qkv = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config=neuron_config)
 
-    # Q = (hidden @ wQ) + bQ
-    active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
+        # Split
+        slice_lim = active_qkv.sizes[-1] // FUSED_QKV_TP_FACTOR
+        active_q = hlo.slice_along(active_qkv, -1, slice_lim, start=0)
+        active_k = hlo.slice_along(active_qkv, -1, 2*slice_lim, start=slice_lim)
+        active_v = hlo.slice_along(active_qkv, -1, 3*slice_lim, start=2*slice_lim)
+    else:
+        # Q = (hidden @ wQ) + bQ
+        active_q = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config)
 
-    # K = (hidden @ wK) + bK
-    active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
+        # K = (hidden @ wK) + bK
+        active_k = hlo.dot00_add1(hidden_r, k_weight, k_bias, k_scales, neuron_config)
 
-    # V = (hidden @ wV) + bV
-    active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
+        # V = (hidden @ wV) + bV
+        active_v = hlo.dot00_add1(hidden_r, v_weight, v_bias, v_scales, neuron_config)
 
     if shard_over_batch:
         # shard over batch
@@ -157,11 +174,11 @@ def scale(query, d_head):
     """
     dtype = query.dtype
     scale = dtype.Constant(constant_value=d_head ** 0.5)
-    scale_br = dtype[query.sizes].Broadcast(scale, dimensions=[])
+    scale_br = hlo.broadcast(scale, query.sizes, broadcast_dimensions=[])
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, n_kv_heads=0, shard_over_batch=False):
+def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
     """
     Compute the attention score by combining scaled-query & keys.
 
@@ -169,7 +186,6 @@ def score(query, keys, n_kv_heads=0, shard_over_batch=False):
 
     If n_kv_heads != 0, uses multi-query/grouped-query attention.
     """
-
     dtype = query.dtype
     scribe = query.scribe
     pred = scribe.pred
@@ -196,7 +212,7 @@ def score(query, keys, n_kv_heads=0, shard_over_batch=False):
     return result_dot
 
 
-def mask(score, mask, constant_val=-30000):
+def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_val=-30000):
     """
     Masks the computed attention scores with the attention mask.
 
@@ -211,15 +227,15 @@ def mask(score, mask, constant_val=-30000):
     const = dtype.Constant(constant_value=constant_val) # Valid for fp32/fp16/bf16
     const_br = dtype[score_sizes].Broadcast(const, dimensions=[])
     if len(mask.sizes) == 2:
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[2, 3])
+        mask_br = hlo.broadcast(mask, score_sizes, broadcast_dimensions=[0, 3])
     else:
-        mask_br = pred[score_sizes].Broadcast(mask, dimensions=[0, 2, 3])
+        mask_br = hlo.broadcast(mask, score_sizes , broadcast_dimensions=[0, 2, 3])
     score = dtype[score_sizes].Select(mask_br, score, const_br)
     return score
 
 
 def context(past_scores, active_score, past_values, active_values, n_kv_heads=0, dtype=None,
-            sparse_mask=None, active_sparse_mask=None):
+            sparse_mask=None, active_sparse_mask=None, shard_over_batch=False, tp_degree=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -309,7 +325,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     return output
 
 
-def context_combined(score, values, tp_degree, n_kv_heads=0, dtype=None, sparse_mask=None, shard_over_batch=False):
+def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sparse_mask=None, shard_over_batch=False):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -396,30 +412,11 @@ def output(
     n_seqs, n_active_tokens, n_heads_tp, d_head = context.sizes
     _, hidden_size = out_weight.sizes
     hidden_sizes = n_seqs, n_active_tokens, hidden_size
-    hidden_r_sizes = n_seqs * n_active_tokens, hidden_size
-
-    enable_quantize = neuron_config and neuron_config.quant
-    if enable_quantize:
-        out_weight = dtype[out_weight.sizes].Convert(out_weight)
 
     result_sizes_2d = n_seqs * n_active_tokens, n_heads_tp * d_head
     result = dtype[result_sizes_2d].Reshape(context)
-    dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
-    result = dtype[hidden_r_sizes].Dot(result, out_weight, dot_dimension_numbers=dot_dims)
-    if enable_quantize:
-        result = hlo.dequantize(result, out_scales, neuron_config, 1)
-
-    if out_bias is not None:
-        out_bias = dtype[hidden_r_sizes].Broadcast(out_bias, dimensions=[1])
-        result = dtype[hidden_r_sizes].Add(result, out_bias)
-
+    result = hlo.dot10_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
-    if tp_degree == 1:
-        return result
-
-    all_reduce_dtype = None
-    if neuron_config:
-        all_reduce_dtype = neuron_config.all_reduce_dtype
-    result = hlo.all_reduce_sum(result, tp_degree, dtype=all_reduce_dtype)
-    return result
+    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+    return hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)

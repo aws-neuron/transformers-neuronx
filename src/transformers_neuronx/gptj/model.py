@@ -20,6 +20,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
@@ -32,14 +33,14 @@ class GPTJForSampling(module.PretrainedModel):
         super().__init__()
         config = GPTJConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
             max_allowed_sequence_length = config.n_ctx
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
-        if neuron_config and neuron_config.quant:
+        if self.neuron_config.quant:
             raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is None:
             unroll = config.n_layer
@@ -144,6 +145,13 @@ class GPTJForSampling(module.PretrainedModel):
         pos_embd = torch.eye(head_dim)
         pos_embd[:dim, :dim] = sincos
         return pos_embd
+
+    def _cast_logits(self, logits):
+        # Cast logits to float32 or  the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        return logits.to(logits_dtype)
 
 
 class GPTJBuffers:
@@ -315,7 +323,7 @@ class GPTJLnLmHead:
         # Pad the lm_head_weight and lm_head_bias if vocab_size % tp_degree != 0
         lm_head_weight = self.lm_head.weight.detach().T
         _, vocab_size = lm_head_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = shard_along(lm_head_weight, dim=1)
         lm_head_bias = self.lm_head.bias.detach()

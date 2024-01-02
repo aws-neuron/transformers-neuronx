@@ -1,5 +1,5 @@
 # Copyright Amazon Web Services and its Affiliates. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -27,6 +27,8 @@ from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
@@ -38,7 +40,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
@@ -49,14 +51,14 @@ class GPT2ForSampling(base.NeuronModelBase):
             unroll = config.n_layer
         n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
         attention_head_size = config.n_embd // config.n_head
+
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config
+            unroll=unroll, neuron_config=self.neuron_config,
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=neuron_config,
-                                                   shard_over_batch=config.shard_over_batch)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -64,7 +66,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()
         self.chkpt_model.transformer.wpe.materialize()
@@ -91,18 +93,31 @@ class GPT2ForSampling(base.NeuronModelBase):
                                             c_attn_bias[n_embd:n_embd*2])
                 new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                               c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
+            else:
+                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
                 new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
             else:
-                new_layer.add_mlp_output(
-                    mlp.c_proj.weight.detach().T,
-                    mlp.c_proj.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
+                if is_bsh:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach(),
+                        mlp.c_proj.bias.detach(),
+                        sharding=0,
+                        transposed=True,
+                    )
+                else:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach().T,
+                        mlp.c_proj.bias.detach(),
+                        sharding=1,
+                        transposed=False,
+                    )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -139,9 +154,12 @@ class GPT2ForSampling(base.NeuronModelBase):
         position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
         position_embeds = self.chkpt_model.transformer.wpe(position_ids)
         hidden = inputs_embeds + position_embeds
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
         hidden = hidden.transpose(0, 2).contiguous()
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
-        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -200,13 +218,14 @@ class GPT2ForHuggingFaceSampling(GPT2ForSampling):
 class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, prompt_batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, n_parallel_output_tokens=1, **kwargs):
+                 unroll=None, context_length_estimate=None, context_unroll=1, neuron_config=None, reorder_cache=False, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         if unroll is None:
             unroll = config.n_layer
+        self.unroll=unroll
         self.prompt_batch_size = prompt_batch_size
         attention_head_size = config.n_embd // config.n_head
         if context_length_estimate is None:
@@ -216,24 +235,31 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.context_buckets = bucket.context_sizes(
             context_length_estimate, self.token_buckets
         )
-        self.n_parallel_output_tokens=n_parallel_output_tokens
         self.max_positions=self.token_buckets[-1]
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=self.n_parallel_output_tokens,
-            batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
-            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=neuron_config, n_parallel_output_tokens= self.n_parallel_output_tokens
-        )
-
-
-        self.decoder_lm_head.need_reorder_cache = reorder_cache
-        self.register_for_serialization(self.decoder_lm_head)
 
         # TODO: the start_mask needs to be True with left padding for context estimate,
         # need to fix this after having right padding
         start_mask = True
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask,
-                                                   neuron_config=neuron_config)
+                                                   neuron_config=self.neuron_config)
+        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
+            attention_head_size=attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
+        )
+
+        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
+            batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=self.neuron_config, return_all_outputs=True
+        )
+
+        self.decoder_lm_head.need_reorder_cache = reorder_cache
+        self.register_for_serialization(self.decoder_lm_head)
+
+
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
@@ -268,8 +294,9 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                     n_head=config.n_head,
                     n_kv_head=config.n_kv_head,
                     unroll=context_unroll,
-                    neuron_config=neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad
+                    neuron_config=self.neuron_config,
+                    allow_pad=self.decoder_lm_head.allow_pad,
+                    return_all_outputs=False
                 )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
@@ -284,13 +311,13 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                         config.n_layer,
                     )
                     self.register_for_serialization(self.broadcaster[context_length_estimate])
-
+        self.decoder_lm_head_for_speculation={}
         self.context_pre_hook = None
         self.context_hook = None
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
 
-    def to_neuron(self):
+    def load_weights(self):
         ops.init()
         self.chkpt_model.transformer.wte.materialize()
         self.chkpt_model.transformer.wpe.materialize()
@@ -309,18 +336,30 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                         c_attn_bias[n_embd:n_embd*2])
             new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                           c_attn_bias[n_embd*2:n_embd*3])
-            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
+            else:
+                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
                 new_layer.add_mlp_output(mlp.c_proj.weight.detach(), mlp.c_proj.bias.detach())
             else:
-                new_layer.add_mlp_output(
-                    mlp.c_proj.weight.detach().T,
-                    mlp.c_proj.bias.detach(),
-                    sharding=1,
-                    transposed=False,
-                )
+                if is_bsh:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach(),
+                        mlp.c_proj.bias.detach(),
+                        sharding=0,
+                        transposed=True,
+                    )
+                else:
+                    new_layer.add_mlp_output(
+                        mlp.c_proj.weight.detach().T,
+                        mlp.c_proj.bias.detach(),
+                        sharding=1,
+                        transposed=False,
+                    )
             new_layer.to_neuron()
             layer.nullify()
         ln_f = self.chkpt_model.transformer.ln_f
@@ -342,38 +381,42 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             for i, context_length_estimate in enumerate(self.context_buckets):
                 model = self.decoder_lm_head.build_weight_shared(share_caches=self.share_caches,
                                                                     new=self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
-                source_caches = []
-                for layer in model.layers:
-                    source_caches.append(layer.attn_k_cache[model.batch_size[bs_idx]])
-                    source_caches.append(layer.attn_v_cache[model.batch_size[bs_idx]])
-                manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
-                target_caches = []
-                for layer in self.decoder_lm_head.layers:
-                    attn_k_cache = manipulator.slice_on_nc(
-                        layer.attn_k_cache[batch_size],
-                        0,
-                        start=0,
-                        end=context_length_estimate,
-                        step=1,
-                    )
-                    attn_v_cache = manipulator.slice_on_nc(
-                        layer.attn_v_cache[batch_size],
-                        0,
-                        start=0,
-                        end=context_length_estimate,
-                        step=1,
-                    )
-                    target_caches.append(attn_k_cache)
-                    target_caches.append(attn_v_cache)
                 if not self.share_caches:
-                    self.broadcaster[context_length_estimate].build()
-                    self.broadcaster[context_length_estimate].load()
-                    self.broadcaster[context_length_estimate].setup(source_caches, target_caches)
+                    source_caches = []
+                    for layer in model.layers:
+                        source_caches.append(layer.attn_k_cache[model.batch_size[bs_idx]])
+                        source_caches.append(layer.attn_v_cache[model.batch_size[bs_idx]])
+                    manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
+                    target_caches = []
+                    for layer in self.decoder_lm_head.layers:
+                        attn_k_cache = manipulator.slice_on_nc(
+                            layer.attn_k_cache[batch_size],
+                            0,
+                            start=0,
+                            end=context_length_estimate,
+                            step=1,
+                        )
+                        attn_v_cache = manipulator.slice_on_nc(
+                            layer.attn_v_cache[batch_size],
+                            0,
+                            start=0,
+                            end=context_length_estimate,
+                            step=1,
+                        )
+                        target_caches.append(attn_k_cache)
+                        target_caches.append(attn_v_cache)
+                    self.broadcaster[context_length_estimate].set_source_caches(source_caches)
+                    self.broadcaster[context_length_estimate].set_target_caches(target_caches)
                 self.tensor_pool = tensor_pool.TensorPool()
                 # We need to reset once, since there might be NaN initially in KVcache.
                 # This is done right after weight loading which is shared for different generation methods.
                 self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
                 self.reset(context_length_estimate=context_length_estimate)
+        if self.decoder_lm_head_for_speculation:
+            for i,k in enumerate(self.decoder_lm_head_for_speculation):
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True,
+                                                                      new=self.decoder_lm_head_for_speculation[k])
+                self.decoder_lm_head_for_speculation[k]=model
 
     def reset(self,context_length_estimate):
         self.decoder_lm_head.reset()
@@ -402,6 +445,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         batch_size, context_length = input_ids.shape
 
         model=self.decoder_lm_head
+
         if is_context_encode:
             model=self.decoder_lm_head_for_context[estimate, batch_size]
 
@@ -425,20 +469,19 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             task = self.tensor_pool.async_clear()
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        if is_bsh:
+            hidden = hidden.permute(2, 1, 0)
         hidden=hidden.transpose(0,2).contiguous()
         if context_length > 1:
-            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+            logits = self.context(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         else:
-            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+            logits = self.decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
-        _,n_active_tokens,_=logits.shape
-        if n_active_tokens>1:
-            logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
-        else:
-            logits = logits[:self.config.vocab_size, -1, :]
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         if is_context_encode:
             task.wait()
@@ -446,6 +489,46 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if is_context_encode and not self.share_caches:
             self.broadcaster[estimate].run_broadcast()
 
+        return logits
+
+    def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
+
+        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+
+        batch_size, context_length = input_ids.shape
+
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+
+        if cache_ids is None:
+            cache_ids = torch.arange(context_length, dtype=torch.int32)
+
+
+        if speculation_length is None:
+            model=self.decoder_lm_head
+        else:
+            model=self.decoder_lm_head_for_speculation[speculation_length]
+        hidden, start_ids = self._embedding(model, input_ids, cache_ids,
+                                            start_ids, is_context_encode=False)
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = \
+            self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
+            if sliding_window_attn_enabled else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        if start_ids.shape[0] != batch_size:
+            start_ids = start_ids.repeat(batch_size)
+        hidden=hidden.transpose(0,2).contiguous()
+        logits=model(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        self.num_processed_tokens += (last_token_id + 1)
+        logits = self._cast_logits(logits)
+        _,n_active_tokens,_=logits.shape
+        logits = logits[:self.config.vocab_size, -n_active_tokens:, :]
+        logits = logits.transpose(0, 1)
         return logits
 
     @torch.no_grad()
@@ -475,8 +558,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
-            output_scores=output_scores,
-            n_parallel_output_tokens=self.n_parallel_output_tokens,
+            output_scores=output_scores
         )
         if output_scores:
             interleaved, scores = interleaved

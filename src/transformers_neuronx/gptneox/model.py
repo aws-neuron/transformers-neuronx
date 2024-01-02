@@ -22,6 +22,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
@@ -35,13 +36,13 @@ class GPTNeoXForSampling(module.PretrainedModel):
         config = GPTNeoXConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.debug = kwargs.get('debug', False)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         if self.config.activation_function not in ["gelu_new"]: # TODO see if we actually need to implement any other activation func variants
             warnings.warn(f'hidden_act="{self.config.activation_function}" ignored in favor of hidden_act="gelu_new"')
             self.config.activation_function = "gelu_new"
         if not self.config.use_parallel_residual: # TODO implement use_parallel_residual = False
             raise NotImplementedError(f'use_parallel_residual=False is not yet implemented')
-        if neuron_config and neuron_config.quant:
+        if self.neuron_config.quant:
             raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is not None: # TODO add support for unroll
             raise NotImplementedError(f'unroll={unroll} is not yet implemented')
@@ -400,7 +401,7 @@ class GPTNeoXLnLmHead:
         # Pad the lm_head_weight if vocab_size % tp_degree != 0
         embed_out_weight = self.embed_out.weight.detach().T
         _, vocab_size = embed_out_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         embed_out_weight = torch.nn.functional.pad(embed_out_weight, (0, vocab_pad, 0, 0))
         self.embed_out_weight = shard_along(embed_out_weight, dim=1)
         self.embed_out.nullify()

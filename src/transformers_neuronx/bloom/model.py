@@ -22,6 +22,8 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
+from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import alibi
 from transformers_neuronx.bloom.config import BloomConfig
 from transformers_neuronx.bloom.modules import BloomForCausalLM
@@ -36,7 +38,7 @@ class BloomForSampling(base.NeuronModelBase):
         config = BloomConfig(config, n_positions, batch_size, amp, tp_degree, **kwargs)
         super().__init__(BloomForCausalLM, config)
         self.config = config
-        self.neuron_config =  neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
 
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:
@@ -60,10 +62,10 @@ class BloomForSampling(base.NeuronModelBase):
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True
         )
         self.register_for_serialization(self.decoder_lm_head)
-        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
+        hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
         self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
@@ -83,13 +85,13 @@ class BloomForSampling(base.NeuronModelBase):
                         num_layers=config.n_layer,
                         n_head=config.n_head,
                         unroll=context_unroll,
-                        neuron_config=neuron_config,
-                        allow_pad=self.decoder_lm_head.allow_pad
+                        neuron_config=self.neuron_config,
+                        allow_pad=self.decoder_lm_head.allow_pad,
+                        return_all_outputs=False
                     )
                 self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
 
-    def to_neuron(self):
-
+    def load_weights(self):
         # Materialize the embedding to CPU
         self.chkpt_model.transformer.word_embeddings.materialize()
         self.chkpt_model.transformer.word_embeddings_layernorm.materialize()
@@ -129,11 +131,19 @@ class BloomForSampling(base.NeuronModelBase):
             new_layer.add_attention_key(k, k_bias)
             new_layer.add_attention_value(v, v_bias)
 
-            new_layer.add_attention_output(
-                attn.dense.weight.detach(),
-                attn.dense.bias.detach(),
-                sharding=1,
-            )
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                new_layer.add_attention_output(
+                    attn.dense.weight.detach().T,
+                    attn.dense.bias.detach(),
+                    sharding=0,
+                )
+            else:
+                new_layer.add_attention_output(
+                    attn.dense.weight.detach(),
+                    attn.dense.bias.detach(),
+                    sharding=1,
+                )
             new_layer.add_pre_mlp_layer_norm(
                 layer.post_attention_layernorm.weight.detach(),
                 layer.post_attention_layernorm.bias.detach()
@@ -142,12 +152,20 @@ class BloomForSampling(base.NeuronModelBase):
                 mlp.dense_h_to_4h.weight.detach().T,
                 mlp.dense_h_to_4h.bias.detach()
             )
-            new_layer.add_mlp_output(
-                mlp.dense_4h_to_h.weight.detach(),
-                mlp.dense_4h_to_h.bias.detach(),
-                sharding=1,
-                transposed=False,
-            )
+            if is_bsh:
+                new_layer.add_mlp_output(
+                    mlp.dense_4h_to_h.weight.detach().T,
+                    mlp.dense_4h_to_h.bias.detach(),
+                    sharding=0,
+                    transposed=True,
+                )
+            else:
+                new_layer.add_mlp_output(
+                    mlp.dense_4h_to_h.weight.detach(),
+                    mlp.dense_4h_to_h.bias.detach(),
+                    sharding=1,
+                    transposed=False,
+                )
             new_layer.to_neuron()
             layer.nullify()
 
@@ -161,6 +179,10 @@ class BloomForSampling(base.NeuronModelBase):
         lm_head.nullify()
         slopes = alibi.build_slopes(self.config.n_head)
         self.decoder_lm_head.add_pre_layer_parameter(slopes, sharding=0, allow_pad=True)
+        if self.neuron_config.on_device_embedding:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings.weight, sharding=1, allow_pad=True)
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.weight)
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.bias)
         self.decoder_lm_head.to_neuron()
 
         if self.context_buckets:
@@ -171,9 +193,15 @@ class BloomForSampling(base.NeuronModelBase):
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+
+        if self.neuron_config.on_device_embedding:
+            return self._forward(input_ids, *rst, neuron_config=self.neuron_config)
+
         hidden = self.chkpt_model.transformer.word_embeddings(input_ids)
         hidden = self.chkpt_model.transformer.word_embeddings_layernorm(hidden)
-        return self._forward(hidden, *rst)
+        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
+            hidden = hidden.permute(2, 1, 0)
+        return self._forward(hidden, *rst, neuron_config=self.neuron_config)
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         batch_size, *_  = input_ids.shape
