@@ -241,7 +241,7 @@ def main():
         "I don't know how to write a program, but I know that I can do it. " \
         "I'm not going to tell you how I learned to code, or how much I've learned. " \
         "But I will tell the story of my first programming experience, and how it changed my life.")
-    run_parser.add_argument('--prompt_len', type=int, default=None)
+    run_parser.add_argument('--prompt_len', type=int, default=None, help="If set, will use random input_ids as (batch_size, prompt_len) instead provided prompt.")
     # neuron_utils utils
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
@@ -255,6 +255,8 @@ def main():
     run_parser.add_argument('--suffix', type=str, default=None)
     # profile
     run_parser.add_argument('--profile', action='store_true')
+    # profile-torch
+    run_parser.add_argument('--profile_torch', action='store_true')
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -441,21 +443,30 @@ def save(args, hf_model_name, model_type):
 def run(args, hf_model_name, model_cls):
     torch.manual_seed(15213)
 
-    full_prompt_text = args.prompt
-    if args.various:
-        batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
-            len(full_prompt_text), (args.batch_size,)).tolist()
-    else:
-        batched_seq_lens = [args.prompt_len for _ in range(args.batch_size)]
-
-    batched_prompt_text = [full_prompt_text[:l] for l in batched_seq_lens]
-    print(batched_prompt_text)
-
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name, padding_side="left")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
-    print(encoded_text, "len:", encoded_text.input_ids.shape[-1])
+    # prepare input
+    if args.prompt_len is not None:
+        input_ids = torch.randint(0, 100, (args.batch_size, args.prompt_len))
+        attention_mask = None
+    else:
+        full_prompt_text = args.prompt
+        if args.various:
+            batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
+                len(full_prompt_text), (args.batch_size,)).tolist()
+        else:
+            batched_seq_lens = [args.prompt_len for _ in range(args.batch_size)]
+
+        batched_prompt_text = [full_prompt_text[:l] for l in batched_seq_lens]
+        print(batched_prompt_text)
+
+        encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
+        input_ids = encoded_text.input_ids
+        attention_mask = encoded_text.attention_mask
+
+    print("input_ids", input_ids, " len:", input_ids.shape[-1])
+    print("attention_mask:", attention_mask,)
 
 
     forward_func = None
@@ -467,7 +478,7 @@ def run(args, hf_model_name, model_cls):
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
-            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}" if args.suffix is None else args.suffix
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}_ctx{args.context_length_estimate}_wctx{args.window_context_length_estimate}" if args.suffix is None else args.suffix
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
             if args.snapshot or args.pack_artifacts:
@@ -485,8 +496,6 @@ def run(args, hf_model_name, model_cls):
                                                 unroll=args.unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
                 if args.window_context_length_estimate is not None:
                     neuron_model.enable_window_context_decoder(args.window_context_length_estimate, args.unroll)
-
-
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=args.n_positions,
@@ -557,11 +566,18 @@ def run(args, hf_model_name, model_cls):
 
             with torch.inference_mode():
                 forward_func = lambda : model.generate(
-                    input_ids=encoded_text.input_ids,
-                    attention_mask=encoded_text.attention_mask,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     **generation_config,
                 )
+                # also serve as a warm up for torch profiling
                 outputs = forward_func()
+
+            if args.profile_torch:
+                from torch.profiler import profile, record_function, ProfilerActivity
+                with profile(activities=[ProfilerActivity.CPU]) as prof:
+                    result = forward_func()
+                prof.export_chrome_trace(f"torch-trace_{suffix}.json")
 
         if args.dump_logits:
             dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
@@ -594,7 +610,7 @@ def run(args, hf_model_name, model_cls):
                 upload_folder_to_s3(compiler_artifacts_dir, args.to_s3)
 
     if args.benchmark:
-        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=encoded_text.input_ids.shape[-1])
+        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=input_ids.shape[-1])
 
 if __name__ == "__main__":
     main()
