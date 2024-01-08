@@ -653,7 +653,7 @@ def gated_mlp_bsh(
         out_bias:   [h]
         result:     [b, a, h]
     """
-	dtype = hidden.dtype
+    dtype = hidden.dtype
     batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
