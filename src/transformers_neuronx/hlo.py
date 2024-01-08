@@ -653,21 +653,36 @@ def gated_mlp_bsh(
         out_bias:   [h]
         result:     [b, a, h]
     """
-
-    dtype = hidden.dtype
+	dtype = hidden.dtype
     batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-
-    hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
-                               scales=in0_scales, neuron_config=neuron_config)
-    hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
-                               scales=in1_scales, neuron_config=neuron_config)
-    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
-    result = dot11_add1(hidden_states, out_weight, out_bias,
+    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+        assert hidden_size % constants.TILE_SIZE == 0, \
+            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+            f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+        hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = reshape(hidden, hidden_tiled_sizes)
+        hidden_active  = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
+        hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden_active = reshape(hidden_active, hidden_tiled_sizes)
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+        hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
+        hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        result = dot_1220_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
+    else:
+        hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+                               scales=in0_scales, neuron_config=neuron_config)
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+        hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+                               scales=in1_scales, neuron_config=neuron_config)
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        result = dot11_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
+
     result = dtype[hidden_sizes].Reshape(result)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
