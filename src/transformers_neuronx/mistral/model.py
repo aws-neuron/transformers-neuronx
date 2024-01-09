@@ -133,7 +133,7 @@ class MistralForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
-        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size)
+        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
 
         input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
