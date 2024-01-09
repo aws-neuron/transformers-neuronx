@@ -131,9 +131,12 @@ class MistralForSamplingNoEmbeddingHlo:
         if n_active_tokens == 1:
             sparse_mask = None
         else:
-            # Generate sliding-window mask
-            sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
-            sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
+            if self.config.window_size:
+                # Generate sliding-window mask
+                sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
+                sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
+            else:
+                sparse_mask = None
 
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -175,10 +178,11 @@ class MistralForSamplingNoEmbeddingHlo:
             useful_cached_values = cached_values
             useful_mask = mask
 
-            if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
-                useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
-                useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
-                useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
+            if self.config.window_size:
+                if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
+                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
+                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
+                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,
@@ -207,7 +211,8 @@ class MistralForSamplingNoEmbeddingHlo:
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
                                     tp_degree=tp_degree, shard_over_batch=shard_over_batch)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
-            score = attention.sparse_attn_mask(score, sparse_mask)
+            if self.config.window_size:
+                score = attention.sparse_attn_mask(score, sparse_mask)
             context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=self.config.num_key_value_heads,
                                                  tp_degree=tp_degree, shard_over_batch=shard_over_batch)
 
