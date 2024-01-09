@@ -26,6 +26,9 @@ class LlamaForCausalLM(module.PretrainedModel):
         self.model = LlamaModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
+    def get_tied_parameter_paths(self):
+        return [('model.embed_tokens.weight', 'lm_head.weight')]
+
 
 class LlamaModel(module.LowMemoryModule):
 
