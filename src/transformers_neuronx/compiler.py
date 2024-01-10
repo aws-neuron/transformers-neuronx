@@ -453,6 +453,20 @@ class ParallelKernel:
             logging.debug(f"loading model with tp_degree {self.tp_degree}, g_start_device_id {self.g_start_device_id} g_device_count {self.g_device_count}")
             self.model.load()
 
+    def warmup(self):
+        """
+        Execute the kernel with each memory once.
+
+        This ensure that any initialization latency related to caching or
+        runtime setup is already complete prior to the model being executed.
+        """
+        for memory in self.memories:
+            try:
+                self(memory)
+            except Exception:
+                # Ignoring exceptions avoids uninitialized memory related errors
+                pass
+
     def snapshot_path(self):
         path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
         os.makedirs(path, exist_ok=True)
