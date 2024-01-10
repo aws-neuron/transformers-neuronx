@@ -589,7 +589,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             return logits
 
         return compiler.compile_py_func(ln_lm_head)
-    
+
     def _hlo_post_layer(self, logits):
         return self.post_layer_builder(logits)
 
@@ -1512,6 +1512,10 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
                 input_tensors.extend(ln_lm_head_params)
                 self.memories[npos,batch_size].setup(input_tensors, output_tensors)
 
+        # Warmup kernels to avoid unexpected initialization at runtime
+        for kernel in self.get_kernels():
+            kernel.warmup()
+
     def run(self, bucket_id, batch_size):
         npos = self.n_positions_list[bucket_id]
         self.kernels[npos,batch_size](self.memories[npos,batch_size])
@@ -1604,6 +1608,10 @@ class DecoderProgramMultiLayer(DecoderProgram):
                 self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], output_tensors)
                 self.ln_lm_head_kernels[head_idx].build()
                 self.ln_lm_head_kernels[head_idx].load()
+
+        # Warmup kernels to avoid unexpected initialization at runtime
+        for kernel in self.get_kernels():
+            kernel.warmup()
 
     def run(self, bucket_id, batch_size):
         npos = self.n_positions_list[bucket_id]
