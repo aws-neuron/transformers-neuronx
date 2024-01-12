@@ -2056,13 +2056,20 @@ def literal(dtype, tensor):
 
     converter = compiler.DataTypeConverter()
 
+    # Convert boolean tensors to int8 to avoid an error in Python 3.11:
+    #   `TypeError: True has type <class 'numpy.bool_'>, but expected one of: (<class 'bool'>, <class 'numbers.Integral'>)`
+    original_dtype = dtype
+    dtype_is_bool = dtype == dtype.scribe.pred
+    if dtype_is_bool:
+        dtype = dtype.scribe.s8
+
     # Convert tensor data to expected HLO data type
     torch_dtype = converter.hlo2torch(dtype.shape_proto.element_type)
     if tensor.dtype != torch_dtype:
         tensor = tensor.to(torch_dtype)
 
     data = tensor.data.numpy().ravel()
-    if tensor.dtype in [torch.float16, torch.bfloat16, torch.int16]:
+    if tensor.dtype in [torch.float16, torch.bfloat16, torch.int16, torch.int8]:
         data = data.tobytes()
 
     accessor = accessors[tensor.dtype]
@@ -2082,6 +2089,7 @@ def literal(dtype, tensor):
             ),
         },
     )
+    result = cast(result, original_dtype)
     return result
 
 
