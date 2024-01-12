@@ -414,7 +414,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if self.neuron_config.rank_id == 0:
             broad_cast_objects = [args, kwargs]
             dist.broadcast_object_list(broad_cast_objects, src=0, device=torch.device("cpu"))
-            res = self.forward(*args, **kwargs)
+            res = self(*args, **kwargs)
             return res
         else:
             # if non-host, fall back to a for loop
@@ -430,7 +430,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 # it is now naturally handled in forward call
                 dist.broadcast_object_list(broad_cast_objects, src=0, device=torch.device("cpu"))
                 args, kwargs = broad_cast_objects
-                self.forward(*args, **kwargs)
+                self(*args, **kwargs)
 
     def serialization_enabled(self):
         return getattr(self, 'nbs_objs', None) is not None
