@@ -41,7 +41,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 return_all_outputs=True, builder=None):
+                 return_all_outputs=True, builder=None, tag=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -83,6 +83,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = False
         self.hlo_builder=builder
         self.check_gqa_fallback()
+        self.tag = tag
 
     def check_gqa_fallback(self):
         """
@@ -175,6 +176,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     neuron_config=self.neuron_config,
                     allow_pad=self.allow_pad,
                     return_all_outputs=False,
+                    tag="context"
                 )
                 base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
         return decoder_lm_head
@@ -448,7 +450,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             num_inputs = len(self.inputs_sdim)
             batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
                 if self.neuron_config.continuous_batching else None
-            program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches)
+            program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
         else:
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
@@ -459,12 +461,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             if self.neuron_config.is_pp():
                 program = PipelineParallelProgram(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
-                                                    self.n_positions_list, self.batch_size, self.prefixed_length)
+                                                    self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
                 program.init_pp_sync_programs()
             else:
                 program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
-                                                    self.n_positions_list, self.batch_size, self.prefixed_length)
+                                                    self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
 
         return program
 
@@ -1331,7 +1333,7 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, neuron_config, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False):
+    def __init__(self, neuron_config, layers, hlo_modules : dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False, tag=None):
         # Each hlo module corresponds to one npos and one batch_size
         # hlo_modules is a 2D map (i,j) i is npos , j is batch_size
         self.neuron_config = neuron_config
@@ -1347,7 +1349,10 @@ class DecoderProgram:
         self.input_buffers = [[compiler.gen_zero_input(hlo,idx) for idx in range(num_inputs)] for hlo in hlos_for_input]
         self.kernels = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=f"{npos}-{batch_size}")
+            kernel_tag = f"{npos}-{batch_size}"
+            if tag is not None:
+                kernel_tag = f"{tag}-{npos}-{batch_size}"
+            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag)
         # self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
@@ -1480,8 +1485,8 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None):
-        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches)
+    def __init__(self, neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None, tag=None):
+        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag)
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
         if self.neuron_config.log_softmax_scores:
@@ -1553,8 +1558,8 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, neuron_config, layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0):
-        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length)
+    def __init__(self, neuron_config, layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, tag=None):
+        super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, tag=tag)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
         self.num_layers = num_layers
@@ -1698,25 +1703,25 @@ class PipelineParallelProgram(DecoderProgramMultiLayer):
             if self.neuron_config.first_rank():
                 # setup send hidden
                 send_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, self.neuron_config.rank_id+1, self.tp_degree))
-                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
                 # setup receive logits
                 recv_logits_hlo = sync_tensor_program(logits_sizes, logits_dtype, replica_groups=replica_groups_helper(self.neuron_config.pp_stages-1, self.neuron_config.rank_id, self.tp_degree))
-                self.recv_logits_kernels[batch_size] = compiler.HLOKernel(recv_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.recv_logits_kernels[batch_size] = compiler.HLOKernel(recv_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
 
             elif self.neuron_config.last_rank():
                 # setup receive hidden
                 recv_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id-1, self.neuron_config.rank_id, self.tp_degree))
-                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
                 # setup send logits
                 send_logits_hlo = sync_tensor_program(logits_sizes, logits_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, 0, self.tp_degree))
-                self.send_logits_kernels[batch_size] = compiler.HLOKernel(send_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.send_logits_kernels[batch_size] = compiler.HLOKernel(send_logits_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
             else:
                 # setup receive hidden
                 recv_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id-1, self.neuron_config.rank_id, self.tp_degree))
-                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.recv_hidden_kernels[batch_size] = compiler.HLOKernel(recv_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
                 # setup send hidden
                 send_hidden_hlo = sync_tensor_program(hidden_sizes, hidden_dtype, replica_groups=replica_groups_helper(self.neuron_config.rank_id, self.neuron_config.rank_id+1, self.tp_degree))
-                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree)
+                self.send_hidden_kernels[batch_size] = compiler.HLOKernel(send_hidden_hlo, self.tp_degree, self.neuron_config.rank_id*self.tp_degree, self.neuron_config.pp_stages*self.tp_degree, tag=self.tag)
                 pass
 
     def setup(self, layers, pre_layer_parameters, ln_lm_head_params):
