@@ -36,7 +36,8 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None, **kwargs):
+                 unroll=None, init_n_active_tokens=None, neuron_config=None, 
+                 tag=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
@@ -55,7 +56,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config,
+            unroll=unroll, neuron_config=self.neuron_config, tag=tag
         )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', start_mask, neuron_config=self.neuron_config)
@@ -65,6 +66,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.register_for_serialization(self.decoder_lm_head)
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
+        self.tag = tag
 
     def load_weights(self):
         ops.init()

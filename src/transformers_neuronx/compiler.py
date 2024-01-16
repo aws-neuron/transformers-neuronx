@@ -605,7 +605,7 @@ def get_total_input_tensors_size(hlo_module):
     return total_bytes
 
 class HLOKernel:
-    def __init__(self, hlo_program, tp, start_g_nc_id=0, g_nc_count=None):
+    def __init__(self, hlo_program, tp, start_g_nc_id=0, g_nc_count=None, tag=None):
         self.hlo_program = hlo_program
         self.tp = tp
         self.start_g_nc_id = start_g_nc_id
@@ -614,7 +614,7 @@ class HLOKernel:
         self.g_nc_count = g_nc_count
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree=self.tp)
         self.hlo_module = compile_py_func(self.hlo_program)
-        self.kernel = ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count)
+        self.kernel = ParallelKernel(self.hlo_module, tp_degree=self.tp, g_start_device_id=self.start_g_nc_id, g_device_count=self.g_nc_count, tag=tag)
 
     def build(self):
         # wrap HLO with kernel and compile{
