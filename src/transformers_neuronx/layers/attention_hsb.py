@@ -183,99 +183,118 @@ def query_key_projection(query, key, qk_weight):
     return query, key
 
 
-def update_cache(cache, cache_ids, values, start_ids=None):
+def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None):
+    """
+    The fused K/V cache update is intended for reducing replicated index value calculation for both keys and values,
+    since we are updating K/V with the same index offset.
+
+    KeyCache[I], ValueCache[I] = Keys, Values
+    """
+    dtype = cached_keys.dtype
+    cache_ids_dtype = cache_ids.dtype
+    use_2d_cache_ids = len(cache_ids.sizes) > 1
+    if not use_2d_cache_ids:
+        updated_keys = update_cache(cached_keys, cache_ids, keys)
+        updated_vals = update_cache(cached_vals, cache_ids, vals)
+        return updated_keys, updated_vals
+
+    # 2D cache_ids
+    cache_ids = hlo.transpose(cache_ids, 0, 1)
+    assign_func = hlo.gen_assign_func(dtype)
+    n_positions, n_seqs, n_kv_heads, d_head = cached_keys.sizes
+    n_active_tokens, n_active_seqs, _, _  = keys.sizes
+    assert cache_ids.sizes[0] == n_active_tokens, \
+        f"inconsistent sizes between cache_ids ({cache_ids.sizes}) and values ({keys.sizes})"
+
+    # reshape cache, and scatter values in a for loop.
+    #
+    # NOTE: Due to limitation in hlo.scatter, we make cache flatten: (p0 as positions, s0 as sequences)
+    #       (p0, s0), (p0, s1), (p0, s2), (p1, s0), (p1, s1), (p1, s2)
+    #       This means we cannot update the sequence in the cache with one scatter op, without reordering the cache.
+    kv_hidden_size = n_kv_heads * d_head
+    cached_keys_r = hlo.reshape(cached_keys, [n_positions * n_seqs, kv_hidden_size])
+    cached_vals_r = hlo.reshape(cached_vals, [n_positions * n_seqs, kv_hidden_size])
+
+    if n_active_tokens == 1 and n_seqs == n_active_seqs:
+        # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+        #        +---------3-4-----6-7------9-10-----------------
+        # seq 0  |                [A,B]
+        # seq 1  |        [C,D]
+        # seq 2  |                         [E,F]
+        #        +-----------------------------------------------
+        # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+        # seq 0         [[6,7],                                  [[A,B],
+        # seq 1          [3,4],                                   [C,D],
+        # seq 2          [9,10]]                                  [E,F]]
+        #
+        keys_r = hlo.reshape(keys, [n_seqs, kv_hidden_size])
+        vals_r = hlo.reshape(vals, [n_seqs, kv_hidden_size])
+
+        # [6,3,9] -> [(0,6),(1,3),(2,9)] -> [6*3,3*3+1,9*3+2] -> [18,10,29]
+        # cache_ids * n_seqs + iota
+        batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
+        indices = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
+        offset = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[1])
+        indices = cache_ids_dtype[cache_ids.sizes].Add(indices, offset)
+        indices = hlo.transpose(indices, 0, 1)
+
+        scatter_dims = dict(update_window_dims=[1],
+                            inserted_window_dims=[0],
+                            scatter_dims_to_operand_dims=[0],
+                            index_vector_dim=1)
+        updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
+        updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+
+    elif n_active_tokens == n_positions and n_seqs > n_active_seqs:
+        # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+        #        +-0-1-2-3-4-5-----------------------------------
+        # seq 0  |[x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x]
+        # seq 1  |[A,B,C,D,E,F] <- insert new sequence here
+        # seq 2  |[y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y]
+        #        +-----------------------------------------------
+        # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+        # seq 1         [[0,1,2,3,4,5]]                          [[A,B,C,D,E,F]]
+        keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
+        vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
+
+        batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
+        start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
+
+        indices = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[0])
+        indices = cache_ids_dtype[cache_ids.sizes].Multiply(indices, batch_size_br)
+        indices = cache_ids_dtype[cache_ids.sizes].Add(indices, start_ids_br)
+
+        # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
+        assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
+
+        scatter_dims = dict(update_window_dims=[1],
+                            inserted_window_dims=[0],
+                            scatter_dims_to_operand_dims=[0],
+                            index_vector_dim=1)
+        updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
+        updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+
+    else:
+        raise NotImplementedError(f"Updating 2D cache_ids is not implemented for "
+                                  f"n_active_tokens={n_active_tokens}, n_positions={n_positions}, "
+                                  f"n_seqs={n_seqs}, n_active_seqs={n_active_seqs}.")
+
+    return updated_keys, updated_vals
+
+
+def update_cache(cache, cache_ids, values):
     """
     Cache[I] = X
     """
     dtype = cache.dtype
     cache_ids_dtype = cache_ids.dtype
-    use_2d_cache_ids = len(cache_ids.sizes) > 1
-    if use_2d_cache_ids:
-        # 2D cache_ids
-        cache_ids = hlo.transpose(cache_ids, 0, 1)
-        assign_func = hlo.gen_assign_func(dtype)
-        n_positions, n_seqs, n_kv_heads, d_head = cache.sizes
-        n_active_tokens, n_active_seqs, _, _  = values.sizes
-        assert cache_ids.sizes[0] == n_active_tokens, \
-            f"inconsistent sizes between cache_ids ({cache_ids.sizes}) and values ({values.sizes})"
-
-        # reshape cache, and scatter values in a for loop.
-        #
-        # NOTE: Due to limitation in hlo.scatter, we make cache flatten: (p0 as positions, s0 as sequences)
-        #       (p0, s0), (p0, s1), (p0, s2), (p1, s0), (p1, s1), (p1, s2)
-        #       This means we cannot update the sequence in the cache with one scatter op, without reordering the cache.
-        kv_hidden_size = n_kv_heads * d_head
-
-        if n_active_tokens == 1 and n_seqs == n_active_seqs:
-            # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
-            #        +---------3-4-----6-7------9-10-----------------
-            # seq 0  |                [A,B]
-            # seq 1  |        [C,D]
-            # seq 2  |                         [E,F]
-            #        +-----------------------------------------------
-            # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
-            # seq 0         [[6,7],                                  [[A,B],
-            # seq 1          [3,4],                                   [C,D],
-            # seq 2          [9,10]]                                  [E,F]]
-            #
-            cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
-            values_r = hlo.reshape(values, [n_seqs, kv_hidden_size])
-
-            # [6,3,9] -> [(0,6),(1,3),(2,9)] -> [6*3,3*3+1,9*3+2] -> [18,10,29]
-            # cache_ids * n_seqs + iota
-            batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
-            indices = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
-            offset = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[1])
-            indices = cache_ids_dtype[cache_ids.sizes].Add(indices, offset)
-            indices = hlo.transpose(indices, 0, 1)
-
-            scatter_dims = dict(update_window_dims=[1],
-                                inserted_window_dims=[0],
-                                scatter_dims_to_operand_dims=[0],
-                                index_vector_dim=1)
-            cache_r = hlo.scatter(cache_r, indices, values_r, scatter_dims=scatter_dims, to_apply=assign_func)
-
-        elif n_active_tokens == n_positions and n_seqs > n_active_seqs:
-            # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
-            #        +-0-1-2-3-4-5-----------------------------------
-            # seq 0  |[x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x]
-            # seq 1  |[A,B,C,D,E,F] <- insert new sequence here
-            # seq 2  |[y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y,y]
-            #        +-----------------------------------------------
-            # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
-            # seq 1         [[0,1,2,3,4,5]]                          [[A,B,C,D,E,F]]
-            cache_r = hlo.reshape(cache, [n_positions * n_seqs, kv_hidden_size])
-
-            batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
-            start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
-
-            indices = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[0])
-            indices = cache_ids_dtype[cache_ids.sizes].Multiply(indices, batch_size_br)
-            indices = cache_ids_dtype[cache_ids.sizes].Add(indices, start_ids_br)
-
-            # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
-            assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
-            value_r = hlo.reshape(values, [n_active_tokens, kv_hidden_size])
-
-            scatter_dims = dict(update_window_dims=[1],
-                                inserted_window_dims=[0],
-                                scatter_dims_to_operand_dims=[0],
-                                index_vector_dim=1)
-            cache_r = hlo.scatter(cache_r, indices, value_r, scatter_dims=scatter_dims, to_apply=assign_func)
-
-        else:
-            raise NotImplementedError(f"Updating 2D cache_ids is not implemented for "
-                                      f"n_active_tokens={n_active_tokens}, n_positions={n_positions}, "
-                                      f"n_seqs={n_seqs}, n_active_seqs={n_active_seqs}.")
-        updated = cache_r
-    else:
-        # 1D cache_ids
-        scatter_dims = dict(update_window_dims=[1,2,3],
-                            inserted_window_dims=[0],
-                            scatter_dims_to_operand_dims=[0],
-                            index_vector_dim=1)
-        assign_func = hlo.gen_assign_func(dtype)
-        updated = hlo.scatter(cache, cache_ids, values, scatter_dims=scatter_dims, to_apply=assign_func)
+    # 1D cache_ids
+    scatter_dims = dict(update_window_dims=[1,2,3],
+                        inserted_window_dims=[0],
+                        scatter_dims_to_operand_dims=[0],
+                        index_vector_dim=1)
+    assign_func = hlo.gen_assign_func(dtype)
+    updated = hlo.scatter(cache, cache_ids, values, scatter_dims=scatter_dims, to_apply=assign_func)
     return updated
 
 
