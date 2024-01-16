@@ -584,7 +584,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         )
         if output_scores:
             if log_softmax:
-                interleaved, scores, log_softmax_scores = interleaved    
+                interleaved, scores, log_softmax_scores = interleaved
             else:
                 interleaved, scores = interleaved
         interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
@@ -606,8 +606,11 @@ class GPT2CheckpointCompatible(module.PretrainedModel):
         self.transformer = GPT2Transformer(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
-    def get_tied_parameter_paths(self):
-        return [('transformer.wte.weight', 'lm_head.weight')]
+    def get_tied_parameters(self):
+        return [(self.transformer.wte.weight, self.lm_head.weight)]
+
+    def get_base_model(self):
+        return self.transformer
 
 
 class GPT2Transformer(module.LowMemoryModule):
