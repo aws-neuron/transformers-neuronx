@@ -497,6 +497,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 outputs = [logits, scores, *out_caches]
             else:
                 outputs = [logits, *out_caches]
+            # Filter out the None's in outputs
+            outputs = [o for o in outputs if o is not None]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
@@ -516,6 +518,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             out_hidden, out_caches = self._hlo_layers(hidden, tensors, layers, layers_caches, layers_weights)
             out_hidden.set_alias_to(hidden)
             outputs = [out_hidden, *out_caches]
+            # Filter out the None's in outputs
+            outputs = [o for o in outputs if o is not None]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
@@ -550,12 +554,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights):
         output_caches = []
         for layer, caches, weights in zip(layers, layers_caches, layers_weights):
-            in_caches = [hlo.transfer_with_static_ring(cache) for cache in caches]
+            in_caches = [maybe_transfer_with_static_ring(cache) for cache in caches]
             weights = [maybe_transfer_with_static_ring(weight) for weight in weights]
             weights = layer.hlo_maybe_dequantize_weights(weights)
             hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
             for out_cache, cache in zip(out_caches, caches):
-                out_cache.set_alias_to(cache, must=True)
+                if out_cache is not None:
+                    assert cache is not None, "out_cache must alias with a valid cache!"
+                    out_cache.set_alias_to(cache, must=True)
             output_caches.extend(out_caches)
         return hidden, output_caches
 
