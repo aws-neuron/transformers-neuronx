@@ -168,10 +168,8 @@ class LlamaForSamplingNoEmbeddingHlo:
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
                                         shard_over_batch=self.shard_over_batch)
 
-            # KCache[I] = K
-            # VCache[I] = V
-            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-            updated_values = attention.update_cache(cached_values, cache_ids, value)
+            # KCache[I], VCache[I] = K, V
+            updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids, key, value, start_ids)
 
         # Multi-Token Context Encoding
         else:
@@ -183,15 +181,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
                                                  tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
-            # KCache = K
-            # VCache = V
+            # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
-                updated_keys = key
-                updated_values = value
+                updated_keys, updated_values = key, value
             else:
-                # continuous batching
-                updated_keys = attention.update_cache(cached_keys, cache_ids, key, start_ids)
-                updated_values = attention.update_cache(cached_values, cache_ids, value, start_ids)
+                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids, key, value, start_ids)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
