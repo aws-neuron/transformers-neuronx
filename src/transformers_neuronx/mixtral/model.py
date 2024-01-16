@@ -39,7 +39,7 @@ class MixtralForSampling(base.NeuronModelBase):
         self.context_pre_hook = None
         self.context_hook = None
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
@@ -73,9 +73,6 @@ class MixtralForSampling(base.NeuronModelBase):
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
 
-        # sanity check
-        assert self.config.num_local_experts == self.config.tp_degree, \
-            "For now, we only support num_local_experts equal to tp_degree, since it is easier to distribute one expert per Neuron core."
 
     def load_weights(self):
 
@@ -104,22 +101,25 @@ class MixtralForSampling(base.NeuronModelBase):
             # 2. Gating network is replicated and distributed across all TP degrees
             # 3. Concatenate weights of all experts
             # 4. Expert parallel is used. Each expert is distributed to a small group of Neuron devices, to reduce collective communication.
-            new_layer.add_parameter(torch.tensor(range(self.config.num_local_experts)), sharding=0, allow_pad=False, allow_quantize=False)
+            expert_indices = torch.tensor(range(self.config.num_local_experts))
+            expert_indices = expert_indices.repeat_interleave(max(1, self.config.tp_degree // self.config.num_local_experts)) # repeat when tp > num of experts
+            new_layer.add_parameter(expert_indices, sharding=0, allow_pad=False, allow_quantize=False)
             new_layer.add_parameter(block_sparse_moe.gate.weight.detach().T, None)
             w1, w2, w3 = [], [], []
             for mlp in block_sparse_moe.experts:
-                w1.append(torch.unsqueeze(mlp.w1.weight.T, dim=0))  # gate_proj
-                w2.append(torch.unsqueeze(mlp.w2.weight, dim=0))  # down_proj (not transposed for HSB layout)
-                w3.append(torch.unsqueeze(mlp.w3.weight.T, dim=0))  # up_proj
-            w1_concat = torch.concat(w1, dim=0)
-            w2_concat = torch.concat(w2, dim=0)
-            w3_concat = torch.concat(w3, dim=0)
-            new_layer.add_parameter(w1_concat, sharding=0, allow_pad=True,  # gate_proj
+                w1.append(mlp.w1.weight.T)  # gate_proj
+                w2.append(mlp.w2.weight)  # down_proj (not transposed for HSB layout)
+                w3.append(mlp.w3.weight.T)  # up_proj
+            w1_concat = torch.concat(w1, dim=1)
+            w2_concat = torch.concat(w2, dim=1)
+            w3_concat = torch.concat(w3, dim=1)
+            new_layer.add_parameter(w1_concat, sharding=1, allow_pad=True,  # gate_proj
                                     allow_quantize=True, allow_transform=True)
-            new_layer.add_parameter(w2_concat, sharding=0, allow_pad=True,  # down_proj
+            new_layer.add_parameter(w2_concat, sharding=1, allow_pad=True,  # down_proj
                                     allow_quantize=True, allow_transform=True)
-            new_layer.add_parameter(w3_concat, sharding=0, allow_pad=True,  # up_proj
+            new_layer.add_parameter(w3_concat, sharding=1, allow_pad=True,  # up_proj
                                     allow_quantize=True, allow_transform=True)
+            
 
             new_layer.to_neuron()
             layer.nullify()
@@ -131,7 +131,10 @@ class MixtralForSampling(base.NeuronModelBase):
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        if self.neuron_config and self.neuron_config.on_device_embedding:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)        
         lm_head.nullify()
+
         self.decoder_lm_head.to_neuron()
         self.decoder_lm_head.use_executor = True
 
@@ -148,15 +151,18 @@ class MixtralForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
-        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size)
+        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
 
         input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            hidden = hidden.permute(2, 1, 0)
-        logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+        if self.neuron_config and self.neuron_config.on_device_embedding:
+            logits = self._forward(input_ids, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+        else:
+            hidden = self.chkpt_model.model.embed_tokens(input_ids)
+            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+            if is_bsh:
+                hidden = hidden.permute(2, 1, 0)
+            logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode

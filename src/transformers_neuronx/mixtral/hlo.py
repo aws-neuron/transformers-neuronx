@@ -16,11 +16,12 @@ from typing import Optional
 
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
+from transformers_neuronx import utils
 from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
 from transformers_neuronx.mistral.hlo import MistralForSamplingNoEmbeddingHlo
 from transformers_neuronx.mixtral.config import MixtralConfig
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.sparse_attn_utils import build_sliding_window_mask
 
 class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
@@ -51,6 +52,20 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
 
         return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
+
+    def embedding(self, input_ids, embed_weight):
+        dtype = getattr(input_ids.scribe, self.config.amp)
+        hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
+        if self.config.hidden_size % self.config.tp_degree != 0:
+            hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
+        if self.neuron_config.attention_layout == LAYOUT_HSB:
+            hidden = hlo.transpose210(hidden)
+        return hidden
+
+    def pre_layer(self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
+        if self.neuron_config and self.neuron_config.on_device_embedding:
+            hidden = self.embedding(hidden, *pre_layer_weights)
+        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
             self,
@@ -115,7 +130,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         # Gating network
         dot_dims = dict(lhs_contracting_dimensions=[0], rhs_contracting_dimensions=[0])
         router_logits = hlo.dot_general(gate_weight, norm_hidden, dot_dims)
-        routing_weights = hlo.softmax(router_logits)
+        routing_weights = hlo.softmax(router_logits, dim=0)
         routing_weights, selected_experts = hlo.topk(routing_weights, k=self.config.num_experts_per_tok, dim=0)
 
         # Normalize weights of activated experts
@@ -123,23 +138,31 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         routing_weights_sum_br = hlo.broadcast(routing_weights_sum, routing_weights.sizes, [0, 1, 2])
         routing_weights = hlo.divide(routing_weights, routing_weights_sum_br)
 
-        # TODO: handle num_local_experts != tp_degree
-        w1_weight = hlo.squeeze(w1_weight_tp, dim=0)
-        w2_weight = hlo.squeeze(w2_weight_tp, dim=0)
-        w3_weight = hlo.squeeze(w3_weight_tp, dim=0)
-
         # Following expert parallelism implement in https://github.com/vllm-project/vllm/pull/2090
-        final_hidden_states = None
-        assert expert_indices.sizes[0] == 1, "limited to one expert per Neuron core"
-        for idx in range(expert_indices.sizes[0]):
-            idx_const = hlo.full(idx, dtype=selected_experts.dtype, sizes=[])
+        num_experts_per_core = expert_indices.sizes[0]
+        _, intermediate_size = w1_weight_tp.sizes
+        slice_size = intermediate_size // num_experts_per_core 
+        slice_size_const = hlo.full(slice_size, dtype=expert_indices.dtype, sizes=[])
+
+        local_hidden_states = None
+        for idx in range(num_experts_per_core):
+            idx_const = hlo.full(idx, dtype=expert_indices.dtype, sizes=[])
+
+            # Slice weight for tp < num_local_experts
+            slice_idx_const = hlo.multiply(idx_const, slice_size_const)
+            w1_weight = hlo.dynamic_slice_along(w1_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
+            w3_weight = hlo.dynamic_slice_along(w3_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
+            w2_weight = hlo.dynamic_slice_along(w2_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
+            
+            # Build expert mask
             expert_idx = hlo.dynamic_slice_along(expert_indices, dim=0, start=idx_const, size=1)
             expert_idx_br = hlo.broadcast(expert_idx, selected_experts.sizes, [0])
             expert_idx_br = hlo.cast(expert_idx_br, selected_experts.dtype)
             expert_mask = hlo.equal(selected_experts, expert_idx_br)
             expert_mask = hlo.cast(expert_mask, routing_weights.dtype)
             expert_weights = hlo.multiply(routing_weights, expert_mask)
-            expert_weights = hlo.reduce_sum(expert_weights, dim=0, keepdim=True)
+            expert_weights = hlo.reduce_sum(expert_weights, dim=0, keepdim=True) # all-reduce across selected experts
+
             mlp_hidden = gated_mlp(
                 norm_hidden,
                 w1_weight, w3_weight, w2_weight,
@@ -148,13 +171,19 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
                 out_scales=w2_scales,
                 activation_function='silu',
                 tp_degree=self.config.tp_degree,
-                neuron_config=self.neuron_config
+                neuron_config=self.neuron_config,
+                return_partial=True,
             )
+            # Apply expert weighting
             expert_weights_br = hlo.broadcast(expert_weights, mlp_hidden.sizes, [0, 1, 2])
             current_hidden_states = hlo.multiply(mlp_hidden, expert_weights_br)
-            if final_hidden_states is None:
-                final_hidden_states = current_hidden_states
+
+            if local_hidden_states is None:
+                local_hidden_states = current_hidden_states
             else:
-                final_hidden_states = hlo.add(final_hidden_states, current_hidden_states)
+                local_hidden_states = hlo.add(local_hidden_states, current_hidden_states)
+
+        dtype, replica_groups = utils.parse_dtype_replica_groups(self.neuron_config, self.config.tp_degree)
+        final_hidden_states = hlo.all_reduce_sum(local_hidden_states, self.config.tp_degree, dtype=dtype, replica_groups=replica_groups)
 
         return final_hidden_states
