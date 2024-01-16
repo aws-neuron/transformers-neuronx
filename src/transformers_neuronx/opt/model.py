@@ -205,8 +205,11 @@ class OPTCheckpointCompatible(module.PretrainedModel):
         self.model = OPTModel(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
-    def get_tied_parameter_paths(self):
-        return [('model.decoder.embed_tokens.weight', 'lm_head.weight')]
+    def get_tied_parameters(self):
+        return [(self.model.decoder.embed_tokens.weight, self.lm_head.weight)]
+
+    def get_base_model(self):
+        return self.model
 
 
 class OPTModel(module.LowMemoryModule):

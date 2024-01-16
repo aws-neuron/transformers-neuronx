@@ -57,6 +57,12 @@ class GPTJForSampling(module.PretrainedModel):
         self.init_program = program.DoNothingDecoder()
         self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
 
+    def get_tied_parameters(self):
+        return [(self.transformer.wte.weight, self.lm_head.weight)]
+
+    def get_base_model(self):
+        return self.transformer
+
     def to_neuron(self):
         ops.init()
         config = self.config
