@@ -635,6 +635,7 @@ def gated_mlp_bsh(
     activation_function='silu',
     tp_degree=1,
     neuron_config=None,
+    return_partial=False,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -682,11 +683,12 @@ def gated_mlp_bsh(
         hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
         result = dot11_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
-
     result = dtype[hidden_sizes].Reshape(result)
 
-    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    return all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if not return_partial:
+        dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    return result
 
 
 def gated_mlp(
@@ -703,6 +705,7 @@ def gated_mlp(
     activation_function='silu',
     tp_degree=1,
     neuron_config=None,
+    return_partial=False,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -769,8 +772,9 @@ def gated_mlp(
         result = transpose(result, 0, 1)
         result = dtype[hidden_sizes].Reshape(result)
 
-    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if not return_partial:
+        dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return permute(result, (2, 1, 0)) if is_bsh else result
