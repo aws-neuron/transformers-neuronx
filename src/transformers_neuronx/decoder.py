@@ -1367,6 +1367,7 @@ class DecoderProgram:
         self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
         self.tp_degree = tp_degree
         self.need_reorder_cache = False
+        self.tag = tag
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
