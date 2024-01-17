@@ -519,16 +519,22 @@ class ParallelKernel:
         tagged_hlo = (f"{self.tag}-" if self.tag else "") + self.hlo_module.name
         ntff_prefix = os.path.join(profile_dir,tagged_hlo)
 
-        # Creates numbered NTFF files f"{ntff_prefix}-0.ntff" etc
-        self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
-
-        # Single inference on the initial allocated memory
+        # Set up inputs as zeros
         for t in self.memories[0].input_tensors:
             zero = torch.zeros(t.shape, dtype=t.dtype)
             zeros = [zero] * self.tp_degree
             ops.parallel_write(t, zeros)
+
+        # Warm up inference
         self(self.memories[0])
 
+        # Profile start numbered NTFF files f"{ntff_prefix}_rank_0.ntff" etc
+        self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
+
+        # Single inference in the profile loop
+        self(self.memories[0])
+
+        # Profile stop
         ops.parallel_profile_stop(self.ntff_paths)
 
         # Save NEFF file
