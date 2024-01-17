@@ -196,7 +196,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config,
             allow_pad=True,
-            return_all_outputs=True
+            return_all_outputs=True,
+            tag="token",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
@@ -219,7 +220,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config,
             allow_pad=True,
-            return_all_outputs=True
+            return_all_outputs=True,
+            tag=f"speculation-k{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
@@ -238,7 +240,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config,
             allow_pad=True,
-            return_all_outputs=False
+            return_all_outputs=False,
+            tag=f"window-width{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
@@ -1355,9 +1358,9 @@ class DecoderProgram:
         self.input_buffers = [[compiler.gen_zero_input(hlo,idx) for idx in range(num_inputs)] for hlo in hlos_for_input]
         self.kernels = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
-            kernel_tag = f"{npos}-{batch_size}"
+            kernel_tag = f"seqlen{npos}-batch{batch_size}"
             if tag is not None:
-                kernel_tag = f"{tag}-{npos}-{batch_size}"
+                kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
             self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag)
         # self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
