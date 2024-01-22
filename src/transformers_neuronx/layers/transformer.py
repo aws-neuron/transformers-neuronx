@@ -167,7 +167,9 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
         n_active_tokens = 1
 
     rms_hidden = hlo.rms_norm(hidden, rms_weight, eps) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0)
-    rms_hidden = dtype[hidden_size, n_active_tokens*batch_size].Reshape(rms_hidden)
+    if is_bsh:
+        rms_hidden = hlo.transpose210(rms_hidden)
+    rms_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(rms_hidden)
     logits = hlo.dot00(lm_head_weight, rms_hidden)
     if lm_head_bias is not None:
         lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])

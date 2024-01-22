@@ -355,8 +355,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return logits.to(logits_dtype)
 
     def _context_dynamic_batching(self, hidden, *args, neuron_config=None):
-        # Taking HSB layout
-        _, context_length, input_batch_size = hidden.shape
+        from transformers_neuronx.constants import LAYOUT_BSH
+
+        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+        input_batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
         running_batch_size = self.context_batch_sizes[-1]
@@ -370,7 +372,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 # Assuming HSB layout
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
-                hidden_per_batch = hidden[:, :, start_idx:end_idx]
+                if is_bsh:
+                    hidden_per_batch = hidden[start_idx:end_idx, :, :]
+                else:
+                    hidden_per_batch = hidden[:, :, start_idx:end_idx]
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id = cache_ids_per_batch.max()
@@ -385,7 +390,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return logits
 
     def _forward(self, hidden, *args, neuron_config=None):
-        # Taking HSB layout
         _, context_length, *_ = hidden.shape
         if not self.neuron_config.on_device_embedding:
             hidden = hidden.transpose(0, -1).contiguous()
