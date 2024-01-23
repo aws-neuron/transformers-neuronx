@@ -32,6 +32,7 @@ from torch_neuronx.proto import metaneff_pb2
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from libneuronxla import neuron_xla_compile
+from libneuronxla.neuron_cc_cache import CacheUrl, create_compile_cache
 from neuronxcc import __version__ as compiler_version
 
 def get_hash_module(hlo_module, flags):
@@ -88,12 +89,15 @@ def compile_hlo_module(hlo_module, tag=None):
 
     dump = "NEURONX_DUMP_TO" in os.environ
     neff_bytes = None
+
+    # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
+    if tag is None:
+        hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_flag_hash}'
+    else:
+        hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
+
     if dump:
-        # tag is used to make folder name more clear (e.g. add bucket-size to folder name)
-        if tag is None:
-            hlo_module_name = f'{hlo_module.name}.{compiler_version}.{module_flag_hash}'
-        else:
-            hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
+
 
         dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
         dump_to = os.path.join(dump_to, hlo_module_name)
@@ -113,8 +117,22 @@ def compile_hlo_module(hlo_module, tag=None):
             neff_bytes = f.read()
     else:
         module_bytes = hlo_module.SerializeToString()
-        neff_bytes = neuron_xla_compile(module_bytes, flags, input_format="hlo", platform_target="trn1",
-            cache_key=module_hash, retry_failed_compilation=False, lazy=True, use_cache=True, cache_dir=None)
+        try:
+            neff_bytes = neuron_xla_compile(module_bytes, flags, input_format="hlo", platform_target="trn1",
+                cache_key=module_hash, retry_failed_compilation=False, lazy=True, use_cache=True, cache_dir=None)
+        finally:
+            notemp_dump = os.environ.get("NEURONX_DUMP_TO_NOTEMP", None)
+
+            # for torch 2.0 pjrt compatibility, check if download_artifacts is implemented
+            cache_url = CacheUrl.get_cache_url()
+            compile_cache = create_compile_cache(cache_url)
+            if notemp_dump and hasattr(compile_cache, "download_artifacts"):
+                dump_path = os.path.join(notemp_dump, hlo_module_name)
+                os.makedirs(dump_path, exist_ok=True)
+
+                parent_dir, cache_key = compile_cache.get_cache_dir(module_hash, flags)
+                compile_cache.download_artifacts(parent_dir, dump_path)
+
     return neff_bytes
 
 
