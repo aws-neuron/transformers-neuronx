@@ -222,7 +222,6 @@ def main():
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
     run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
-    run_parser.add_argument('--enable_O1', action='store_true', help="pass -O1 to compiler")
 
     run_parser.add_argument('--gqa', type=str, default=None)
     # simple_sample
@@ -447,7 +446,11 @@ def logits_analysis(args, hf_model_name, model_cls):
 
 
 def save(args, hf_model_name, model_type):
-    model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
+    if args.random:
+        config = AutoConfig.from_pretrained(args.config)
+        model = AutoModelForCausalLM.from_config(config)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
     save_pretrained_split(model, args.save)
 
 
@@ -489,7 +492,7 @@ def run(args, hf_model_name, model_cls):
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
-            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_nobucket1np_{args.no_bucketing_n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}_cul{args.context_unroll}_wcul{args.window_context_unroll}_ctx{args.context_length_estimate}_wctx{args.window_context_length_estimate}_O1{args.enable_O1}" if args.suffix is None else args.suffix
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_nobucket1np_{args.no_bucketing_n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}_cul{args.context_unroll}_wcul{args.window_context_unroll}_ctx{args.context_length_estimate}_wctx{args.window_context_length_estimate}" if args.suffix is None else args.suffix
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
             if args.snapshot or args.pack_artifacts:
@@ -501,6 +504,8 @@ def run(args, hf_model_name, model_cls):
 
             if args.no_bucketing_n_positions:
                 n_positions_passed_to_model = [args.n_positions]
+            else:
+                n_positions_passed_to_model = args.n_positions
 
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
@@ -515,8 +520,6 @@ def run(args, hf_model_name, model_cls):
                                                 tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
                                                 unroll=args.unroll, context_unroll=args.context_unroll)
                 
-            if args.enable_O1:
-                os.environ['NEURON_CC_FLAGS'] = '-O1'
             if args.dump_penguin_ir:
                 if os.environ.get('NEURON_CC_FLAGS') is not None:
                     os.environ['NEURON_CC_FLAGS'] += ' --internal-compiler-debug-mode=penguin'
