@@ -156,13 +156,13 @@ class MixtralForSampling(base.NeuronModelBase):
 
         input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if self.neuron_config and self.neuron_config.on_device_embedding:
-            logits = self._forward(input_ids, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            logits = self._forward(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
         else:
             hidden = self.chkpt_model.model.embed_tokens(input_ids)
             is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
             if is_bsh:
                 hidden = hidden.permute(2, 1, 0)
-            logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start, neuron_config=self.neuron_config)
+            logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
