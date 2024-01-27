@@ -2219,6 +2219,11 @@ def logical_and(lhs, rhs):
     return pred[lhs.sizes].And(lhs, rhs)
 
 
+def logical_not(lhs):
+    pred = lhs.scribe.pred
+    return pred[lhs.sizes].Not(lhs)
+
+
 def dtype_maximum(dtype):
     scribe = dtype.scribe
     maximums = {
@@ -2438,6 +2443,66 @@ def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
     # Final broadcast ensures we use correct path in layers/attention.py:mask
     size = batch_size, n_positions, n_positions
     prior_mask = broadcast(prior_mask, size, [1, 2])
+
+    active_mask = None
+    return prior_mask, active_mask
+
+
+def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
+    """
+    Creates block diagonal causal masks for multiple prompts.
+
+    This mask is dynamic and depends on the input prompt lengths.
+
+    Example:
+        prompt_lens = [2, 3, 2, 0], n_positions = 7
+
+        prior_mask = [
+            [1, 0, 0, 0, 0, 0, 0], # At position 0 attend to 1st prompt
+            [1, 1, 0, 0, 0, 0, 0], # At position 1 attend to 1st prompt
+            [0, 0, 1, 0, 0, 0, 0], # At position 0 attend to 2nd prompt
+            [0, 0, 1, 1, 0, 0, 0], # At position 1 attend to 2nd prompt
+            [0, 0, 1, 1, 1, 0, 0], # At position 2 attend to 2nd prompt
+            [0, 0, 0, 0, 0, 1, 0], # At position 0 attend to 3rd prompt
+            [0, 0, 0, 0, 0, 1, 1], # At position 1 attend to 3rd prompt
+        ]
+        active_mask = None
+
+    Args:
+        prompt_lens: The list of prompt lengths.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+    """
+    pred = prompt_lens.scribe.pred
+    s32 = prompt_lens.scribe.s32
+    sizes = n_positions, n_positions
+    num_prompts, = prompt_lens.sizes
+
+    a = s32[sizes].Iota(dimensions=[0])
+    b = s32[sizes].Iota(dimensions=[1])
+    prior_mask = pred[sizes].Compare(a, b, comparison_direction="GE")
+
+    anchors = cumsum(prompt_lens, dim=0)
+
+    for idx in range(num_prompts):
+        zero = s32.Constant(constant_value=idx)
+        value = dynamic_slice_along(anchors, dim=0, start=zero, size=1)
+
+        # mask = jnp.logical_and(b<c, a>=c)
+        c = s32[sizes].Broadcast(value, dimensions=[])
+        bc = pred[sizes].Compare(b, c, comparison_direction="LT")
+        ac = pred[sizes].Compare(a, c, comparison_direction="GE")
+        mask = logical_and(bc, ac)
+
+        # prior_mask = jnp.logical_and(prior_mask, jnp.logical_not(mask))
+        prior_mask = logical_and(prior_mask, logical_not(mask))
+
+    # [n_positions, n_positions] -> [1, n_positions, n_positions]
+    prior_mask = unsqueeze(prior_mask, dim=0)
 
     active_mask = None
     return prior_mask, active_mask
