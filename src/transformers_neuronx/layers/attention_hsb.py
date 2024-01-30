@@ -584,16 +584,25 @@ def output(
     context,
     out_weight, out_scales, out_bias,
     tp_degree,
-    neuron_config=None
+    neuron_config=None,
+    transposed=False,
 ):
     """
     The output projection of a transformer applied to the attention context.
 
     O = (C @ wO) + bO
+
+    Dot if transposed:
+        (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
+    else:
+        (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
-    hidden_size, _ = out_weight.sizes
+    if transposed:
+        _, hidden_size = out_weight.sizes
+    else:
+        hidden_size, _ = out_weight.sizes
     hidden_sizes = hidden_size, n_active_tokens, n_seqs
 
     enable_quantize = neuron_config and neuron_config.quant
@@ -603,8 +612,12 @@ def output(
     result_sizes_2d = n_active_tokens * n_seqs, n_heads_tp * d_head
     result = dtype[result_sizes_2d].Reshape(context)
 
-    # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
-    result = hlo.dot11_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
+    if transposed:
+        # (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
+        result = hlo.dot10_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
+    else:
+        # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
+        result = hlo.dot11_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
 
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
