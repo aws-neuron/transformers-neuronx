@@ -361,10 +361,14 @@ class Executor:
             casted.append(cpu)
 
         if self.kernel.snapshot is not None:
-            self.kernel.snapshot_enter(self.memory.input_tensors)
-            self.kernel.snapshot_tensors(inputs, 'inputs')  # Overwrite with current values
-            outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
-            self.kernel.snapshot_exit(self.memory.output_tensors)
+            if self.kernel.snapshot_steps is None or ParallelKernel.hlo_snapshot_iter in self.kernel.snapshot_steps:
+                self.kernel.snapshot_enter(self.memory.input_tensors)
+                self.kernel.snapshot_tensors(inputs, 'inputs')  # Overwrite with current values
+                outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+                self.kernel.snapshot_exit(self.memory.output_tensors)
+            else:
+                outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
+            ParallelKernel.hlo_snapshot_iter += 1
         else:
             outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
 
@@ -478,12 +482,16 @@ class ParallelKernel:
         This ensure that any initialization latency related to caching or
         runtime setup is already complete prior to the model being executed.
         """
+        # Note: Explicitly turn off snapshot during warmup
+        snapshot = self.snapshot
+        self.snapshot = None
         for memory in self.memories:
             try:
                 self(memory)
             except Exception:
                 # Ignoring exceptions avoids uninitialized memory related errors
                 pass
+        self.snapshot = snapshot
 
     def snapshot_path(self):
         path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
