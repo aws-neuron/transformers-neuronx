@@ -428,6 +428,14 @@ class SpeculativeGenerator:
             # token into the KV cache since it was generated but never executed
             if num_accepted == self.k:
                 self.draft(accepted_tokens[:, -2:-1], 1, torch.tensor([current - 1]), start_ids)
+            
+            # Boundary condition: When number of leftover tokens to be generated is less than k, 
+            # we use the target model to auto-regressively generate the remaining tokens
+            if current >= sequence_length - 1 - self.k:
+                target_cache_id = torch.tensor([current], dtype=torch.int32)
+                sampled_tokens=self.target.sample(target_next_id, sequence_length=sequence_length, cache_ids=target_cache_id, top_k=1)
+                tokens.append(sampled_tokens[:, 1:]) # remove duplicate token of target_next_id
+                break
 
         if streamer:
             streamer.end()

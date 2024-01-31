@@ -550,7 +550,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         
         if not self.neuron_config.on_device_embedding:
             input_ids, start_ids = self._embedding(model, input_ids, cache_ids, start_ids, is_context_encode=False)
-            input_ids = input_ids.transpose(0,2).contiguous()
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                input_ids = input_ids.transpose(0,2).contiguous()
         logits = model(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
@@ -560,7 +561,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         return logits
 
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, output_scores=False):
+    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, output_scores=False, **kwargs):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         runtime_batch_size, context_length = input_ids.shape
@@ -574,9 +575,9 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
         log_softmax = self.neuron_config and self.neuron_config.log_softmax_scores
         if log_softmax:
-            next_token_scores, log_softmax_scores = self.forward(input_ids, start_ids=start_ids)
+            next_token_scores, log_softmax_scores = self.forward(input_ids, cache_ids=cache_ids,start_ids=start_ids)
         else:
-            next_token_scores = self.forward(input_ids, start_ids=start_ids)
+            next_token_scores = self.forward(input_ids, cache_ids=cache_ids, start_ids=start_ids)
             log_softmax_scores = None
         repeat_factor = batch_size // runtime_batch_size
         input_ids = input_ids.repeat([repeat_factor, 1])
@@ -596,14 +597,20 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             output_scores=output_scores,
             neuron_config=self.neuron_config,
             log_softmax_scores=log_softmax_scores,
+            cache_ids=cache_ids,
         )
         if output_scores:
             if log_softmax:
                 interleaved, scores, log_softmax_scores = interleaved
             else:
                 interleaved, scores = interleaved
-        interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
-        interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
+
+        # When we pass cache_ids explicitly to sample, we are not using sample to generate
+        # all tokens but just a subset of the tokens (For example: To generate leftover tokens
+        # autoregressively in speculative sampling). Assuming batch_size = runtime_batch_size = 1
+        if not cache_ids:
+            interleaved = interleaved.reshape([-1, runtime_batch_size, sequence_length])
+            interleaved= interleaved.permute([1, 0, 2]).reshape([-1, sequence_length])
 
         if output_scores:
             if log_softmax:

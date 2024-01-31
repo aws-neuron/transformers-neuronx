@@ -200,15 +200,16 @@ class LlamaForSampling(base.NeuronModelBase):
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
-            inputs = inputs.transpose(0, -1).contiguous()
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
         logits = model(inputs, *args)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
         return logits
 
-    def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None):
+    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         batch_size, context_length = input_ids.shape
@@ -226,7 +227,7 @@ class LlamaForSampling(base.NeuronModelBase):
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
-            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size,
+            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size, cache_ids=cache_ids,
         )
 
         return result
