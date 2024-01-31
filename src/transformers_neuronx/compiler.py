@@ -538,7 +538,7 @@ class ParallelKernel:
     def build_executor(self, memory, inputs, outputs):
         return Executor(self, memory, inputs, outputs)
 
-    def profile(self, profile_dir):
+    def profile(self, profile_dir, ntff_count_limit):
         if not os.path.exists(profile_dir):
             os.makedirs(profile_dir, exist_ok=True)
 
@@ -555,7 +555,8 @@ class ParallelKernel:
         self(self.memories[0])
 
         # Profile start numbered NTFF files f"{ntff_prefix}_rank_0.ntff" etc
-        self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix)
+        # Allow user to limit the number of NTFF files generated
+        self.ntff_paths = ops.parallel_profile_start(self.model, ntff_prefix, ntff_count_limit)
 
         # Single inference in the profile loop
         self(self.memories[0])
@@ -569,12 +570,16 @@ class ParallelKernel:
         with open(neff_filename, "wb") as f:
             f.write(self.neff_bytes)
 
+        # Tar file was part of th original code, comment for now to
+        # save disk space
+        """
         ntff_tar_path = os.path.join(profile_dir,
                                      f'{tagged_hlo}.profile.tar')
         with tarfile.open(ntff_tar_path, 'w|') as fp:
             fp.add(neff_filename)
             for ntff_path in self.ntff_paths:
                 fp.add(ntff_path)
+        """
 
 
 def gen_zero_input(hlo_module, index):
