@@ -1388,6 +1388,20 @@ def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_h
     return cache_broadcast_impl
 
 
+def concatenate(operands, dimension):
+    # Concatenates a sequence of arrays along dimension.
+    dtype = operands[0].dtype
+    sizes = list(operands[0].sizes)
+    for op_idx in range(1, len(operands)):
+        for dim_idx in range(len(sizes)):
+            if dim_idx != dimension:
+                assert sizes[dim_idx] == operands[op_idx].sizes[dim_idx], \
+                    "All tensors must have the same shape (except in the concatenating dimension)."
+        sizes[dimension] = sizes[dimension] + operands[op_idx].sizes[dimension]
+    output = dtype[sizes].Concatenate(*operands, dimensions=[dimension])
+    return output
+
+
 def quantize(tensor, neuron_config: NeuronConfig, scales_dim):
     scribe = tensor.scribe
     quant_dtype = getattr(scribe, neuron_config.quant.quant_dtype)
@@ -2663,3 +2677,45 @@ def masked_select(mask, true_tensor, false_tensor):
         f"mask shape={len(mask.sizes)}, true_tensor shape={len(true_tensor.sizes)}, false_tensor shape={len(false_tensor.sizes)}"
     )
     return dtype[mask.sizes].Select(mask, true_tensor, false_tensor)
+
+
+def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
+    """
+    Fused K/V cache placement with slot_mapping.
+
+    Example:
+        prompt_lens = [3, 6, 2], num_blocks = 4, block_size = 128,
+
+        #              |<-- seq 0 -->|<--------   seq 1 ---------->|  seq 2  |
+        slot_mapping = [128, 129, 130, 256, 257, 258, 259, 260, 261, 384, 385]
+
+        updated_keys = [
+            # |<---- block_size (128) ------>|
+            [................................] # empty slot
+            [128, 129, 130, .................] # 3 tokens taking 2nd block
+            [256, 257, 258, 259, 260, 261 ...] # 6 tokens taking 3rd block
+            [384, 385 .......................] # 2 tokens taking 4th block
+        ]
+    """
+    dtype = key.dtype
+    assign_func = gen_assign_func(dtype)
+    n_active_tokens, n_head, d_head = key.sizes
+    n_blocks, block_size, _, _ = key_cache.sizes
+    hidden_size = n_head * d_head
+
+    key = reshape(key, [n_active_tokens, hidden_size])
+    value = reshape(value, [n_active_tokens, hidden_size])
+    key_cache = reshape(key_cache, [n_blocks*block_size, hidden_size])
+    value_cache = reshape(value_cache, [n_blocks*block_size, hidden_size])
+
+    scatter_dims = dict(update_window_dims=[1],
+                        inserted_window_dims=[0],
+                        scatter_dims_to_operand_dims=[0],
+                        index_vector_dim=1)
+    updated_keys = scatter(key_cache, slot_mapping, key, scatter_dims=scatter_dims, to_apply=assign_func)
+    updated_values = scatter(value_cache, slot_mapping, value, scatter_dims=scatter_dims, to_apply=assign_func)
+
+    updated_keys = reshape(updated_keys, [n_blocks, block_size, n_head, d_head])
+    updated_values = reshape(updated_values, [n_blocks, block_size, n_head, d_head])
+
+    return updated_keys, updated_values
