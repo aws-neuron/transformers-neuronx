@@ -21,7 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.constants import LAYOUT_HSB, LAYOUT_BSH
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.mixtral.config import MixtralConfig
 from transformers_neuronx.mixtral.modules import MixtralForCausalLM
@@ -46,8 +46,10 @@ class MixtralForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.num_hidden_layers
-
         self.unroll=unroll
+
+        self.validate_on_device_embedding(config.num_hidden_layers, unroll, context_unroll)
+
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.max_positions = self.token_buckets[-1]
@@ -119,7 +121,7 @@ class MixtralForSampling(base.NeuronModelBase):
                                     allow_quantize=True, allow_transform=True)
             new_layer.add_parameter(w3_concat, sharding=1, allow_pad=True,  # up_proj
                                     allow_quantize=True, allow_transform=True)
-            
+
 
             new_layer.to_neuron()
             layer.nullify()
@@ -132,7 +134,7 @@ class MixtralForSampling(base.NeuronModelBase):
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         if self.neuron_config and self.neuron_config.on_device_embedding:
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)        
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
@@ -154,15 +156,13 @@ class MixtralForSampling(base.NeuronModelBase):
         curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
 
-        input_ids, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        if self.neuron_config and self.neuron_config.on_device_embedding:
-            logits = self._forward(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
-        else:
-            hidden = self.chkpt_model.model.embed_tokens(input_ids)
-            is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-            if is_bsh:
-                hidden = hidden.permute(2, 1, 0)
-            logits = self._forward(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.permute(2, 1, 0).contiguous()
+
+        logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode

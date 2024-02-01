@@ -52,6 +52,9 @@ class OPTForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.num_hidden_layers
+
+        self.validate_on_device_embedding(config.num_hidden_layers, unroll, context_unroll)
+
         n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
         if isinstance(batch_size,int):
             self.batch_sizes = [batch_size]
@@ -70,9 +73,11 @@ class OPTForSampling(base.NeuronModelBase):
         self.register_for_serialization(self.decoder_lm_head)
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
-                                                   config.activation_function, start_mask,
+                                                   config.activation_function,
+                                                   amp=amp, start_mask=start_mask,
                                                    neuron_config=self.neuron_config)
         self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
+        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
         self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
         self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         self.decoder_lm_head_for_context = dict()
@@ -133,6 +138,9 @@ class OPTForSampling(base.NeuronModelBase):
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        if self.neuron_config.on_device_embedding:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_tokens.weight.detach(), sharding=1, allow_pad=True)
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_positions.weight.detach(), sharding=1, allow_pad=True)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         if self.context_length_estimate is not None:
@@ -157,23 +165,27 @@ class OPTForSampling(base.NeuronModelBase):
         sliding_window_attn_enabled = self.neuron_config and \
                                       self.neuron_config.sparse_attn and \
                                       self.neuron_config.sparse_attn.skip_masking_decode
-        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
-        batch_size, context_length = input_ids.shape
+        inputs, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+        batch_size, context_length = inputs.shape
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
-        inputs_embeds = self.chkpt_model.model.decoder.embed_tokens(input_ids)
-        batch_size, _ = input_ids.shape
-        position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids, batch_size)
-        position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
-        hidden = inputs_embeds + position_embeds
-        hidden = hidden.transpose(0, 2).contiguous()
+
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.decoder.embed_tokens(inputs)
+            position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+            position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
+            inputs = inputs + position_embeds
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, 2).contiguous()
+
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-        logits = decoder_lm_head(hidden, cache_ids, start_ids, last_token_id, curr_window_start)
+
+        logits = decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -320,7 +332,7 @@ class OPTForSamplingNoEmbeddingHlo:
             hidden = hlo.slice_along(hidden, dim=-1, limit=self.hidden_size, start=0)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
-        return hidden    
+        return hidden
 
     def pre_layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
         if self.neuron_config.on_device_embedding:
