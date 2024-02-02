@@ -28,6 +28,7 @@ def query_key_value(
     tp_degree=None,
     neuron_config=None,
     shard_over_batch=False,
+    n_kv_heads_tp=None,
 ):
     """
     Self-attention input projections.
@@ -46,12 +47,24 @@ def query_key_value(
     _, hidden_size_tp = q_weight.sizes
     fuse_qkv = neuron_config and neuron_config.fuse_qkv
     if fuse_qkv:
-        hidden_size_tp //= FUSED_QKV_TP_FACTOR
-        kv_hidden_size_tp = hidden_size_tp
+        # If KV head count explicit, find Q head count
+        if n_kv_heads_tp != None:
+            n_total_heads_tp = hidden_size_tp // d_head
+            n_heads_tp = n_total_heads_tp - 2 * n_kv_heads_tp
+            # Q hidden size
+            hidden_size_tp = d_head * n_heads_tp
+            # KV hidden size
+            kv_hidden_size_tp = d_head * n_kv_heads_tp
+        # KV head count not specified, assume same as Q
+        else:
+            hidden_size_tp //= FUSED_QKV_TP_FACTOR
+            kv_hidden_size_tp = hidden_size_tp
+            n_heads_tp = hidden_size_tp // d_head
+            n_kv_heads_tp = kv_hidden_size_tp // d_head
     else:
         _, kv_hidden_size_tp = k_weight.sizes
-    n_heads_tp = hidden_size_tp // d_head
-    n_kv_heads_tp = kv_hidden_size_tp // d_head
+        n_heads_tp = hidden_size_tp // d_head
+        n_kv_heads_tp = kv_hidden_size_tp // d_head
 
     sharded_gqa_kv = (
         kv_hidden_size_tp < d_head
@@ -79,10 +92,10 @@ def query_key_value(
         active_qkv = hlo.dot00_add1(hidden_r, q_weight, q_bias, q_scales, neuron_config=neuron_config)
 
         # Split
-        slice_lim = active_qkv.sizes[-1] // FUSED_QKV_TP_FACTOR
-        active_q = hlo.slice_along(active_qkv, -1, slice_lim, start=0)
-        active_k = hlo.slice_along(active_qkv, -1, 2*slice_lim, start=slice_lim)
-        active_v = hlo.slice_along(active_qkv, -1, 3*slice_lim, start=2*slice_lim)
+        slice_lim = active_qkv.sizes[-1] // (n_heads_tp + 2 * n_kv_heads_tp)
+        active_q = hlo.slice_along(active_qkv, -1, n_heads_tp*slice_lim, start=0)
+        active_k = hlo.slice_along(active_qkv, -1, (n_heads_tp+n_kv_heads_tp)*slice_lim, start=n_heads_tp*slice_lim)
+        active_v = hlo.slice_along(active_qkv, -1, (n_heads_tp+2*n_kv_heads_tp)*slice_lim, start=(n_heads_tp+n_kv_heads_tp)*slice_lim)
 
     # MHA & Non-sharded KV GQA
     else:
