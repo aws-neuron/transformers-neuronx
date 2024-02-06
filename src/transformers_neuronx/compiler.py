@@ -543,6 +543,8 @@ class ParallelKernel:
             os.makedirs(profile_dir, exist_ok=True)
 
         tagged_hlo = (f"{self.tag}-" if self.tag else "") + self.hlo_module.name
+        # Replace problem characters used in filenames
+        tagged_hlo = tagged_hlo.translate(str.maketrans("(), ","__x_"))
         ntff_prefix = os.path.join(profile_dir,tagged_hlo)
 
         # Set up inputs as zeros
