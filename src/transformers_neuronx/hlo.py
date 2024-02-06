@@ -13,10 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 import os
-
 import functools
 import operator
-import warnings
+from typing import Optional, List
 
 import torch
 import numpy as np
@@ -295,62 +294,78 @@ def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
     return lhs, rhs, dtype
 
 
-def mmadd(
-    lhs,
-    rhs,
-    bias=None,
-    lhs_contracting_dimension=0,
-    rhs_contracting_dimension=0,
-    bias_dimension=0,
-    scales=None,
-    neuron_config=None
+def dot_add(
+    lhs: 'HloShape',
+    rhs: 'HloShape',
+    bias: 'HloShape' = None,
+    lhs_contracting_dimension: List[int] = 0,
+    rhs_contracting_dimension: List[int] = 0,
+    bias_dimension: int = 0,
+    scales: Optional['HloShape'] = None,
+    neuron_config: Optional[NeuronConfig] = None,
 ):
     """
-    Matrix-matrix multiplication and optional addition
+    Perform tensor product and optional addition of bias.
+
+    A tensor product is performed on the lhs and rhs tensors,
+    contracting over the dimensions specified in
+    lhs_contracting_dimension and rhs_contracting_dimension.
+
+    If provided, the bias tensor is broadcast to the shape of
+    the dot product and added to the result.
+
+    The result is optionally dequantized before returning.
+
+    Arguments:
+        lhs: Left-hand side tensor (HloShape).
+        rhs: Right-hand side tensor (HloShape).
+        bias: Bias tensor to be added to the result.
+        lhs_contracting_dimension: Contracting dimension(s) for the left-hand side tensor.
+        rhs_contracting_dimension: Contracting dimension(s) for the right-hand side tensor.
+        bias_dimension: Dimension to broadcast the bias tensor.
+        scales: Scales to "rescale" the quantized tensor after it's multiplied,
+            where W_f = W_q * scales.
+        neuron_config: NeuronConfig object that specifies the quantization dtype
+            and method.
+
+    Returns:
+        tensor: Result of tensor product and optional addition.
     """
-    assert len(lhs.sizes) == 2, f"Expected rank 2 LHS. Found shape={lhs.sizes}"
-    assert len(rhs.sizes) == 2, f"Expected rank 2 RHS. Found shape={rhs.sizes}"
-    lhs_size = lhs.sizes[lhs_contracting_dimension]
-    rhs_size = rhs.sizes[rhs_contracting_dimension]
-    assert lhs_size == rhs_size, (
-        f"Contracting dimension mismatch:"
-        f" LHS (dim={lhs_contracting_dimension} shape={lhs.sizes})"
-        f" RHS (dim={rhs_contracting_dimension} shape={rhs.sizes})"
-    )
 
-    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None \
-                        and neuron_config.quant is not None
+    lhs, rhs, _ = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None and neuron_config.quant is not None
 
-    lhs_size = lhs.sizes[1 if lhs_contracting_dimension == 0 else 0]
-    rhs_size = rhs.sizes[1 if rhs_contracting_dimension == 0 else 0]
-    dot_dims = dict(
-        lhs_contracting_dimensions=[lhs_contracting_dimension],
-        rhs_contracting_dimensions=[rhs_contracting_dimension]
+    if not isinstance(lhs_contracting_dimension, list):
+        lhs_contracting_dimension = [lhs_contracting_dimension]
+    if not isinstance(rhs_contracting_dimension, list):
+        rhs_contracting_dimension = [rhs_contracting_dimension]
+    dimension_numbers = dict(
+        lhs_contracting_dimensions=lhs_contracting_dimension,
+        rhs_contracting_dimensions=rhs_contracting_dimension,
     )
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    dot = dot_general(lhs, rhs, dimension_numbers)
     if enable_quantize:
         dot = dequantize(dot, scales, neuron_config, bias_dimension)
     if bias is None:
         return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    bias = broadcast(bias, dot.sizes, broadcast_dimensions=[bias_dimension])
+    return add(dot, bias)
 
 
 def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
 
 
 def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
 
 
 def dot11_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
 
 
 def dot_with_tiled_weight_add(lhs, rhs, bias,
