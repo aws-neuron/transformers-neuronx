@@ -40,8 +40,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
         hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
-            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
-        )
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config)
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
@@ -49,7 +48,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
         return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), dims
 
-    def embedding(self, input_ids, embed_weight):
+    def embedding(self, input_ids, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -57,11 +56,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
-
-    def pre_layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
-        if self.neuron_config.on_device_embedding:
-            hidden = self.embedding(hidden, *pre_layer_weights)
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,

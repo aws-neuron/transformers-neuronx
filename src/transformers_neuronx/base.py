@@ -86,23 +86,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for k in self.window_context_buckets:
             self.decoder_lm_head_for_window_context[k]=self.decoder_param_set.init_window_context_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
-
-    def validate_on_device_embedding(self, n_layer, unroll, context_unroll=None):
-        if not self.neuron_config.on_device_embedding:
-            return
-        if unroll != n_layer:
-            warnings.warn(
-                f"On-device embedding cannot be enabled when unroll({unroll}) "
-                f"is not equal to number of layers({n_layer})"
-            )
-            self.neuron_config.on_device_embedding = False
-        if context_unroll is not None and context_unroll != n_layer:
-            warnings.warn(
-                f"On-device embedding cannot be enabled when context_unroll({context_unroll}) "
-                f"is not equal to number of layers({n_layer})"
-            )
-            self.neuron_config.on_device_embedding = False
-
     def is_compiled(self):
         # First check if the kernels have neffs already
         try:
