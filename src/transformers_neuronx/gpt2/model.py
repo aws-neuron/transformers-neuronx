@@ -36,7 +36,7 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 class GPT2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, batch_size=1, amp='f32', tp_degree=2,
-                 unroll=None, init_n_active_tokens=None, neuron_config=None, 
+                 unroll=None, init_n_active_tokens=None, neuron_config=None,
                  tag=None, **kwargs):
         config = GPT2Config(config, batch_size, amp, tp_degree, **kwargs)
         super().__init__(GPT2CheckpointCompatible, config)
@@ -50,22 +50,19 @@ class GPT2ForSampling(base.NeuronModelBase):
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
         if unroll is None:
             unroll = config.n_layer
-        self.validate_on_device_embedding(self.config.n_layer, unroll)
-        n_positions_list = utils.power_of_two_bucket_sizes(128, config.n_positions)
+        self.token_buckets = bucket.token_sizes(config.n_positions)
         attention_head_size = config.n_embd // config.n_head
 
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, 1, batch_size, attention_head_size, amp=amp,
-            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, tag=tag
-        )
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', amp, start_mask, neuron_config=self.neuron_config)
-        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
-        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
-        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
-        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.register_for_serialization(self.decoder_lm_head)
+
+        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
+            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
+            unroll=unroll, neuron_config=self.neuron_config, tag=tag, builder=hlo_builder,
+        )
+        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self)
+
         # Token counter for sliding window attention
         self.num_processed_tokens = 0
         self.tag = tag
@@ -237,7 +234,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if context_length_estimate is None:
             context_length_estimate = config.n_positions
         self.context_unroll = context_unroll
-        self.validate_on_device_embedding(self.config.n_layer, self.unroll, self.context_unroll)
         self.token_buckets = bucket.token_sizes(config.n_positions)
         self.context_buckets = bucket.context_sizes(
             context_length_estimate, self.token_buckets
@@ -256,21 +252,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
         )
 
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
-            batch_size=batch_size, attention_head_size=attention_head_size, amp=amp,
-            num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, return_all_outputs=True
-        )
+        self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets,
+                                                                                      model_obj=self)
+        self.decoder_lm_head=self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
 
         self.decoder_lm_head.need_reorder_cache = reorder_cache
-        self.register_for_serialization(self.decoder_lm_head)
-
-
-        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
-        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
-        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
-        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
         if self.neuron_config.log_softmax_scores:
             self.decoder_lm_head.add_post_layer_builder(hlo_builder.post_layer)
 
@@ -287,28 +273,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # Only share caches when we don't generate multiple suggestions
         self.share_caches = self.prompt_batch_size == self.decoder_lm_head.batch_size[bs_idx]
         if self.context_buckets:
-            self.decoder_lm_head_for_context={}
             self.broadcaster={}
             for context_length_estimate in self.context_buckets:
-                # todo - GPT2 does not support compilation for multiple batch sizes. However context decoding in base.py/context
-                # is common across all models, to satisfy the indexing mechanism, add 'batch_size' to the key
-                # note the batch size for decoder_lm_head_for_context is the self.prompt_batch_size
-                self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                    tp_degree,
-                    [context_length_estimate],
-                    context_length_estimate,
-                    self.prompt_batch_size,
-                    attention_head_size,
-                    amp=amp,
-                    num_layers=config.n_layer,
-                    n_head=config.n_head,
-                    n_kv_head=config.n_kv_head,
-                    unroll=context_unroll,
-                    neuron_config=self.neuron_config,
-                    allow_pad=self.decoder_lm_head.allow_pad,
-                    return_all_outputs=False
-                )
-                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate, self.prompt_batch_size])
                 if not self.share_caches:
                     self.broadcaster[context_length_estimate] = decoder.FastCacheBroadcaster(
                         context_length_estimate,
@@ -474,7 +440,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-        
+
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
 
@@ -547,7 +513,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
-        
+
         if not self.neuron_config.on_device_embedding:
             input_ids, start_ids = self._embedding(model, input_ids, cache_ids, start_ids, is_context_encode=False)
             if self.neuron_config.attention_layout == LAYOUT_HSB:

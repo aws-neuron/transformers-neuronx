@@ -50,7 +50,6 @@ class BloomForSampling(base.NeuronModelBase):
             unroll = config.n_layer
         self.unroll = unroll
 
-        self.validate_on_device_embedding(self.config.n_layer, self.unroll, self.context_unroll)
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.max_positions = self.token_buckets[-1]
@@ -62,38 +61,14 @@ class BloomForSampling(base.NeuronModelBase):
         else:
             raise TypeError("batch_size must be list of ints or int type")
 
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, self.token_buckets, 1, self.batch_sizes, config.attention_head_size, amp=amp,
-            num_layers=config.n_layer, n_head=config.n_head,
-            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True
-        )
-        self.register_for_serialization(self.decoder_lm_head)
         hlo_builder = BloomForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
-        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
-        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
-        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
-        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-
-        if self.context_buckets:
-            self.decoder_lm_head_for_context = {}
-            for context_length_estimate in self.context_buckets:
-                for batch_size in self.batch_sizes:
-                    self.decoder_lm_head_for_context[context_length_estimate,batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                        tp_degree,
-                        [context_length_estimate],
-                        context_length_estimate,
-                        batch_size,
-                        config.attention_head_size,
-                        amp=amp,
-                        num_layers=config.n_layer,
-                        n_head=config.n_head,
-                        unroll=context_unroll,
-                        neuron_config=self.neuron_config,
-                        allow_pad=self.decoder_lm_head.allow_pad,
-                        return_all_outputs=False,
-                        tag="context"
-                    )
-                self.register_for_serialization(self.decoder_lm_head_for_context[context_length_estimate,batch_size])
+        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
+            attention_head_size=config.attention_head_size, amp=amp,num_layers=config.n_layer, n_head=config.n_head,
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True, builder=hlo_builder
+        )
+        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
+        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
 
     def load_weights(self):
         # Materialize the embedding to CPU

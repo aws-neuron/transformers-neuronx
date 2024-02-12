@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from typing import Optional
+
 from transformers_neuronx import hlo
 from transformers_neuronx import utils
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import constants
+from transformers_neuronx.config import NeuronConfig
 
 
 def query_key_value(
@@ -594,43 +597,105 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
 
 
 def output(
-    context,
-    out_weight, out_scales, out_bias,
-    tp_degree,
-    neuron_config=None,
-    transposed=False,
+    context: 'HloShape',
+    out_weight: 'HloShape',
+    out_scales: 'HloShape',
+    out_bias: 'HloShape',
+    tp_degree: int,
+    neuron_config: Optional[NeuronConfig] = None,
+    transposed: Optional[bool] = False,
 ):
     """
     The output projection of a transformer applied to the attention context.
 
     O = (C @ wO) + bO
 
-    Dot if transposed:
-        (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
-    else:
-        (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
+    Arguments:
+        context: Attention context.
+        out_weight: Model attention outout projection weight.
+        out_scales: Scales to "rescale" the quantized weight after it's
+            multiplied where W_f = W_q * scales.
+        out_bias: Model attention outout projection bias.
+        tp_degree: Tensor parallelism degree.
+        neuron_config: NeuronConfig object that specifies the quantization and
+            collectives configurations.
+        transposed: Whether the weight is transposed.
+
+    Implementation details:
+
+        2D out_weight case:
+            Weight shape if transposed:
+                [d_head * n_heads_tp, hidden]
+            else:
+                [hidden, d_head * n_heads_tp]
+
+            Dot if transposed:
+                (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
+            else:
+                (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
+
+        3D out_weight case
+            Weight shape if transposed:
+                [d_head, n_heads_tp, hidden]
+            else:
+                [hidden, d_head, n_heads_tp]
+
+            Dot if transposed:
+                (b * s, d_head, n_heads_tp) @ (d_head, n_heads_tp, h) contract=((1, 2). (0, 1)) => (b * s, h)
+            else:
+                (b * s, d_head, n_heads_tp) @ (h, d_head, n_heads_tp) contract=((1, 2), (1, 2)) => (b * s, h)
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
+
     if transposed:
-        _, hidden_size = out_weight.sizes
+        *_, hidden_size = out_weight.sizes
     else:
-        hidden_size, _ = out_weight.sizes
+        hidden_size, *_ = out_weight.sizes
     hidden_sizes = hidden_size, n_active_tokens, n_seqs
 
     enable_quantize = neuron_config and neuron_config.quant
     if enable_quantize:
-        out_weight = dtype[out_weight.sizes].Convert(out_weight)
+        out_weight = hlo.cast(out_weight, dtype)
 
-    result_sizes_2d = n_active_tokens * n_seqs, n_heads_tp * d_head
-    result = dtype[result_sizes_2d].Reshape(context)
+    three_dims = len(out_weight.sizes) == 3
 
-    if transposed:
-        # (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
-        result = hlo.dot10_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
+    if three_dims:
+        result_sizes = n_active_tokens * n_seqs, n_heads_tp, d_head
     else:
-        # (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
-        result = hlo.dot11_add1(result, out_weight, out_bias, out_scales, neuron_config=neuron_config)
+        result_sizes = n_active_tokens * n_seqs, n_heads_tp * d_head
+
+    result = hlo.reshape(context, result_sizes)
+
+    if three_dims:
+        # (b * s, n_heads_tp, d_head) -> (b * s, d_head, n_heads_tp)
+        result = hlo.permute(result, (0, 2, 1))
+
+    if three_dims:
+        if transposed:
+            lhs_contract_dims = [1, 2]
+            rhs_contract_dims = [0, 1]
+        else:
+            lhs_contract_dims = [1, 2]
+            rhs_contract_dims = [1, 2]
+    else:
+        if transposed:
+            lhs_contract_dims = [1]
+            rhs_contract_dims = [0]
+        else:
+            lhs_contract_dims = [1]
+            rhs_contract_dims = [1]
+
+    result = hlo.dot_add(
+        lhs=result,
+        rhs=out_weight,
+        bias=out_bias,
+        lhs_contracting_dimension=lhs_contract_dims,
+        rhs_contracting_dimension=rhs_contract_dims,
+        bias_dimension=1,
+        scales=out_scales,
+        neuron_config=neuron_config,
+    )
 
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
@@ -640,7 +705,7 @@ def output(
     else:
         # (b * s, h) => (h, s, b)
         result = hlo.transpose(result, 0, 1)
-        result = dtype[hidden_sizes].Reshape(result)
+        result = hlo.reshape(result, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
     result = hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
