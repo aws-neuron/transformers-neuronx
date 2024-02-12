@@ -264,6 +264,8 @@ def main():
     run_parser.add_argument('--profile', action='store_true')
     # profile-torch
     run_parser.add_argument('--profile_torch', action='store_true')
+    # ntff_count_limit
+    run_parser.add_argument('--ntff_count_limit', type=int, default=1, help='Maximum number of NTFF files to generate')
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -533,7 +535,7 @@ def run(args, hf_model_name, model_cls):
             print(f'ran model.to_neuron in {end - begin} seconds')
 
             if args.profile:
-                neuron_model.profile(f"profile_{suffix}")
+                neuron_model.profile(f"profile_{suffix}", args.ntff_count_limit)
 
             config = AutoConfig.from_pretrained(args.load)
             if args.beam > 1:
