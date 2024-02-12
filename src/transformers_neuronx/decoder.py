@@ -71,6 +71,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.lm_head_bias = None
         self.inputs_sdim = None
         self.inputs_builder = None
+        self.embedding_builder = None
         self.layer_builder = None
         self.ln_lm_head_params = []
         self.ln_lm_head_builder = None
@@ -201,9 +202,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
-        decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
+        if hasattr(self.hlo_builder, 'pre_layer'):
+            decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
         decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
         decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
+        if hasattr(self.hlo_builder, 'embedding'):
+            decoder_lm_head.add_embedding_builder(self.hlo_builder.embedding)
         return decoder_lm_head
 
     def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
@@ -255,6 +259,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def add_inputs_builder(self, inputs_builder):
         self.inputs_builder = inputs_builder
+
+    def add_embedding_builder(self, embedding_builder):
+	    self.embedding_builder = embedding_builder
 
     def add_pre_layer_parameter(self, param, sharding=None, allow_pad=False):
         self.pre_layer_parameters.append((param, sharding, allow_pad))
@@ -338,6 +345,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
+        new.add_embedding_builder(self.embedding_builder)
         if self.neuron_config.log_softmax_scores:
             new.add_post_layer_builder(self.post_layer_builder)
         for layer in self.layers:
@@ -455,10 +463,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 if self.neuron_config.continuous_batching else None
             program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
         else:
-            on_device_embedding = self.neuron_config.on_device_embedding
-            if on_device_embedding:
-                warnings.warn("Multi-layer decoders do not support on-device embedding. Embeddings will be computed on CPU.")
-                self.neuron_config.on_device_embedding = False
+
             if utils.amp_is_u8(self.amp):
                 raise NotImplementedError(f'amp={self.amp} only supports fully unrolled decoder')
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
@@ -471,12 +476,30 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                                                     self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
                 program.init_pp_sync_programs()
             else:
-                program = DecoderProgramMultiLayer(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+                ode_hlo_modules = None
+                ode_num_inputs = None
+                if self.neuron_config.on_device_embedding:
+                    ode_hlo_modules = [self._hlo_embedding_layer(batch_size) for batch_size in self.batch_size]
+                    ode_num_inputs = len(self.ode_sdim)
+                program = DecoderProgramMultiLayer(self.neuron_config, self.layers, ode_hlo_modules, ode_num_inputs, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
                                                     self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
-            if on_device_embedding:
-                self.neuron_config.on_device_embedding = True
         return program
+
+    def _hlo_embedding_layer(self, batch_size):
+
+        def _embedding(scribe):
+            amp, quantized, dequantized = utils.parse_amp(self.amp)
+            dtype = getattr(scribe, amp)
+            *_, n_positions = self.n_positions_list
+            (hidden, *tensors), self.ode_sdim = self.inputs_builder(
+                    scribe, dtype, n_positions, self.n_active_tokens, batch_size)
+            param_builder = DecoderParameterBuilder(scribe, len(self.ode_sdim))
+            pre_layer_params = self._hlo_pre_layer_params(param_builder)
+            hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
+            return hidden
+
+        return compiler.compile_py_func(_embedding)
 
     def _hlo_fully_unrolled(self, n_positions, batch_size):
 
@@ -489,7 +512,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions, batch_size)
             hidden = maybe_transfer_with_static_ring(hidden)
-            hidden, tensors = self._hlo_pre_layer(hidden, tensors, param_builder)
+            pre_layer_params = self._hlo_pre_layer_params(param_builder)
+            hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
+            hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params)
             ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
@@ -522,7 +547,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # use the first `unroll` layers to build the HLO -- assuming all layers are same
             layers = self.layers[:self.unroll]
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, layers, n_positions, batch_size)
-            hidden, tensors = self._hlo_pre_layer(hidden, tensors, param_builder)
+            pre_layer_params = self._hlo_pre_layer_params(param_builder)
+            hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params)
             out_hidden, out_caches = self._hlo_layers(hidden, tensors, layers, layers_caches, layers_weights)
             out_hidden.set_alias_to(hidden)
             outputs = [out_hidden, *out_caches]
@@ -531,15 +557,35 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
             return scribe.tuple(*root_shapes).Tuple(*outputs)
 
-        return compiler.compile_py_func(multi_layer)
+        # NOTE: Forcefully disable on device embedding when setting up multilayer
+        #       layers to ensure that hidden size is uniform on input/output
+        prior = self.neuron_config.on_device_embedding
+        self.neuron_config.on_device_embedding = False
+        result = compiler.compile_py_func(multi_layer)
+        self.neuron_config.on_device_embedding = prior
+        return result
 
-    def _hlo_pre_layer(self, hidden, tensors, param_builder):
+    def _hlo_pre_layer_params(self, param_builder):
         params = []
+        for param in self.pre_layer_parameters:
+            param = param_builder.from_tensor(param)
+            param = hlo.transfer_with_static_ring(param)
+            params.append(param)
+        return params
+
+    def _hlo_embedding(self, hidden, tensors, params):
+        # Only insert embedding operation when on-device embedding is being used
+        if not self.neuron_config.on_device_embedding:
+            return hidden
+
+        assert self.embedding_builder is not None, (
+            f"On-device embedding may only be used on models which provide this functionality"
+        )
+        hidden = self.embedding_builder(hidden, *tensors, *params)
+        return hidden
+
+    def _hlo_pre_layer(self, hidden, tensors, params):
         if self.pre_layer_builder is not None:
-            for param in self.pre_layer_parameters:
-                param = param_builder.from_tensor(param)
-                param = hlo.transfer_with_static_ring(param)
-                params.append(param)
             (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
         return hidden, tensors
 
@@ -585,7 +631,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             hidden_sizes.extend(hidden.sizes)
             return hidden
 
+        # NOTE: Forcefully disable on device embedding when setting up multilayer
+        #       layers to ensure that hidden size is uniform on input/output
+        prior = self.neuron_config.on_device_embedding
+        self.neuron_config.on_device_embedding = False
         compiler.compile_py_func(capture_hidden_sizes)
+        self.neuron_config.on_device_embedding = prior
 
         def ln_lm_head(scribe):
             dtype = getattr(scribe, self.amp)
@@ -851,11 +902,14 @@ class DecoderLayer(torch.nn.Module):
         self.attn_v_weight = weight
         self.attn_v_bias = bias
 
-    def add_attention_output(self, weight, bias, sharding=0, transposed=True):
+    def add_attention_output(self, weight, bias, sharding=0, transposed=True, out_feature_dim=None, contract_dims=None, pad=True):
         self.attn_out_weight = weight
         self.attn_out_bias = bias
         self.attn_out_sharding = sharding
         self.attn_out_transposed = transposed
+        self.attn_out_feature_dim = out_feature_dim
+        self.attn_out_contract_dims = contract_dims
+        self.attn_out_pad = pad
 
     def add_post_attention_layer_norm(self, weight, bias):
         self.post_attn_ln_weight = weight
@@ -938,7 +992,8 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_weight = None
                 self.attn_v_scales = None
                 self.attn_v_bias = None
-            self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
+            if self.attn_out_pad:
+                self.attn_out_weight = maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
                 _, intermediate_size = self.mlp_in_weight.shape
@@ -979,10 +1034,17 @@ class DecoderLayer(torch.nn.Module):
                         quantize.maybe_quantize_weights(self.attn_k_weight, self.neuron_config.quant)
                     self.attn_v_weight, self.attn_v_scales = \
                         quantize.maybe_quantize_weights(self.attn_v_weight, self.neuron_config.quant)
-                self.attn_out_weight, self.attn_out_scales = \
-                    quantize.maybe_quantize_weights(self.attn_out_weight, self.neuron_config.quant,
-                                                    out_feature_dim = 1 if self.attn_out_transposed else 0)
 
+                if self.attn_out_feature_dim is not None:
+                    out_feature_dim = self.attn_out_feature_dim
+                else:
+                    out_feature_dim = 1 if self.attn_out_transposed else 0
+                self.attn_out_weight, self.attn_out_scales = quantize.maybe_quantize_weights(
+                    tensor=self.attn_out_weight,
+                    quantize_config=self.neuron_config.quant,
+                    out_feature_dim=out_feature_dim,
+                    contract_dims=self.attn_out_contract_dims,
+                )
 
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
@@ -1394,7 +1456,11 @@ class DecoderProgram:
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
 
     def inputs_host_to_device(self, input_tensors, batch_size):
-        input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
+        # This means there is a separate neff for embedding so the inputs will be the input_ids
+        if self.neuron_config.on_device_embedding and isinstance(self, DecoderProgramMultiLayer):
+            input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
+        else:
+            input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
         for buf, tensor in zip(input_buffers, input_tensors):
             assert buf.shape == tensor.shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor.shape}) have different shapes!"
             tensor = tensor.to(buf.dtype)
@@ -1573,7 +1639,7 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, neuron_config, layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, tag=None):
+    def __init__(self, neuron_config, layers, ode_hlo_modules, ode_num_inputs, hlo_modules, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, tag=None):
         super().__init__(neuron_config, layers, hlo_modules, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, tag=tag)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
@@ -1589,9 +1655,34 @@ class DecoderProgramMultiLayer(DecoderProgram):
         self.ln_lm_head_kernels = [compiler.ParallelKernel(hm, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree)) for hm in ln_lm_head_hlo_modules]
         self.layer_executors = list()
         self.lm_head_executors = list()
+        self.ode_kernels = []
+        if self.neuron_config.on_device_embedding:
+            for ode_hlo in ode_hlo_modules:
+                self.ode_kernels.append(compiler.ParallelKernel(ode_hlo, self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=f"ode-hlo"))
+            self.ode_hlo_modules = ode_hlo_modules
+            self.input_ids_buffer = []
+            for i in range(len(ode_hlo_modules)):
+                # While there is more than one input for this hlo, the rest of them will be shared with the input_buffers
+                self.input_ids_buffer.append([compiler.gen_zero_input(ode_hlo_modules[i], 0)])
+            self.ode_executors = []
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params):
         super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_layers // self.unroll)
+
+        if self.neuron_config.on_device_embedding:
+            for i in range(len(self.input_ids_buffer)):
+                # Share the buffers here so we only need to move the inputs from host to device once (separate on-device embedding NEFF)
+                self.input_ids_buffer[i] = [self.manipulator.duplicate(self.input_ids_buffer[i][0])] + self.input_buffers[i][1:]
+            for kernel in self.ode_kernels:
+                kernel.load()
+
+            self.ode_memories = [ode_kernel.build_memory() for ode_kernel in self.ode_kernels]
+            for ode, inp_ids, inp in zip(self.ode_memories, self.input_ids_buffer, self.input_buffers):
+                ode_input_tensors = [*inp_ids]
+                for weight in pre_layer_params:
+                    ode_input_tensors.append(weight)
+                # make the output of the ODE NEFF the input to the layers NEFF
+                ode.setup(ode_input_tensors, [inp[0]])
 
         self.multi_layers_memories = []
         for _ in range(self.num_layers // self.unroll):
@@ -1635,13 +1726,19 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
     def run(self, bucket_id, batch_size):
         npos = self.n_positions_list[bucket_id]
+        bs_idx = self.batch_sizes.index(batch_size)
+        if self.neuron_config.on_device_embedding:
+	        self.ode_kernels[bs_idx](self.ode_memories[bs_idx])
         for memories in self.multi_layers_memories:
             self.kernels[npos,batch_size](memories[npos,batch_size])
-        bs_idx = self.batch_sizes.index(batch_size)
         if self.neuron_config.is_valid_lm_head():
             self.ln_lm_head_kernels[bs_idx](self.ln_lm_head_memories[bs_idx])
 
     def enable_executor(self):
+        if self.neuron_config.on_device_embedding:
+            for i, (ode_memory, ode_kernel) in enumerate(zip(self.ode_memories, self.ode_kernels)):
+                # Make the output of the ODE kernel share the same buffer as the input to the layer kernel
+                self.ode_executors.append(ode_kernel.build_executor(ode_memory, [*self.input_ids_buffer[i]], [self.input_buffers[i][0]]))
         for layer_memories in self.multi_layers_memories:
             executors = dict()
             self.layer_executors.append(executors)
@@ -1655,6 +1752,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
     def execute(self, bucket_id, batch_size, *inputs, return_ranks=-1):
         self.inputs_host_to_device(inputs, batch_size) # One-time input copy
+        if self.neuron_config.on_device_embedding:
+	        self.ode_executors[self.batch_sizes.index(batch_size)]([], return_ranks=return_ranks)
         npos = self.n_positions_list[bucket_id]
         for layer_executor in self.layer_executors:
             layer_executor[npos,batch_size]([], return_ranks=0)
@@ -1670,6 +1769,9 @@ class DecoderProgramMultiLayer(DecoderProgram):
         if self.need_reorder_cache:
             for hlo_kernel in self.reorder_cache_hlo_kernels:
                 all_kernels.append(hlo_kernel.kernel)
+        if self.neuron_config.on_device_embedding:
+	        for kernel in self.ode_kernels:
+	            all_kernels.append(kernel)
         return all_kernels
 
 

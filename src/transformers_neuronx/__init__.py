@@ -16,6 +16,7 @@ from transformers_neuronx.version import __version__
 
 from transformers_neuronx.config import NeuronConfig, QuantizationConfig, ContinuousBatchingConfig
 from transformers_neuronx.constants import GQA
+from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
 from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling

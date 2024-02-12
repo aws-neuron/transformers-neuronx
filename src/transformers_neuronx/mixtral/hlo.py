@@ -38,35 +38,6 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         assert str(MistralForSamplingNoEmbeddingHlo.attention) == str(self.attention.__func__), \
             "The self.attention() function should be derived from MistralForSamplingNoEmbeddingHlo.attention()"
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
-            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
-        )
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
-
-        head_dim = self.config.attention_head_size
-        pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
-                                                base=self.config.rope_theta,
-                                                interpolation_factor=self.config.position_interpolation_factor)
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-
-        return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
-
-    def embedding(self, input_ids, embed_weight):
-        dtype = getattr(input_ids.scribe, self.config.amp)
-        hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
-        if self.config.hidden_size % self.config.tp_degree != 0:
-            hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
-        if self.neuron_config.attention_layout == LAYOUT_HSB:
-            hidden = hlo.transpose210(hidden)
-        return hidden
-
-    def pre_layer(self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
-        if self.neuron_config and self.neuron_config.on_device_embedding:
-            hidden = self.embedding(hidden, *pre_layer_weights)
-        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
-
     def layer(
             self,
             # hidden in layer_builder (from decoder.py)
@@ -141,7 +112,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         # Following expert parallelism implement in https://github.com/vllm-project/vllm/pull/2090
         num_experts_per_core = expert_indices.sizes[0]
         _, intermediate_size = w1_weight_tp.sizes
-        slice_size = intermediate_size // num_experts_per_core 
+        slice_size = intermediate_size // num_experts_per_core
         slice_size_const = hlo.full(slice_size, dtype=expert_indices.dtype, sizes=[])
 
         local_hidden_states = None
@@ -153,7 +124,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
             w1_weight = hlo.dynamic_slice_along(w1_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
             w3_weight = hlo.dynamic_slice_along(w3_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
             w2_weight = hlo.dynamic_slice_along(w2_weight_tp, dim=1, start=slice_idx_const, size=slice_size)
-            
+
             # Build expert mask
             expert_idx = hlo.dynamic_slice_along(expert_indices, dim=0, start=idx_const, size=1)
             expert_idx_br = hlo.broadcast(expert_idx, selected_experts.sizes, [0])
