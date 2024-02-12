@@ -23,6 +23,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import base
+from transformers_neuronx import bucket
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
@@ -52,10 +53,16 @@ class OPTForSampling(base.NeuronModelBase):
 
         if unroll is None:
             unroll = config.num_hidden_layers
+        self.unroll = unroll
 
-        self.validate_on_device_embedding(config.num_hidden_layers, unroll, context_unroll)
+        if context_unroll is None:
+            context_unroll = config.num_hidden_layers
+        self.context_unroll = context_unroll
 
-        n_positions_list = utils.power_of_two_bucket_sizes(128, n_positions)
+        self.token_buckets = bucket.token_sizes(n_positions)
+        self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.max_positions = self.token_buckets[-1]
+
         if isinstance(batch_size,int):
             self.batch_sizes = [batch_size]
         elif isinstance(batch_size,list):
@@ -64,43 +71,22 @@ class OPTForSampling(base.NeuronModelBase):
             raise TypeError("batch_size must be list of ints or int type")
 
         attention_head_size = config.hidden_size // config.num_attention_heads
-        self.decoder_lm_head = decoder.DecoderLmHeadForSamplingNoEmbedding(
-            tp_degree, n_positions_list, 1, # n_active_tokens
-            self.batch_sizes, attention_head_size, amp=amp,
-            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
-            unroll=unroll, neuron_config=self.neuron_config
-        )
-        self.register_for_serialization(self.decoder_lm_head)
+
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
                                                    config.activation_function,
                                                    amp=amp, start_mask=start_mask,
-                                                   neuron_config=self.neuron_config)
-        self.decoder_lm_head.add_inputs_builder(hlo_builder.inputs)
-        self.decoder_lm_head.add_pre_layer_builder(hlo_builder.pre_layer)
-        self.decoder_lm_head.add_layer_builder(hlo_builder.layer)
-        self.decoder_lm_head.add_ln_lm_head_builder(hlo_builder.ln_lm_head)
-        self.decoder_lm_head_for_context = dict()
-        self.context_length_estimate = context_length_estimate
-        self.context_unroll = context_unroll
-        if self.context_length_estimate is not None:
-            for batch_size in self.batch_sizes:
-                self.decoder_lm_head_for_context[batch_size] = decoder.DecoderLmHeadForSamplingNoEmbedding(
-                                                    tp_degree,
-                                                    [context_length_estimate],
-                                                    context_length_estimate,
-                                                    batch_size,
-                                                    attention_head_size,
-                                                    amp=amp,
-                                                    num_layers=config.num_hidden_layers,
-                                                    n_head=config.num_attention_heads,
-                                                    unroll=context_unroll,
-                                                    neuron_config=self.neuron_config,
-                                                    allow_pad=self.decoder_lm_head.allow_pad,
-                                                    return_all_outputs=False,
-                                                    tag="context"
-                                                )
-                self.register_for_serialization(self.decoder_lm_head_for_context[batch_size])
+                                                   neuron_config=self.neuron_config, position_offset=2)
+
+        self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
+            tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1,
+            batch_size=self.batch_sizes, attention_head_size=attention_head_size, amp=amp,
+            num_layers=config.num_hidden_layers, n_head=config.num_attention_heads,
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder,
+        )
+        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
+        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
+
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
 
@@ -143,40 +129,35 @@ class OPTForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_positions.weight.detach(), sharding=1, allow_pad=True)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
-        if self.context_length_estimate is not None:
-            for batch_size in self.batch_sizes:
-                self.decoder_lm_head_for_context[batch_size] = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[batch_size], share_caches=True)
+
+        if self.context_buckets:
+            for context_length_estimate in self.context_buckets:
+                for batch_size in self.batch_sizes:
+                    model = self.decoder_lm_head.build_weight_shared(new=self.decoder_lm_head_for_context[context_length_estimate, batch_size], share_caches=True)
+                    self.decoder_lm_head_for_context[context_length_estimate, batch_size] = model
+
 
     def reset(self):
         self.decoder_lm_head.reset()
         # Reset the token counter
         self.num_processed_tokens = 0
 
-    def forward(self, input_ids, cache_ids, start_ids=None):
-        return self._forward(self.decoder_lm_head, input_ids, cache_ids, start_ids)
+    def forward(self, input_ids, cache_ids=None, start_ids=None):
 
-    def forward_for_context(self, input_ids, cache_ids, start_ids=None):
-        batch_size , _ = input_ids.shape
-        context_decoder = self.decoder_lm_head_for_context[batch_size]
-        return self._forward(context_decoder, input_ids, cache_ids, start_ids)
-
-    def _forward(self, decoder_lm_head, input_ids, cache_ids, start_ids):
-        # Check if sliding window attention is applied
-        sliding_window_attn_enabled = self.neuron_config and \
-                                      self.neuron_config.sparse_attn and \
-                                      self.neuron_config.sparse_attn.skip_masking_decode
-        inputs, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
-        batch_size, context_length = inputs.shape
-        if cache_ids is None:
-            cache_ids = torch.arange(context_length, dtype=torch.int32)
+        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.decoder.embed_tokens(inputs)
-            position_ids, start_ids = decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
+            position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
             position_embeds = self.chkpt_model.model.decoder.embed_positions(position_ids)
             inputs = inputs + position_embeds
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, 2).contiguous()
+
+        # Check if sliding window attention is applied
+        sliding_window_attn_enabled = self.neuron_config and \
+                                      self.neuron_config.sparse_attn and \
+                                      self.neuron_config.sparse_attn.skip_masking_decode
 
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
@@ -185,28 +166,13 @@ class OPTForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
 
-        logits = decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
-        logits = self._cast_logits(logits)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
-        # Increment the token counter
-        # If running decode mode then last_token_id = 0
+        result = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
         self.num_processed_tokens += (last_token_id+1)
-        return logits
+        return result
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        if self.context_length_estimate is None:
-            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
-        _, start = input_ids.shape
-        context_length = self.context_length_estimate
-        next_token_scores = self.forward_for_context(input_ids, None, start_ids)
-        for cur_len in range(context_length, start):
-            cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-            next_token_scores = self(input_ids[:, cur_len:cur_len+1], cache_ids, start_ids)
-        return sampling.sample_loop(
-            self, input_ids, start_ids, next_token_scores, sequence_length,
-            eos_token_id=self.config.eos_token_id, top_k=top_k)
+        return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                      eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):
@@ -289,7 +255,7 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, amp=None, start_mask=True, neuron_config=None):
+    def __init__(self, tp_degree, hidden_size, activation_function, amp=None, start_mask=True, neuron_config=None, position_offset=0):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
@@ -297,6 +263,10 @@ class OPTForSamplingNoEmbeddingHlo:
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
+
+        # Offset for for architecture specific on-device embedding
+        # OPT Reference: https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/opt/modeling_opt.py#L94-L96
+        self.position_offset = position_offset
 
     @property
     def shard_over_batch(self):
@@ -322,22 +292,23 @@ class OPTForSamplingNoEmbeddingHlo:
         mask = hlo.less(position_ids, zero)
         return hlo.masked_select(mask, zero, position_ids)
 
-    def embedding(self, input_ids, cache_ids, start_ids, wte, wpe):
+    def embedding(self, input_ids, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, wte, wpe):
         dtype = getattr(input_ids.scribe, self.amp)
         inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
         position_ids = self.embed_positions_ids(cache_ids, start_ids)
+
+        if self.position_offset != 0:
+            offset = hlo.full_like(position_ids, self.position_offset)
+            position_ids = hlo.add(position_ids, offset)
+
         position_embeds = hlo.embedding(wpe, position_ids, tp_degree=self.tp_degree, dtype=dtype)
         hidden = hlo.add(inputs_embeds, position_embeds)
+
         if self.hidden_size % self.tp_degree != 0:
             hidden = hlo.slice_along(hidden, dim=-1, limit=self.hidden_size, start=0)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
-
-    def pre_layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
-        if self.neuron_config.on_device_embedding:
-            hidden = self.embedding(hidden, cache_ids, start_ids, *pre_layer_weights)
-        return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,

@@ -52,6 +52,8 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     """
     s32 = scribe.s32
 
+    # Multilayer on device embedding will use the already-embedded inputs for the layers NEFF
+    # because there is a separate neff for embedding.
     if neuron_config and neuron_config.on_device_embedding:
         hidden_sizes = batch_size, n_active_tokens
     else:
@@ -62,7 +64,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
 
     hidden = (
         s32[hidden_sizes].Parameter(parameter_number=0) if neuron_config and neuron_config.on_device_embedding
-        else 
+        else
         dtype[hidden_sizes].Parameter(parameter_number=0)
     )
     cache_2d = neuron_config and neuron_config.use_2d_cache_ids
@@ -83,7 +85,6 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     )
 
     return hidden, cache_ids, start_ids, last_token_id, sequence_slice_dimensions
-
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """

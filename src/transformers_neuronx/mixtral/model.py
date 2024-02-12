@@ -48,8 +48,6 @@ class MixtralForSampling(base.NeuronModelBase):
             unroll = config.num_hidden_layers
         self.unroll=unroll
 
-        self.validate_on_device_embedding(config.num_hidden_layers, unroll, context_unroll)
-
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
         self.max_positions = self.token_buckets[-1]
