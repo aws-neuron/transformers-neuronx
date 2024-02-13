@@ -48,13 +48,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.tp_degree = tp_degree
         self.n_positions_list = n_positions_list
         self.n_active_tokens = n_active_tokens
-        self.batch_size = list()
-        if isinstance(batch_size,int):
-            self.batch_size = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_size = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
+        self.batch_size = bucket.batch_sizes(batch_size)
         self.attention_head_size = attention_head_size  # TODO: rename to size_per_head
         self.n_head = n_head
         self.n_kv_head = n_kv_head if (n_kv_head > 0) else n_head
