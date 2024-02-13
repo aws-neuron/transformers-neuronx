@@ -41,6 +41,9 @@ class BloomForSampling(base.NeuronModelBase):
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
 
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
+
         self.context_length_estimate = context_length_estimate
         if context_unroll is None:
             context_unroll = config.n_layer
@@ -184,6 +187,10 @@ class BloomForSampling(base.NeuronModelBase):
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
-        result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+        if self.neuron_config.on_device_generation:
+            result = sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
+                                            config=self.neuron_config.on_device_generation)
+        else:
+            result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                            eos_token_id=self.config.eos_token_id, top_k=top_k)
         return result

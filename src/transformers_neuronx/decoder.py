@@ -69,6 +69,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.ln_f_bias = None
         self.lm_head_weight = None
         self.lm_head_bias = None
+        self.logits_indices = None
         self.inputs_sdim = None
         self.inputs_builder = None
         self.embedding_builder = None
@@ -80,7 +81,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.pre_layer_builder = None
         self.allow_pad = allow_pad
         self.use_executor = False
-        self.return_ranks = -1
+        self.return_ranks = -1 if not self.neuron_config.on_device_generation else 1
         self.need_reorder_cache = False
         self.hlo_builder=builder
         self.check_gqa_fallback()
@@ -319,6 +320,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.lm_head_bias is not None:
             self.lm_head_bias = manipulator.shard_along(self.lm_head_bias, dim=0)
             ln_lm_head_params.append(self.lm_head_bias)
+        if self.neuron_config.on_device_generation:
+            logits_indices = torch.arange(lm_head_weight.shape[-1], dtype=torch.int32)
+            self.logits_indices = manipulator.shard_along(logits_indices, dim=0)
+            ln_lm_head_params.append(self.logits_indices)
         self.ln_lm_head_params = ln_lm_head_params
 
         self.program = self._build_program()
@@ -364,6 +369,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
         if new.lm_head_bias is not None:
             ln_lm_head_params.append(new.lm_head_bias)
+        if self.neuron_config.on_device_generation:
+            new.logits_indices = self.logits_indices
+            ln_lm_head_params.append(self.logits_indices)
         new.ln_lm_head_params = ln_lm_head_params
         new.program = new._build_program()
         return new
@@ -400,7 +408,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         else:
             self.program.inputs_host_to_device(inputs, batch_size)
             self.program.run(bucket_id, batch_size)
-            return self.program.maybe_logits_device_to_host(batch_size)
+            return self.program.maybe_logits_device_to_host(batch_size,  return_ranks=self.return_ranks)
 
     def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
@@ -437,7 +445,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 self.program.run(bucket_id, batch_size)
 
         if not self.use_executor:
-            outputs = self.program.maybe_logits_device_to_host(batch_size)
+            outputs = self.program.maybe_logits_device_to_host(batch_size, return_ranks=self.return_ranks)
 
         return outputs
 
@@ -519,12 +527,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
+            logits_indices = param_builder.from_tensor(self.logits_indices)
             hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights)
             ln_f_weight = maybe_transfer_with_static_ring(ln_f_weight)
             ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
             head_weight = maybe_transfer_with_static_ring(head_weight)
             head_bias = maybe_transfer_with_static_ring(head_bias)
-            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
+
+            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices, return_all_outputs=self.return_all_outputs)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores, *out_caches]
@@ -647,7 +657,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
             head_weight = param_builder.from_tensor(self.lm_head_weight)
             head_bias = param_builder.from_tensor(self.lm_head_bias)
-            logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, self.return_all_outputs)
+            logits_indices = param_builder.from_tensor(self.logits_indices)
+            logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices, return_all_outputs=self.return_all_outputs)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores]
@@ -1470,14 +1481,20 @@ class DecoderProgram:
     def run(self, bucket_id):
         raise NotImplementedError(DecoderProgram)
 
-    def maybe_logits_device_to_host(self, batch_size):
+    def maybe_logits_device_to_host(self, batch_size, return_ranks):
         idx = self.batch_sizes.index(batch_size)
         if self.logits_buffer:
             if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
+                
                 if self.neuron_config.log_softmax_scores:
                     return [self.manipulator.unshard_along(val, dim=0) for val in self.logits_buffer[idx]]
                 else:
-                    return self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+                    logits = self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
+                    if return_ranks > 0:
+                        rank_size = logits.shape[0] // self.tp_degree
+                        logits = logits[:rank_size * return_ranks]
+                    return logits
+
             else:
                 return ops.parallel_cpu(self.logits_buffer[idx])[0]
         else:

@@ -28,7 +28,7 @@ from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH, LAYO
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.layers import transformer
+from transformers_neuronx.layers import transformer, generation
 
 
 class OPTForSampling(base.NeuronModelBase):
@@ -44,6 +44,8 @@ class OPTForSampling(base.NeuronModelBase):
         super().__init__(OPTCheckpointCompatible, config)
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = n_positions
@@ -75,6 +77,7 @@ class OPTForSampling(base.NeuronModelBase):
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
         hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.hidden_size,
                                                    config.activation_function,
+                                                   eos_token_id=config.eos_token_id,
                                                    amp=amp, start_mask=start_mask,
                                                    neuron_config=self.neuron_config, position_offset=2)
 
@@ -171,8 +174,12 @@ class OPTForSampling(base.NeuronModelBase):
         return result
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                      eos_token_id=self.config.eos_token_id, top_k=top_k)
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
+                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
+        else:
+            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):
@@ -255,10 +262,11 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, amp=None, start_mask=True, neuron_config=None, position_offset=0):
+    def __init__(self, tp_degree, hidden_size, activation_function, eos_token_id=None, amp=None, start_mask=True, neuron_config=None):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
+        self.eos_token_id = eos_token_id
         self.amp = amp
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
@@ -354,8 +362,12 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+        logits = transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
+        if self.neuron_config.on_device_generation:
+            logits = generation.generate(logits, logits_indices, self.neuron_config.on_device_generation, 
+                                         tp_degree=self.tp_degree, eos_token_id=self.eos_token_id)               
+        return logits
 
     def post_layer(self, logits):
         if self.neuron_config.log_softmax_scores:

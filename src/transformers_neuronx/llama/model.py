@@ -39,6 +39,8 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
         self.layers_after_partition = self.neuron_config.auto_layer_partition(config.num_hidden_layers)
         self.prefixed_length = prefixed_length
@@ -209,6 +211,11 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
+        
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
+                                            config=self.neuron_config.on_device_generation)
+
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         batch_size, context_length = input_ids.shape

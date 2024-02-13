@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.layers import transformer, alibi
+from transformers_neuronx.layers import transformer, alibi, generation
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -87,8 +87,15 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.ln_lm_head(self.config.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+        logits = transformer.ln_lm_head(self.config.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight,
+                                        lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
+        if self.neuron_config.on_device_generation is not None:
+            return generation.generate(logits, logits_indices,
+                                       config=self.neuron_config.on_device_generation, 
+                                       tp_degree=self.config.tp_degree, 
+                                       eos_token_id=self.config.eos_token_id)
+        return logits
 
     def attention(self,
         hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
