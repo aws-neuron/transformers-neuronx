@@ -15,8 +15,8 @@
 from transformers_neuronx import hlo, config
 
 
-def generate(logits, config: config.GenerationConfig, tp_degree=1):
-
+def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1, eos_token_id=None):
+    logits = mask_logits(logits, logits_indices, config.vocab_size, eos_token_id, config)
     if config.do_sample:
         return sample(
             logits,
@@ -26,6 +26,21 @@ def generate(logits, config: config.GenerationConfig, tp_degree=1):
         )
     else:
         return greedy_search(logits, tp_degree=tp_degree)
+
+
+def mask_logits(logits, indices, model_vocab_size, eos_token_id, config):
+    vocab_size, n_active_tokens, _ = logits.sizes
+    assert n_active_tokens == 1
+    indices_br = hlo.broadcast(indices, (logits.sizes), broadcast_dimensions=(0,))
+    max_index = hlo.full(value=model_vocab_size, dtype=indices.dtype, sizes=logits.sizes)
+    mask = hlo.less(indices_br, max_index)
+    min_value = hlo.full(value=float('-inf'), dtype=logits.dtype, sizes=logits.sizes)
+    logits = hlo.masked_select(mask, logits, min_value)
+    if config.eos_token_id is None and eos_token_id is not None:
+        eos_token = hlo.full(value=eos_token_id, dtype=indices_br.dtype, sizes=logits.sizes)
+        mask = hlo.equal(indices_br, eos_token)
+        logits = hlo.masked_select(mask, min_value, logits)
+    return logits
 
 
 def greedy_search(logits, *, tp_degree=1):
@@ -39,10 +54,12 @@ def sample(logits, *, k=50, temperature=None, tp_degree=1):
     vocab_size, n_active_tokens, batch_size = logits.sizes
     assert n_active_tokens == 1
 
-    if k == 1:
+    if k == 1 and batch_size == 1:
         return greedy_search(logits, tp_degree=tp_degree)
 
-    logits = hlo.reshape(logits, (batch_size, vocab_size))
+    logits = hlo.reshape(logits, (vocab_size, batch_size))
+    logits = hlo.transpose(logits, src=0, dst=1)
+
     topk_logits, topk_indices = hlo.topk(logits, k=k, dim=1, tp_degree=tp_degree)
 
     if temperature is not None and temperature != 1.0:

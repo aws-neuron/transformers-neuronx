@@ -399,6 +399,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         else:
             logits = self.decoder_lm_head(hidden, *args)
 
+        if self.neuron_config.on_device_generation:
+            return logits
+
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)

@@ -42,6 +42,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
@@ -54,7 +56,9 @@ class GPT2ForSampling(base.NeuronModelBase):
         attention_head_size = config.n_embd // config.n_head
 
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', amp, start_mask, neuron_config=self.neuron_config)
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
+                                                   self.config.eos_token_id, amp, start_mask, 
+                                                   neuron_config=self.neuron_config)
 
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree, self.token_buckets, 1, batch_size, attention_head_size, amp=amp,
@@ -155,6 +159,7 @@ class GPT2ForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
+        
         if not self.neuron_config.on_device_embedding:
             input_ids = self.chkpt_model.transformer.wte(input_ids)
             position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
@@ -163,6 +168,10 @@ class GPT2ForSampling(base.NeuronModelBase):
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 input_ids = input_ids.transpose(0, 2).contiguous()
         logits = self.decoder_lm_head(input_ids, cache_ids, start_ids, last_token_id, curr_window_start)
+
+        if self.neuron_config.on_device_generation:
+            return logits
+
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
@@ -171,7 +180,11 @@ class GPT2ForSampling(base.NeuronModelBase):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
-        return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
+                                          config=self.neuron_config.on_device_generation)
+        else:
+            return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
                                       eos_token_id=self.config.eos_token_id, top_k=top_k)
 
     def beam_search(self, input_ids, num_beams, sequence_length, start_ids=None):
@@ -226,6 +239,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         super().__init__(GPT2CheckpointCompatible, config)
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         if unroll is None:
             unroll = config.n_layer
         self.unroll=unroll
@@ -239,12 +254,18 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             context_length_estimate, self.token_buckets
         )
         self.max_positions=self.token_buckets[-1]
+        self.return_ranks = -1 if not self.neuron_config.on_device_generation else 1
 
         # TODO: the start_mask needs to be True with left padding for context estimate,
         # need to fix this after having right padding
         start_mask = True
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', amp, start_mask,
+
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
+                                                   eos_token_id=self.config.eos_token_id,
+                                                   amp=amp,
+                                                   start_mask=start_mask,
                                                    neuron_config=self.neuron_config)
+
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
@@ -466,6 +487,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                 logits, scores = self.decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
             else:
                 logits = self.decoder_lm_head(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+
+        if self.neuron_config.on_device_generation is not None:
+            return logits
+
         # Increment the token counter
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
@@ -528,6 +553,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     @torch.no_grad()
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, output_scores=False, **kwargs):
+
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
+                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
+
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         runtime_batch_size, context_length = input_ids.shape
