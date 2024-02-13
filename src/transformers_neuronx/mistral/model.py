@@ -51,14 +51,8 @@ class MistralForSampling(base.NeuronModelBase):
 
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
-        self.max_positions = self.token_buckets[-1]
 
-        if isinstance(batch_size,int):
-            self.batch_sizes = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_sizes = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
+        self.batch_sizes = bucket.batch_sizes(batch_size)
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = MistralForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
