@@ -60,14 +60,8 @@ class LlamaForSampling(base.NeuronModelBase):
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
                 self.context_buckets = sorted(self.context_buckets)
-        self.max_positions = self.token_buckets[-1]
 
-        if isinstance(batch_size,int):
-            self.batch_sizes = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_sizes = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
+        self.batch_sizes = bucket.batch_sizes(batch_size)
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
