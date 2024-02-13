@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import transformer, rotary
+from transformers_neuronx.layers import transformer, rotary, generation
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -102,8 +102,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+        logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
+        if self.neuron_config.on_device_generation is not None:
+            return generation.generate(logits, logits_indices,
+                                       config=self.neuron_config.on_device_generation,
+                                       tp_degree=self.config.tp_degree,
+                                       eos_token_id=self.config.eos_token_id)
+        return logits
 
     def attention(
         self,
