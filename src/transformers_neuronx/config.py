@@ -82,6 +82,9 @@ class NeuronConfig():
             Default: `False`.
         log_softmax_scores: (`bool`, optional): Return log-softmax scores along with logits.
             Default: False
+        on_device_generation (GenerationConfig, optional): Generation related configurations.
+            Used to set configurations to sample on device.
+            Default: `None`.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -101,6 +104,7 @@ class NeuronConfig():
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
         self.on_device_embedding = kargs.pop('on_device_embedding', False)
+        self.on_device_generation = kargs.pop('generation_config', None)
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
 
