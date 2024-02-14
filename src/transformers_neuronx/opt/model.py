@@ -255,7 +255,7 @@ class OPTAttention(module.LowMemoryModule):
 
 class OPTForSamplingNoEmbeddingHlo:
 
-    def __init__(self, tp_degree, hidden_size, activation_function, eos_token_id=None, amp=None, start_mask=True, neuron_config=None):
+    def __init__(self, tp_degree, hidden_size, activation_function, eos_token_id=None, amp=None, start_mask=True, neuron_config=None, position_offset=0):
         self.tp_degree = tp_degree
         self.hidden_size = hidden_size
         self.activation_function = activation_function
