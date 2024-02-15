@@ -386,6 +386,11 @@ class PretrainedModel(LowMemoryModule):
                 assert isinstance(n_positions, list) and len(n_positions) == 1
                 assert context_length_estimate == n_positions, \
                     "To use continuous batching features, context length estimate should equal to n_positions."
+            else:
+                bsh_cache_layout = False
+                if neuron_config is not None:
+                    bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+                assert not bsh_cache_layout, "BSH cache layout can only be configured with continuous batching."
 
         _sanity_check(**kwargs)
         config = AutoConfig.from_pretrained(pretrained_model_path)

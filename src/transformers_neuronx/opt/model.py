@@ -424,6 +424,7 @@ class OPTForSamplingNoEmbeddingHlo:
             import transformers_neuronx.layers.attention as attention
         else:
             import transformers_neuronx.layers.attention_hsb as attention
+        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -442,6 +443,13 @@ class OPTForSamplingNoEmbeddingHlo:
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
 
+        # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
+        bsh_cache_layout = False
+        if self.neuron_config is not None:
+            bsh_cache_layout = self.neuron_config.cache_layout == constants.LAYOUT_BSH
+        if bsh_cache_layout:
+            query, key, value = attention_utils.transpose_qkv(query, key, value)
+
         # Single Token Generation ("Prefetch"-style)
         if active_mask is not None:
             # When using window attention, directly slice the KV cache
@@ -458,7 +466,7 @@ class OPTForSamplingNoEmbeddingHlo:
                 useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=window_size)
 
             # Sp = Q @ Kp
-            prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=n_kv_heads, tp_degree=tp_degree, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, useful_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             # Apply the sparse mask to the raw scores, notice that we don't have the mask for window attention
             if enable_sparse_attn and not window_attn_decode:
@@ -468,13 +476,13 @@ class OPTForSamplingNoEmbeddingHlo:
             prior_scores = hlo.cast(prior_scores, f32)
 
             # Sa = Q @ Ka
-            active_score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            active_score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, neuron_config=self.neuron_config)
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             active_score = hlo.cast(active_score, f32)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, useful_cached_values, value, sparse_mask=sparse_mask,
-                                        n_kv_heads=n_kv_heads, dtype=dtype, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                        n_kv_heads=n_kv_heads, dtype=dtype, tp_degree=tp_degree, neuron_config=self.neuron_config)
 
             # KCache[I] = K
             # VCache[I] = V
@@ -484,13 +492,13 @@ class OPTForSamplingNoEmbeddingHlo:
         # Multi-Token Context Encoding
         else:
             # S = Q @ K
-            score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            score = attention.score(query, key, n_kv_heads=n_kv_heads, tp_degree=tp_degree, neuron_config=self.neuron_config)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             if enable_sparse_attn:
                 score = attention.mask(score, sparse_mask, tp_degree=None, shard_over_batch=False)
             score = hlo.cast(score, f32)
             context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=n_kv_heads, dtype=dtype, \
-                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
 
             # KCache = K
             # VCache = V
