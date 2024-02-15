@@ -270,8 +270,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder,
-            prompt_batch_size=self.prompt_batch_size
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
         )
 
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets,
@@ -442,7 +441,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
 
-        inputs, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
+        inputs, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
         batch_size, context_length = inputs.shape
 
         model = self.decoder_lm_head
@@ -529,7 +528,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if speculation_length is None:
             model=self.decoder_lm_head
         else:
-            model=self.decoder_lm_head_for_speculation[speculation_length, batch_size]
+            model=self.decoder_lm_head_for_speculation[speculation_length]
 
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used

@@ -66,10 +66,7 @@ class MistralForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
 
         # Track number of processed tokens for sliding window attention
-        if self.neuron_config and self.neuron_config.lhs_aligned:
-            self.num_processed_tokens = torch.zeros(batch_size, dtype=torch.long)
-        else:
-            self.num_processed_tokens = torch.tensor(0, dtype=torch.long)
+        self.num_processed_tokens = 0
 
     def load_weights(self):
 
@@ -135,10 +132,8 @@ class MistralForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
-        if self.config.window_size:
-            curr_window_start = torch.max(torch.tensor(0, dtype=torch.long), self.num_processed_tokens - self.config.window_size)
-        else:
-            curr_window_start = self.num_processed_tokens
+        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)

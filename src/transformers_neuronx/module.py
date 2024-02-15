@@ -308,7 +308,7 @@ class LowMemoryEmbedding(torch.nn.Embedding, LowMemoryModule):
         pass
 
 
-def maybe_download_weights(path_or_repo_id, safe_serialization=True, **kwargs):
+def maybe_download_weights(path_or_repo_id, **kwargs):
     """
     Get the local path to weights or download them from the huggingface hub.
 
@@ -324,7 +324,6 @@ def maybe_download_weights(path_or_repo_id, safe_serialization=True, **kwargs):
             path (i.e. `bigscience/bloom-560m` or `/home/ubuntu/example`)
 
     Kwargs:
-        safe_serialization: Allow/Prohibit safetensor checkpoints.
         kwargs: Passed to `cached_file` in order to allow downloads with
             specific authorization/branches/etc.
 
@@ -336,23 +335,15 @@ def maybe_download_weights(path_or_repo_id, safe_serialization=True, **kwargs):
     if os.path.isdir(path_or_repo_id):
         return path_or_repo_id
 
-    checkpoints = [
+    # Search for checkpoints in order of fastest loads
+    filename = None
+    checkpoint = None
+    for checkpoint in [
         _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
         _SAFETENSORS_MODEL_FILENAME,
         _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
         _PYTORCH_MODEL_BIN_FILENAME,
-    ]
-
-    if not safe_serialization:
-        checkpoints = [
-            _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
-            _PYTORCH_MODEL_BIN_FILENAME,
-        ]
-
-    # Search for checkpoints in order of fastest loads
-    filename = None
-    checkpoint = None
-    for checkpoint in checkpoints:
+    ]:
         # Ignore errors since only one format may exist
         filename = hub.cached_file(path_or_repo_id, checkpoint, _raise_exceptions_for_missing_entries=False, **kwargs)
         if filename:
@@ -386,20 +377,20 @@ class PretrainedModel(LowMemoryModule):
             context_length_estimate = kwargs.get("context_length_estimate", None)
             n_positions = kwargs.get("n_positions", 2048)
             neuron_config = kwargs.get("neuron_config", None)
-            bsh_cache_layout = False
-            if neuron_config is not None:
-                bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
             continuous_batching = neuron_config and neuron_config.continuous_batching
             if continuous_batching:
                 batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
                 expected_batch_size = kwargs.get("batch_size")
                 assert batch_size_for_shared_caches == expected_batch_size, \
                     f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"
+                assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1
                 assert isinstance(n_positions, list) and len(n_positions) == 1
-                if bsh_cache_layout:
-                    assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1, \
-                    	"BSH cache layout does not support multi-bucketing"
+                assert context_length_estimate == n_positions, \
+                    "To use continuous batching features, context length estimate should equal to n_positions."
             else:
+                bsh_cache_layout = False
+                if neuron_config is not None:
+                    bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
                 assert not bsh_cache_layout, "BSH cache layout can only be configured with continuous batching."
 
         _sanity_check(**kwargs)
