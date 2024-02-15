@@ -58,16 +58,26 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         attention_mask = None
         cache_ids = None
         start_ids = None
+
         if "attention_mask" in kwargs:
             attention_mask = kwargs["attention_mask"]
 
         if attention_mask is not None:
             _, start_ids = attention_mask.max(axis=1)
 
-
         if self.cur_len > 0:
             input_ids = input_ids[:, -1:]
             cache_ids = torch.as_tensor([self.cur_len], dtype=torch.int32)
+
+        continuous_batching = self.model.neuron_config.continuous_batching is not None
+        if continuous_batching:
+            if self.cur_len > 0:
+                batch_size = input_ids.shape[0]
+                cache_ids = torch.as_tensor([self.cur_len]*batch_size, dtype=torch.int32).reshape(batch_size, 1)
+                start_ids = None
+            else:
+                cache_ids = torch.arange(input_ids.shape[-1]) * attention_mask
+                start_ids = torch.arange(input_ids.shape[0])
 
         # no need to prepare cache_ids for parallel context encoding here as forward will pad input_ids and generate legalized cache_ids
 

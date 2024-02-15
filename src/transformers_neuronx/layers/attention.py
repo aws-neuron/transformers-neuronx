@@ -15,7 +15,7 @@
 from transformers_neuronx import hlo
 from transformers_neuronx import parallel
 from transformers_neuronx import utils
-from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
+from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, GQA
 
 def query_key_value(
     hidden,
@@ -278,7 +278,7 @@ def scale(query, d_head):
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
+def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
     """
     Compute the attention score by combining scaled-query & keys.
 
@@ -286,6 +286,10 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, shard_over_batch=False):
 
     If n_kv_heads != 0, uses multi-query/grouped-query attention.
     """
+    shard_over_batch=False
+    if neuron_config is not None:
+        shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
+
     dtype = query.dtype
     scribe = query.scribe
     pred = scribe.pred
@@ -335,7 +339,7 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_val=-3000
 
 
 def context(past_scores, active_score, past_values, active_values, n_kv_heads=0, dtype=None,
-            sparse_mask=None, active_sparse_mask=None, shard_over_batch=False, tp_degree=None):
+            sparse_mask=None, active_sparse_mask=None, neuron_config=None, tp_degree=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -350,6 +354,9 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     If both sparse_mask and active_sparse_mask are provided, use sparse attention by masking them on
     top of the softmax results.
     """
+    shard_over_batch=False
+    if neuron_config is not None:
+        shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
 
     assert (sparse_mask is None) == (active_sparse_mask is None), "Both sparse masks must be valid to use sparse attention!"
 
@@ -425,7 +432,7 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     return output
 
 
-def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sparse_mask=None, shard_over_batch=False):
+def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sparse_mask=None, neuron_config=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -442,6 +449,10 @@ def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sp
     If dtype is None, uses values datatype.
     If sparse_mask is not None, apply sparse mask after the softmax
     """
+    shard_over_batch=False
+    if neuron_config is not None:
+        shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
+
     probs = hlo.softmax(score)
     if sparse_mask is not None:
         # Mask with 0 because we have probabilities here
