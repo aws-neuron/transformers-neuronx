@@ -23,6 +23,7 @@ FUSED_QKV_TP_FACTOR = 3
 # Layout for attention
 LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
+LAYOUT_SBH = 'SBH'
 
 # Group query attention sharding configurations
 class GQA(enum.Enum):

@@ -81,6 +81,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.check_gqa_fallback()
         self.tag = tag
 
+    @property
+    def bsh_cache_layout(self):
+        return self.neuron_config.cache_layout == constants.LAYOUT_BSH
+
     def check_gqa_fallback(self):
         """
         Check if a fallback mechanism is needed for a user-provided GQA config.
@@ -595,12 +599,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_layers_params(self, param_builder, layers, n_positions, batch_size):
         layers_caches = []
+        dim_size = {1: n_positions} if self.bsh_cache_layout else {0: n_positions}
         if self.neuron_config.continuous_batching:
             batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
         for layer in layers:
             layer_caches = []
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
-                par = param_builder.from_tensor(cache, dim_size={0: n_positions})
+                par = param_builder.from_tensor(cache, dim_size=dim_size)
                 layer_caches.append(par)
             layers_caches.append(layer_caches)
         layers_weights = []
@@ -1127,6 +1132,10 @@ class DecoderLayer(torch.nn.Module):
     def shard_over_batch(self):
         return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
+    @property
+    def bsh_cache_layout(self):
+        return self.neuron_config.cache_layout == constants.LAYOUT_BSH
+
     def init_caches(self):
         n_heads_kv_cache = self.n_kv_head
 
@@ -1138,16 +1147,21 @@ class DecoderLayer(torch.nn.Module):
         # Separate KV cache for each batch size
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         for batch_size in self.batch_sizes:
-            cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
+            if self.bsh_cache_layout:
+                cache_shape = [batch_size, self.n_positions, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [batch_size, self.n_positions, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+            else:
+                cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [self.n_positions, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
             if self.shard_over_batch:
+                assert not self.bsh_cache_layout, "shard-over-batch for GQA with BSH cache layout is not supported."
                 self.cache_shape[batch_size] = [self.n_positions, batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
             else:
                 assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
                     f"cannot shard along kv_heads dimension: n_kv_head={n_heads_kv_cache}, tp_degree={self.tp_degree}"
-                self.cache_shape[batch_size] = [self.n_positions, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=2))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=2))
 

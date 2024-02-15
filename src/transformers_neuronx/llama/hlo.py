@@ -127,6 +127,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             import transformers_neuronx.layers.attention as attention
         else:
             import transformers_neuronx.layers.attention_hsb as attention
+        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -150,42 +151,51 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
 
+        # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
+        bsh_cache_layout = False
+        if self.neuron_config is not None:
+            bsh_cache_layout = self.neuron_config.cache_layout == constants.LAYOUT_BSH
+        if bsh_cache_layout:
+            query, key, value = attention_utils.transpose_qkv(query, key, value)
+
         # Single Token Generation ("Prefetch"-style)
         if active_mask is not None:
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        shard_over_batch=self.shard_over_batch)
+                                        neuron_config=self.neuron_config)
 
             # KCache[I], VCache[I] = K, V
-            updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids, key, value, start_ids)
+            updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                           key, value, start_ids, neuron_config=self.neuron_config)
 
         # Multi-Token Context Encoding
         else:
 
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
 
             # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
                 updated_keys, updated_values = key, value
             else:
-                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids, key, value, start_ids)
+                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                               key, value, start_ids, neuron_config=self.neuron_config)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
