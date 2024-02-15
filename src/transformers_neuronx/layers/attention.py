@@ -14,8 +14,9 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import parallel
-from transformers_neuronx import utils
+from transformers_neuronx import utils, constants
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, GQA
+from transformers_neuronx.layers import attention_utils
 
 def query_key_value(
     hidden,
@@ -151,13 +152,18 @@ def query_key_projection(query, key, qk_weight):
     return query, key
 
 
-def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None):
+def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None, neuron_config=None):
     """
     The fused K/V cache update is intended for reducing replicated index value calculation for both keys and values,
     since we are updating K/V with the same index offset.
 
     KeyCache[I], ValueCache[I] = Keys, Values
     """
+    # Check K/V cache layout
+    bsh_cache_layout = False
+    if neuron_config is not None:
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+
     dtype = cached_keys.dtype
     cache_ids_dtype = cache_ids.dtype
     use_2d_cache_ids = len(cache_ids.sizes) > 1
@@ -169,8 +175,12 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
     # 2D cache_ids
     cache_ids = hlo.transpose(cache_ids, 0, 1)
     assign_func = hlo.gen_assign_func(dtype)
-    n_positions, n_seqs, n_kv_heads, d_head = cached_keys.sizes
-    n_active_tokens, n_active_seqs, _, _  = keys.sizes
+    if bsh_cache_layout:
+        n_seqs, n_positions, n_kv_heads, d_head = cached_keys.sizes
+        n_active_seqs, n_active_tokens, _, _  = keys.sizes
+    else:
+        n_positions, n_seqs, n_kv_heads, d_head = cached_keys.sizes
+        n_active_tokens, n_active_seqs, _, _  = keys.sizes
     assert cache_ids.sizes[0] == n_active_tokens, \
         f"inconsistent sizes between cache_ids ({cache_ids.sizes}) and values ({keys.sizes})"
 
@@ -198,12 +208,7 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         keys_r = hlo.reshape(keys, [n_seqs, kv_hidden_size])
         vals_r = hlo.reshape(vals, [n_seqs, kv_hidden_size])
 
-        # [6,3,9] -> [(0,6),(1,3),(2,9)] -> [6*3,3*3+1,9*3+2] -> [18,10,29]
-        # cache_ids * n_seqs + iota
-        batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
-        indices = cache_ids_dtype[cache_ids.sizes].Multiply(cache_ids, batch_size_br)
-        offset = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[1])
-        indices = cache_ids_dtype[cache_ids.sizes].Add(indices, offset)
+        indices = attention_utils.update_indices_decode(cached_keys, cache_ids, neuron_config)
         indices = hlo.transpose(indices, 0, 1)
 
         scatter_dims = dict(update_window_dims=[1],
@@ -225,12 +230,7 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
         vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
 
-        batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
-        start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
-
-        indices = cache_ids_dtype[cache_ids.sizes].Iota(dimensions=[0])
-        indices = cache_ids_dtype[cache_ids.sizes].Multiply(indices, batch_size_br)
-        indices = cache_ids_dtype[cache_ids.sizes].Add(indices, start_ids_br)
+        indices = attention_utils.update_indices_context(cached_keys, cache_ids, start_ids, neuron_config)
 
         # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
         assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
@@ -287,8 +287,10 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
     If n_kv_heads != 0, uses multi-query/grouped-query attention.
     """
     shard_over_batch=False
+    bsh_cache_layout = False
     if neuron_config is not None:
         shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
     dtype = query.dtype
     scribe = query.scribe
@@ -306,10 +308,11 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
         keys = hlo.repeat_kv(keys, n_repeats=n_repeats, repeat_dim=2)
 
     # Q @ K
+    batch_dimensions = [0, 2] if bsh_cache_layout else [1, 2]
     dot_dims = dict(lhs_contracting_dimensions=[3],
-                    lhs_batch_dimensions=[1, 2],
+                    lhs_batch_dimensions=batch_dimensions,
                     rhs_contracting_dimensions=[3],
-                    rhs_batch_dimensions=[1, 2])
+                    rhs_batch_dimensions=batch_dimensions)
 
     result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
 
@@ -355,8 +358,10 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
     top of the softmax results.
     """
     shard_over_batch=False
+    bsh_cache_layout = False
     if neuron_config is not None:
         shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
     assert (sparse_mask is None) == (active_sparse_mask is None), "Both sparse masks must be valid to use sparse attention!"
 
@@ -367,7 +372,10 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
 
     n_seqs, n_heads_tp, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
     n_seqs, n_heads_tp, n_active_tokens, n_positions = past_scores.sizes
-    n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
+    if bsh_cache_layout:
+        n_seqs, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+    else:
+        n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
 
     # Upcast to f32 before computation
     past_scores = hlo.cast(past_scores, f32)
@@ -416,10 +424,16 @@ def context(past_scores, active_score, past_values, active_values, n_kv_heads=0,
         past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
         active_values = hlo.repeat_kv(active_values, n_repeats=n_repeats, repeat_dim=2)
 
+    # lhs (past_prob): (n_seqs, n_heads, n_active_tokens, n_positions)
+    # rhs (value):
+    # - SBH cache layout: (n_positions, n_seqs, n_heads, d_head)
+    # - BSH cache layout: (n_seqs, n_positions, n_heads, d_head)
+    rhs_contracting_dimensions = [1] if bsh_cache_layout else [0]
+    rhs_batch_dimensions = [0, 2] if bsh_cache_layout else [1, 2]
     dot_dims = dict(lhs_contracting_dimensions=[3],
                 lhs_batch_dimensions=[0, 1],
-                rhs_contracting_dimensions=[0],
-                rhs_batch_dimensions=[1, 2])
+                rhs_contracting_dimensions=rhs_contracting_dimensions,
+                rhs_batch_dimensions=rhs_batch_dimensions)
 
     output = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
     active_output = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
@@ -450,8 +464,10 @@ def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sp
     If sparse_mask is not None, apply sparse mask after the softmax
     """
     shard_over_batch=False
+    bsh_cache_layout = False
     if neuron_config is not None:
         shard_over_batch = neuron_config.group_query_attention == GQA.SHARD_OVER_BATCH
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
     probs = hlo.softmax(score)
     if sparse_mask is not None:
@@ -459,7 +475,10 @@ def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sp
         probs = mask(probs, sparse_mask, constant_val=0)
 
     n_seqs, n_heads_tp, n_active_tokens, n_positions = probs.sizes
-    n_positions, n_seqs, n_kv_heads_tp, d_head = values.sizes
+    if bsh_cache_layout:
+        n_seqs, _, n_kv_heads_tp, d_head = values.sizes
+    else:
+        _, n_seqs, n_kv_heads_tp, d_head = values.sizes
 
     if dtype is None:
         dtype = values.dtype
@@ -469,11 +488,13 @@ def context_combined(score, values, tp_degree=None, n_kv_heads=0, dtype=None, sp
         n_repeats = n_heads_tp // n_kv_heads_tp
         values = hlo.repeat_kv(values, n_repeats=n_repeats, repeat_dim=2)
 
+    rhs_contracting_dimensions = [1] if bsh_cache_layout else [0]
+    rhs_batch_dimensions = [0, 2] if bsh_cache_layout else [1, 2]
     dot_dims = dict(
         lhs_contracting_dimensions=[3],
         lhs_batch_dimensions=[0, 1],
-        rhs_contracting_dimensions=[0],
-        rhs_batch_dimensions=[1, 2]
+        rhs_contracting_dimensions=rhs_contracting_dimensions,
+        rhs_batch_dimensions=rhs_batch_dimensions
     )
     result = hlo.dot_general(probs, values, dimension_numbers=dot_dims)
 
