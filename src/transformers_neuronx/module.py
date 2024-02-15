@@ -23,6 +23,7 @@ from safetensors import safe_open
 from torch.nn.parameter import UninitializedParameter
 from transformers import AutoConfig
 from transformers.utils import hub
+from transformers_neuronx import constants
 
 # Disable lazy module warning since torch-neuronx version is pinned
 warnings.filterwarnings("ignore", category=UserWarning, module='torch.nn.modules.lazy')
