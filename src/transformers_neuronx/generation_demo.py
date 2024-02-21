@@ -251,7 +251,6 @@ def main():
     # neuron_utils utils
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
-    run_parser.add_argument('--dump_penguin_ir', action='store_true', help="Should set snapshot or pack_artifacts: dump penguin IR by passing --internal-compiler-debug-mode=penguin to compiler.")
     run_parser.add_argument('--to_s3', default=None)
     # dump logits
     run_parser.add_argument('--dump_logits', action='store_true', default=None)
@@ -522,12 +521,6 @@ def run(args, hf_model_name, model_cls):
                                                 tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
                                                 unroll=args.unroll, context_unroll=args.context_unroll)
                 
-            if args.dump_penguin_ir:
-                if os.environ.get('NEURON_CC_FLAGS') is not None:
-                    os.environ['NEURON_CC_FLAGS'] += ' --internal-compiler-debug-mode=penguin'
-                else:
-                    os.environ['NEURON_CC_FLAGS'] = '--internal-compiler-debug-mode=penguin'
-
             print('running model.to_neuron')
             begin = time.time()
             neuron_model.to_neuron()
