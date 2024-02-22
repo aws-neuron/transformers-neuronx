@@ -95,7 +95,7 @@ class MistralForSampling(base.NeuronModelBase):
                                     allow_quantize=True, allow_transform=True)
             new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1, allow_pad=True,
                                     allow_quantize=True, allow_transform=True)
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+            if self.neuron_config.weight_tiling:
                 new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
                                         allow_quantize=True, allow_transform=True)
             else:

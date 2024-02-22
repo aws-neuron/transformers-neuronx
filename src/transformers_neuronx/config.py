@@ -18,6 +18,7 @@ from transformers_neuronx import constants
 import os
 import math
 import logging
+import warnings
 
 class QuantizationConfig:
     """ The config class that contains all quantization related settings """
@@ -85,6 +86,10 @@ class NeuronConfig():
         on_device_generation (GenerationConfig, optional): Generation related configurations.
             Used to set configurations to sample on device.
             Default: `None`.
+        qkv_tiling: (`bool`, optional): [Performance] Split attention QKV
+            weights to introduce "free" 128 dimensions.
+        weight_tiling: (`bool`, optional): [Performance] Split model weights to
+            introduce "free" 128 dimensions.
     """
     def __init__(self, **kargs):
         self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
@@ -106,12 +111,24 @@ class NeuronConfig():
             self.group_query_attention = constants.GQA(self.group_query_attention)
         self.on_device_embedding = kargs.pop('on_device_embedding', False)
         self.on_device_generation = kargs.pop('generation_config', None)
+        self.qkv_tiling = kargs.pop('qkv_tiling', False)
+        if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", False):
+            warnings.warn(
+                "NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT is deprecated. "
+                "To enable weight tiling, please use `NeuronConfig(weight_tiling=True)` instead.",
+            )
+            self.weight_tiling = True
+        else:
+            self.weight_tiling = kargs.pop('weight_tiling', False)
+        if self.qkv_tiling is True:
+            assert (
+                self.fuse_qkv is True
+            ), "QKV weight tiling is currently only supported when QKV fusion is enabled."
         assert len(kargs)==0, f"unexpected arguments: {kargs}"
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
 
         self.local_tp = os.getenv("NEURON_LOCAL_TP", None)
-
 
         self.pp_stages = int(os.getenv("NEURON_PP_STAGES", 1))
 

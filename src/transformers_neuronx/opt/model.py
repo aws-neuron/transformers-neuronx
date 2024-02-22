@@ -103,7 +103,7 @@ class OPTForSampling(base.NeuronModelBase):
             new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
                                              layer.final_layer_norm.bias.detach())
             new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+            if self.neuron_config.weight_tiling:
                 new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
             else:
                 new_layer.add_mlp_output(
@@ -333,8 +333,6 @@ class OPTForSamplingNoEmbeddingHlo:
         else:
             k_weight_shape = attn_k_weight.sizes
             k_weight_dim = k_weight_shape[-1]
-        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == k_weight_dim, \
-            f"kv cache shapxe ({attn_k_cache.sizes}) doesn't match kv weight shape ({k_weight_shape})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -402,7 +400,12 @@ class OPTForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
 
         hidden_size, n_active_tokens, n_seqs = hidden.sizes
-        _, hidden_size_tp = q_weight.sizes
+        if len(q_weight.sizes) == 4:
+            weight_tiling = True
+            tile_size, hidden_size_tile, _, _ = q_weight.sizes
+            hidden_size_tp = tile_size * hidden_size_tile
+        else:
+            _, hidden_size_tp = q_weight.sizes
         fuse_qkv = neuron_config and neuron_config.fuse_qkv
         if fuse_qkv:
             hidden_size_tp //= FUSED_QKV_TP_FACTOR
