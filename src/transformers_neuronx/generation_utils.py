@@ -15,6 +15,10 @@ It requires model to have a forward interface as:
 class HuggingFaceGenerationModelAdapter(PreTrainedModel):
 
     def __init__(self, config, model):
+        # sdpa attension is currently unsupported. Torch >=2.1.1 sets _attn_implementation to sdpa causing failures.
+        if hasattr(config, "_attn_implementation") and config._attn_implementation == "sdpa":
+            warnings.warn("Warning: sdpa is unsupported as part of attention implementation. Falling back to eager attention implementation.")
+            config._attn_implementation = "eager"
         super().__init__(config)
         self.model = model
         self.config = config
