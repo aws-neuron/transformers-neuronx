@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import os
 import functools
 import operator
 from typing import Optional, List
@@ -387,14 +386,15 @@ def dot_with_tiled_weight_add(lhs, rhs, bias,
     dot = dtype[dot_result_sizes].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
     lhs_size = np.product(dot_result_lhs_sizes)
     rhs_size = np.product(dot_result_rhs_sizes)
-    dot = dtype[lhs_size, rhs_size].Reshape(dot)
+    dot = reshape(dot, (lhs_size, rhs_size))
 
     if enable_quantize:
         dot = dequantize(dot, scales, neuron_config, bias_dimension)
     if bias is None:
         return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    bias = broadcast(bias, (lhs_size, rhs_size), broadcast_dimensions=[bias_dimension])
+    result = add(dot, bias)
+    return result
 
 
 def dot_1220_add1(lhs, rhs, bias, scales=None, neuron_config=None):
@@ -466,10 +466,10 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
     hidden_r_sizes = hidden_size, n_active_tokens * batch_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+    if neuron_config is not None and neuron_config.weight_tiling:
         assert hidden_size % constants.TILE_SIZE == 0, \
-                f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
-                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+            f"in order to use weight tiling."
         hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
         hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
         hidden = dot_0120_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
@@ -528,10 +528,10 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
 
-    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+    if neuron_config is not None and neuron_config.weight_tiling:
         assert hidden_size % constants.TILE_SIZE == 0, \
-                f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
-                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+            f"in order to use weight tiling."
         hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden = dot_1220_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
@@ -587,10 +587,10 @@ def gated_mlp_bsh(
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+    if neuron_config is not None and neuron_config.weight_tiling:
         assert hidden_size % constants.TILE_SIZE == 0, \
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
-            f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+            f"in order to use weight tiling."
         hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden_active  = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
@@ -662,7 +662,7 @@ def gated_mlp(
     if len(in0_weight.sizes) == 4:
         assert hidden_size % constants.TILE_SIZE == 0, \
                 f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
-                f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+                f"in order to use weight tiling."
         hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
         hidden = hidden.dtype[hidden_tiled_sizes].Reshape(hidden)
 
