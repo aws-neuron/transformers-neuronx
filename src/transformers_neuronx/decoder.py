@@ -475,15 +475,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
                 hlo_modules[npos,batch_size] = self._hlo_multi_layer(npos,batch_size)
             ln_lm_head_hlo_modules = [self._hlo_ln_lm_head(batch_size) for batch_size in self.batch_size]
-            ode_hlo_modules = None
-            ode_num_inputs = None
             num_inputs = len(self.inputs_sdim)
             if self.neuron_config.is_pp():
-                program = PipelineParallelProgram(self.neuron_config, self.layers, ode_hlo_modules, ode_num_inputs, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+                program = PipelineParallelProgram(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
                                                     self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
                 program.init_pp_sync_programs()
             else:
+                ode_hlo_modules = None
+                ode_num_inputs = None
                 if self.neuron_config.on_device_embedding:
                     ode_hlo_modules = [self._hlo_embedding_layer(batch_size) for batch_size in self.batch_size]
                     ode_num_inputs = len(self.ode_sdim)
@@ -1500,7 +1500,7 @@ class DecoderProgram:
         idx = self.batch_sizes.index(batch_size)
         if self.logits_buffer:
             if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
-
+                
                 if self.neuron_config.log_softmax_scores:
                     return [self.manipulator.unshard_along(val, dim=0) for val in self.logits_buffer[idx]]
                 else:
@@ -1861,7 +1861,7 @@ class PipelineParallelProgram(DecoderProgramMultiLayer):
             hidden_sizes = hidden.dimensions
             hidden_dtype = compiler.primitive2name(hidden.element_type)
 
-            logits = self.ln_lm_head_hlo_modules[batch_idx].module.host_program_shape.result.tuple_shapes[0]
+            logits = self.ln_lm_head_hlo_modules[batch_idx].host_program_shape.result
 
             logits_sizes = logits.dimensions
             logits_dtype = compiler.primitive2name(logits.element_type)
@@ -2005,7 +2005,7 @@ def populate_debug_tensors(debug_outputs={}):
                     outputs.append(debug_tensor.tensor)
             # Now we just have to actually return a tuple
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
-            return scribe.tuple(*root_shapes).Tuple(*outputs)
+            return scribe.tuple(*root_shapes).Tuple(*outputs) 
         return wrapper
     return inner
 
