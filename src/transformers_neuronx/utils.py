@@ -260,9 +260,3 @@ def build_replica_groups(num_groups, group_size):
     ]
     return replica_groups
 
-
-def kernel_tag(npos, batch_size, tag=None):
-    kernel_tag = f"seqlen{npos}-batch{batch_size}"
-    if tag is not None:
-        kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
-    return kernel_tag
