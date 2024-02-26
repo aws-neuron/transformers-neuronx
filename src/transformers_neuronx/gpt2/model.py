@@ -270,7 +270,8 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=batch_size,
             attention_head_size=attention_head_size, amp=amp,
             num_layers=config.n_layer, n_head=config.n_head, n_kv_head=config.n_kv_head,
-            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder
+            unroll=unroll, neuron_config=self.neuron_config, builder=hlo_builder,
+            prompt_batch_size=self.prompt_batch_size
         )
 
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets,
