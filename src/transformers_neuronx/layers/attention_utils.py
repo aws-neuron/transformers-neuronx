@@ -83,3 +83,31 @@ def update_indices_context(cached_keys, cache_ids, start_ids, neuron_config=None
         indices = cache_ids_dtype[cache_ids.sizes].Multiply(indices, batch_size_br)
         indices = cache_ids_dtype[cache_ids.sizes].Add(indices, start_ids_br)
     return indices
+
+
+def gather_blocks(key_cache, block_tables):
+    """
+    Select KV cache blocks and gather assigned blocks into output buffer.
+
+    Args:
+        key_cache: The KV cache blocks.
+            The input shape is [num_blocks, block_size, n_kv_heads, d_head]
+        block_tables: The block table that contains block indices for each of the sequences.
+            The input shape is [n_seqs, max_num_blocks_per_seq]
+
+    Returns:
+        cached_keys: The selected KV cache blocks.
+            The output layout is [n_seqs, max_model_len, n_kv_heads, d_head],
+            where max_model_len=max_num_blocks_per_seq*block_size
+    """
+    num_blocks, block_size, n_kv_heads, d_head = key_cache.sizes
+    n_seqs, max_num_blocks_per_seq = block_tables.sizes
+    dtype = key_cache.dtype
+    hidden_size = n_kv_heads * d_head
+    chunk_size = block_size * hidden_size
+    key_cache = hlo.reshape(key_cache, (num_blocks, chunk_size))
+    index = hlo.reshape(block_tables, (n_seqs * max_num_blocks_per_seq,))
+    o_sizes = (n_seqs * max_num_blocks_per_seq, chunk_size)
+    cached_keys = hlo.index_select(key_cache, dim=0, index=index)
+    cached_keys = hlo.reshape(cached_keys, (n_seqs, max_num_blocks_per_seq * block_size, n_kv_heads, d_head))
+    return cached_keys
