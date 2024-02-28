@@ -89,6 +89,10 @@ def gather_blocks(key_cache, block_tables):
     """
     Select KV cache blocks and gather assigned blocks into output buffer.
 
+    Reference design in PyTorch:
+        result = torch.index_select(key_cache, dim=0, index=block_table.flatten())
+        result = torch.reshape(result, (n_seqs, max_model_len, n_kv_heads, d_head))
+
     Args:
         key_cache: The KV cache blocks.
             The input shape is [num_blocks, block_size, n_kv_heads, d_head]
@@ -111,3 +115,57 @@ def gather_blocks(key_cache, block_tables):
     cached_keys = hlo.index_select(key_cache, dim=0, index=index)
     cached_keys = hlo.reshape(cached_keys, (n_seqs, max_num_blocks_per_seq * block_size, n_kv_heads, d_head))
     return cached_keys
+
+
+def prior_context(past_scores, past_values,
+                  n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None):
+    """
+    Compute "context" output from the QK score and value projection.
+
+    C = softmax(S) @ V
+
+    If n_kv_heads != 0, uses multi-query, multi-group attention.
+    If dtype is None, uses past_scores datatype.
+    """
+
+    if dtype == None:
+        dtype = past_scores.dtype
+    scribe = past_scores.scribe
+    f32 = scribe.f32
+
+    bsh_cache_layout = False
+    if neuron_config is not None:
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+
+    n_seqs, n_heads, n_active_tokens, n_positions = past_scores.sizes
+    if bsh_cache_layout:
+        n_seqs, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+    else:
+        n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
+    reduce_sizes = n_seqs, n_heads, n_active_tokens
+
+    # Upcast to f32 before computation
+    past_scores = hlo.cast(past_scores, f32)
+    past_prob = hlo.softmax(past_scores)
+
+    if n_kv_heads != 0:
+        _, n_heads_tp, *_ = past_prob.sizes
+        _, _, n_kv_heads_tp, *_ = past_values.sizes
+        n_repeats = n_heads_tp // n_kv_heads_tp
+
+        # values layout: (n_positions, n_seqs_per_nc, n_kv_heads, d_head) -> repeat_dim=2
+        past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
+
+    # lhs (past_prob): (n_seqs, n_heads, n_active_tokens, n_positions)
+    # rhs (value):
+    # - SBH cache layout: (n_positions, n_seqs, n_heads, d_head)
+    # - BSH cache layout: (n_seqs, n_positions, n_heads, d_head)
+    rhs_contracting_dimensions = [1] if bsh_cache_layout else [0]
+    rhs_batch_dimensions = [0, 2] if bsh_cache_layout else [1, 2]
+    dot_dims = dict(lhs_contracting_dimensions=[3],
+                lhs_batch_dimensions=[0, 1],
+                rhs_contracting_dimensions=rhs_contracting_dimensions,
+                rhs_batch_dimensions=rhs_batch_dimensions)
+
+    output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
+    return output_dot
