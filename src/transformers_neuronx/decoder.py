@@ -482,14 +482,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 hlo_modules[npos,batch_size] = self._hlo_multi_layer(npos,batch_size)
             ln_lm_head_hlo_modules = [self._hlo_ln_lm_head(batch_size) for batch_size in self.batch_size]
             num_inputs = len(self.inputs_sdim)
+            ode_hlo_modules = None
+            ode_num_inputs = None
             if self.neuron_config.is_pp():
-                program = PipelineParallelProgram(self.neuron_config, self.layers, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
+                program = PipelineParallelProgram(self.neuron_config, self.layers, ode_hlo_modules, ode_num_inputs, hlo_modules, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
                                                     self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
                 program.init_pp_sync_programs()
             else:
-                ode_hlo_modules = None
-                ode_num_inputs = None
                 if self.neuron_config.on_device_embedding:
                     ode_hlo_modules = [self._hlo_embedding_layer(batch_size) for batch_size in self.batch_size]
                     ode_num_inputs = len(self.ode_sdim)
