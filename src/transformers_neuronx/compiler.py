@@ -372,7 +372,12 @@ class Executor:
         else:
             outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
 
-        if return_ranks == 1:
+        # Executor v1 returns multiple shards
+        # Executor v2 returns concatenated shards (across dim=0) in one contiguous allocation
+        # This logic is compatible with both new/old versions of `libtorchneuron.so`
+        if len(outputs) > 0 and isinstance(outputs[0], torch.Tensor):
+            result = tuple(outputs)
+        elif return_ranks == 1:
             result = tuple(shards[0] for shards in outputs)
         else:
             result = tuple(torch.cat(shards, dim=0) for shards in outputs)
