@@ -66,7 +66,6 @@ def nki_call(func, *args, **kwargs):
             return o        
     """
     
-    kernel_attrs = kwargs.pop("kernel_attrs", ())
     grid = kwargs.pop("grid", None)   
     return NkiHloKernel(func, grid=grid)(*args, **kwargs)
 
