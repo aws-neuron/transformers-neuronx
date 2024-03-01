@@ -71,3 +71,8 @@ def lower(func: Callable, inputs: Union[Tuple[torch.Tensor, ...], torch.Tensor])
 
     hlo_module = compiler.compile_py_func(interface)
     return hlo_module
+
+def build_run(network, example):
+    hlo_module = lower(network, example)
+    neuron = PyHloSingleCoreExecutable(hlo_module)
+    return neuron(*example)
