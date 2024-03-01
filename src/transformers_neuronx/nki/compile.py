@@ -20,6 +20,7 @@ import numpy as np
 import inspect
 from transformers_neuronx import compiler
 from neuronxcc.nki import trace
+import neuronxcc.nki.language as nl
 from neuronxcc.nki import FrameworkKernel
 from torch_neuronx.pyhlo.scribe import HloShape
 
@@ -34,7 +35,7 @@ class PyTorchTracedKernel(FrameworkKernel):
     def translate_to_neuron_dtype(self, _dtype):
         dtype = self.dtype_converter.hlo2torch(_dtype)
         if dtype == torch.bfloat16:
-            dtype = np.dtype("|V2")
+            dtype = nl.bfloat16
         else:
             dtype = torch.empty(1, dtype=dtype).numpy().dtype
         return dtype
