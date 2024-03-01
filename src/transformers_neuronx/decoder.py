@@ -159,6 +159,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.neuron_config.group_query_attention = constants.GQA.REPLICATED_HEADS
 
     def init_context_decoder(self, unroll, buckets, model_obj):
+        cls = type(self)
         decoder_lm_head = {}
         if self.prompt_batch_size:
             self.context_batch_sizes = [self.prompt_batch_size]
@@ -168,7 +169,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.context_batch_sizes = self.batch_size
         for context_length_estimate in buckets:
             for batch_size in self.context_batch_sizes:
-                decoder_lm_head[context_length_estimate, batch_size] = DecoderLmHeadForSamplingNoEmbedding(
+                decoder_lm_head[context_length_estimate, batch_size] = cls(
                     tp_degree=self.tp_degree,
                     n_positions_list=[context_length_estimate],
                     n_active_tokens=context_length_estimate,
@@ -189,7 +190,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
 
     def init_token_decoder(self,unroll, buckets, model_obj):
-        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        cls = type(self)
+        decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
             n_active_tokens=1,
@@ -216,7 +218,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         return decoder_lm_head
 
     def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
-        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        cls = type(self)
+        decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
             n_active_tokens=n_active_tokens,
@@ -236,7 +239,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         return decoder_lm_head
 
     def init_window_context_decoder(self, unroll, buckets, model_obj, n_active_tokens):
-        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+        cls = type(self)
+        decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
             n_active_tokens=n_active_tokens,
@@ -344,7 +348,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
                             unroll=None, share_caches=False, new=None):
         if new == None:
-            new = DecoderLmHeadForSamplingNoEmbedding(
+            cls = type(self)
+            new = cls(
                 self.tp_degree, self.n_positions_list, self.n_active_tokens, self.batch_size, self.attention_head_size,
                 amp=self.amp, num_layers=self.num_layers, n_head=self.n_head, n_kv_head=self.n_kv_head,
                 unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
@@ -1403,7 +1408,7 @@ class MaybeParallelTensorManipulator:
             new_tensors = []
             for tensor in tensors:
                 K, N = tensor.shape
-                assert(K % constants.TILE_SIZE == 0 and N % constants.TILE_SIZE == 0,  
+                assert(K % constants.TILE_SIZE == 0 and N % constants.TILE_SIZE == 0,
                     f"Weight dimensions must be divisible by {constants.TILE_SIZE} but received weight with shape={K, N}."
                 )
                 reshape_sizes = [K // constants.TILE_SIZE,
@@ -1513,7 +1518,7 @@ class DecoderProgram:
         idx = self.batch_sizes.index(batch_size)
         if self.logits_buffer:
             if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
-                
+
                 if self.neuron_config.log_softmax_scores:
                     return [self.manipulator.unshard_along(val, dim=0) for val in self.logits_buffer[idx]]
                 else:
