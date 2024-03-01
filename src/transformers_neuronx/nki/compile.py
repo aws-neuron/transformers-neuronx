@@ -17,8 +17,35 @@ import json
 import torch
 import base64
 import numpy as np
+import inspect
 from transformers_neuronx import compiler
-from neuronxcc.nki import decltensor, trace
+from neuronxcc.nki import trace
+from neuronxcc.nki import FrameworkKernel
+from torch_neuronx.pyhlo.scribe import HloShape
+
+
+class PyTorchTracedKernel(FrameworkKernel):
+    dtype_converter = compiler.DataTypeConverter()
+
+    @staticmethod
+    def get_shape(hloShape):
+        return tuple([d for d in hloShape.shape_proto.dimensions])
+
+    def translate_to_neuron_dtype(self, _dtype):
+        dtype = self.dtype_converter.hlo2torch(_dtype)
+        if dtype == torch.bfloat16:
+            dtype = np.dtype("|V2")
+        else:
+            dtype = torch.empty(1, dtype=dtype).numpy().dtype
+        return dtype
+
+    def is_framework_tensor(self, t):
+        return isinstance(t, HloShape)
+
+    def map_framework_tensor(self, hloShape):
+        shape = self.get_shape(hloShape)
+        dtype = hloShape.shape_proto.element_type
+        return shape, dtype
 
 def nki_call(func, *args, **kwargs):
     """ 
@@ -28,7 +55,6 @@ def nki_call(func, *args, **kwargs):
         func: NKI kernel function
         args: inputs of func
         kwargs:
-            kernel_attrs (kernel attributes)
             grid (grid used in NKI kernel function)
             output_HloShapes (HloShapes of outputs of NKI kernel)
 
@@ -42,7 +68,7 @@ def nki_call(func, *args, **kwargs):
     
     kernel_attrs = kwargs.pop("kernel_attrs", ())
     grid = kwargs.pop("grid", None)   
-    return NkiHloKernel(func, grid, kernel_attrs)(*args, **kwargs)
+    return NkiHloKernel(func, grid=grid)(*args, **kwargs)
 
 
 class NkiHloKernel:
@@ -63,87 +89,65 @@ class NkiHloKernel:
     Example:
         # 1) Define NKI Kernel
 
-        def add_subtract_kernel(a_ptr, b_ptr, c_ptr, d_ptr):
-            ix = arange(128)[:, None]
-            iy = arange(512)[None, :]
-            tile_size = 128 * 512
-            block_size = 8 * tile_size
-            n_elements = 32 * 8 * 128 * 512
-            j = program_id(axis=0)
-            for i in affine_range(8):
-                offset = j * block_size + i * tile_size + 512 * ix + iy
-                mask = offset < n_elements
-                a_ptr = a_ptr + offset
-                b_ptr = b_ptr + offset
-                c_ptr = c_ptr + offset
-                d_ptr = d_ptr + offset
-                a = load(a_ptr)
-                b = load(b_ptr)
-                c = a + b
-                d = a - b
-                store(c_ptr, value=c)
-                store(d_ptr, value=d)   
+            def add_kernel(a_input, b_input, c_output):
+                # Calculate tile offsets based on current 'program'
+                offset_i_x = nl.program_id(0) * 128
+                offset_i_y = nl.program_id(1) * 512
+
+                # Generate tensor indices to index tensors a and b
+                ix = offset_i_x + nl.arange(128)[:, None]
+                iy = offset_i_y + nl.arange(512)[None, :]
+
+                # Load input data from external memory to on-chip memory
+                # We refer to an indexed portion of a tensor as an intermediate tensor
+                a_tile = nl.load(a_input[ix, iy])
+                b_tile = nl.load(b_input[ix, iy])
+
+                # compute a + b
+                c_tile = a_tile + b_tile
+
+                # store the addition results back to external memory (c_output)
+                nl.store(c_output[ix, iy], value=c_tile)
 
         # 2) Use NKI kernel by nki_call:
 
             def mixed_pyhlo_nki(x, y):
+                grid_x = x.sizes[0] // 128
+                grid_y = x.sizes[1] // 512
                 h = x.dtype[x.sizes].Multiply(x, x)
-                o = nki_call(add_subtract_kernel, h, y, grid=32, output_HloShapes=[y.dtype[y.sizes], y.dtype[y.sizes]])
+                o = nki_call(nki_add, h, y, grid=(grid_x, grid_y), output_HloShapes=[y.dtype[y.sizes]])
                 return o
+
 
     """
 
-    def __init__(self, func, grid=None, kernel_attrs=("tiled")):
+    def __init__(self, func, grid=None, **kwargs):
         self.func = func
-        self.func_literal = None
-        self.grid = ()        
-        self.kernel_attrs = kernel_attrs
-        self.func_name = func.__name__
+        self.grid = ()
         if grid is not None:
            self.set_grid(grid)
-
-    def dump_config(self):
-        config = {}
-        config["func_literal"] = self.func_literal
-        config["kernel_attrs"] = self.kernel_attrs
-        config["grid"] = self.grid
-        config["func_name"] = self.func_name
-        return base64.b64encode(json.dumps(config).encode("utf-8")).decode("utf-8")
+        self._kernel = PyTorchTracedKernel(
+            func_name=func.__name__,
+            func=self.func,
+            grid=self.grid,
+            **kwargs
+        )
 
     def set_grid(self, grid):
         if not isinstance(grid, (tuple, list)):
             grid = [grid]
         self.grid = grid
-        return self
-
-    @staticmethod
-    def _to_neuron_dtype(hloShape):
-        """
-        Translate a pytorch dtype to neuron specific dtype representation in numpy
-        """
-        dtype_converter = compiler.DataTypeConverter()
-        _dtype = dtype_converter.hlo2torch(hloShape.shape_proto.element_type)
-        if _dtype == torch.bfloat16:            
-            return np.dtype("|V2")        
-        return torch.empty(1, dtype=_dtype).numpy().dtype
 
     def __call__(self, *args, output_HloShapes=None):        
         if output_HloShapes is None: 
            raise ValueError("output_shape should be set in NkiHloKernel !")
+
         if not isinstance(output_HloShapes, (list, tuple)):
             output_HloShapes = [output_HloShapes]
-        get_shape = lambda hloShape: tuple([d for d in hloShape.shape_proto.dimensions])
-        virtual_tensors = [
-            decltensor(shape=get_shape(hloShape), dtype=self._to_neuron_dtype(hloShape))
-            for hloShape in (*args, *output_HloShapes)
-        ]
         
-        traced = trace(
-            func=self.func, grid=self.grid, kernel_attrs=self.kernel_attrs
-        ).specialize(*virtual_tensors)
+        input_output_HloShapes = (*args, *output_HloShapes)
+        config_str, input_names, output_names = self._kernel.dump_config(*input_output_HloShapes)
 
-        self.func_literal = traced.serialize_ir_string(f"{self.func_name}_ir")
-        config_str=self.dump_config()
         if len(output_HloShapes) > 1: 
             output_HloShapes = args[0].scribe.tuple(*output_HloShapes) 
         else:
@@ -154,4 +158,3 @@ class NkiHloKernel:
                                              custom_call_target='AwsNeuronCustomNativeKernel')
 
         return output
-
