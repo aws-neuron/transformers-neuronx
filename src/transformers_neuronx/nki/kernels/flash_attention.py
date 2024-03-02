@@ -15,7 +15,7 @@
 
 import numpy as np
 
-from neuronxcc.nki.kernels import flash_fwd
+import neuronxcc.nki.language as nl
 from transformers_neuronx.nki.compile import nki_call
 
 def flash_fwd_wrapper(q, k, v, o, lse):
@@ -28,10 +28,14 @@ def flash_fwd_wrapper(q, k, v, o, lse):
     o: output buffer of shape (b, h, seqlen, d)
     lse: log-sum-exp for bwd pass stored in (b, h, nl.tile_size.pmax, seqlen // nl.tile_size.pmax) where nl.tile_size.pmax is 128
   """
+  from neuronxcc.nki.kernels.attention import flash_fwd_512
+
   softmax_scale=None
   use_causal_mask=True
   mixed_precision=True  
-  flash_fwd(q, k, v, o, lse, softmax_scale=softmax_scale, use_causal_mask=use_causal_mask, mixed_precision=mixed_precision)
+  
+  # flash_fwd(q, k, v, o, lse, softmax_scale=softmax_scale, use_causal_mask=use_causal_mask, mixed_precision=mixed_precision)
+  flash_fwd_512(q, k, v, o, lse, use_causal_mask=use_causal_mask, mixed_precision=mixed_precision)
 
 if __name__ == "__main__":
     import torch
