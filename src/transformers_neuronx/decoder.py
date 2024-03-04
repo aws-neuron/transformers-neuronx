@@ -259,7 +259,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = True
 
     def enable_executor(self, return_ranks=-1):
-        self.return_ranks = return_ranks
+        self.return_ranks = return_ranks if not self.neuron_config.on_device_generation else 1
         self.program.enable_executor()
 
     def add_inputs_builder(self, inputs_builder):
