@@ -110,7 +110,7 @@ class NeuronConfig():
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
         self.on_device_embedding = kargs.pop('on_device_embedding', False)
-        self.on_device_generation = kargs.pop('generation_config', None)
+        self.on_device_generation = kargs.pop('on_device_generation', None)
         self.qkv_tiling = kargs.pop('qkv_tiling', False)
         if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", False):
             warnings.warn(
