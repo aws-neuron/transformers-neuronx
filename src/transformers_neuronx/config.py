@@ -105,7 +105,7 @@ class NeuronConfig():
         if self.group_query_attention is not None:
             self.group_query_attention = constants.GQA(self.group_query_attention)
         self.on_device_embedding = kargs.pop('on_device_embedding', False)
-        self.on_device_generation = kargs.pop('generation_config', None)
+        self.on_device_generation = kargs.pop('on_device_generation', None)
         assert len(kargs)==0, f"unexpected arguments: {kargs}"
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
