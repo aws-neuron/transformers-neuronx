@@ -983,6 +983,16 @@ class DecoderLayer(torch.nn.Module):
             ):
                 ratio = int(self.n_head / self.n_kv_head)
 
+                # Reduced replication - This maintains GQA but minimizes the replication of the
+                #   KV cache only up to the tensor parallel degree so that the data copying is
+                #   minimal per NeuronCore.
+                if (
+                    (self.n_kv_head < self.tp_degree)
+                    and (self.tp_degree % self.n_kv_head == 0)
+                    and (self.n_head % self.tp_degree == 0)
+                ):
+                    ratio = int(self.tp_degree / self.n_kv_head)
+
                 def repeat(weight):
                     if weight is None:
                         return weight
@@ -996,7 +1006,7 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_weight = repeat(self.attn_v_weight)
                 self.attn_k_bias = repeat(self.attn_k_bias)
                 self.attn_v_bias = repeat(self.attn_v_bias)
-                self.n_kv_head = self.n_head
+                self.n_kv_head *= ratio
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = qkv_maybe_pad(self.attn_k_weight, dim=1)
