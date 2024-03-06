@@ -321,7 +321,7 @@ class LowMemoryEmbedding(torch.nn.Embedding, LowMemoryModule):
         pass
 
 
-def maybe_download_weights(path_or_repo_id, **kwargs):
+def maybe_download_weights(path_or_repo_id, safe_serialization=True, **kwargs):
     """
     Get the local path to weights or download them from the huggingface hub.
 
@@ -337,6 +337,7 @@ def maybe_download_weights(path_or_repo_id, **kwargs):
             path (i.e. `bigscience/bloom-560m` or `/home/ubuntu/example`)
 
     Kwargs:
+        safe_serialization: Allow/Prohibit safetensor checkpoints.
         kwargs: Passed to `cached_file` in order to allow downloads with
             specific authorization/branches/etc.
 
@@ -348,15 +349,23 @@ def maybe_download_weights(path_or_repo_id, **kwargs):
     if os.path.isdir(path_or_repo_id):
         return path_or_repo_id
 
-    # Search for checkpoints in order of fastest loads
-    filename = None
-    checkpoint = None
-    for checkpoint in [
+    checkpoints = [
         _SAFETENSORS_MODEL_INDEX_FILENAME_JSON,
         _SAFETENSORS_MODEL_FILENAME,
         _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
         _PYTORCH_MODEL_BIN_FILENAME,
-    ]:
+    ]
+
+    if not safe_serialization:
+        checkpoints = [
+            _PYTORCH_MODEL_BIN_INDEX_FILENAME_JSON,
+            _PYTORCH_MODEL_BIN_FILENAME,
+        ]
+
+    # Search for checkpoints in order of fastest loads
+    filename = None
+    checkpoint = None
+    for checkpoint in checkpoints:
         # Ignore errors since only one format may exist
         filename = hub.cached_file(path_or_repo_id, checkpoint, _raise_exceptions_for_missing_entries=False, **kwargs)
         if filename:
