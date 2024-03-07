@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx.version import __version__
 
-from transformers_neuronx.config import NeuronConfig, QuantizationConfig, ContinuousBatchingConfig
+from transformers_neuronx.config import NeuronConfig, QuantizationConfig, ContinuousBatchingConfig, GenerationConfig
 from transformers_neuronx.constants import GQA
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
