@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import pickle
 import os
 import itertools
 import warnings
@@ -30,10 +29,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.utils import interleave_qkv, get_pad_size
-
-from concurrent.futures import ProcessPoolExecutor
+from transformers_neuronx.utils import interleave_qkv
 
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
@@ -78,7 +74,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.use_executor = False
         self.return_ranks = -1 if not self.neuron_config.on_device_generation else 1
         self.need_reorder_cache = False
-        self.hlo_builder=builder
+        self.builder = builder
         self.check_gqa_fallback()
         self.tag = tag
 
@@ -183,6 +179,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     neuron_config=self.neuron_config,
                     allow_pad=self.allow_pad,
                     return_all_outputs=False,
+                    builder=self.builder,
                     tag="context"
                 )
                 base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head[context_length_estimate, batch_size])
@@ -205,16 +202,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             neuron_config=self.neuron_config,
             allow_pad=True,
             return_all_outputs=True,
+            builder=self.builder,
             tag="token",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
-        decoder_lm_head.add_inputs_builder(self.hlo_builder.inputs)
-        if hasattr(self.hlo_builder, 'pre_layer'):
-            decoder_lm_head.add_pre_layer_builder(self.hlo_builder.pre_layer)
-        decoder_lm_head.add_layer_builder(self.hlo_builder.layer)
-        decoder_lm_head.add_ln_lm_head_builder(self.hlo_builder.ln_lm_head)
-        if hasattr(self.hlo_builder, 'embedding'):
-            decoder_lm_head.add_embedding_builder(self.hlo_builder.embedding)
+        decoder_lm_head.add_inputs_builder(self.builder.inputs)
+        if hasattr(self.builder, 'pre_layer'):
+            decoder_lm_head.add_pre_layer_builder(self.builder.pre_layer)
+        decoder_lm_head.add_layer_builder(self.builder.layer)
+        decoder_lm_head.add_ln_lm_head_builder(self.builder.ln_lm_head)
+        if hasattr(self.builder, 'embedding'):
+            decoder_lm_head.add_embedding_builder(self.builder.embedding)
         return decoder_lm_head
 
     def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
@@ -233,6 +231,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             neuron_config=self.neuron_config,
             allow_pad=True,
             return_all_outputs=True,
+            builder=self.builder,
             tag=f"speculation-k{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -254,6 +253,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             neuron_config=self.neuron_config,
             allow_pad=True,
             return_all_outputs=False,
+            builder=self.builder,
             tag=f"window-width{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -505,12 +505,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_embedding_layer(self, batch_size):
 
+        *_, n_positions = self.n_positions_list
+        self.builder.n_positions = n_positions
+
         def _embedding(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
-            *_, n_positions = self.n_positions_list
             (hidden, *tensors), self.ode_sdim = self.inputs_builder(
-                    scribe, dtype, n_positions, self.n_active_tokens, batch_size)
+                    scribe, dtype, self.n_active_tokens, batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.ode_sdim))
             pre_layer_params = self._hlo_pre_layer_params(param_builder)
             hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
@@ -520,12 +522,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_fully_unrolled(self, n_positions, batch_size):
 
+        self.builder.n_positions = n_positions
+
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, self.n_active_tokens, batch_size)
-            last_token_id = tensors[0]
+                scribe, dtype, self.n_active_tokens, batch_size)
+            last_token_id = tensors[2]
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions, batch_size)
             hidden = maybe_transfer_with_static_ring(hidden)
@@ -558,10 +562,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_multi_layer(self, n_positions, batch_size):
 
+        self.builder.n_positions = n_positions
+
         def multi_layer(scribe):
             dtype = getattr(scribe, self.amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, n_positions, self.n_active_tokens, batch_size)
+                scribe, dtype, self.n_active_tokens, batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
             # use the first `unroll` layers to build the HLO -- assuming all layers are same
             layers = self.layers[:self.unroll]
@@ -641,12 +647,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_ln_lm_head(self, batch_size):
         hidden_sizes = []
+        *_, n_positions = self.n_positions_list
+        self.builder.n_positions = n_positions
 
         def capture_hidden_sizes(scribe):
             dtype = getattr(scribe, self.amp)
-            *_, n_positions = self.n_positions_list
             (hidden, *_), _ = self.inputs_builder(
-                scribe, dtype, n_positions, self.n_active_tokens, batch_size)
+                scribe, dtype, self.n_active_tokens, batch_size)
             hidden_sizes.clear()
             hidden_sizes.extend(hidden.sizes)
             return hidden
