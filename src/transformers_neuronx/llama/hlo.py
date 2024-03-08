@@ -29,6 +29,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         self.config = config
         self.neuron_config = neuron_config
+        self.n_positions = None
 
     @property
     def shard_over_batch(self):
@@ -38,17 +39,13 @@ class LlamaForSamplingNoEmbeddingHlo:
             and self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
         )
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config)
-        head_dim = self.config.attention_head_size
-        pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
-                                                base=self.config.rope_theta,
-                                                interpolation_factor=self.config.position_interpolation_factor)
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), dims
 
-    def embedding(self, input_ids, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
+        return tensors, dims
+
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -56,6 +53,17 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
+
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
+        head_dim = self.config.attention_head_size
+        pos_embed = rotary.hlo_rotary_embedding(
+            hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+            base=self.config.rope_theta,
+            interpolation_factor=self.config.position_interpolation_factor
+        )
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
+
 
     def layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,

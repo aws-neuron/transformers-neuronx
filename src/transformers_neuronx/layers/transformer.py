@@ -84,7 +84,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         None                   # last_token_id | Scalar, no slicing required
     )
 
-    return hidden, cache_ids, start_ids, last_token_id, sequence_slice_dimensions
+    return (hidden, cache_ids, start_ids, last_token_id), sequence_slice_dimensions
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
