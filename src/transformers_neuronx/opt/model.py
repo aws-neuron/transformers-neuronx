@@ -168,7 +168,7 @@ class OPTForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
+            return sampling.sample_tokens(self, input_ids, start_ids=start_ids,
                                           sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
         else:
             return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
@@ -264,6 +264,7 @@ class OPTForSamplingNoEmbeddingHlo:
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
+        self.n_positions = None
 
         # Offset for for architecture specific on-device embedding
         # OPT Reference: https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/opt/modeling_opt.py#L94-L96
@@ -274,13 +275,12 @@ class OPTForSamplingNoEmbeddingHlo:
         # Property access allows fallback configuration to be enabled after construction
         return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
         curr_window_start = scribe.s32.Parameter(parameter_number=4)
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask), (*dims, None)
+        return (*tensors, curr_window_start), (*dims, None)
 
     def embed_positions_ids(self, position_ids, start_ids):
         batch_size, = start_ids.sizes
@@ -293,7 +293,7 @@ class OPTForSamplingNoEmbeddingHlo:
         mask = hlo.less(position_ids, zero)
         return hlo.masked_select(mask, zero, position_ids)
 
-    def embedding(self, input_ids, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, wte, wpe):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, wte, wpe):
         dtype = getattr(input_ids.scribe, self.amp)
         inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
         position_ids = self.embed_positions_ids(cache_ids, start_ids)
@@ -310,6 +310,10 @@ class OPTForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
+
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
@@ -356,8 +360,8 @@ class OPTForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
         logits = transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
         if self.neuron_config.on_device_generation:
-            logits = generation.generate(logits, logits_indices, self.neuron_config.on_device_generation, 
-                                         tp_degree=self.tp_degree, eos_token_id=self.eos_token_id)               
+            logits = generation.generate(logits, logits_indices, self.neuron_config.on_device_generation,
+                                         tp_degree=self.tp_degree, eos_token_id=self.eos_token_id)
         return logits
 
     def post_layer(self, logits):
