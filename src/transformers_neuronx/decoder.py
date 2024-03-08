@@ -215,12 +215,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             decoder_lm_head.add_embedding_builder(self.hlo_builder.embedding)
         return decoder_lm_head
 
-    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
-        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None):
+        cls = type(self)
+        decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
             n_active_tokens=n_active_tokens,
-            batch_size=self.batch_size,
+            batch_size=self.batch_size if batch_size is None else batch_size,
             attention_head_size=self.attention_head_size,
             amp=self.amp,
             num_layers=self.num_layers,
@@ -416,7 +417,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
-        batch_size, = start_ids.shape
+        batch_size = start_ids.shape[0]
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
