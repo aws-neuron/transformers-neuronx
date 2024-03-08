@@ -85,6 +85,35 @@ def update_indices_context(cached_keys, cache_ids, start_ids, neuron_config=None
     return indices
 
 
+def update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config=None):
+    # Check K/V cache layout: similar to `update_indices_context` above,
+    # but handles the case where n_active_tokens > 1 and n_active_tokens < n_positions
+    bsh_cache_layout = False
+    if neuron_config is not None:
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+    if bsh_cache_layout:
+        n_seqs, n_positions, n_kv_heads, d_head = cached_keys.sizes
+    else:
+        n_positions, n_seqs, n_kv_heads, d_head = cached_keys.sizes
+    cache_ids_dtype = cache_ids.dtype
+    if bsh_cache_layout:
+        # start_ids * n_positions + iota
+        n_positions_br = hlo.full(n_positions, cache_ids_dtype, cache_ids.sizes)
+        start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
+        offset = hlo.multiply(start_ids_br, n_positions_br)
+        indices = hlo.add(indices, cache_ids)
+        indices = hlo.reshape(indices, [n_active_tokens * batch_size])
+    else:
+        # start_ids + cache_ids * n_seqs
+        n_active_tokens, batch_size = cache_ids.sizes
+        batch_size_br = hlo.full(n_seqs, cache_ids_dtype, cache_ids.sizes)
+        start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
+        indices = hlo.multiply(cache_ids, batch_size_br)
+        indices = hlo.add(indices, start_ids_br)
+        indices = hlo.reshape(indices, [n_active_tokens * batch_size])
+    return indices
+
+
 def gather_blocks(key_cache, block_tables):
     """
     Select KV cache blocks and gather assigned blocks into output buffer.
