@@ -520,6 +520,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         return compiler.compile_py_func(_embedding)
 
+    def _hlo_unroll(self, hidden, tensors, layers_caches, layers_weights, pre_layer_params, lm_head_params):
+        last_token_id = tensors[2]
+        hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
+        hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params)
+        hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights, alias_caches=False)
+        logits = self.ln_lm_head_builder(hidden, last_token_id, *lm_head_params, return_all_outputs=self.return_all_outputs)
+        return logits, out_caches
+
     def _hlo_fully_unrolled(self, n_positions, batch_size):
 
         self.builder.n_positions = n_positions
@@ -527,32 +535,27 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
+
+            # Create user parameters
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, self.n_active_tokens, batch_size)
-            last_token_id = tensors[2]
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
-            layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions, batch_size)
-            hidden = maybe_transfer_with_static_ring(hidden)
-            pre_layer_params = self._hlo_pre_layer_params(param_builder)
-            hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
-            hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params)
-            ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
-            ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
-            head_weight = param_builder.from_tensor(self.lm_head_weight)
-            head_bias = param_builder.from_tensor(self.lm_head_bias)
-            logits_indices = param_builder.from_tensor(self.logits_indices)
-            hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights)
-            ln_f_weight = maybe_transfer_with_static_ring(ln_f_weight)
-            ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
-            head_weight = maybe_transfer_with_static_ring(head_weight)
-            head_bias = maybe_transfer_with_static_ring(head_bias)
 
-            logits = self.ln_lm_head_builder(hidden, last_token_id, ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices, return_all_outputs=self.return_all_outputs)
+            # Create inputs for all weights & caches
+            in_caches, layers_weights, pre_layer_params, lm_head_params = self._hlo_parameters(n_positions, batch_size, param_builder)
+
+            # Unroll the graph
+            logits, out_caches = self._hlo_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
+            self._hlo_cache_aliases(in_caches, out_caches)
+
+            # Set the output
+            out_caches = itertools.chain(*out_caches)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores, *out_caches]
             else:
                 outputs = [logits, *out_caches]
+
             # Filter out the None's in outputs
             outputs = [o for o in outputs if o is not None]
             root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
@@ -576,6 +579,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params)
             out_hidden, out_caches = self._hlo_layers(hidden, tensors, layers, layers_caches, layers_weights)
             out_hidden.set_alias_to(hidden)
+            out_caches = itertools.chain(*out_caches)
             outputs = [out_hidden, *out_caches]
             # Filter out the None's in outputs
             outputs = [o for o in outputs if o is not None]
@@ -590,6 +594,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.neuron_config.on_device_embedding = prior
         return result
 
+    def _hlo_parameters(self, n_positions, batch_size, param_builder):
+        layers_caches, layers_weights = self._hlo_layers_params(param_builder, self.layers, n_positions, batch_size)
+        pre_layer_params = self._hlo_pre_layer_params(param_builder)
+        lm_head_params = self._hlo_lm_head_params(param_builder)
+        return layers_caches, layers_weights, pre_layer_params, lm_head_params
+
     def _hlo_pre_layer_params(self, param_builder):
         params = []
         for param in self.pre_layer_parameters:
@@ -597,6 +607,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             param = hlo.transfer_with_static_ring(param)
             params.append(param)
         return params
+
+    def _hlo_pre_layer(self, hidden, tensors, params):
+        if self.pre_layer_builder is not None:
+            (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
+        return hidden, tensors
 
     def _hlo_embedding(self, hidden, tensors, params):
         # Only insert embedding operation when on-device embedding is being used
@@ -608,11 +623,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         )
         hidden = self.embedding_builder(hidden, *tensors, *params)
         return hidden
-
-    def _hlo_pre_layer(self, hidden, tensors, params):
-        if self.pre_layer_builder is not None:
-            (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
-        return hidden, tensors
 
     def _hlo_layers_params(self, param_builder, layers, n_positions, batch_size):
         layers_caches = []
@@ -631,19 +641,39 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             layers_weights.append(layer_weights)
         return layers_caches, layers_weights
 
-    def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights):
+    def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights, alias_caches=True):
         output_caches = []
         for layer, caches, weights in zip(layers, layers_caches, layers_weights):
             in_caches = [maybe_transfer_with_static_ring(cache) for cache in caches]
             weights = [maybe_transfer_with_static_ring(weight) for weight in weights]
             weights = layer.hlo_maybe_dequantize_weights(weights)
             hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
-            for out_cache, cache in zip(out_caches, caches):
-                if out_cache is not None:
-                    assert cache is not None, "out_cache must alias with a valid cache!"
-                    out_cache.set_alias_to(cache, must=True)
-            output_caches.extend(out_caches)
+            output_caches.append(out_caches)
+
+        if alias_caches:
+            self._hlo_cache_aliases(layers_caches, output_caches)
+
         return hidden, output_caches
+
+    def _hlo_cache_aliases(self, in_caches, out_caches):
+        assert len(in_caches) == len(out_caches)
+        for src, dst in zip(itertools.chain(*in_caches), itertools.chain(*out_caches)):
+            if dst is not None:
+                assert src is not None, "out_cache must alias with a valid cache!"
+                dst.set_alias_to(src, must=True)
+
+    def _hlo_lm_head_params(self, param_builder):
+        ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
+        ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
+        head_weight = param_builder.from_tensor(self.lm_head_weight)
+        head_bias = param_builder.from_tensor(self.lm_head_bias)
+        logits_indices = param_builder.from_tensor(self.logits_indices)
+        ln_f_weight = maybe_transfer_with_static_ring(ln_f_weight)
+        ln_f_bias = maybe_transfer_with_static_ring(ln_f_bias)
+        head_weight = maybe_transfer_with_static_ring(head_weight)
+        head_bias = maybe_transfer_with_static_ring(head_bias)
+        logits_indices = maybe_transfer_with_static_ring(logits_indices)
+        return ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices
 
     def _hlo_ln_lm_head(self, batch_size):
         hidden_sizes = []
@@ -670,11 +700,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             hidden = dtype[tuple(hidden_sizes)].Parameter(parameter_number=0)
             next_tok_id = scribe.s32.Parameter(parameter_number=1)
             param_builder = DecoderParameterBuilder(scribe, 2)
-            ln_f_weight = param_builder.from_tensor(self.ln_f_weight)
-            ln_f_bias = param_builder.from_tensor(self.ln_f_bias)
-            head_weight = param_builder.from_tensor(self.lm_head_weight)
-            head_bias = param_builder.from_tensor(self.lm_head_bias)
-            logits_indices = param_builder.from_tensor(self.logits_indices)
+            ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices = self._hlo_lm_head_params(param_builder)
             logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, logits_indices, return_all_outputs=self.return_all_outputs)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
