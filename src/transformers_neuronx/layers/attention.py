@@ -242,6 +242,24 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
         updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
+    elif n_active_tokens > 1 and n_active_tokens < n_positions:
+        # Speculative forward: n_active_tokens > 1 and < n_positions
+        # similar to case above, but appends a K-token chunk (K > 1) to one of the sequences in the batch
+        # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
+        #        +-0-1-2-3-4-5-----------------------------------
+        # seq 0  |[x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x]
+        # seq 1  |[y,y,y,y,y,y,y,y,y,A,B,C,D,E,F] <- Append or modify 5 tokens to this sequence
+        # seq 2  |[z,z,z,z,z,z,z,z,z,z,z,z,z,z,z,z,z,z,z]
+        #        +-----------------------------------------------
+        # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
+        # seq 1         [[45,46,47,48,49,50]]                    [[A,B,C,D,E,F]]
+        n_active_tokens, batch_size, n_head, d_head = keys.sizes
+        keys_r = hlo.reshape(keys, [n_active_tokens * batch_size, n_head, d_head])
+        vals_r = hlo.reshape(vals, [n_active_tokens * batch_size, n_head, d_head])
+
+        indices = attention_utils.update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config)
+        updated_keys, updated_vals = hlo.reshape_and_cache(keys_r, vals_r, cached_keys, cached_vals, indices)
+
     else:
         raise NotImplementedError(f"Updating 2D cache_ids is not implemented for "
                                   f"n_active_tokens={n_active_tokens}, n_positions={n_positions}, "

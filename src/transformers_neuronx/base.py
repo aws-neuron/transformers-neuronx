@@ -73,11 +73,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         self.setup()
 
     # top level api
-    def enable_speculative_decoder(self,speculation_length:Optional[Union[List[int], int]]):
+    def enable_speculative_decoder(self, speculation_length: Optional[Union[List[int], int]], batch_sizes: Optional[Union[List[int], int]]):
         if isinstance(speculation_length, int):
-            speculation_length=[speculation_length]
+            speculation_length = [speculation_length]
+        if isinstance(batch_sizes, int):
+            batch_sizes = [batch_sizes]
+        if batch_sizes is None:
+            batch_sizes = self.decoder_param_set.batch_size
         for k in speculation_length:
-            self.decoder_lm_head_for_speculation[k]=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
+            for batch_size in batch_sizes:
+                self.decoder_lm_head_for_speculation[k, batch_size] = \
+                    self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k, batch_size=batch_size)
 
     def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll):
         if isinstance(window_context_length, int):
@@ -164,7 +170,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         Other arguments that are required by the model are contained in `rest`.
         """
         context_length = hidden.shape[1]
-        batch_size, = start_ids.shape
+        batch_size = start_ids.shape[0]
 
         if self.is_fid:
             # Fusion-In-Decoder context encoding
@@ -291,6 +297,27 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             n_positions = self.context_buckets[-1]
             assert n_active_seqs == cache_ids.shape[0], f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]})"
             assert n_active_tokens <= n_positions, f"invalid input prompt length ({n_active_tokens} <= {n_positions})"
+            cache_ids_pad = torch.zeros(n_active_seqs, n_positions, dtype=cache_ids.dtype, device='cpu')
+            for seq_id in range(n_active_seqs):
+                cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
+            return input_ids, cache_ids_pad, seq_ids
+
+        elif n_active_tokens > 1 and cache_ids.flatten()[0].item() > 0:
+            # speculative forward
+            n_active_seqs, n_active_tokens = input_ids.shape
+            n_positions = self.context_buckets[-1]
+            assert n_active_tokens <= n_positions, f"invalid input prompt length ({n_active_tokens} <= {n_positions})"
+            prompt_buckets = list(set([k for k, batch_size in self.decoder_lm_head_for_speculation.keys()]))
+            speculation_bucket = bucket.find(prompt_buckets, n_active_tokens)
+            # validate the speculative head was compiled for the given batch size
+            speculation_batches = [batch_size for (k, batch_size) in self.decoder_lm_head_for_speculation.keys()]
+            assert n_active_seqs in speculation_batches, \
+                    f"invalid batch size for speculative forward ({n_active_seqs} not in {speculation_batches})"
+            # make cache ids 2d if needed and pad to match speculation bucket
+            if len(cache_ids.shape) == 1:
+                cache_ids = cache_ids.unsqueeze(0)
+            assert cache_ids.shape[0] == n_active_seqs, \
+                    f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]}) in speculative forward"
             cache_ids_pad = torch.zeros(n_active_seqs, n_positions, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]

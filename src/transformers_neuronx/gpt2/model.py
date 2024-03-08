@@ -529,7 +529,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         if speculation_length is None:
             model=self.decoder_lm_head
         else:
-            model=self.decoder_lm_head_for_speculation[speculation_length]
+            model=self.decoder_lm_head_for_speculation[speculation_length, batch_size]
 
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
