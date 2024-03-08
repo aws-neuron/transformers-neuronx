@@ -357,11 +357,8 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
-        if self.neuron_config.on_device_generation:
-            logits = generation.generate(logits, logits_indices, self.neuron_config.on_device_generation,
-                                         tp_degree=self.tp_degree, eos_token_id=self.eos_token_id)
         return logits
 
     def post_layer(self, logits):
