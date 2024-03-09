@@ -766,24 +766,31 @@ def softmax_new(logits, dim=None):
     return dtype[shape].CustomCall(logits, custom_call_target="AwsNeuronSoftmax", backend_config=backend_config,)
 
 
-def softmax(logits, dim=None):
+def softmax(logits, dim=None, tp_degree=1):
+    """
+    When tp_degree > 1 this function assumes that the softmax operation is
+    sharded over the `dim` dimension.
+    """
     rank = len(logits.sizes)
     if dim is None:
         dim = rank - 1
-    br_dims = [di for di in range(rank) if di != dim]
-    dtype = logits.dtype
-    constant_2 = dtype.Constant(constant_value=float('-inf'))
-    reduce_sizes = [logits.sizes[di] for di in br_dims]
-    max_func = gen_max_func(dtype)
-    reduce_7 = dtype[reduce_sizes].Reduce(logits, constant_2, dimensions=[dim], to_apply=max_func)
-    broadcast_8 = dtype[logits.sizes].Broadcast(reduce_7, dimensions=br_dims)
-    subtract_9 = dtype[logits.sizes].Subtract(logits, broadcast_8)
-    exp = dtype[logits.sizes].Exp(subtract_9)
-    constant_11 = dtype.Constant(constant_value=0)
-    add_func = gen_add_func(dtype)
-    reduce_16 = dtype[reduce_sizes].Reduce(exp, constant_11, dimensions=[dim], to_apply=add_func)
-    broadcast_17 = dtype[logits.sizes].Broadcast(reduce_16, dimensions=br_dims)
-    return dtype[logits.sizes].Divide(exp, broadcast_17)
+    dims = list(range(rank))
+    dims.pop(dim)
+
+    maximum = reduce_max(logits, dim)
+    if tp_degree > 1:
+        maximum = all_reduce_max(maximum, tp_degree=tp_degree)
+    maximum = broadcast(maximum, logits.sizes, dims)
+
+    difference = subtract(logits, maximum)
+    exponential = exp(difference)
+
+    denominator = reduce_sum(exponential, dim)
+    if tp_degree > 1:
+        denominator = all_reduce_sum(denominator, tp_degree=tp_degree)
+    denominator = broadcast(denominator, logits.sizes, dims)
+
+    return divide(exponential, denominator)
 
 
 def transfer_with_static_ring(shape):
