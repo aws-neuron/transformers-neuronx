@@ -1958,31 +1958,67 @@ def topk(tensor, dim, k=50, tp_degree=1):
     return output(value, index)
 
 
-def multinomial(probabilities, dim):
+def numel(tensor):
+    elements = 1
+    for dim in tensor.sizes:
+        elements *= dim
+    return elements
+
+
+def sort(tensor, dim, ascending=True):
+    dtype = tensor.dtype
+    sizes = tensor.sizes
+
+    def comparator(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        if ascending:
+            return less(p0, p1)
+        else:
+            return greater(p0, p1)
+
+    return dtype[sizes].Sort(tensor, to_apply=comparator, dimensions=[dim])
+
+
+def multinomial(probabilities, dim, deterministic=False):
     """
-    Single sample multinomial selection along a dimension
+    Single sample multinomial selection along a dimension.
+
+    Input probabilities must be sorted in descending order along the
+    dimension. This operator cannot validate that this prerequisite is true.
+
+    Args:
+        probabilities: The probabilities to sample. This must be sorted from
+            in descending order.
+        dim: The dimension to sample across.
+        deterministic: Flag which enables using a constant 0.5 as token
+            acceptance threshold instead of a random uniform. This is used for
+            debug/testing.
+
+    Returns:
+        indices: The selected index across the given dimension.
     """
     scribe = probabilities.scribe
     dtype = probabilities.dtype
-    pred = scribe.pred
     u32 = scribe.u32
 
     cumprob = cumsum(probabilities, dim)
 
-    minimum = dtype.Constant(constant_value=0)
-    maximum = dtype.Constant(constant_value=1)
     sizes = list(probabilities.sizes)
     sizes.pop(dim)
-    uniform = dtype[sizes].Rng(minimum, maximum, distribution=1) # Uniform distribution
+    if deterministic:
+        uniform = full(0.5, dtype, sizes)
+    else:
+        uniform = random_uniform(dtype, sizes)
 
     dims = list(range(len(probabilities.sizes)))
     dims.pop(dim)
-    uniform = dtype[probabilities.sizes].Broadcast(uniform, dimensions=dims)
+    uniform = broadcast(uniform, probabilities.sizes, dims)
 
-    cmp = pred[probabilities.sizes].Compare(uniform, cumprob, comparison_direction='GT')
-    result = cast(cmp, u32)
-    summation = reduce_sum(result, dim, keepdim=True)
-    return summation
+    result = greater(uniform, cumprob)
+    result = cast(result, u32)
+    result = reduce_sum(result, dim, keepdim=True)
+    return result
 
 
 def full(value, dtype, sizes):
@@ -2836,7 +2872,7 @@ def speculative_token_selection(
     Reference: https://arxiv.org/pdf/2302.01318.pdf
 
     Note that this function does not perform initial sampling and assumes that
-    both target/draft token generation has before performed prior to executing
+    both target/draft token generation has been performed prior to executing
     this function.
 
     Args:
@@ -2846,13 +2882,13 @@ def speculative_token_selection(
         target_scores: The raw target model logits output.
         tp_degree: The number of ranks to collect across.
         deterministic: Flag which enables using a constant 0.5 as token
-            acceptance threshold instead of a random normal. This is used for
+            acceptance threshold instead of a random uniform. This is used for
             debug/testing.
 
     Returns:
         tokens: The accepted tokens (with padding)
         mask: The mask for the accepted tokens
-        accepted: The number of tokens accepted for each batche line.
+        accepted: The number of tokens accepted for each batch line.
     """
     s32 = draft_ids.scribe.s32
 
