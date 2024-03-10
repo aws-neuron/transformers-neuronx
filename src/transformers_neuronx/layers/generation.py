@@ -31,39 +31,34 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
 
 def mask_logits(logits, indices, model_vocab_size):
     vocab_size, n_active_tokens, _ = logits.sizes
-    assert n_active_tokens == 1
     indices_br = hlo.broadcast(indices, (logits.sizes), broadcast_dimensions=(0,))
-    max_index = hlo.full(value=model_vocab_size, dtype=indices.dtype, sizes=logits.sizes)
-    mask = hlo.less(indices_br, max_index)
-    min_value = hlo.full(value=float('-inf'), dtype=logits.dtype, sizes=logits.sizes)
-    logits = hlo.masked_select(mask, logits, min_value)
+    mask = hlo.less(indices_br, model_vocab_size)
+    logits = hlo.masked_select(mask, logits, float('-inf'))
     return logits
 
 
 def greedy_search(logits, *, tp_degree=1):
     vocab_size, n_active_tokens, batch_size = logits.sizes
-    assert n_active_tokens == 1
-    result = hlo.argmax(logits, 0, tp_degree=tp_degree)
-    return result.dtype[batch_size, 1].Reshape(result)
+    result = hlo.argmax(logits, 0, tp_degree=tp_degree) # shape: n_active_tokens, batch_size
+    return hlo.transpose(result, 0, 1) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, k=50, temperature=None, tp_degree=1):
+def sample(logits, *, k=50, temperature=None, tp_degree=1, deterministic=False):
     vocab_size, n_active_tokens, batch_size = logits.sizes
-    assert n_active_tokens == 1
 
+    # NOTE: Compiler failures can occur when batch != 1
     if k == 1 and batch_size == 1:
         return greedy_search(logits, tp_degree=tp_degree)
 
-    logits = hlo.reshape(logits, (vocab_size, batch_size))
-    logits = hlo.transpose(logits, src=0, dst=1)
-
-    topk_logits, topk_indices = hlo.topk(logits, k=k, dim=1, tp_degree=tp_degree)
+    logits, indices = hlo.topk(logits, k=k, dim=0, tp_degree=tp_degree)
 
     if temperature is not None and temperature != 1.0:
-        temperature = hlo.full_like(topk_logits, temperature)
-        topk_logits = hlo.divide(topk_logits, temperature)
+        logits = hlo.divide(logits, temperature)
 
-    probs = hlo.softmax(topk_logits, dim=1)
-    samples = hlo.multinomial(probs, dim=1)
-    result = hlo.select(topk_indices, dim=1, index=samples)
-    return hlo.reshape(result, (batch_size, 1))
+    probs = hlo.softmax(logits, dim=0)
+    samples = hlo.multinomial(probs, dim=0, deterministic=deterministic)
+
+    tokens = hlo.gather(indices, 0, samples)
+    tokens = hlo.squeeze(tokens, 0)
+    return hlo.transpose(tokens, 0, 1)
+
