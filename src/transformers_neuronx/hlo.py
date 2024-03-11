@@ -2886,9 +2886,8 @@ def speculative_token_selection(
             debug/testing.
 
     Returns:
-        tokens: The accepted tokens (with padding)
-        mask: The mask for the accepted tokens
-        accepted: The number of tokens accepted for each batch line.
+        token: The accepted tokens (with 0-padding)
+        index: The last index accepted for each batch line.
     """
     s32 = draft_ids.scribe.s32
 
@@ -2927,30 +2926,26 @@ def speculative_token_selection(
     positions = add(positions, 1)
     accepted_mask = equal(accepted_cumsum, positions) # shape: (k, batch_size)
 
-    # Compute number of accepted tokens per batch line
-    accepted = reduce_sum(cast(accepted_mask, s32), dim=0)
-    all_accepted = equal(accepted, k)
-
-    # If all draft tokens were accepted, update the mask
-    padded_mask = pad(accepted_mask, dim=0, size=1, value=False)
+    # Compute index of *final* accepted token per batch line
+    index = reduce_sum(cast(accepted_mask, s32), dim=0)
 
     # Select the final tokens
+    # Note:
+    # - When all rejected: Mask will select target in all positions (position 0 required)
+    # - When all accepted: Mask will select draft in all positons but the last
+    token_selector = pad(accepted_mask, dim=0, size=1, value=False)
     draft_ids = pad(draft_ids, dim=0, size=1, value=0)
-    tokens = masked_select(padded_mask, draft_ids, target_ids)
+    tokens = masked_select(token_selector, draft_ids, target_ids)
 
-    # If all draft tokens were accepted, increment accepted
-    accepted = masked_select(all_accepted, k + 1, accepted)
-
-    # If all draft tokens were accepted, update the mask
-    accept_mask = broadcast(all_accepted, padded_mask.sizes, [1])
-    mask = logical_or(accept_mask, padded_mask)
+    # Zero-out tokens beyond the used tokens
+    positions = iota(s32, tokens.sizes, 0)
+    mask = greater_equal(broadcast(index, tokens.sizes, [0]), positions)
+    tokens = masked_select(mask, tokens, 0)
 
     # Transpose back to SB -> BS layout
     tokens = transpose(tokens, 0, 1)
-    mask = transpose(mask, 0, 1)
 
     return (
-        tokens,    # shape: (batch_size, k + 1)
-        mask,      # shape: (batch_size, k + 1)
-        accepted,  # shape: (batch_size,)
+        tokens,  # shape: (batch_size, k + 1)
+        index,   # shape: (batch_size,)
     )
