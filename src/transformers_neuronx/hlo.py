@@ -2939,7 +2939,7 @@ def speculative_token_selection(
 
     # Zero-out tokens beyond the used tokens
     positions = iota(s32, tokens.sizes, 0)
-    mask = greater_equal(broadcast(index, tokens.sizes, [0]), positions)
+    mask = greater_equal(broadcast(index, tokens.sizes, [1]), positions)
     tokens = masked_select(mask, tokens, 0)
 
     # Transpose back to SB -> BS layout
