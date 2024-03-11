@@ -73,13 +73,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         self.setup()
 
     # top level api
-    def enable_speculative_decoder(self, speculation_length: Optional[Union[List[int], int]], batch_sizes: Optional[Union[List[int], int]]):
+    def enable_speculative_decoder(self, speculation_length: Optional[Union[List[int], int]], batch_sizes: Optional[Union[List[int], int]]=None):
         if isinstance(speculation_length, int):
             speculation_length = [speculation_length]
-        if isinstance(batch_sizes, int):
-            batch_sizes = [batch_sizes]
         if batch_sizes is None:
             batch_sizes = self.decoder_param_set.batch_size
+        if isinstance(batch_sizes, int):
+            batch_sizes = [batch_sizes]
         for k in speculation_length:
             for batch_size in batch_sizes:
                 self.decoder_lm_head_for_speculation[k, batch_size] = \
