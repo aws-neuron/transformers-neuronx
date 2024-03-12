@@ -300,10 +300,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0:
             # context encoding
             n_active_seqs, n_active_tokens = input_ids.shape
-            n_positions = self.context_buckets[-1]
+            continuous_batching_n_positions = bucket.find(self.context_buckets, n_active_tokens)
             assert n_active_seqs == cache_ids.shape[0], f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]})"
-            assert n_active_tokens <= n_positions, f"invalid input prompt length ({n_active_tokens} <= {n_positions})"
-            cache_ids_pad = torch.zeros(n_active_seqs, n_positions, dtype=cache_ids.dtype, device='cpu')
+            assert n_active_tokens <= continuous_batching_n_positions, \
+                f"invalid input prompt length ({n_active_tokens} <= {continuous_batching_n_positions})"
+            cache_ids_pad = torch.zeros(n_active_seqs, continuous_batching_n_positions, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
@@ -311,8 +312,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         elif n_active_tokens > 1 and cache_ids.flatten()[0].item() > 0:
             # speculative forward
             n_active_seqs, n_active_tokens = input_ids.shape
-            n_positions = self.context_buckets[-1]
-            assert n_active_tokens <= n_positions, f"invalid input prompt length ({n_active_tokens} <= {n_positions})"
+            speculative_n_positions = bucket.find(self.context_buckets, n_active_tokens)
+            assert n_active_tokens <= speculative_n_positions, \
+                f"invalid input prompt length ({n_active_tokens} <= {speculative_n_positions})"
             prompt_buckets = list(set([k for k, batch_size in self.decoder_lm_head_for_speculation.keys()]))
             speculation_bucket = bucket.find(prompt_buckets, n_active_tokens)
             # validate the speculative head was compiled for the given batch size
@@ -324,7 +326,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 cache_ids = cache_ids.unsqueeze(0)
             assert cache_ids.shape[0] == n_active_seqs, \
                     f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]}) in speculative forward"
-            cache_ids_pad = torch.zeros(n_active_seqs, n_positions, dtype=cache_ids.dtype, device='cpu')
+            cache_ids_pad = torch.zeros(n_active_seqs, speculative_n_positions, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
