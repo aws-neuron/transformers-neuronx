@@ -603,6 +603,44 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         generation_params = self._hlo_generation_params(param_builder)
         return layers_caches, layers_weights, pre_layer_params, lm_head_params, generation_params
 
+    def all_parameters(self, n_positions, batch_size):
+        """
+        Get all the parameters for the current model.
+
+        NOTE: It is extremely important that these tensors are returned in the
+              same order as the parameters returned in the _hlo_parameters
+              function. If this is not done correctly, the HLO parameter and
+              the corresponding weight tensor cannot be assocated.
+        """
+        parameters = list()
+
+        # Layer caches
+        for layer in self.layers:
+            for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
+                parameters.append(cache)
+
+        # Layer weights
+        for layer in self.layers:
+            parameters.extend(layer.all_parameters())
+
+        # Prelayer parameters
+        parameters.extend(self.pre_layer_parameters)
+
+        # LM head parameters
+        parameters.append(self.ln_f_weight)
+        parameters.append(self.ln_f_bias)
+        parameters.append(self.lm_head_weight)
+        parameters.append(self.lm_head_bias)
+
+        # Generation parameters
+        parameters.append(self.logits_indices)
+
+        return parameters
+
+    def valid_parameters(self, n_positions, batch_size):
+        parameters = self.all_parameters(n_positions, batch_size)
+        return [par for par in parameters if par is not None]
+
     def _hlo_pre_layer_params(self, param_builder):
         params = []
         for param in self.pre_layer_parameters:
