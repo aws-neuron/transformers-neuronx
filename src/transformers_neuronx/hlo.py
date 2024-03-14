@@ -46,7 +46,7 @@ def ax_minus_by(a, x, b, y):
     return ax_by
 
 
-def batch_norm(tensor, norm_size, feature_index, epsilon=1e-5):
+def batch_norm(tensor, feature_index, epsilon=1e-5):
     """
     Normalizes an array across batch and spatial dimensions.
 
@@ -59,7 +59,6 @@ def batch_norm(tensor, norm_size, feature_index, epsilon=1e-5):
 
     Arguments:
         tensor: N dimensional tensor to be normalized.
-        norm_size: Size of the region on which the man and variance are calculated.
         feature_index: Index to feature dimension in operand.
         epsilon: Value used in normalization calculation to avoid dividing by 0.
 
@@ -72,9 +71,10 @@ def batch_norm(tensor, norm_size, feature_index, epsilon=1e-5):
     scribe = tensor.scribe
     dtype = tensor.dtype
     sizes = tensor.sizes
-    scale = full(1, dtype, norm_size)
-    offset = full(0, dtype, norm_size)
-    shape = scribe.tuple(dtype[sizes], dtype[norm_size], dtype[norm_size])
+    num_features = sizes[feature_index]
+    scale = full(1, dtype, num_features)
+    offset = full(0, dtype, num_features)
+    shape = scribe.tuple(dtype[sizes], dtype[num_features], dtype[num_features])
     bn_tuple = shape.BatchNormTraining(tensor, scale, offset, epsilon=epsilon, feature_index=feature_index)
     return bn_tuple
 
@@ -88,7 +88,7 @@ def layer_norm(hidden, weight, bias):
     sizes = hidden_size, norm_size
     hidden = dtype[sizes].Reshape(hidden)
     hidden = f32[sizes].Convert(hidden)
-    bn_tuple = batch_norm(hidden, norm_size, feature_index=1)
+    bn_tuple = batch_norm(hidden, feature_index=1)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
     weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
     output = f32[sizes].Multiply(bn_output, weight_br)
@@ -108,7 +108,7 @@ def layer_norm_bsh(hidden, weight, bias):
     sizes = norm_size, hidden_size
     hidden = dtype[sizes].Reshape(hidden)
     hidden = f32[sizes].Convert(hidden)
-    bn_tuple = batch_norm(hidden, norm_size, feature_index=0)
+    bn_tuple = batch_norm(hidden, feature_index=0)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
     weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
     output = f32[sizes].Multiply(bn_output, weight_br)
@@ -145,7 +145,7 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     hidden = cast(hidden, f32)
 
     # Batchnorm
-    bn_tuple = batch_norm(hidden, group_size, feature_index=0)
+    bn_tuple = batch_norm(hidden, feature_index=0)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
 
     # Reshape back to (B, S, g, H // g)
@@ -170,13 +170,15 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     Perform GroupNorm on input with shape (S, H, B).
     """
     raise NotImplementedError("SHB GroupNorm is not currently implemented, use HSB")
-    
+
+
 def group_norm_bsh(hidden, weight, bias, num_groups):
     """
     Perform GroupNorm on input with shape (B, S, H).
     """
     raise NotImplementedError("BSH GroupNorm is not currently implemented, use HSB")
-    
+
+
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
@@ -2030,12 +2032,15 @@ def full(value, dtype, sizes):
 # https://www.tensorflow.org/xla/operation_semantics#broadcastindim
 def broadcast(tensor, out_dim_size, broadcast_dimensions):
     dtype = tensor.dtype
+    sizes = list(tensor.sizes)
 
     assert len(broadcast_dimensions) == len(tensor.sizes), (
         f"Input operand rank ({len(tensor.sizes)}) does not match broadcast dimensions ({broadcast_dimensions})"
     )
 
-    for i, (dim, size) in enumerate(zip(broadcast_dimensions, tensor.sizes)):
+    br_dims_to_keep = []
+    reshape_sizes = []
+    for i, (dim, size) in enumerate(zip(broadcast_dimensions, sizes)):
 
         # Broadcast dimension must be within the output shape
         assert dim < len(out_dim_size), (
@@ -2046,6 +2051,9 @@ def broadcast(tensor, out_dim_size, broadcast_dimensions):
         if size == 1:
             continue
 
+        br_dims_to_keep.append(dim)
+        reshape_sizes.append(size)
+
         # Broadcast dimension sizes must match when non-1
         dst = out_dim_size[dim]
         assert dst == size, (
@@ -2054,7 +2062,11 @@ def broadcast(tensor, out_dim_size, broadcast_dimensions):
             f"(src={tensor.sizes} dst={out_dim_size})"
         )
 
-    output = dtype[out_dim_size].Broadcast(tensor, dimensions=broadcast_dimensions)
+    # Legalize the Broadcast op input so that it complies with https://openxla.org/xla/operation_semantics#broadcast syntax
+    tensor = reshape(tensor, reshape_sizes)
+    output = dtype[out_dim_size].Broadcast(tensor, dimensions=br_dims_to_keep)
+    # tensor = reshape(tensor, [])
+    # output = dtype[out_dim_size].Broadcast(tensor, dimensions=[])
     return output
 
 
@@ -2225,8 +2237,10 @@ def random_uniform(dtype, shape, minimum=0, maximum=1):
     return dtype[shape].Rng(minimum, maximum, distribution=1) # Uniform distribution
 
 
-
 def reshape(tensor, shape):
+    # Return a scalar reshape directly
+    if shape == []:
+        return tensor.dtype.Reshape(tensor)
     if isinstance(shape, int):
         shape = [shape]
     if shape == tensor.sizes:
@@ -2627,14 +2641,13 @@ def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
         prior_mask: The attention mask to apply to the KV cache.
         active_mask: The attention mask to apply to the active tokens (None).
     """
-    pred = prompt_lens.scribe.pred
     s32 = prompt_lens.scribe.s32
     sizes = n_positions, n_positions
     num_prompts, = prompt_lens.sizes
 
-    a = s32[sizes].Iota(dimensions=[0])
-    b = s32[sizes].Iota(dimensions=[1])
-    prior_mask = pred[sizes].Compare(a, b, comparison_direction="GE")
+    a = iota(s32, sizes, [0])
+    b = iota(s32, sizes, [1])
+    prior_mask = compare(a, b, "GE")
 
     anchors = cumsum(prompt_lens, dim=0)
 
@@ -2643,9 +2656,10 @@ def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
         value = dynamic_slice_along(anchors, dim=0, start=zero, size=1)
 
         # mask = jnp.logical_and(b<c, a>=c)
-        c = s32[sizes].Broadcast(value, dimensions=[])
-        bc = pred[sizes].Compare(b, c, comparison_direction="LT")
-        ac = pred[sizes].Compare(a, c, comparison_direction="GE")
+        c = broadcast(value, sizes, [0])
+        c = cast(c, s32)
+        bc = compare(b, c, "LT")
+        ac = compare(a, c, "GE")
         mask = logical_and(bc, ac)
 
         # prior_mask = jnp.logical_and(prior_mask, jnp.logical_not(mask))
