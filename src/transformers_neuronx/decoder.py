@@ -400,9 +400,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         etc.
         """
         _, cache_ids, start_ids, *_ = inputs
-        batch_size, = start_ids.shape
-        # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
-        if self.neuron_config and self.neuron_config.continuous_batching:
+        batch_size = start_ids.shape[0]
+        # With 2D cache_ids, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
+        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
             bucket_id = 0
             batch_size, _ = cache_ids.shape
         else:
@@ -459,8 +459,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             batch_size = self.batch_size[0]
         if start_ids is None:
             return position_ids, torch.zeros([batch_size], dtype=torch.int32)
-        position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
-        position_ids -= start_ids.unsqueeze(1)
+        if not self.neuron_config.use_2d_cache_ids:
+            position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
+            position_ids -= start_ids.unsqueeze(1)
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
 

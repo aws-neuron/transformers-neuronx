@@ -93,10 +93,10 @@ class NeuronConfig():
         self.cast_logits_dtype = kargs.pop('cast_logits_dtype', 'float32')
         self.fuse_qkv = kargs.pop('fuse_qkv', False)
         self.continuous_batching = kargs.pop('continuous_batching', None)
-        self.use_2d_cache_ids = kargs.pop('use_2d_cache_ids', False)
+        self.lhs_aligned = kargs.pop('use_2d_cache_ids', False) or kargs.pop('lhs_aligned', False)
         if self.continuous_batching:
             # Force using 2D cache_ids layout for continuous batching.
-            self.use_2d_cache_ids = True
+            self.lhs_aligned = True
         self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
         self.cache_layout = kargs.pop('cache_layout', constants.LAYOUT_SBH)
         self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
@@ -121,6 +121,14 @@ class NeuronConfig():
         self.dist = None
 
         self.layer_partition = {}
+
+    @property
+    def use_2d_cache_ids(self):
+        return self.lhs_aligned
+
+    @property
+    def vectorize_last_token_id(self):
+        return self.lhs_aligned
 
     def is_valid_layer(self, layer_id):
         if not self.is_pp():

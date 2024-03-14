@@ -31,13 +31,15 @@ class MistralForSamplingNoEmbeddingHlo:
         self.config = config
         self.neuron_config = neuron_config
 
-
     def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
 
         hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
+        if self.neuron_config.lhs_aligned:
+            curr_window_start = scribe.s32[batch_size].Parameter(parameter_number=4)
+        else:
+            curr_window_start = scribe.s32.Parameter(parameter_number=4)
 
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
