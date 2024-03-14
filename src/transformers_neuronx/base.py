@@ -245,7 +245,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return logits, scores
         return logits
 
-    def _prepare_for_par_ctx_rhs_padding(self, input_ids):
+    def _prepare_for_par_ctx_rhs_padding(self, input_ids, cache_ids):
         """A helper to do rhs padding on prompt for parallel context encoding model
         i.e.
             input_ids = [[111, 222, 333]]
@@ -263,9 +263,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         batch_size, context_length = input_ids.shape
 
         # if last_token_id not used, simply set to 0
-        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+        if self.neuron_config.vectorize_last_token_id:
+            last_token_id = torch.zeros(batch_size, dtype=torch.int32)
+        else:
+            last_token_id = torch.as_tensor(0, dtype=torch.int32)
         if context_length == 1:
-            return input_ids, last_token_id
+            return input_ids, cache_ids, last_token_id
 
         # TODO: check context_buckets for compatibility with OPT
         if hasattr(self, "context_buckets"):
@@ -275,11 +278,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         if estimate:
             # when context length is larger than estimate, last_token_id=estimate-1
-            last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
+            if self.neuron_config.vectorize_last_token_id:
+                last_token_id = cache_ids.max(dim=1).values
+            else:
+                last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
+                cache_ids = torch.arange(estimate, dtype=torch.long)
+                if self.neuron_config.use_2d_cache_ids:
+                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
 
-        return input_ids, last_token_id
+        return input_ids, cache_ids, last_token_id
 
     def _prepare_for_continuous_batching(self, input_ids, cache_ids=None, seq_ids=None):
         n_seqs, n_active_tokens = input_ids.shape
@@ -338,7 +347,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         input_ids, cache_ids, start_ids = self._prepare_for_continuous_batching(input_ids, cache_ids, start_ids)
 
         # right pad the input_ids if neccessary
-        input_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids)
+        input_ids, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
 
         # note: this context_length is after right padded
         batch_size, context_length = input_ids.shape
@@ -348,6 +357,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         if cache_ids is None:
             cache_ids = torch.arange(context_length, dtype=torch.int32)
+            if self.neuron_config.use_2d_cache_ids:
+                cache_ids = cache_ids.unsqueeze(0).expand(batch_size, context_length)
 
         if hasattr(self, "prefixed_length") and self.prefixed_length:
             cache_ids += self.prefixed_length
