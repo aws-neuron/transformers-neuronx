@@ -434,8 +434,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             # static batching
             return input_ids, cache_ids, seq_ids
 
-        # continuous batching
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
+
         if n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0:
             # context encoding
             n_active_seqs, n_active_tokens = input_ids.shape
