@@ -72,9 +72,6 @@ class LlamaAttention(module.LowMemoryModule):
         self.k_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.v_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.o_proj = module.LowMemoryLazyLinear(self.hidden_size, bias=False, dtype=dtype)
-        if config.qk_norm:
-            self.q_norm = LlamaRMSNorm(config)
-            self.k_norm = LlamaRMSNorm(config)
 
 
 class LlamaMLP(module.LowMemoryModule):

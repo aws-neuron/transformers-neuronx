@@ -81,7 +81,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             in0_weight, in0_scales,
             in1_weight, in1_scales,
             out_weight, out_scales,
-            q_norm_weight=None, k_norm_weight=None,
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
@@ -92,8 +91,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias,
-            q_norm_weight=q_norm_weight, k_norm_weight=k_norm_weight,
+            attn_out_weight, attn_out_scales, attn_out_bias
         )
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
@@ -124,7 +122,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         k_weight, k_scales, k_bias,
         v_weight, v_scales, v_bias,
         out_weight, out_scales, out_bias,
-        q_norm_weight=None, k_norm_weight=None,
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -154,22 +151,8 @@ class LlamaForSamplingNoEmbeddingHlo:
         query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage,
                                         tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
-        if q_norm_weight is not None:
-            eps = self.config.rms_norm_eps
-            query_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head = query.sizes
-            query = hlo.reshape(query, [n_active_tokens, n_seqs, n_heads_tp * d_head])
-            query = hlo.sharded_rms_norm(query, q_norm_weight, tp_degree, eps)
-            query = hlo.reshape(query, query_sizes)
-        else:
-            # Q = Q / sqrt(d_head)
-            query = attention.scale(query, d_head)
-
-        if k_norm_weight is not None:
-            eps = self.config.rms_norm_eps
-            key_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, d_head = key.sizes
-            key = hlo.reshape(key, [n_active_tokens, n_seqs, n_kv_heads_tp * d_head])
-            key = hlo.sharded_rms_norm(key, k_norm_weight, tp_degree, eps)
-            key = hlo.reshape(key, key_sizes)
+        # Q = Q / sqrt(d_head)
+        query = attention.scale(query, d_head)
 
         # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
         bsh_cache_layout = False

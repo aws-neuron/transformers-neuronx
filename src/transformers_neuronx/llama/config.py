@@ -23,7 +23,6 @@ class LlamaConfig:
             batch_size,
             amp,
             tp_degree,
-            qk_norm=False,
             **kwargs
         ):
 
@@ -51,5 +50,4 @@ class LlamaConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
-        self.qk_norm = qk_norm
 

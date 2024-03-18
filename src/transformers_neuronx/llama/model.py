@@ -32,8 +32,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, prefixed_length=0, qk_norm=False, **kwargs):
-        config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree, qk_norm)
+                 neuron_config=None, prefixed_length=0, **kwargs):
+        config = LlamaConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(LlamaForCausalLM, config)
         self.context_pre_hook = None
         self.context_hook = None
@@ -110,9 +110,6 @@ class LlamaForSampling(base.NeuronModelBase):
             else:
                 new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True,
                                         allow_quantize=True, out_feature_dim=0)
-            if self.config.qk_norm:
-                new_layer.add_parameter(attn.q_norm.weight, sharding=0, allow_pad=True)
-                new_layer.add_parameter(attn.k_norm.weight, sharding=0, allow_pad=True)
 
             new_layer.to_neuron()
             layer.nullify()
