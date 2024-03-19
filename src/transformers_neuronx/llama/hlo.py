@@ -168,6 +168,10 @@ class LlamaForSamplingNoEmbeddingHlo:
             query, key, value = attention_utils.transpose_qkv(query, key, value)
             batch_dim = 0
 
+        # Score and mult with V
+        scribe = query.scribe
+        f32 = scribe.f32
+        dtype = query.dtype
         # Single Token Generation ("Prefetch"-style) ans speculative forward
         if active_mask is not None:
 
@@ -180,21 +184,37 @@ class LlamaForSamplingNoEmbeddingHlo:
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
+            
+
+            # Communication 1: all-gather query from cores
+            # Notice that this is not necessary for context encoding because we don't read from the KV cache
+            if (n_active_tokens != self.n_positions):
+                cores_per_kv_head = tp_degree // self.config.num_kv_heads
+                cores_per_q_head = tp_degree // self.config.num_q_heads
+                group_size = cores_per_kv_head // cores_per_q_head
+                num_groups = tp_degree // group_size
+                replica_groups = utils.build_replica_groups(num_groups, group_size)
+                # Query shape: n_active_tokens, n_seqs, n_heads_tp, d_head
+                query = hlo.all_gather(query, 2, tp_degree, replica_groups)
+
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys_s, n_kv_heads=self.config.num_key_value_heads,
                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            prior_scores = hlo.cast(prior_scores, f32)
+
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+            active_score = hlo.cast(active_score, f32)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values_s, value,
-                                        n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        neuron_config=self.neuron_config)
+            context = self.context_shard_over_seq(prior_scores, active_score, cached_values_s, value,core_id, mask, active_mask,
+                                        n_kv_heads=self.config.num_key_value_heads, dtype=dtype, tp_degree=tp_degree,
+                                        shard_over_batch=self.shard_over_batch)
 
             # KCache[I], VCache[I] = K, V
             updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
