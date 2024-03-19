@@ -2842,6 +2842,7 @@ def speculative_token_selection(
         draft_scores,        # shape: (vocab_size_tp, k, batch_size)
         target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
         tp_degree=1,
+        pad_token_id=0,
         deterministic=False,
     ):
     """
@@ -2918,7 +2919,7 @@ def speculative_token_selection(
     # Zero-out tokens beyond the used tokens
     positions = iota(s32, tokens.sizes, 0)
     mask = greater_equal(broadcast(index, tokens.sizes, [1]), positions)
-    tokens = masked_select(mask, tokens, 0)
+    tokens = masked_select(mask, tokens, pad_token_id)
 
     # Transpose back to SB -> BS layout
     tokens = transpose(tokens, 0, 1)
