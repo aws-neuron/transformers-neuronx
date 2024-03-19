@@ -1282,6 +1282,10 @@ class DecoderLayer(torch.nn.Module):
         return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
     @property
+    def shard_over_sequence(self):
+        return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_SEQUENCE
+
+    @property
     def bsh_cache_layout(self):
         return self.neuron_config.cache_layout == constants.LAYOUT_BSH
 
@@ -1308,6 +1312,15 @@ class DecoderLayer(torch.nn.Module):
                 self.cache_shape[batch_size] = [self.n_positions, batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+            elif (n_heads_kv_cache % self.tp_degree == 0) and self.n_heads > n_heads_kv_cache:
+                kv_groups = self.n_heads//n_heads_kv_cache
+                cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
+
+                self.cache_shape[batch_size] = [self.n_positions//kv_groups, batch_size, n_heads_kv_cache, self.attention_head_size]
+                self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+
+
             else:
                 assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
                     f"cannot shard along kv_heads dimension: n_kv_head={n_heads_kv_cache}, tp_degree={self.tp_degree}"
