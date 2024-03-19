@@ -1065,6 +1065,28 @@ class DecoderLayer(torch.nn.Module):
                                             constants.TILE_SIZE) * self.tp_degree
                 qkv_maybe_pad = MaybePadder(hidden_size_padded_qkv)
                 attn_out_maybe_pad = MaybePadder(hidden_size_padded)
+
+                # Adjust padding strategy if we can use less K/V replication
+                # with interleaved padding.
+                extra_heads = n_heads_padded - n_heads
+                if (
+                    self.n_head != self.n_kv_head
+                    and self.neuron_config.group_query_attention == constants.GQA.REPLICATED_HEADS
+                    and self.tp_degree % self.n_kv_head == 0
+                    and extra_heads % self.n_kv_head == 0
+                    and extra_heads > 0
+                ):
+                    qkv_maybe_pad = MaybePadder(
+                        hidden_size_padded_qkv,
+                        padding="interleaved",
+                        split_size=n_heads, interleaved_factor=self.n_kv_head
+                    )
+                    attn_out_maybe_pad = MaybePadder(
+                        hidden_size_padded,
+                        padding="interleaved",
+                        split_size=n_heads, interleaved_factor=self.n_kv_head
+                    )
+
             self.attn_q_weight = qkv_maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = qkv_maybe_pad(self.attn_q_bias, dim=0)
             # Replication GQA: Handle explicit/implicit configuration
@@ -1080,7 +1102,13 @@ class DecoderLayer(torch.nn.Module):
                 if (
                     (self.n_kv_head < self.tp_degree)
                     and (self.tp_degree % self.n_kv_head == 0)
-                    and (self.n_head % self.tp_degree == 0)
+                    and (
+                        (self.n_head % self.tp_degree == 0)
+                        or (
+                            (n_heads_padded - n_heads) % self.n_kv_head == 0
+                            and n_heads_padded - n_heads > 0
+                        )
+                    )
                 ):
                     ratio = int(self.tp_degree / self.n_kv_head)
 
