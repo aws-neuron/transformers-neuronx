@@ -368,7 +368,7 @@ class Executor:
                 self.kernel.snapshot_exit(self.memory.output_tensors)
             else:
                 outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
-            ParallelKernel.hlo_snapshot_iter += 1
+                ParallelKernel.hlo_snapshot_iter += 1
         else:
             outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
 
@@ -499,7 +499,10 @@ class ParallelKernel:
         self.snapshot = snapshot
 
     def snapshot_path(self):
-        path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
+        suffix = ''
+        if self.tag is not None:
+            suffix = f'-{self.tag}'
+        path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}{suffix}')
         os.makedirs(path, exist_ok=True)
         return path
 
