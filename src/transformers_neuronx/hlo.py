@@ -119,7 +119,7 @@ def layer_norm_bsh(hidden, weight, bias):
     return output
 
 
-def group_norm(hidden, weight, bias, num_groups = 1): 
+def group_norm(hidden, weight, bias, num_groups = 1):
     """
     Perform GroupNorm on input with shape (H, S, B).
     """
@@ -1931,19 +1931,53 @@ def numel(tensor):
     return elements
 
 
-def sort(tensor, dim, ascending=True):
+def sort(tensor, dim=-1, descending=False):
+    if dim < 0:
+        dim = dim % len(tensor.sizes)
+
     dtype = tensor.dtype
     sizes = tensor.sizes
 
     def comparator(scribe):
         p0 = dtype.Parameter(parameter_number=0)
         p1 = dtype.Parameter(parameter_number=1)
-        if ascending:
-            return less(p0, p1)
-        else:
+        if descending:
             return greater(p0, p1)
+        else:
+            return less(p0, p1)
 
     return dtype[sizes].Sort(tensor, to_apply=comparator, dimensions=[dim])
+
+
+def sort_with_indices(tensor, dim=-1, descending=False):
+    if dim < 0:
+        dim = dim % len(tensor.sizes)
+
+    scribe = tensor.scribe
+    dtype = tensor.dtype
+    sizes = tensor.sizes
+    s32 = scribe.s32
+
+    def comparator(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        p2 = s32.Parameter(parameter_number=2)
+        p3 = s32.Parameter(parameter_number=3)
+        if descending:
+            return greater(p0, p1)
+        else:
+            return less(p0, p1)
+
+    indices = iota(s32, sizes, dims=[dim])
+    result = scribe.tuple(dtype[sizes], s32[sizes]).Sort(tensor, indices, to_apply=comparator, dimensions=[dim])
+    value = get_tuple_element(result, 0)
+    index = get_tuple_element(result, 1)
+    return value, index
+
+
+def argsort(tensor, dim=-1, descending=False):
+    _, index = sort_with_indices(tensor, dim, descending)
+    return index
 
 
 def multinomial(probabilities, dim, deterministic=False):
