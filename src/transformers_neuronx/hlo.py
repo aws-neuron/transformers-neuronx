@@ -2964,3 +2964,9 @@ def speculative_token_selection(
         tokens,  # shape: (batch_size, k + 1)
         index,   # shape: (batch_size,)
     )
+
+
+def flip(tensor, dims):
+    if isinstance(dims, int):
+        dims = [dims]
+    return tensor.dtype[tensor.sizes].Reverse(tensor, dimensions=dims)
