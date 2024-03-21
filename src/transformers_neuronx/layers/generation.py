@@ -21,8 +21,10 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
     if config.do_sample:
         return sample(
             logits,
-            k=config.top_k,
+            top_k=config.top_k,
+            top_p=config.top_p,
             temperature=config.temperature,
+            top_p_min_tokens=config.top_p_min_tokens,
             tp_degree=tp_degree
         )
     else:
@@ -43,22 +45,53 @@ def greedy_search(logits, *, tp_degree=1):
     return hlo.transpose(result, 0, 1) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, k=50, temperature=None, tp_degree=1, deterministic=False):
+def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, deterministic=False):
     vocab_size, n_active_tokens, batch_size = logits.sizes
 
     # NOTE: Compiler failures can occur when batch != 1
-    if k == 1 and batch_size == 1:
+    if top_k == 1 and batch_size == 1:
         return greedy_search(logits, tp_degree=tp_degree)
-
-    logits, indices = hlo.topk(logits, k=k, dim=0, tp_degree=tp_degree)
 
     if temperature is not None and temperature != 1.0:
         logits = hlo.divide(logits, temperature)
 
-    probs = hlo.softmax(logits, dim=0)
-    samples = hlo.multinomial(probs, dim=0, deterministic=deterministic)
+    indices = None
 
+    # Perform Top-K
+    if top_k is not None:
+        logits, indices = hlo.topk(logits, k=top_k, dim=0, tp_degree=tp_degree)
+
+    # Perform Top-P
+    if top_p is not None and top_p < 1.0:
+
+        # Sort when using Top-P alone
+        if indices is None:
+            logits = hlo.all_gather(logits, dim=0, tp_degree=tp_degree)
+            logits, indices = hlo.sort_with_indices(logits, dim=0, descending=True)
+
+        logits_ascending = hlo.flip(logits, dims=0)
+
+        # Probability mask - Keep only the positions whose cumulative
+        #   probability is less than the user-provided threshold. This removes
+        #   the long tail of small probababilitiess.
+        probs = hlo.softmax(logits_ascending, dim=0)
+        cumulative_prob = hlo.cumsum(probs, dim=0)
+        remove_probs = hlo.less_equal(cumulative_prob, 1 - top_p)
+        keep_probs = hlo.logical_not(remove_probs)
+        keep_probs = hlo.flip(keep_probs, dims=0)
+
+        # Positional mask - Support minimum number of positions.
+        # Reference: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/generation/logits_process.py#L409-L410
+        positions = hlo.iota(probs.dtype, probs.sizes, dims=0)
+        keep_positions = hlo.less(positions, top_p_min_tokens)
+
+        keep_mask = hlo.logical_or(keep_probs, keep_positions)
+        logits = hlo.masked_select(keep_mask, logits, -30000)
+
+    probs = hlo.softmax(logits, dim=0)
+
+    # Final sample after filtering TopP/TopK
+    samples = hlo.multinomial(probs, dim=0, deterministic=deterministic)
     tokens = hlo.gather(indices, 0, samples)
     tokens = hlo.squeeze(tokens, 0)
     return hlo.transpose(tokens, 0, 1)
-
