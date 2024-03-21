@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import functools
+import concurrent.futures
+from typing import List, Tuple, Dict, Optional
+
 import torch
+
+import transformers_neuronx
 from transformers_neuronx import compiler
 from transformers_neuronx import parallel
-from transformers_neuronx.compiler import DataTypeConverter
-from typing import List, Tuple, Dict
+from transformers_neuronx import bucket
 
 
 class DecoderProgram:
@@ -167,7 +172,7 @@ class HloMetadata:
     @staticmethod
     def inputs(hlo_module) -> List[Tuple[Tuple[int], torch.dtype]]:
         inputs = list()
-        converter = DataTypeConverter()
+        converter = compiler.DataTypeConverter()
         for parameter in hlo_module.host_program_shape.parameters:
             shape = tuple(dim for dim in parameter.dimensions)
             dtype = converter.hlo2torch(parameter.element_type)
@@ -177,7 +182,7 @@ class HloMetadata:
     @staticmethod
     def outputs(hlo_module) -> List[Tuple[Tuple[int], torch.dtype]]:
         outputs = list()
-        converter = DataTypeConverter()
+        converter = compiler.DataTypeConverter()
 
         parameters = hlo_module.host_program_shape.result.tuple_shapes
         if len(parameters) == 0: # Edge case: single output
@@ -305,3 +310,141 @@ class ParallelProgram:
 
     def execute(self, *inputs, return_ranks=-1):
         return self.executor(inputs, return_ranks)
+
+
+class Selector:
+    """
+    A class which selects a program index based on input values.
+
+    This is a base class that can be used to implement many different network
+    selection behaviors. For example context network selection, autoregressive
+    token network selection, speculative decoder network selection, etc.
+    """
+    def __call__(self, *inputs) -> int:
+        raise NotImplementedError()
+
+
+class BucketedParallelProgram:
+    """
+    Multiple parallel programs with shared parameters.
+
+    The execution of a specific parallel program is determined by the provided
+    `selector` object.
+
+    Args:
+        hlo_modules: The modules to build ParallelPrograms for.
+        selector: An callable which chooses one parallel program based on inputs.
+        num_inputs: The user-provided inputs to all the programs.
+        num_outputs: The user-facing outputs to all the programs.
+        neuron_config: Neuron configurations - Used for pipeline parallel.
+        tp_degree: The local tensor parallel degree.
+        tags: The tags to apply to each HLO module provided.
+    """
+
+    def __init__(
+            self,
+            hlo_modules: List['HloModuleProto'],
+            selector: Selector,
+            num_inputs: int,
+            num_outputs: int,
+            neuron_config: transformers_neuronx.NeuronConfig,
+            tp_degree: int = 1,
+            tags: Optional[List[Optional[str]]] = None,
+        ):
+        self.selector = selector
+
+        if tags is None:
+            tags = [None] * len(hlo_modules)
+        assert len(tags) == len(hlo_modules)
+
+        self.programs = list()
+        for hlo_module, tag in zip(hlo_modules, tags):
+            self.programs.append(ParallelProgram(hlo_module, num_inputs, num_outputs, neuron_config, tp_degree, tag))
+
+    def build(self, workers=None):
+        if workers is None:
+            workers = len(self.programs)
+        with concurrent.futures.ProcessPoolExecutor(workers) as executor:
+            for kernel in self.get_kernels():
+                executor.submit(kernel.compile)
+
+    def setup(self, parameters):
+        for program in self.programs:
+            program.setup(parameters)
+
+    def get_kernels(self):
+        return [program.kernel for program in self.programs]
+
+    def execute(self, *inputs, return_ranks=-1):
+        index = self.selector(*inputs)
+        program = self.programs[index]
+        return program.execute(*inputs, return_ranks=return_ranks)
+
+
+class TokenSelector(Selector):
+    """
+    Select a program using batch size and sequence length.
+
+    This attempts to find the best fit for the maximum position found in the
+    input `cache_ids`. If either the batch size or position exceeds a program
+    size, an IndexError will be thrown.
+
+    Args:
+        sizes: The pairs of batch sizes and maximum sequence lengths
+            corresponding to each program.
+    """
+
+    def __init__(self, sizes: List[Tuple[int, int]]):
+        self.buckets = dict()
+        batch_sizes, seqlens = tuple(zip(*sizes))
+        for index, key in enumerate(sizes):
+            self.buckets[key] = index
+        self.seqlens = list(sorted(set(seqlens)))
+        self.batch_sizes = list(sorted(set(batch_sizes)))
+        self.index = self.indexer()
+
+    def indexer(self):
+
+        max_batch = self.batch_sizes[-1]
+        max_seqlen = self.seqlens[-1]
+
+        @functools.lru_cache(maxsize=max_batch * max_seqlen)
+        def index(batch_size, position):
+            if batch_size not in self.batch_sizes:
+                raise IndexError(f'Could not find a program for batch size {batch_size}. Batch Sizes: {self.batch_sizes}')
+            seqlen = bucket.find(self.seqlens, position + 1)
+            if seqlen is None:
+                raise IndexError(f'Could not find a program for position {position}. Sequence Lengths: {self.seqlens}')
+            return self.buckets[(batch_size, seqlen)]
+        return index
+
+    def get_position(self, cache_ids):
+        return cache_ids.max().item()
+
+    def __call__(self, *inputs):
+        input_ids, cache_ids, *rest = inputs
+        batch_size, *_ = input_ids.shape
+        position = self.get_position(cache_ids)
+        return self.index(batch_size, position)
+
+
+class FusedSpeculativeSelector(TokenSelector):
+    """
+    Select a program using batch size, sequence length, and speculation length.
+
+    Unlike normal token selection, this uses a `k` offset to select the
+    correct network since a fused speculative network will need to update
+    the KV cache `k` positions ahead of the current maximum position.
+
+    Args:
+        sizes: The pairs of batch sizes and maximum sequence lengths
+            corresponding to each program.
+        k: The speculation length.
+    """
+
+    def __init__(self, sizes: List[Tuple[int, int]], k):
+        self.k = k
+        super().__init__(sizes)
+
+    def get_position(self, cache_ids):
+        return cache_ids.max().item() + self.k
