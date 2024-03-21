@@ -1219,7 +1219,8 @@ def _argmax(tensor, dim, keepdim=False, return_values=False):
     if keepdim:
         keepdim_shape = list(tensor.sizes)
         keepdim_shape[dim] = 1
-        index = u32[keepdim_shape].Reshape(index)
+        index = reshape(index, keepdim_shape)
+        index = cast(index, u32)
 
     if return_values:
         return reduce_max(tensor, dim, keepdim), index
@@ -1230,8 +1231,6 @@ def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
 
     if tp_degree == 1:
         return _argmax(tensor, dim, keepdim, return_values=return_values)
-
-    scribe = tensor.scribe
 
     # Initially reduce on each replica for replica-local result
     index = _argmax(tensor, dim, keepdim=True)
@@ -1246,10 +1245,10 @@ def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
 
     # Fix concatenated replica-local indices. Offset by (replica_id * replica_size)
     replica_size = dtype.Constant(constant_value=tensor.sizes[dim])
-    replica_size = dtype[sizes].Broadcast(replica_size)
-    replica_ids = dtype[sizes].Iota(dimensions=[dim])
-    offset = dtype[sizes].Multiply(replica_ids, replica_size)
-    index = dtype[sizes].Add(index, offset)
+    replica_size = broadcast(replica_size, sizes, [])
+    replica_ids = iota(dtype, sizes, dim)
+    offset = multiply(replica_ids, replica_size)
+    index = add(index, offset)
 
     # Find replica with globally maximum value
     replica_index = _argmax(value, dim, keepdim=True)
@@ -1262,18 +1261,19 @@ def argmax(tensor, dim, keepdim=False, return_values=False, tp_degree=1):
     rs_size[dim] *= tp_degree
     br_size = list(replica_index.sizes)
     br_size.insert(dim, tp_degree)
-    replica_index = dtype[br_size].Broadcast(replica_index, dimensions=dimensions)
-    replica_index = dtype[rs_size].Reshape(replica_index)
+    replica_index = broadcast(replica_index, br_size, dimensions)
+    replica_index = reshape(replica_index, rs_size)
 
-    mask = scribe.pred[sizes].Compare(replica_index, replica_ids, comparison_direction='EQ')
-    mask_index = index.dtype[mask.sizes].Convert(mask)
-    masked = dtype[sizes].Multiply(index, mask_index)
+    mask = compare(replica_index, replica_ids, direction='EQ')
+    mask_index = cast(mask, index.dtype)
+    masked = multiply(index, mask_index)
     index = reduce_sum(masked, dim=dim, keepdim=keepdim)
 
     if return_values:
         value = reduce_max(value, dim=dim, keepdim=keepdim)
         return value, index
     return index
+
 
 def _embedding(weight, index, dtype=None):
     """
@@ -2243,6 +2243,8 @@ def reshape(tensor, shape):
         shape = [shape]
     if shape == tensor.sizes:
         return tensor
+    if not tensor.sizes: # Handle scalar input special case
+        return tensor.dtype[shape].Reshape(tensor)
     dst_numel = functools.reduce(operator.mul, shape)
     src_numel = functools.reduce(operator.mul, tensor.sizes)
     assert dst_numel == src_numel, (
