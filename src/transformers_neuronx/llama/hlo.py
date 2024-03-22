@@ -63,7 +63,12 @@ class LlamaForSamplingNoEmbeddingHlo:
             base=self.config.rope_theta,
             interpolation_factor=self.config.position_interpolation_factor
         )
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        # mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        n_heads_tp = self.config.hidden_size // self.config.tp_degree
+    
+        cache_ids, mask, active_mask = self.convert_attn_mask_and_cache_id(cache_ids, 
+                                                                    self.neuron_config.rank_id, 
+                                                                    n_heads_tp)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
