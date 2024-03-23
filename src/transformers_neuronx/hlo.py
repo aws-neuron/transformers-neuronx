@@ -1766,8 +1766,8 @@ def _topk(tensor, k):
         backend_config=str(k).encode(),
     )
 
-    value = dtype[sizes].GetTupleElement(results, tuple_index=0)
-    index = u32[sizes].GetTupleElement(results, tuple_index=1)
+    value = get_tuple_element(results, tuple_index=0)
+    index = get_tuple_element(results, tuple_index=1)
 
     return value, index
 
@@ -1909,7 +1909,7 @@ def topk(tensor, dim, k=50, tp_degree=1):
     )
     sizes.insert(dim + 1, k)
     sizes[dim] = tp_degree
-    rank_id = dtype[sizes].Iota(dimensions=[dim])
+    rank_id = iota(dtype, sizes, dim)
     rank_id = reshape(rank_id, index.sizes)
     shard_size = full(tensor.sizes[dim], dtype, index.sizes)
     offset = multiply(rank_id, shard_size)
