@@ -1546,8 +1546,9 @@ class MaybeParallelTensorManipulator:
             new_tensors = []
             for tensor in tensors:
                 K, N = tensor.shape
-                assert(K % constants.TILE_SIZE == 0 and N % constants.TILE_SIZE == 0,
-                    f"Weight dimensions must be divisible by {constants.TILE_SIZE} but received weight with shape={K, N}."
+                assert K % constants.TILE_SIZE == 0 and N % constants.TILE_SIZE == 0, (f"Weight dimensions must be "
+                                                                                       f"divisible by {constants.TILE_SIZE} "
+                                                                                       f"but received weight with shape={K, N}."
                 )
                 reshape_sizes = [K // constants.TILE_SIZE,
                                  constants.TILE_SIZE,
