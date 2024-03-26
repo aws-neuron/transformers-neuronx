@@ -2923,16 +2923,16 @@ def speculative_token_selection(
     """
     s32 = draft_ids.scribe.s32
 
+    # Convert score into probabilities
+    draft_probabilities = softmax(draft_scores, dim=0, tp_degree=tp_degree)
+    target_probabilities = softmax(target_scores, dim=0, tp_degree=tp_degree)
+
     # For simplicity all-gather the scores
     if tp_degree > 1:
-        draft_scores = all_gather(draft_scores, dim=0, tp_degree=tp_degree)
-        target_scores = all_gather(target_scores, dim=0, tp_degree=tp_degree)
+        draft_probabilities = all_gather(draft_probabilities, dim=0, tp_degree=tp_degree)
+        target_probabilities = all_gather(target_probabilities, dim=0, tp_degree=tp_degree)
 
     vocab_size, k, batch_size = draft_scores.sizes
-
-    # Convert score into probabilities
-    draft_probabilities = softmax(draft_scores, dim=0)
-    target_probabilities = softmax(target_scores, dim=0)
 
     # Gather the target/draft probabilities corresponding to draft sampling predictions
     index = reshape(draft_ids, (1, k, batch_size))
