@@ -444,14 +444,23 @@ def gen_max_func(dtype):
     return max_func
 
 
-def get_activation(activation_function: Union[str, Callable]):
+def get_activation(activation_function: Union[str, Callable]) -> Callable:
     """
     Returns an activation function if it's a callable. Otherwise returns
-    the mapping to the function in activations.py
+    the mapping to the named function in activations.py.
+
+    Arguments:
+        activation_function: Callable or name of a function in activations.py.
+
+    Returns:
+        activation: A callable activation function.
     """
     if callable(activation_function):
         return activation_function
-    return getattr(activations, activation_function)
+    assert hasattr(activations, activation_function), f"{activation_function} is not defined in activations.py"
+    activation = getattr(activations, activation_function)
+    assert callable(activation), f"Expected a callable activation function but recieved a {type(activation)}"
+    return activation
 
 
 def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
