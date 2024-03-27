@@ -2897,6 +2897,7 @@ def speculative_token_selection(
         tp_degree=1,
         pad_token_id=0,
         deterministic=False,
+        output_mask=False,
     ):
     """
     A speculative token acceptor based on original DeepMind paper.
@@ -2916,10 +2917,14 @@ def speculative_token_selection(
         deterministic: Flag which enables using a constant 0.5 as token
             acceptance threshold instead of a random uniform. This is used for
             debug/testing.
+        output_mask: Flag that enables returning the token selection mask. This
+            is useful for downstream tasks such as retrieving the accepted
+            scores in a speculative loop.
 
     Returns:
         token: The accepted tokens (with 0-padding)
         index: The last index accepted for each batch line.
+        mask: (optional) The token selection mask.
     """
     s32 = draft_ids.scribe.s32
 
@@ -2977,6 +2982,14 @@ def speculative_token_selection(
     # Transpose back to SB -> BS layout
     tokens = transpose(tokens, 0, 1)
 
+    if output_mask:
+        # Transpose back to SB -> BS layout
+        mask = transpose(mask, 0, 1)
+        return (
+            tokens, # shape: (batch_size, k + 1)
+            index,  # shape: (batch_size,)
+            mask,   # shape: (batch_size, k + 1)
+        )
     return (
         tokens,  # shape: (batch_size, k + 1)
         index,   # shape: (batch_size,)
