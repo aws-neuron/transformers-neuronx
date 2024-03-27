@@ -85,10 +85,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 self.decoder_lm_head_for_speculation[k, batch_size] = \
                     self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k, batch_size=batch_size)
 
-    def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll):
+    def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll: Optional[int] = None):
         if isinstance(window_context_length, int):
             window_context_length=[window_context_length]
         self.window_context_buckets = bucket.context_sizes(window_context_length, self.token_buckets)
+        if unroll is None:
+            unroll = self.decoder_param_set.num_layers
         for k in self.window_context_buckets:
             self.decoder_lm_head_for_window_context[k]=self.decoder_param_set.init_window_context_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
@@ -209,10 +211,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 else:
                     logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
 
-
-
         # process the leftovers context
-        while current < context_length - 1:
+        while current < context_length:
             # find the optimal "window"
             estimate = None
             if hasattr(self, "window_context_buckets"):
@@ -365,7 +365,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def _postprocess(self, logits, start_ids=None, is_context_encoding=False):
         if start_ids is None:
             return logits
-        
+
         if is_context_encoding:
             # NOTE: logits are returned directly, since dynamic batching is handled in _context_dynamic_batching
             return logits
@@ -420,7 +420,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"
             logits = self.context(hidden, *args)
         return logits
-    
+
     def _is_context_encoding(self, inputs):
         _, context_length, *_ = inputs.shape
         return context_length > 1
