@@ -547,7 +547,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         return logits
 
     @torch.no_grad()
-    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, output_scores=False, **kwargs):
+    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, streamer=None, output_scores=False, **kwargs):
 
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids=start_ids,
@@ -585,6 +585,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             sequence_length,
             eos_token_id=self.config.eos_token_id,
             top_k=top_k,
+            streamer=streamer,
             output_scores=output_scores,
             neuron_config=self.neuron_config,
             log_softmax_scores=log_softmax_scores,
