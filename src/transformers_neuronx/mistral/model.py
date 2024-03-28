@@ -145,7 +145,7 @@ class MistralForSampling(base.NeuronModelBase):
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
-        logits = self._postprocess(logits, start_ids=start_ids, is_context_encoding=self._is_context_encoding(inputs))
+        logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
         self.num_processed_tokens += (last_token_id+1)

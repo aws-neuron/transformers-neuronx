@@ -364,17 +364,18 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         return input_ids, cache_ids, start_ids, last_token_id
 
-    def _postprocess(self, logits, start_ids=None, is_context_encoding=False):
+    def _postprocess(self, logits, start_ids=None):
         if start_ids is None:
             return logits
 
-        if is_context_encoding:
+        running_batch_size, n_embed = logits.shape
+        input_batch_size = start_ids.shape[0]
+        if running_batch_size == input_batch_size:
+            # context encoding (aka prefill)
             # NOTE: logits are returned directly, since dynamic batching is handled in _context_dynamic_batching
             return logits
 
-        _, n_embed = logits.shape
-        input_batch_size = start_ids.shape[0]
-
+        # token generation (aka decoding)
         seq_ids = start_ids.flatten().tolist()
         assert input_batch_size == len(seq_ids), f"expected seq_ids to be {input_batch_size} in length, but seq_ids={seq_ids}"
         new_logits = torch.zeros(input_batch_size, n_embed, dtype=logits.dtype, device=logits.device)
@@ -423,19 +424,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits = self.context(hidden, *args)
         return logits
 
-    def _is_context_encoding(self, inputs):
-        _, context_length, *_ = inputs.shape
-        return context_length > 1
+    def _forward(self, hidden, *args):
+        _, context_length, *_ = hidden.shape
 
-    def _forward(self, inputs, *args):
-        if self._is_context_encoding(inputs=inputs):
+        if context_length > 1:
             continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
             if continuous_batching:
-                logits = self._context_dynamic_batching(inputs, *args)
+                logits = self._context_dynamic_batching(hidden, *args)
             else:
-                logits = self.context(inputs, *args)
+                logits = self.context(hidden, *args)
         else:
-            logits = self.decoder_lm_head(inputs, *args)
+            logits = self.decoder_lm_head(hidden, *args)
 
         if self.neuron_config.on_device_generation:
             return logits
