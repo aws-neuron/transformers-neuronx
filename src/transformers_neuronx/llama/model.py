@@ -181,7 +181,7 @@ class LlamaForSampling(base.NeuronModelBase):
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, *rst)
-        logits = self._postprocess(logits, start_ids=start_ids, is_context_encoding=self._is_context_encoding(inputs))
+        logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 
 
