@@ -15,9 +15,8 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx import constants
 from transformers_neuronx import utils
-from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary
+from transformers_neuronx.layers import transformer
 from transformers_neuronx.mistral.hlo import MistralForSamplingNoEmbeddingHlo
 from transformers_neuronx.mixtral.config import MixtralConfig
 from transformers_neuronx.config import NeuronConfig
@@ -30,9 +29,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         config: MixtralConfig,
         neuron_config: Optional[NeuronConfig] = None
     ):
-        self.config = config
-        self.neuron_config = neuron_config
-
+        super().__init__(config, neuron_config)
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         assert not is_bsh, "BSH layout is currently not supported for moe_layer"
         assert str(MistralForSamplingNoEmbeddingHlo.attention) == str(self.attention.__func__), \

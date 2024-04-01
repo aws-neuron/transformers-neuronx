@@ -16,7 +16,7 @@ from typing import Optional
 
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary, generation
+from transformers_neuronx.layers import attention, transformer, rotary, attention_utils
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -152,12 +152,9 @@ class MistralForSamplingNoEmbeddingHlo:
 
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
-
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
-        from transformers_neuronx.layers import attention_utils
+        n_kv_heads_tp = self.config.num_key_value_heads
+        if n_kv_heads_tp is not None:
+            n_kv_heads_tp = n_kv_heads_tp // tp_degree
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -170,7 +167,8 @@ class MistralForSamplingNoEmbeddingHlo:
             d_head,
             neuron_config=self.neuron_config,
             tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
-            shard_over_batch=shard_over_batch
+            shard_over_batch=shard_over_batch,
+            n_kv_heads_tp=n_kv_heads_tp,
         )
 
         # Q = Rotate(Q)

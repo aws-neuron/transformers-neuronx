@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.layers import transformer, alibi, generation
+from transformers_neuronx.layers import transformer, alibi, attention
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -106,12 +106,6 @@ class BloomForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
         dtype = hidden.dtype
         d_head = self.config.hidden_size // self.config.n_head
-
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
