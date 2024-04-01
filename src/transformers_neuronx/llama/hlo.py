@@ -21,6 +21,7 @@ from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx import constants
 
+
 class LlamaForSamplingNoEmbeddingHlo:
 
     def __init__(self,
@@ -112,6 +113,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
         return logits
+    
 
     def attention(
         self,
@@ -195,12 +197,16 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Multi-Token Context Encoding
         else:
 
-            # S = Q @ K
-            score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
-            score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-            context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
+            context = attention.flash_attention(query, key, value)
+
+            if context is None:
+                # S = Q @ K
+
+                score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
+                                        tp_degree=tp_degree, neuron_config=self.neuron_config)
+                score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
+                                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
 
             # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
@@ -212,3 +218,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
+
+
+
+

@@ -14,6 +14,8 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
+from neuronxcc.nki.kernels.attention import flash_fwd, FlashConfig
+from dataclasses import dataclass
 
 
 def transpose_qkv(query, key, value):
@@ -198,3 +200,19 @@ def prior_context(past_scores, past_values,
 
     output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
     return output_dot
+
+
+@dataclass(frozen=True)
+class FlashConfig:
+  """
+    Config class for flash attention with default values
+  """
+  seq_tile_size:int = 2048
+  training:bool=False
+
+def wrapper_flash_attention_nki(q, k, v, o, lse=None):
+    softmax_scale = 1.0
+    config = FlashConfig()
+    seed = None
+    flash_fwd(q, k, v, seed, o, lse, softmax_scale=softmax_scale, use_causal_mask=True, mixed_precision=True, dropout_p=0.0, config=config)
+

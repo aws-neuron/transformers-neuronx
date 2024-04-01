@@ -21,6 +21,8 @@ from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import attention_utils
+from transformers_neuronx.nki.compile import nki_call
+import logging
 
 
 def query_key_value(
@@ -783,3 +785,31 @@ def output(
     if bsh_collective and not bsh_output:
         return hlo.permute(result, (2, 1, 0))
     return result
+
+
+def flash_attention(query, key, value):
+
+    n_active_tokens, batch_size, n_kv_heads_tp, d_head = query.sizes
+
+    flash_attention_nki_compatiblilty = (n_active_tokens % 2048 == 0 and n_active_tokens >= 8192 and query.sizes[2] == key.sizes[2])
+    context = None
+
+    if flash_attention_nki_compatiblilty:
+
+        # query shape is (n_active_tokens, n_seqs, n_kv_heads_tp, d_head)
+        # expected by nki flash_fwd (batch_size, n_kv_heads_tp, d_head, n_active_tokens)
+        n_kv_heads_tp = query.sizes[2]
+        
+        query_nki = hlo.permute(query, [1, 2, 3, 0])
+        key_nki = hlo.permute(key, [1, 2, 3, 0])
+        value_nki = hlo.permute(value, [1, 2, 0, 3]) # shape (batch_size, n_kv_heads_tp, n_active_tokens, d_head)
+
+        context_nki_shape = nki_call(attention_utils.wrapper_flash_attention_nki, query_nki, key_nki, value_nki, grid=[batch_size, n_kv_heads_tp], output_HloShapes=[query.dtype[batch_size, n_kv_heads_tp, n_active_tokens, d_head]])
+
+        # nki flash_fwd output shape (n_seqs, n_kv_heads_tp, n_active_tokens, d_head)
+        context = hlo.permute(context_nki_shape, [0, 2, 1, 3])
+
+    elif n_active_tokens >= 8192 and n_active_tokens % 2048 != 0:
+        logging.warning("Flash Attention is not active. context length should be a multiple of 2k tokens and larger than 8k in order to use flash attention.")
+
+    return context
