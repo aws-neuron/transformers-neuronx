@@ -225,8 +225,8 @@ def main():
     run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
 
     run_parser.add_argument('--gqa', type=str, default=None)
-    run_parser.add_argument('--flash_attention', action='store_true')
     run_parser.add_argument('--quant', action='store_true')
+    run_parser.add_argument('--fuse_qkv', action='store_true')
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--simple_sample_eos_token_override', type=int, default=None, help="override eos token, set to -1 to always generate exactly as many tokens as desired.")
@@ -507,7 +507,6 @@ def run(args, hf_model_name, model_cls):
 
             neuron_config = NeuronConfig(
                 group_query_attention=args.gqa,
-                flash_attention=args.flash_attention,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
             )
 
@@ -646,3 +645,5 @@ def run(args, hf_model_name, model_cls):
 
 if __name__ == "__main__":
     main()
+
+
