@@ -172,12 +172,14 @@ def benchmark(
         "context_length": context_length,
         "output_length": output_length,
         "batch_size": args.batch_size,
+        "iterations": iterations,
         "batches": len(latencies),
         "inferences": inferences,
         "total_duration_seconds": duration,
         "mean_context_encoding_latency": 1000* sum(context_encoding_latency_list) / len(context_encoding_latency_list),
         "e2e_output_token_throughput": (inferences * (output_length - context_length)) / duration,
         "mean_output_token_latency": mean_e2e_token_gen_latency / (output_length - context_length),
+        "sequence_latency_percentiles": percentiles,
     }
 
     print(metrics)
@@ -212,14 +214,19 @@ def main():
     # compilation configuration
     run_parser.add_argument('--batch_size', type=int, default=1, help="Input batch size")
     run_parser.add_argument('--n_positions', type=int, default=128, help="Input sequence length")
+    run_parser.add_argument('--no_bucketing_n_positions', action='store_true', help="Pass n_positions as a list meaning exactly one value gets compiled (no bucketing)")
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
+    run_parser.add_argument('--context_unroll', type=int, default=None)
+    run_parser.add_argument('--window_context_unroll', type=int, default=None)
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
+    run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
 
     run_parser.add_argument('--gqa', type=str, default=None)
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
+    run_parser.add_argument('--simple_sample_eos_token_override', type=int, default=None, help="override eos token, set to -1 to always generate exactly as many tokens as desired.")
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
     # generation configuration
     # TODO: could we simply make unparsed arguments as generation configuration?
@@ -240,7 +247,7 @@ def main():
         "I don't know how to write a program, but I know that I can do it. " \
         "I'm not going to tell you how I learned to code, or how much I've learned. " \
         "But I will tell the story of my first programming experience, and how it changed my life.")
-    run_parser.add_argument('--prompt_len', type=int, default=None)
+    run_parser.add_argument('--prompt_len', type=int, default=None, help="If set, will use random input_ids as (batch_size, prompt_len) instead provided prompt.")
     # neuron_utils utils
     run_parser.add_argument('--snapshot', action='store_true')
     run_parser.add_argument('--pack_artifacts', action='store_true')
@@ -252,6 +259,12 @@ def main():
     run_parser.add_argument('--benchmark', action='store_true', default=None)
     # suffix
     run_parser.add_argument('--suffix', type=str, default=None)
+    # profile
+    run_parser.add_argument('--profile', action='store_true')
+    # profile-torch
+    run_parser.add_argument('--profile_torch', action='store_true')
+    # ntff_count_limit
+    run_parser.add_argument('--ntff_count_limit', type=int, default=1, help='Maximum number of NTFF files to generate')
 
     logits_analysis_name = 'analyze'
     logits_analysis_parser = subparsers.add_parser(logits_analysis_name)
@@ -283,9 +296,12 @@ def main():
     elif model_type == "gptj":
         model_cls = GPTJForSampling
         hf_model_name = get_hf_model('EleutherAI/gpt-j-6B')
-    elif model_type == "llama":
+    elif model_type == "llama" or model_type == "llama_3b":
         model_cls = LlamaForSampling
         hf_model_name = get_hf_model('openlm-research/open_llama_3b')
+    elif model_type == "llama_7b_v2":
+        model_cls = LlamaForSampling
+        hf_model_name = get_hf_model('openlm-research/open_llama_7b_v2')
     elif model_type == "bloom":
         model_cls = BloomForSampling
         hf_model_name = get_hf_model('bigscience/bloom-560m')
@@ -431,28 +447,41 @@ def logits_analysis(args, hf_model_name, model_cls):
 
 
 def save(args, hf_model_name, model_type):
-    model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
+    if args.random:
+        config = AutoConfig.from_pretrained(args.config)
+        model = AutoModelForCausalLM.from_config(config)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
     save_pretrained_split(model, args.save)
 
 
 def run(args, hf_model_name, model_cls):
     torch.manual_seed(15213)
 
-    full_prompt_text = args.prompt
-    if args.various:
-        batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
-            len(full_prompt_text), (args.batch_size,)).tolist()
-    else:
-        batched_seq_lens = [args.prompt_len for _ in range(args.batch_size)]
-
-    batched_prompt_text = [full_prompt_text[:l] for l in batched_seq_lens]
-    print(batched_prompt_text)
-
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name, padding_side="left")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
-    print(encoded_text, "len:", encoded_text.input_ids.shape[-1])
+    # prepare input
+    if args.prompt_len is not None:
+        input_ids = torch.randint(0, 100, (args.batch_size, args.prompt_len))
+        attention_mask = None
+    else:
+        full_prompt_text = args.prompt
+        if args.various:
+            batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
+                len(full_prompt_text), (args.batch_size,)).tolist()
+        else:
+            batched_seq_lens = [args.prompt_len for _ in range(args.batch_size)]
+
+        batched_prompt_text = [full_prompt_text[:l] for l in batched_seq_lens]
+        print(batched_prompt_text)
+
+        encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
+        input_ids = encoded_text.input_ids
+        attention_mask = encoded_text.attention_mask
+
+    print("input_ids", input_ids, " len:", input_ids.shape[-1])
+    print("attention_mask:", attention_mask,)
 
 
     forward_func = None
@@ -464,7 +493,7 @@ def run(args, hf_model_name, model_cls):
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
-            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}" if args.suffix is None else args.suffix
+            suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_nobucket1np_{args.no_bucketing_n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}_cul{args.context_unroll}_wcul{args.window_context_unroll}_ctx{args.context_length_estimate}_wctx{args.window_context_length_estimate}" if args.suffix is None else args.suffix
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
             if args.snapshot or args.pack_artifacts:
@@ -474,18 +503,32 @@ def run(args, hf_model_name, model_cls):
 
             neuron_config = NeuronConfig(group_query_attention=args.gqa)
 
+            if args.no_bucketing_n_positions:
+                n_positions_passed_to_model = [args.n_positions]
+            else:
+                n_positions_passed_to_model = args.n_positions
+
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
-                                                tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                                unroll=args.unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
+                                                tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
+                                                unroll=args.unroll, context_unroll=args.context_unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
+                if args.window_context_length_estimate is not None:
+                    neuron_model.enable_window_context_decoder(args.window_context_length_estimate, args.window_context_unroll)
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
-                                                tp_degree=args.tp_degree, n_positions=args.n_positions,
-                                                unroll=args.unroll)
+                                                tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
+                                                unroll=args.unroll, context_unroll=args.context_unroll)
+                
             print('running model.to_neuron')
+            begin = time.time()
             neuron_model.to_neuron()
+            end = time.time()
+            print(f'ran model.to_neuron in {end - begin} seconds')
+
+            if args.profile:
+                neuron_model.profile(f"profile_{suffix}", args.ntff_count_limit)
 
             config = AutoConfig.from_pretrained(args.load)
             if args.beam > 1:
@@ -507,8 +550,8 @@ def run(args, hf_model_name, model_cls):
                     self.scores = scores
             with torch.inference_mode():
                 max_length = args.max_length if args.max_length is not None else args.n_positions
-                forward_func = lambda : neuron_model.sample(encoded_text.input_ids, max_length,
-                    top_k=args.top_k)
+                forward_func = lambda : neuron_model.sample(input_ids, max_length,
+                    top_k=args.top_k, eos_token_override=args.simple_sample_eos_token_override)
                 sequences = forward_func()
 
                 scores = None
@@ -547,11 +590,18 @@ def run(args, hf_model_name, model_cls):
 
             with torch.inference_mode():
                 forward_func = lambda : model.generate(
-                    input_ids=encoded_text.input_ids,
-                    attention_mask=encoded_text.attention_mask,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     **generation_config,
                 )
+                # also serve as a warm up for torch profiling
                 outputs = forward_func()
+
+        if args.profile_torch:
+            from torch.profiler import profile, record_function, ProfilerActivity
+            with profile(activities=[ProfilerActivity.CPU]) as prof:
+                result = forward_func()
+            prof.export_chrome_trace(f"torch-trace_{suffix}.json")
 
         if args.dump_logits:
             dump_logits_dir = f"logits_dump_{suffix}_simple{args.simple_sample}"
@@ -584,7 +634,7 @@ def run(args, hf_model_name, model_cls):
                 upload_folder_to_s3(compiler_artifacts_dir, args.to_s3)
 
     if args.benchmark:
-        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=encoded_text.input_ids.shape[-1])
+        benchmark(args, neuron_model, forward_func, output_length=outputs.sequences.shape[-1], context_length=input_ids.shape[-1])
 
 if __name__ == "__main__":
     main()

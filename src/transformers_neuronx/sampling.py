@@ -115,10 +115,14 @@ def sample_greedy(model, input_ids, start_ids=None, sequence_length=128):
 
 
 def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                top_k=50, streamer=None, output_scores=False):
+                top_k=50, streamer=None, output_scores=False, neuron_config=None, log_softmax_scores=None, cache_ids=None):
+    log_softmax = neuron_config and neuron_config.log_softmax_scores
     tokens = [input_ids]
     _, start = input_ids.shape
+    if cache_ids:
+        start=cache_ids.item() + 1
     scores = []
+    ls_scores = []
     for cur_len in range(start, sequence_length):
         next_len = cur_len + 1
 
@@ -128,6 +132,8 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
         # Remove all tokens with a probability less than the last token of the top-k
         if output_scores:
             scores.append(next_token_scores)
+            if log_softmax:
+                ls_scores.append(log_softmax_scores)
         topk_values, topk_indices = torch.topk(next_token_scores, top_k)
 
         # sample
@@ -144,12 +150,17 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
 
         # forward pass to get next token
         cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
-        next_token_scores = model(inputs, cache_ids, start_ids)
+        if log_softmax:
+            next_token_scores, log_softmax_scores =  model(inputs, cache_ids, start_ids)
+        else:
+            next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
         streamer.end()
 
     if output_scores:
+        if log_softmax:
+            return torch.cat(tokens, dim=-1), scores, ls_scores
         return torch.cat(tokens, dim=-1), scores
 
     return torch.cat(tokens, dim=-1)
@@ -284,7 +295,7 @@ def filter_ngrams(ngram_size, input_ids, next_token_scores, cur_len):
 
 
 def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id=2,
-                      top_k=50, top_p=1.0, temperature=1.0, streamer=None, stopping_criteria_list=None, ngram_size=None):
+                      top_k=50, top_p=1.0, temperature=1.0, streamer=None, stopping_criteria_list=None, ngram_size=None, cache_ids=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
 
     if not isinstance(temperature, float) or not (temperature > 0):
@@ -296,6 +307,8 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
     tokens = [input_ids]
     _, start = input_ids.shape
+    if cache_ids:
+        start = cache_ids.item()+1
 
     for cur_len in range(start, sequence_length):
 
@@ -347,17 +360,17 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
 @torch.no_grad()
 def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0,
-                 streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None):
+                 streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, cache_ids=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
-
+    
     # populate key/value caches according to the prompt text
     _, start = input_ids.shape
-    next_token_scores = model(input_ids, None, start_ids)
+    next_token_scores = model(input_ids, cache_ids, start_ids)
     if model.context_hook is not None:
         model.context_hook()
     return sample_loop_llama(
         model, input_ids, start_ids, next_token_scores, sequence_length, eos_token_id, top_k, top_p, temperature,
-        streamer, stopping_criteria_list, ngram_size=no_repeat_ngram_size
+        streamer, stopping_criteria_list, ngram_size=no_repeat_ngram_size, cache_ids=cache_ids
     )
 
 #TODO Leverage Generation Args data class as input args

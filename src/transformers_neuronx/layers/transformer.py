@@ -52,6 +52,8 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     """
     s32 = scribe.s32
 
+    # Multilayer on device embedding will use the already-embedded inputs for the layers NEFF
+    # because there is a separate neff for embedding.
     if neuron_config and neuron_config.on_device_embedding:
         hidden_sizes = batch_size, n_active_tokens
     else:
@@ -62,7 +64,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
 
     hidden = (
         s32[hidden_sizes].Parameter(parameter_number=0) if neuron_config and neuron_config.on_device_embedding
-        else 
+        else
         dtype[hidden_sizes].Parameter(parameter_number=0)
     )
     cache_2d = neuron_config and neuron_config.use_2d_cache_ids
@@ -83,7 +85,6 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     )
 
     return hidden, cache_ids, start_ids, last_token_id, sequence_slice_dimensions
-
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
@@ -167,7 +168,9 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
         n_active_tokens = 1
 
     rms_hidden = hlo.rms_norm(hidden, rms_weight, eps) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0)
-    rms_hidden = dtype[hidden_size, n_active_tokens*batch_size].Reshape(rms_hidden)
+    if is_bsh:
+        rms_hidden = hlo.transpose210(rms_hidden)
+    rms_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(rms_hidden)
     logits = hlo.dot00(lm_head_weight, rms_hidden)
     if lm_head_bias is not None:
         lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])

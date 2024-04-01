@@ -15,7 +15,7 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import transformer, rotary
+from transformers_neuronx.layers import transformer, rotary, generation
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -40,8 +40,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
         hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
-            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
-        )
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config)
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
                                                 base=self.config.rope_theta,
@@ -49,7 +48,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
         return (hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask), dims
 
-    def embedding(self, input_ids, embed_weight):
+    def embedding(self, input_ids, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -57,11 +56,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
-
-    def pre_layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, *pre_layer_weights):
-        if self.neuron_config.on_device_embedding:
-            hidden = self.embedding(hidden, *pre_layer_weights)
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,
@@ -108,8 +102,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
-        return transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+        logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
+        if self.neuron_config.on_device_generation is not None:
+            return generation.generate(logits, logits_indices,
+                                       config=self.neuron_config.on_device_generation,
+                                       tp_degree=self.config.tp_degree,
+                                       eos_token_id=self.config.eos_token_id)
+        return logits
 
     def attention(
         self,
@@ -127,6 +127,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             import transformers_neuronx.layers.attention as attention
         else:
             import transformers_neuronx.layers.attention_hsb as attention
+        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -150,48 +151,51 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Q = Q / sqrt(d_head)
         query = attention.scale(query, d_head)
 
+        # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
+        bsh_cache_layout = False
+        if self.neuron_config is not None:
+            bsh_cache_layout = self.neuron_config.cache_layout == constants.LAYOUT_BSH
+        if bsh_cache_layout:
+            query, key, value = attention_utils.transpose_qkv(query, key, value)
+
         # Single Token Generation ("Prefetch"-style)
         if active_mask is not None:
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # Sa = Q @ Ka
             active_score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        shard_over_batch=self.shard_over_batch)
+                                        neuron_config=self.neuron_config)
 
-            # KCache[I] = K
-            # VCache[I] = V
-            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-            updated_values = attention.update_cache(cached_values, cache_ids, value)
+            # KCache[I], VCache[I] = K, V
+            updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                           key, value, start_ids, neuron_config=self.neuron_config)
 
         # Multi-Token Context Encoding
         else:
 
             # S = Q @ K
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                    tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
             context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
-                                                 tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
 
-            # KCache = K
-            # VCache = V
+            # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
-                updated_keys = key
-                updated_values = value
+                updated_keys, updated_values = key, value
             else:
-                # continuous batching
-                updated_keys = attention.update_cache(cached_keys, cache_ids, key, start_ids)
-                updated_values = attention.update_cache(cached_values, cache_ids, value, start_ids)
+                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                               key, value, start_ids, neuron_config=self.neuron_config)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)

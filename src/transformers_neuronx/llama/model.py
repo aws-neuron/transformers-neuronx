@@ -21,7 +21,7 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
@@ -39,6 +39,8 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
         self.layers_after_partition = self.neuron_config.auto_layer_partition(config.num_hidden_layers)
         self.prefixed_length = prefixed_length
@@ -50,20 +52,16 @@ class LlamaForSampling(base.NeuronModelBase):
         if unroll is None:
             unroll = len(self.layers_after_partition)
         self.unroll=unroll
+
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        self.window_context_buckets = []
         if prefixed_length:
             if prefixed_length not in self.context_buckets:
                 self.context_buckets.append(prefixed_length)
                 self.context_buckets = sorted(self.context_buckets)
-        self.max_positions = self.token_buckets[-1]
 
-        if isinstance(batch_size,int):
-            self.batch_sizes = [batch_size]
-        elif isinstance(batch_size,list):
-            self.batch_sizes = sorted(batch_size)
-        else:
-            raise TypeError("batch_size must be list of ints or int type")
+        self.batch_sizes = bucket.batch_sizes(batch_size)
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -73,9 +71,10 @@ class LlamaForSampling(base.NeuronModelBase):
             unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
-        self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
-        self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
-        self.decoder_lm_head_for_speculation={}
+        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
+        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
+        self.decoder_lm_head_for_speculation = {}
+        self.decoder_lm_head_for_window_context = {}
 
     def load_weights(self):
         # Materialize the embedding to CPU
@@ -153,6 +152,12 @@ class LlamaForSampling(base.NeuronModelBase):
                                                                       new=self.decoder_lm_head_for_speculation[k])
                 self.decoder_lm_head_for_speculation[k]=model
 
+        if self.decoder_lm_head_for_window_context:
+            for i,k in enumerate(self.decoder_lm_head_for_window_context):
+                model= self.decoder_lm_head.build_weight_shared(share_caches=True,
+                                                                      new=self.decoder_lm_head_for_window_context[k])
+                self.decoder_lm_head_for_window_context[k]=model
+
 
     def set_prefixed(self, input_ids):
         self.prefixed_input_ids = input_ids[:, :self.prefixed_length]
@@ -162,36 +167,49 @@ class LlamaForSampling(base.NeuronModelBase):
         self.prefixed_length = prefixed_length
 
 
+    def _compute_logits(self, input_ids, *rst):
+        hidden = self.chkpt_model.model.embed_tokens(input_ids)
+        if self.neuron_config.attention_layout == LAYOUT_HSB:
+            hidden = hidden.transpose(0, -1).contiguous()
+        return self._forward(hidden, *rst)
+
+
     def forward(self, input_ids, cache_ids=None, start_ids=None):
-        input_ids, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        if self.neuron_config.on_device_embedding:
-            logits = self._forward(input_ids, *rst, neuron_config=self.neuron_config)
-        else:
-            hidden = self.chkpt_model.model.embed_tokens(input_ids)
-            if self.neuron_config.attention_layout == LAYOUT_BSH:
-                hidden = hidden.permute(2, 1, 0)
-            logits = self._forward(hidden, *rst, neuron_config=self.neuron_config)
+        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 
+
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        input_ids, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        hidden = hidden.transpose(0, -1).contiguous()
+        inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
         if speculation_length is None:
             model=self.decoder_lm_head
         else:
             model=self.decoder_lm_head_for_speculation[speculation_length]
 
-        logits=model(hidden, *args)
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        logits = model(inputs, *args)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
         return logits
 
-    def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None):
+    def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
+        
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
+                                            config=self.neuron_config.on_device_generation)
+
         if self.context_pre_hook is not None:
             self.context_pre_hook()
         batch_size, context_length = input_ids.shape
@@ -209,7 +227,7 @@ class LlamaForSampling(base.NeuronModelBase):
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
-            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size,
+            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size, cache_ids=cache_ids,
         )
 
         return result

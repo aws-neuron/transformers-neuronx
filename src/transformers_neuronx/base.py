@@ -16,8 +16,9 @@
 import os
 import torch
 import logging
-from typing import Optional, Union, List
 import hashlib
+import warnings
+from typing import Optional, Union, List
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
@@ -39,7 +40,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def load(self, directory):
         assert self.serialization_enabled(), 'serialization is not enabled for this model'
         self._compiled_artifacts_directory = directory
-    
+
     # top level api
     def compile(self, parallel_degree=None):
         kernels = self._get_all_kernels()
@@ -77,6 +78,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             speculation_length=[speculation_length]
         for k in speculation_length:
             self.decoder_lm_head_for_speculation[k]=self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
+
+    def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll):
+        if isinstance(window_context_length, int):
+            window_context_length=[window_context_length]
+        self.window_context_buckets = bucket.context_sizes(window_context_length, self.token_buckets)
+        for k in self.window_context_buckets:
+            self.decoder_lm_head_for_window_context[k]=self.decoder_param_set.init_window_context_decoder(unroll=unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k)
 
     def is_compiled(self):
         # First check if the kernels have neffs already
@@ -141,7 +149,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
-    def context(self, hidden, cache_ids, start_ids, last_token_id, *rest, neuron_config=None):
+    def context(self, hidden, cache_ids, start_ids, last_token_id, *rest):
         """A helper to process context (prompt)
         1) if there is available context encoding model (infered from self.context_buckets)
             - when context_length >= estimate, slice the context up to estimate,
@@ -190,17 +198,45 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             if current == estimate:
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
-                logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+                if self.neuron_config.log_softmax_scores:
+                    logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
+                else:
+                    logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
 
-        for i in range(current, context_length):
-            cache_ids = torch.as_tensor([i], dtype=torch.int32)
-            hidden_slice = hidden[:, i:i+1].contiguous()
-            logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest, neuron_config=neuron_config)
+
+
+        # process the leftovers context
+        while current < context_length - 1:
+            # find the optimal "window"
+            estimate = None
+            if hasattr(self, "window_context_buckets"):
+                estimate = bucket.find(self.window_context_buckets, context_length - current)
+
+            # when the leftovers is smaller than estimate, fall back to single token generation
+            # TODO: can we pad?
+            if estimate is None or context_length - current < estimate:
+                for i in range(current, context_length):
+                    cache_ids = torch.as_tensor([i], dtype=torch.int32)
+                    hidden_slice = hidden[:, i:i+1].contiguous()
+                    logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest)
+                break
+
+            hidden_slice = hidden[:, current:current+estimate].contiguous()
+            cache_ids = torch.as_tensor([i for i in range(current, current+estimate)], dtype=torch.int32)
+            last_token_id = torch.as_tensor(estimate - 1)
+            if self.neuron_config.log_softmax_scores:
+                logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
+            else:
+                logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
+
+            current += estimate
 
         if self.is_fid:
             logits[:] = float('-inf')
             logits[self.bos_token_id] = 1.0
 
+        if self.neuron_config.log_softmax_scores:
+            return logits, scores
         return logits
 
     def _prepare_for_par_ctx_rhs_padding(self, input_ids):
@@ -318,9 +354,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
         return logits.to(logits_dtype)
 
-    def _context_dynamic_batching(self, hidden, *args, neuron_config=None):
-        # Taking HSB layout
-        _, context_length, input_batch_size = hidden.shape
+    def _context_dynamic_batching(self, hidden, *args):
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        input_batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
         running_batch_size = self.context_batch_sizes[-1]
@@ -334,34 +370,37 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 # Assuming HSB layout
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
-                hidden_per_batch = hidden[:, :, start_idx:end_idx]
+                if is_bsh:
+                    hidden_per_batch = hidden[start_idx:end_idx, :, :]
+                else:
+                    hidden_per_batch = hidden[:, :, start_idx:end_idx]
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id = cache_ids_per_batch.max()
                 logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
-                                                start_ids_per_batch, last_token_id, neuron_config=neuron_config)
+                                                start_ids_per_batch, last_token_id)
                 all_logits.append(logits_per_batch)
             logits = torch.cat(all_logits, dim=2)
         else:
             assert input_batch_size == running_batch_size, \
                 "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"
-            logits = self.context(hidden, *args, neuron_config=neuron_config)
+            logits = self.context(hidden, *args)
         return logits
 
-    def _forward(self, hidden, *args, neuron_config=None):
-        # Taking HSB layout
+    def _forward(self, hidden, *args):
         _, context_length, *_ = hidden.shape
-        if not self.neuron_config.on_device_embedding:
-            hidden = hidden.transpose(0, -1).contiguous()
 
         if context_length > 1:
             continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
             if continuous_batching:
-                logits = self._context_dynamic_batching(hidden, *args, neuron_config=neuron_config)
+                logits = self._context_dynamic_batching(hidden, *args)
             else:
-                logits = self.context(hidden, *args, neuron_config=neuron_config)
+                logits = self.context(hidden, *args)
         else:
-            logits = self.decoder_lm_head(hidden, *args, neuron_config=neuron_config)
+            logits = self.decoder_lm_head(hidden, *args)
+
+        if self.neuron_config.on_device_generation:
+            return logits
 
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -1, :]
@@ -378,7 +417,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if self.neuron_config.rank_id == 0:
             broad_cast_objects = [args, kwargs]
             dist.broadcast_object_list(broad_cast_objects, src=0, device=torch.device("cpu"))
-            res = self.forward(*args, **kwargs)
+            res = self(*args, **kwargs)
             return res
         else:
             # if non-host, fall back to a for loop
@@ -394,17 +433,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 # it is now naturally handled in forward call
                 dist.broadcast_object_list(broad_cast_objects, src=0, device=torch.device("cpu"))
                 args, kwargs = broad_cast_objects
-                self.forward(*args, **kwargs)
+                self(*args, **kwargs)
 
     def serialization_enabled(self):
         return getattr(self, 'nbs_objs', None) is not None
 
-    def profile(self, profile_dir):
+    def profile(self, profile_dir, ntff_count_limit):
         kernels = self._get_all_kernels()
 
         for kernel in kernels:
             if isinstance(kernel, ParallelKernel):
-                kernel.profile(profile_dir)
+                kernel.profile(profile_dir, ntff_count_limit)
 
 # Base class for all "Serializable Objects"
 class NeuronBaseSerializer:

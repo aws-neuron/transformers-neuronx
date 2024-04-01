@@ -13,10 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 import os
-
 import functools
 import operator
-import warnings
+from typing import Optional, List
 
 import torch
 import numpy as np
@@ -121,7 +120,7 @@ def layer_norm_bsh(hidden, weight, bias):
     return output
 
 
-def group_norm(hidden, weight, bias, num_groups = 1):
+def group_norm(hidden, weight, bias, num_groups = 1): 
     """
     Perform GroupNorm on input with shape (H, S, B).
     """
@@ -134,32 +133,35 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     if hidden_size % num_groups!= 0:
         raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
 
-    # Reshape hidden to (H // g, S, B * g)
+    # Permute HSB->BSH
+    hidden = permute(hidden, [2, 1, 0])
+    # Reshape hidden to (B, S, g, H // g)
     group_size = hidden_size // num_groups
-    norm_size = batch_size * num_groups
-    sizes = group_size, n_active_tokens, norm_size
+    bsh_unpack_sizes = batch_size, n_active_tokens, num_groups, group_size
+    hidden = reshape(hidden, bsh_unpack_sizes)
+    # Reshape to (B*S*g, H//g)
+    norm_size = batch_size * n_active_tokens * num_groups
+    sizes = norm_size, group_size
     hidden = reshape(hidden, sizes)
     hidden = cast(hidden, f32)
 
-    # Calculate norm of each group
-    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
+    # Batchnorm
+    bn_tuple = batch_norm(hidden, group_size, feature_index=0)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
 
-    # Reshape to (H // g, S, B, g)
-    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
-    bn_output = reshape(bn_output, unpacked_shape)
+    # Reshape back to (B, S, g, H // g)
+    bn_output = reshape(bn_output, bsh_unpack_sizes)
+    # Reshape to BSH
+    bsh_shape = batch_size, n_active_tokens, hidden_size
+    bn_output = reshape(bn_output, bsh_shape)
+    # Permute back to HSB
+    bn_output = permute(bn_output, [2, 1, 0])
 
-    # Permute to (g, H // g, S, B)
-    bn_output = permute(bn_output, [3, 0, 1, 2])
-
-    # Reshape to (H, S, B)
-    bn_output = reshape(bn_output, input_sizes)
-
-    # Scale with weight and bias
-    weight_br = f32[input_sizes].Broadcast(weight, dimensions=[0])
-    output = f32[input_sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[input_sizes].Broadcast(bias, dimensions=[0])
-    output = f32[input_sizes].Add(output, bias_br)
+    # Apply weight and bias
+    weight_br = broadcast(weight, input_sizes, broadcast_dimensions=[0])
+    output = multiply(bn_output, weight_br)
+    bias_br = broadcast(bias, input_sizes, broadcast_dimensions=[0])
+    output = add(output, bias_br)
     output = cast(output, dtype)
     return output
 
@@ -168,104 +170,14 @@ def group_norm_shb(hidden, weight, bias, num_groups):
     """
     Perform GroupNorm on input with shape (S, H, B).
     """
-    dtype = hidden.dtype
-    scribe = hidden.scribe
-    f32 = scribe.f32
-
-    n_active_tokens, hidden_size, batch_size = hidden.sizes
-    hsb_size = hidden_size, n_active_tokens, batch_size
-
-    if hidden_size % num_groups!= 0:
-        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
-
-    # Permute to H, S, B
-    hidden = permute(hidden, [1, 0, 2])
-
-    # Reshape hidden to (H // g, S, B * g)
-    group_size = hidden_size // num_groups
-    norm_size = batch_size * num_groups
-    sizes = group_size, n_active_tokens, norm_size
-    hidden = reshape(hidden, sizes)
-    hidden = cast(hidden, f32)
-
-    # Calculate norm of each group
-    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
-    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-
-    # Reshape to (H // g, S, B, g)
-    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
-    bn_output = reshape(bn_output, unpacked_shape)
-
-    # Permute to (g, H // g, S, B)
-    bn_output = permute(bn_output, [3, 0, 1, 2])
-
-    # Reshape to (H, S, B)
-    bn_output = reshape(bn_output, hsb_size)
-
-    # Scale with weight and bias
-    weight_br = f32[hsb_size].Broadcast(weight, dimensions=[0])
-    output = f32[hsb_size].Multiply(bn_output, weight_br)
-    bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
-    output = f32[hsb_size].Add(output, bias_br)
-    output = cast(output, dtype)
-
-    # Permute to S, H, B
-    output = permute(output, [1, 0, 2])
-
-    return output
-
-
+    raise NotImplementedError("SHB GroupNorm is not currently implemented, use HSB")
+    
 def group_norm_bsh(hidden, weight, bias, num_groups):
     """
     Perform GroupNorm on input with shape (B, S, H).
     """
-    dtype = hidden.dtype
-    scribe = hidden.scribe
-    f32 = scribe.f32
-
-    batch_size, n_active_tokens, hidden_size = hidden.sizes
-    hsb_size = hidden_size, n_active_tokens, batch_size
-
-    if hidden_size % num_groups!= 0:
-        raise ValueError(f'Hidden dim {hidden_size} must be divisible by num_groups {num_groups}')
-
-    # Permute to H, S, B
-    hidden = permute(hidden, [2, 1, 0])
-
-    # Reshape hidden to (H // g, S, B * g)
-    group_size = hidden_size // num_groups
-    norm_size = batch_size * num_groups
-    sizes = group_size, n_active_tokens, norm_size
-    hidden = reshape(hidden, sizes)
-    hidden = cast(hidden, f32)
-
-    # Calculate norm of each group
-    bn_tuple = batch_norm(hidden, norm_size, feature_index=2)
-    bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-
-    # Reshape to (H // g, S, B, g)
-    unpacked_shape = group_size, n_active_tokens, batch_size, num_groups
-    bn_output = reshape(bn_output, unpacked_shape)
-
-    # Permute to (g, H // g, S, B)
-    bn_output = permute(bn_output, [3, 0, 1, 2])
-
-    # Reshape to (H, S, B)
-    bn_output = reshape(bn_output, hsb_size)
-
-    # Scale with weight and bias
-    weight_br = f32[hsb_size].Broadcast(weight, dimensions=[0])
-    output = f32[hsb_size].Multiply(bn_output, weight_br)
-    bias_br = f32[hsb_size].Broadcast(bias, dimensions=[0])
-    output = f32[hsb_size].Add(output, bias_br)
-    output = cast(output, dtype)
-
-    # Permute to B, S, H
-    output = permute(output, [2, 1, 0])
-
-    return output
-
-
+    raise NotImplementedError("BSH GroupNorm is not currently implemented, use HSB")
+    
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
@@ -382,62 +294,78 @@ def canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config):
     return lhs, rhs, dtype
 
 
-def mmadd(
-    lhs,
-    rhs,
-    bias=None,
-    lhs_contracting_dimension=0,
-    rhs_contracting_dimension=0,
-    bias_dimension=0,
-    scales=None,
-    neuron_config=None
+def dot_add(
+    lhs: 'HloShape',
+    rhs: 'HloShape',
+    bias: 'HloShape' = None,
+    lhs_contracting_dimension: List[int] = 0,
+    rhs_contracting_dimension: List[int] = 0,
+    bias_dimension: int = 0,
+    scales: Optional['HloShape'] = None,
+    neuron_config: Optional[NeuronConfig] = None,
 ):
     """
-    Matrix-matrix multiplication and optional addition
+    Perform tensor product and optional addition of bias.
+
+    A tensor product is performed on the lhs and rhs tensors,
+    contracting over the dimensions specified in
+    lhs_contracting_dimension and rhs_contracting_dimension.
+
+    If provided, the bias tensor is broadcast to the shape of
+    the dot product and added to the result.
+
+    The result is optionally dequantized before returning.
+
+    Arguments:
+        lhs: Left-hand side tensor (HloShape).
+        rhs: Right-hand side tensor (HloShape).
+        bias: Bias tensor to be added to the result.
+        lhs_contracting_dimension: Contracting dimension(s) for the left-hand side tensor.
+        rhs_contracting_dimension: Contracting dimension(s) for the right-hand side tensor.
+        bias_dimension: Dimension to broadcast the bias tensor.
+        scales: Scales to "rescale" the quantized tensor after it's multiplied,
+            where W_f = W_q * scales.
+        neuron_config: NeuronConfig object that specifies the quantization dtype
+            and method.
+
+    Returns:
+        tensor: Result of tensor product and optional addition.
     """
-    assert len(lhs.sizes) == 2, f"Expected rank 2 LHS. Found shape={lhs.sizes}"
-    assert len(rhs.sizes) == 2, f"Expected rank 2 RHS. Found shape={rhs.sizes}"
-    lhs_size = lhs.sizes[lhs_contracting_dimension]
-    rhs_size = rhs.sizes[rhs_contracting_dimension]
-    assert lhs_size == rhs_size, (
-        f"Contracting dimension mismatch:"
-        f" LHS (dim={lhs_contracting_dimension} shape={lhs.sizes})"
-        f" RHS (dim={rhs_contracting_dimension} shape={rhs.sizes})"
-    )
 
-    lhs, rhs, dtype = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None \
-                        and neuron_config.quant is not None
+    lhs, rhs, _ = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
+    enable_quantize = neuron_config is not None and neuron_config.quant is not None
 
-    lhs_size = lhs.sizes[1 if lhs_contracting_dimension == 0 else 0]
-    rhs_size = rhs.sizes[1 if rhs_contracting_dimension == 0 else 0]
-    dot_dims = dict(
-        lhs_contracting_dimensions=[lhs_contracting_dimension],
-        rhs_contracting_dimensions=[rhs_contracting_dimension]
+    if not isinstance(lhs_contracting_dimension, list):
+        lhs_contracting_dimension = [lhs_contracting_dimension]
+    if not isinstance(rhs_contracting_dimension, list):
+        rhs_contracting_dimension = [rhs_contracting_dimension]
+    dimension_numbers = dict(
+        lhs_contracting_dimensions=lhs_contracting_dimension,
+        rhs_contracting_dimensions=rhs_contracting_dimension,
     )
-    dot = dtype[lhs_size, rhs_size].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    dot = dot_general(lhs, rhs, dimension_numbers)
     if enable_quantize:
         dot = dequantize(dot, scales, neuron_config, bias_dimension)
     if bias is None:
         return dot
-    bias = dtype[lhs_size, rhs_size].Broadcast(bias, dimensions=[bias_dimension])
-    return dtype[lhs_size, rhs_size].Add(dot, bias)
+    bias = broadcast(bias, dot.sizes, broadcast_dimensions=[bias_dimension])
+    return add(dot, bias)
 
 
 def dot00_add0(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 0, 0, 0, scales, neuron_config)
 
 
 def dot00_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 0, 0, 1, scales, neuron_config)
 
 
 def dot10_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 1, 0, 1, scales, neuron_config)
 
 
 def dot11_add1(lhs, rhs, bias, scales=None, neuron_config=None):
-    return mmadd(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
+    return dot_add(lhs, rhs, bias, 1, 1, 1, scales, neuron_config)
 
 
 def dot_with_tiled_weight_add(lhs, rhs, bias,
@@ -635,6 +563,7 @@ def gated_mlp_bsh(
     activation_function='silu',
     tp_degree=1,
     neuron_config=None,
+    return_partial=False,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -653,25 +582,41 @@ def gated_mlp_bsh(
         out_bias:   [h]
         result:     [b, a, h]
     """
-
     dtype = hidden.dtype
     batch_size, n_active_tokens, hidden_size = hidden_sizes = hidden.sizes
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = hidden.dtype[hidden_r_sizes].Reshape(hidden)
-
-    hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+    if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+        assert hidden_size % constants.TILE_SIZE == 0, \
+            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+            f"in order to use NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT"
+        hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = reshape(hidden, hidden_tiled_sizes)
+        hidden_active  = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
+        hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden_active = reshape(hidden_active, hidden_tiled_sizes)
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+        hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
+        hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        result = dot_1220_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
+    else:
+        hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
                                scales=in0_scales, neuron_config=neuron_config)
-    hidden_active = getattr(activations, activation_function)(hidden_active)
-    hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+        hidden_active = getattr(activations, activation_function)(hidden_active)
+        hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
                                scales=in1_scales, neuron_config=neuron_config)
-    hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
-    result = dot11_add1(hidden_states, out_weight, out_bias,
+        hidden_states = dtype[hidden_linear.sizes].Multiply(hidden_active, hidden_linear)
+        result = dot11_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
     result = dtype[hidden_sizes].Reshape(result)
 
-    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    return all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if not return_partial:
+        dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    return result
 
 
 def gated_mlp(
@@ -688,6 +633,7 @@ def gated_mlp(
     activation_function='silu',
     tp_degree=1,
     neuron_config=None,
+    return_partial=False,
 ):
     """
     An attention MLP using 2 input projections as found in LLama.
@@ -754,8 +700,9 @@ def gated_mlp(
         result = transpose(result, 0, 1)
         result = dtype[hidden_sizes].Reshape(result)
 
-    dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if not return_partial:
+        dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return permute(result, (2, 1, 0)) if is_bsh else result
@@ -1456,6 +1403,20 @@ def cache_broadcast(n_positions, from_batch_size, to_batch_size, n_heads_tp, d_h
     return cache_broadcast_impl
 
 
+def concatenate(operands, dimension):
+    # Concatenates a sequence of arrays along dimension.
+    dtype = operands[0].dtype
+    sizes = list(operands[0].sizes)
+    for op_idx in range(1, len(operands)):
+        for dim_idx in range(len(sizes)):
+            if dim_idx != dimension:
+                assert sizes[dim_idx] == operands[op_idx].sizes[dim_idx], \
+                    "All tensors must have the same shape (except in the concatenating dimension)."
+        sizes[dimension] = sizes[dimension] + operands[op_idx].sizes[dimension]
+    output = dtype[sizes].Concatenate(*operands, dimensions=[dimension])
+    return output
+
+
 def quantize(tensor, neuron_config: NeuronConfig, scales_dim):
     scribe = tensor.scribe
     quant_dtype = getattr(scribe, neuron_config.quant.quant_dtype)
@@ -2041,13 +2002,20 @@ def literal(dtype, tensor):
 
     converter = compiler.DataTypeConverter()
 
+    # Convert boolean tensors to int8 to avoid an error in Python 3.11:
+    #   `TypeError: True has type <class 'numpy.bool_'>, but expected one of: (<class 'bool'>, <class 'numbers.Integral'>)`
+    original_dtype = dtype
+    dtype_is_bool = dtype == dtype.scribe.pred
+    if dtype_is_bool:
+        dtype = dtype.scribe.s8
+
     # Convert tensor data to expected HLO data type
     torch_dtype = converter.hlo2torch(dtype.shape_proto.element_type)
     if tensor.dtype != torch_dtype:
         tensor = tensor.to(torch_dtype)
 
     data = tensor.data.numpy().ravel()
-    if tensor.dtype in [torch.float16, torch.bfloat16, torch.int16]:
+    if tensor.dtype in [torch.float16, torch.bfloat16, torch.int16, torch.int8]:
         data = data.tobytes()
 
     accessor = accessors[tensor.dtype]
@@ -2067,6 +2035,7 @@ def literal(dtype, tensor):
             ),
         },
     )
+    result = cast(result, original_dtype)
     return result
 
 
@@ -2277,6 +2246,11 @@ def logical_and(lhs, rhs):
     pred = lhs.scribe.pred
     _check_binary_arguments(lhs, rhs, dtype=pred)
     return pred[lhs.sizes].And(lhs, rhs)
+
+
+def logical_not(lhs):
+    pred = lhs.scribe.pred
+    return pred[lhs.sizes].Not(lhs)
 
 
 def dtype_maximum(dtype):
@@ -2503,6 +2477,66 @@ def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
     return prior_mask, active_mask
 
 
+def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
+    """
+    Creates block diagonal causal masks for multiple prompts.
+
+    This mask is dynamic and depends on the input prompt lengths.
+
+    Example:
+        prompt_lens = [2, 3, 2, 0], n_positions = 7
+
+        prior_mask = [
+            [1, 0, 0, 0, 0, 0, 0], # At position 0 attend to 1st prompt
+            [1, 1, 0, 0, 0, 0, 0], # At position 1 attend to 1st prompt
+            [0, 0, 1, 0, 0, 0, 0], # At position 0 attend to 2nd prompt
+            [0, 0, 1, 1, 0, 0, 0], # At position 1 attend to 2nd prompt
+            [0, 0, 1, 1, 1, 0, 0], # At position 2 attend to 2nd prompt
+            [0, 0, 0, 0, 0, 1, 0], # At position 0 attend to 3rd prompt
+            [0, 0, 0, 0, 0, 1, 1], # At position 1 attend to 3rd prompt
+        ]
+        active_mask = None
+
+    Args:
+        prompt_lens: The list of prompt lengths.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+    """
+    pred = prompt_lens.scribe.pred
+    s32 = prompt_lens.scribe.s32
+    sizes = n_positions, n_positions
+    num_prompts, = prompt_lens.sizes
+
+    a = s32[sizes].Iota(dimensions=[0])
+    b = s32[sizes].Iota(dimensions=[1])
+    prior_mask = pred[sizes].Compare(a, b, comparison_direction="GE")
+
+    anchors = cumsum(prompt_lens, dim=0)
+
+    for idx in range(num_prompts):
+        zero = s32.Constant(constant_value=idx)
+        value = dynamic_slice_along(anchors, dim=0, start=zero, size=1)
+
+        # mask = jnp.logical_and(b<c, a>=c)
+        c = s32[sizes].Broadcast(value, dimensions=[])
+        bc = pred[sizes].Compare(b, c, comparison_direction="LT")
+        ac = pred[sizes].Compare(a, c, comparison_direction="GE")
+        mask = logical_and(bc, ac)
+
+        # prior_mask = jnp.logical_and(prior_mask, jnp.logical_not(mask))
+        prior_mask = logical_and(prior_mask, logical_not(mask))
+
+    # [n_positions, n_positions] -> [1, n_positions, n_positions]
+    prior_mask = unsqueeze(prior_mask, dim=0)
+
+    active_mask = None
+    return prior_mask, active_mask
+
+
 def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions):
     """
     Creates decomposed prior/active masks for LHS-aligned token generation.
@@ -2623,3 +2657,80 @@ def get_tuple_element(tup, tuple_index):
     size = element.sizes
     dtype = element.dtype
     return dtype[size].GetTupleElement(tup, tuple_index=tuple_index)
+
+
+def log_softmax(scores, tp_degree=1, dim=None):
+    rank = len(scores.sizes)
+    if dim is None:
+        dim = rank - 1
+    dtype = scores.dtype
+    br_dims = [di for di in range(rank) if di != dim]
+    reduce_sizes = [scores.sizes[di] for di in br_dims]
+    const_min = dtype.Constant(constant_value=float('-inf'))
+    max_func = gen_max_func(dtype)
+    reductions = dtype[reduce_sizes].Reduce(scores, const_min, dimensions=[dim], to_apply=max_func)
+    global_reductions = all_gather(reductions, dim, tp_degree)
+    global_max = reduce_max(global_reductions, dim, keepdim=True)
+    br_reduce_max = broadcast(global_max, scores.sizes, broadcast_dimensions=br_dims)
+    sub = subtract(scores, br_reduce_max)
+    exp_score = exp(sub)
+    exp_score = all_gather(exp_score, dim, tp_degree=tp_degree)
+    exp_score_max = reduce_sum(exp_score, dim)
+    log = dtype[exp_score_max.sizes].Log(exp_score_max)
+    br_log = broadcast(log, scores.sizes, broadcast_dimensions=br_dims)
+    out = subtract(scores, br_log)
+    return out
+
+
+# https://www.tensorflow.org/xla/operation_semantics#select
+def masked_select(mask, true_tensor, false_tensor):
+    dtype = true_tensor.dtype
+    assert mask.dtype == mask.scribe.pred, "Mask must be a boolean tensor."
+    assert dtype == false_tensor.dtype
+    assert mask.sizes == true_tensor.sizes == false_tensor.sizes, (
+        "Tensor size mismatch."
+        f"mask shape={len(mask.sizes)}, true_tensor shape={len(true_tensor.sizes)}, false_tensor shape={len(false_tensor.sizes)}"
+    )
+    return dtype[mask.sizes].Select(mask, true_tensor, false_tensor)
+
+
+def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
+    """
+    Fused K/V cache placement with slot_mapping.
+
+    Example:
+        prompt_lens = [3, 6, 2], num_blocks = 4, block_size = 128,
+
+        #              |<-- seq 0 -->|<--------   seq 1 ---------->|  seq 2  |
+        slot_mapping = [128, 129, 130, 256, 257, 258, 259, 260, 261, 384, 385]
+
+        updated_keys = [
+            # |<---- block_size (128) ------>|
+            [................................] # empty slot
+            [128, 129, 130, .................] # 3 tokens taking 2nd block
+            [256, 257, 258, 259, 260, 261 ...] # 6 tokens taking 3rd block
+            [384, 385 .......................] # 2 tokens taking 4th block
+        ]
+    """
+    dtype = key.dtype
+    assign_func = gen_assign_func(dtype)
+    n_active_tokens, n_head, d_head = key.sizes
+    n_blocks, block_size, _, _ = key_cache.sizes
+    hidden_size = n_head * d_head
+
+    key = reshape(key, [n_active_tokens, hidden_size])
+    value = reshape(value, [n_active_tokens, hidden_size])
+    key_cache = reshape(key_cache, [n_blocks*block_size, hidden_size])
+    value_cache = reshape(value_cache, [n_blocks*block_size, hidden_size])
+
+    scatter_dims = dict(update_window_dims=[1],
+                        inserted_window_dims=[0],
+                        scatter_dims_to_operand_dims=[0],
+                        index_vector_dim=1)
+    updated_keys = scatter(key_cache, slot_mapping, key, scatter_dims=scatter_dims, to_apply=assign_func)
+    updated_values = scatter(value_cache, slot_mapping, value, scatter_dims=scatter_dims, to_apply=assign_func)
+
+    updated_keys = reshape(updated_keys, [n_blocks, block_size, n_head, d_head])
+    updated_values = reshape(updated_values, [n_blocks, block_size, n_head, d_head])
+
+    return updated_keys, updated_values
