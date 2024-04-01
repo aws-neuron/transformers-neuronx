@@ -222,3 +222,4 @@ class GenerationConfig:
         self.top_p_min_tokens = top_p_min_tokens
         self.eos_token_id = eos_token_id
         self.temperature = temperature
+
