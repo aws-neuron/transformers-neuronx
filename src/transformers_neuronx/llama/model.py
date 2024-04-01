@@ -93,10 +93,7 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
-            if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-                new_layer.add_attention_output(attn.o_proj.weight.detach().T, None, sharding=0, transposed=True)
-            else:
-                new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
+            new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
@@ -214,7 +211,7 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
-        
+
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
                                             config=self.neuron_config.on_device_generation)

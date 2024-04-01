@@ -56,8 +56,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         attention_head_size = config.n_embd // config.n_head
 
         start_mask = os.environ.get('NEURON_INTERNAL_ASSUME_ALL_PROMPT_LENGTHS_ARE_EQUAL', None) != '1'
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
-                                                   self.config.eos_token_id, amp, start_mask, 
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new',
+                                                   self.config.eos_token_id, amp, start_mask,
                                                    neuron_config=self.neuron_config)
 
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
@@ -99,10 +99,7 @@ class GPT2ForSampling(base.NeuronModelBase):
                 new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                               c_attn_bias[n_embd*2:n_embd*3])
             is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-            if is_bsh:
-                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
-            else:
-                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
 
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
@@ -159,7 +156,7 @@ class GPT2ForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
         last_token_id = torch.as_tensor(0, dtype=torch.int32)
-        
+
         if not self.neuron_config.on_device_embedding:
             input_ids = self.chkpt_model.transformer.wte(input_ids)
             position_ids, start_ids = self.decoder_lm_head.embed_positions_ids(cache_ids, start_ids)
@@ -181,7 +178,7 @@ class GPT2ForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
         if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
                                           config=self.neuron_config.on_device_generation)
         else:
             return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
@@ -260,7 +257,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # need to fix this after having right padding
         start_mask = True
 
-        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new', 
+        hlo_builder = OPTForSamplingNoEmbeddingHlo(tp_degree, config.n_embd, 'gelu_new',
                                                    eos_token_id=self.config.eos_token_id,
                                                    amp=amp,
                                                    start_mask=start_mask,
@@ -335,10 +332,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
             new_layer.add_attention_value(c_attn_weight[:, n_embd*2:n_embd*3],
                                           c_attn_bias[n_embd*2:n_embd*3])
             is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-            if is_bsh:
-                new_layer.add_attention_output(attn.c_proj.weight.detach(), attn.c_proj.bias.detach(), sharding=0, transposed=True)
-            else:
-                new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
+            new_layer.add_attention_output(attn.c_proj.weight.detach().T, attn.c_proj.bias.detach(), sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.ln_2.weight.detach(), layer.ln_2.bias.detach())
             new_layer.add_mlp_input(mlp.c_fc.weight.detach(), mlp.c_fc.bias.detach())
             if self.neuron_config.weight_tiling:
@@ -556,7 +550,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None, top_k=50, output_scores=False, **kwargs):
 
         if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
+            return sampling.sample_tokens(self, input_ids, start_ids=start_ids,
                                           sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
 
         if self.context_pre_hook is not None:

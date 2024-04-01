@@ -68,6 +68,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
 
         if attention_mask is not None:
             _, start_ids = attention_mask.max(axis=1)
+            start_ids = start_ids.int()
 
         if (self.cur_len > 0).any().item():
             input_ids = input_ids[:, -1:]
