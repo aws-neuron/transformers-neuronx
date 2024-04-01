@@ -107,18 +107,11 @@ class BloomForSampling(base.NeuronModelBase):
             new_layer.add_attention_value(v, v_bias)
 
             is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-            if is_bsh:
-                new_layer.add_attention_output(
-                    attn.dense.weight.detach().T,
-                    attn.dense.bias.detach(),
-                    sharding=0,
-                )
-            else:
-                new_layer.add_attention_output(
-                    attn.dense.weight.detach(),
-                    attn.dense.bias.detach(),
-                    sharding=1,
-                )
+            new_layer.add_attention_output(
+                attn.dense.weight.detach(),
+                attn.dense.bias.detach(),
+                sharding=1,
+            )
             new_layer.add_pre_mlp_layer_norm(
                 layer.post_attention_layernorm.weight.detach(),
                 layer.post_attention_layernorm.bias.detach()
@@ -127,7 +120,9 @@ class BloomForSampling(base.NeuronModelBase):
                 mlp.dense_h_to_4h.weight.detach().T,
                 mlp.dense_h_to_4h.bias.detach()
             )
-            if is_bsh:
+            if self.neuron_config.weight_tiling:
+                new_layer.add_mlp_output(mlp.dense_4h_to_h.weight.detach().T, mlp.dense_4h_to_h.bias.detach())
+            elif is_bsh:
                 new_layer.add_mlp_output(
                     mlp.dense_4h_to_h.weight.detach().T,
                     mlp.dense_4h_to_h.bias.detach(),
@@ -181,7 +176,7 @@ class BloomForSampling(base.NeuronModelBase):
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
         if self.neuron_config.on_device_generation:
-            result = sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length, 
+            result = sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
                                             config=self.neuron_config.on_device_generation)
         else:
             result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,

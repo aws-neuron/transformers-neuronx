@@ -28,7 +28,7 @@ from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH, LAYO
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.layers import transformer, generation
+from transformers_neuronx.layers import transformer, generation, attention, attention_utils
 
 
 class OPTForSampling(base.NeuronModelBase):
@@ -422,13 +422,6 @@ class OPTForSamplingNoEmbeddingHlo:
         else:
             max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
             n_kv_heads = n_kv_heads_tp * tp_degree
-
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
-        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK

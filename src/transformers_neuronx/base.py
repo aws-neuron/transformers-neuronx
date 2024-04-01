@@ -284,6 +284,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
+                cache_ids = torch.arange(estimate, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
 
         return input_ids, cache_ids, last_token_id
 
