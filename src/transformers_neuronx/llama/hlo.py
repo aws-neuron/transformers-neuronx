@@ -15,11 +15,12 @@
 from typing import Optional
 
 from transformers_neuronx import hlo
+from transformers_neuronx import constants
+from transformers_neuronx import utils
 from transformers_neuronx.layers import transformer, rotary, attention, attention_utils
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
-from transformers_neuronx import constants
 
 
 class LlamaForSamplingNoEmbeddingHlo:
@@ -113,7 +114,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
         return logits
-    
+
 
     def attention(
         self,
@@ -126,9 +127,14 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
-        n_kv_heads_tp = self.config.num_key_value_heads
-        if n_kv_heads_tp is not None:
-            n_kv_heads_tp = n_kv_heads_tp // tp_degree
+
+        # Compute the expected number of KV heads (Used in case fused QKV is used)
+        n_kv_heads_tp = None
+        if self.config.num_key_value_heads is not None:
+            n_head = self.config.num_attention_heads
+            n_kv_head = self.config.num_key_value_heads
+            _, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_kv_heads_tp = n_kv_head_padded // tp_degree
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -218,7 +224,3 @@ class LlamaForSamplingNoEmbeddingHlo:
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
-
-
-
-

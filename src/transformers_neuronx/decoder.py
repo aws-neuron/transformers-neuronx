@@ -988,6 +988,7 @@ class DecoderLayer(torch.nn.Module):
         self.tp_degree = tp_degree
         self.n_positions = n_positions
         self.n_head = n_head
+        self.n_head_padded = None
         self.n_kv_head = n_kv_head
         self.batch_sizes = batch_size
         self.attention_head_size = attention_head_size  # TODO: rename this to size_per_head
@@ -1061,8 +1062,11 @@ class DecoderLayer(torch.nn.Module):
             # Hidden size padding
             _, hidden_size = self.attn_q_weight.shape
             n_heads = hidden_size // self.attention_head_size
-            n_heads_padded = utils.round_up_to_divisor(n_heads, self.tp_degree)
-            hidden_size_padded = hidden_size_padded_qkv = n_heads_padded * self.attention_head_size
+
+            n_head_padded, n_kv_heads_padded = utils.get_qkv_padding(n_heads, self.n_kv_head, self.tp_degree, self.neuron_config)
+            self.n_head_padded = n_head_padded
+
+            hidden_size_padded = hidden_size_padded_qkv = n_head_padded * self.attention_head_size
             if self.neuron_config.group_query_attention == constants.GQA.ALL_GATHER_HEADS:
                 qkv_maybe_pad = attn_out_maybe_pad = MaybePadder(hidden_size_padded,
                                         padding="interleaved",
@@ -1077,7 +1081,7 @@ class DecoderLayer(torch.nn.Module):
 
                 # Adjust padding strategy if we can use less K/V replication
                 # with interleaved padding.
-                extra_heads = n_heads_padded - n_heads
+                extra_heads = n_head_padded - n_heads
                 if (
                     self.n_head != self.n_kv_head
                     and self.neuron_config.group_query_attention == constants.GQA.REPLICATED_HEADS
@@ -1098,28 +1102,13 @@ class DecoderLayer(torch.nn.Module):
 
             self.attn_q_weight = qkv_maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = qkv_maybe_pad(self.attn_q_bias, dim=0)
-            # Replication GQA: Handle explicit/implicit configuration
-            if (
-                self.n_head != self.n_kv_head
-                and self.neuron_config.group_query_attention == constants.GQA.REPLICATED_HEADS
-            ):
-                ratio = int(self.n_head / self.n_kv_head)
 
-                # Reduced replication - This maintains GQA but minimizes the replication of the
-                #   KV cache only up to the tensor parallel degree so that the data copying is
-                #   minimal per NeuronCore.
-                if (
-                    (self.n_kv_head < self.tp_degree)
-                    and (self.tp_degree % self.n_kv_head == 0)
-                    and (
-                        (self.n_head % self.tp_degree == 0)
-                        or (
-                            (n_heads_padded - n_heads) % self.n_kv_head == 0
-                            and n_heads_padded - n_heads > 0
-                        )
-                    )
-                ):
-                    ratio = int(self.tp_degree / self.n_kv_head)
+            if n_kv_heads_padded != self.n_kv_head:
+
+                if n_kv_heads_padded % self.n_kv_head == 0:
+                    ratio = int(n_kv_heads_padded / self.n_kv_head)
+                else:
+                    ratio = int((n_kv_heads_padded - extra_heads) / self.n_kv_head)
 
                 def repeat(weight):
                     if weight is None:

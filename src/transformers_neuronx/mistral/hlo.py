@@ -16,6 +16,7 @@ from typing import Optional
 
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
+from transformers_neuronx import utils
 from transformers_neuronx.layers import attention, transformer, rotary, attention_utils
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.config import NeuronConfig
@@ -152,9 +153,15 @@ class MistralForSamplingNoEmbeddingHlo:
 
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
-        n_kv_heads_tp = self.config.num_key_value_heads
-        if n_kv_heads_tp is not None:
-            n_kv_heads_tp = n_kv_heads_tp // tp_degree
+
+        # Compute the expected number of KV heads (Used in case fused QKV is used)
+        n_kv_heads_tp = None
+        if self.config.num_key_value_heads is not None:
+            n_head = self.config.num_attention_heads
+            n_kv_head = self.config.num_key_value_heads
+            _, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_kv_heads_tp = n_kv_head_padded // tp_degree
+
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
