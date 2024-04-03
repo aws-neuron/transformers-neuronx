@@ -63,12 +63,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             base=self.config.rope_theta,
             interpolation_factor=self.config.position_interpolation_factor
         )
-        # mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
-        n_heads_tp = self.config.hidden_size // self.config.tp_degree
-    
-        cache_ids, mask, active_mask = self.convert_attn_mask_and_cache_id(cache_ids, 
-                                                                    self.neuron_config.rank_id, 
-                                                                    n_heads_tp)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
@@ -249,3 +244,71 @@ class LlamaForSamplingNoEmbeddingHlo:
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
+
+
+
+
+    def convert_attn_mask_and_cache_id(self, cache_ids, core_id, n_heads_tp,
+                                    batch_size=1, is_context_encoding=False):
+        """
+        Convert normal cache IDs to the format suitable for sharded KV cache, and create proper attention
+        masks. Since each Q/KV head can be distributed to multiple cores, each core will have a
+        different mask and cache ID.
+
+        In this version, the KV cache of all KV heads is evenly split across all cores. Tokens are
+        written to the KV caches in a strided way: token 0 goes to core 0's cache, token 1 goes to core
+        1's cache, etc. When computing active tokens, each core is in charge of tokens that are written
+        to it's cache.
+
+        For tokens that should not be written to the current core's KV cache, the cache ID for this token
+        is set to cache_size. We need 1 or more garbage entries in the KV cache for this purpose.
+        """
+        assert len(cache_ids.sizes) == 1, "Assuming 1D cache IDs!"
+        assert n_heads_tp == 1, "Assuming each core only process 1 Q head!"
+
+        n_active_tokens = cache_ids.sizes[0]
+        cores_per_kv_head = self.config.tp_degree // self.config.num_kv_heads
+        cache_size = self.n_positions // cores_per_kv_head
+        pred = cache_ids.scribe.pred
+        dtype = cache_ids.dtype
+
+        # Real cache ID = raw cache ID // the number of cores that hold a single head's KV cache
+        num_cache_splits = cores_per_kv_head
+        real_cache_ids = hlo.divide(cache_ids, num_cache_splits)
+        # Default cache ID = cache_size
+        default_cache_ids = hlo.full(cache_size, dtype, real_cache_ids.sizes)
+        # Now mask out the entries that should not go to this core's cache
+        target_core_ids = hlo.remainder(cache_ids, num_cache_splits)
+        core_id_cast = hlo.cast(core_id, dtype)
+        curr_core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
+        curr_core_id_in_head = hlo.broadcast(curr_core_id_in_head, target_core_ids.sizes, [0])
+        mask = hlo.compare(target_core_ids, curr_core_id_in_head, "EQ")
+        converted_cache_ids = dtype[cache_ids.sizes].Select(mask, real_cache_ids, default_cache_ids)
+
+        # Generate masks
+        if is_context_encoding:
+            # We don't need active mask for context encoding
+            converted_active_mask = None
+            # Prior mask is simpler for context encoding
+            converted_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
+            converted_mask = hlo.broadcast(converted_mask, (batch_size, n_active_tokens, n_active_tokens), [1, 2])
+        else:
+            converted_mask_size = batch_size, n_active_tokens, cache_size
+
+            # For prior mask, we compute how many tokens are there in this core's KV cache
+            num_processed_tokens = hlo.reduce_min(cache_ids, dim=0, keepdim=True)
+            core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
+            num_tokens_on_core = hlo.divide(hlo.subtract(hlo.add(num_processed_tokens, num_cache_splits-1), core_id_in_head), num_cache_splits)
+            # Use Iota to generate the mask
+            iota = dtype[converted_mask_size].Iota(dimensions=[2])
+            num_tokens_on_core_br = hlo.broadcast(num_tokens_on_core, converted_mask_size, [2])
+            converted_mask = hlo.less(iota, num_tokens_on_core_br)
+
+            # Construct the active mask based on the rule above, each core is in charge of tokens
+            # that are written to its own cache
+            converted_active_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
+            converted_active_mask = hlo.broadcast(converted_active_mask, (batch_size, n_active_tokens, n_active_tokens), broadcast_dimensions=[1, 2])
+            mask_br = hlo.broadcast(mask, converted_active_mask.sizes, [2])
+            converted_active_mask = hlo.logical_and(converted_active_mask, mask_br)
+
+        return converted_cache_ids, converted_mask, converted_active_mask
