@@ -700,9 +700,9 @@ def output(
                 [hidden, d_head * n_heads_tp]
 
             Dot if transposed:
-                (b * s, padded_h) @ (padded_h, h) contract=(1, 0) => (b * s, h)
+                (s * b, padded_h) @ (padded_h, h) contract=(1, 0) => (s * b, h)
             else:
-                (b * s, padded_h) @ (h, padded_h) contract=(1, 1) => (b * s, h)
+                (s * b, padded_h) @ (h, padded_h) contract=(1, 1) => (s * b, h)
 
         3D out_weight case
             Weight shape if transposed:
@@ -711,9 +711,9 @@ def output(
                 [hidden, d_head, n_heads_tp]
 
             Dot if transposed:
-                (b * s, d_head, n_heads_tp) @ (d_head, n_heads_tp, h) contract=((1, 2). (0, 1)) => (b * s, h)
+                (s * b, d_head, n_heads_tp) @ (d_head, n_heads_tp, h) contract=((1, 2), (0, 1)) => (s * b, h)
             else:
-                (b * s, d_head, n_heads_tp) @ (h, d_head, n_heads_tp) contract=((1, 2), (1, 2)) => (b * s, h)
+                (s * b, d_head, n_heads_tp) @ (h, d_head, n_heads_tp) contract=((1, 2), (1, 2)) => (s * b, h)
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
@@ -738,7 +738,7 @@ def output(
     result = hlo.reshape(context, result_sizes)
 
     if three_dims:
-        # (b * s, n_heads_tp, d_head) -> (b * s, d_head, n_heads_tp)
+        # (s * b, n_heads_tp, d_head) -> (s * b, d_head, n_heads_tp)
         result = hlo.permute(result, (0, 2, 1))
 
     if three_dims:
@@ -771,10 +771,11 @@ def output(
     bsh_output = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
 
     if bsh_output or bsh_collective:
-        # (b * s, h) => (b, s, h)
-        result = hlo.reshape(result, (n_seqs, n_active_tokens, hidden_size))
+        # (s * b, h) => (b, s, h)
+        result = hlo.reshape(result, (n_active_tokens, n_seqs, hidden_size))
+        result = hlo.transpose(result, 0, 1)
     else:
-        # (b * s, h) => (h, s, b)
+        # (s * b, h) => (h, s, b)
         result = hlo.transpose(result, 0, 1)
         result = hlo.reshape(result, hidden_sizes)
 
@@ -799,7 +800,7 @@ def flash_attention(query, key, value):
         # query shape is (n_active_tokens, n_seqs, n_kv_heads_tp, d_head)
         # expected by nki flash_fwd (batch_size, n_kv_heads_tp, d_head, n_active_tokens)
         n_kv_heads_tp = query.sizes[2]
-        
+
         query_nki = hlo.permute(query, [1, 2, 3, 0])
         key_nki = hlo.permute(key, [1, 2, 3, 0])
         value_nki = hlo.permute(value, [1, 2, 0, 3]) # shape (batch_size, n_kv_heads_tp, n_active_tokens, d_head)
