@@ -25,6 +25,15 @@ LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
 LAYOUT_SBH = 'SBH'
 
+class Layout(enum.Enum):
+    HSB = 'HSB'
+    BSH = 'BSH'
+    SBH = 'SBH'
+
+    def __eq__(self, value):
+        return super().__eq__(Layout(value))
+
+
 # Group query attention sharding configurations
 class GQA(enum.Enum):
 
