@@ -391,7 +391,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         # Cast logits to float32 or the dtype specified in the neuron config
         logits_dtype = torch.float32
         if self.neuron_config:
-            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+            if self.neuron_config.cast_logits_dtype is not None:
+                logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
         return logits.to(logits_dtype)
 
     def _context_dynamic_batching(self, hidden, *args):
