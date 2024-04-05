@@ -1941,6 +1941,54 @@ def topk(tensor, dim, k=50, tp_degree=1):
     return output(value, index)
 
 
+def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
+    """
+    Get the smallest set of tensor values that add up to top_p or higher.
+
+    Arguments:
+        tensor: The values to select the top-p from.
+        top_p: The cumulative sum of values.
+        top_p_min_tokens: The minimum number of tokens that cannot be filtered.
+        tp_degree: The number of ranks to collect across.
+        indices: Optional indices of the pre-sorted tensor in descending order.
+
+    Returns:
+        probs: The top-p values in the tensor.
+        indices: Indices of the pre-sorted tensor in descending order.
+    """
+
+    if top_p < 0 or top_p > 1.0:
+        raise ValueError(f"`top_p` has to be a float > 0 and <= 1, but is {top_p}")
+    if not isinstance(top_p_min_tokens, int) or (top_p_min_tokens < 1):
+        raise ValueError(f"`top_p_min_tokens` has to be a positive integer, but is {top_p_min_tokens}")
+
+    if indices is None:
+        if tp_degree > 1:
+            tensor = all_gather(tensor, dim=0, tp_degree=tp_degree)
+        tensor, indices = sort_with_indices(tensor, dim=0, descending=True)
+
+    tensor_ascending = flip(tensor, dims=0)
+
+    # Probability mask - Keep only the positions whose cumulative
+    #   probability is less than the user-provided threshold. This removes
+    #   the long tail of small probababilitiess.
+    probs = softmax(tensor_ascending, dim=0)
+    cumulative_prob = cumsum(probs, dim=0)
+    remove_probs = less_equal(cumulative_prob, 1 - top_p)
+    keep_probs = logical_not(remove_probs)
+    keep_probs = flip(keep_probs, dims=0)
+
+    # Positional mask - Support minimum number of positions.
+    # Reference: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/generation/logits_process.py#L409-L410
+    positions = iota(probs.dtype, probs.sizes, dims=0)
+    keep_positions = less(positions, top_p_min_tokens)
+
+    keep_mask = logical_or(keep_probs, keep_positions)
+    probs = masked_select(keep_mask, tensor, -30000)
+
+    return probs, indices
+
+
 def numel(tensor):
     elements = 1
     for dim in tensor.sizes:
