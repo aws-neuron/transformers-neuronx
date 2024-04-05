@@ -1,0 +1,242 @@
+# Copyright Amazon Web Services and its Affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+from transformers_neuronx import hlo
+from transformers_neuronx import utils
+from transformers_neuronx import constants
+from transformers_neuronx.layers import attention
+
+"""
+    Helper functions for shard over sequence / Flash decoding implementaions
+"""
+
+def context(past_scores, active_score, past_values, active_values,
+                        core_id, past_mask, active_mask, n_kv_heads=0, n_heads=None, 
+                        sparse_mask=None, dtype=None, shard_over_batch=False, tp_degree=None, 
+                        neuron_config=None, slice_output=False):
+    """
+    Context method with sharding over sequence under a GQA scenario.
+    """
+    # Check the conditions on sharding over seq
+    assert not shard_over_batch, "Cannot shard over both batch and seq dimensions!"
+    assert sparse_mask is None, "Not supposed to be used for context encoding for now!"
+    assert n_kv_heads > 0 and n_heads > 0 , "n_kv_heads and n_heads has to be non-zero"
+
+    if neuron_config: 
+        assert neuron_config.attention_layout != constants.LAYOUT_BSH, "flash decoding not support for BSH layout"
+
+    if dtype == None:
+        dtype = active_score.dtype
+    scribe = active_score.scribe
+    f32 = scribe.f32
+
+    n_seqs, n_heads_tp, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
+    n_seqs, _, n_active_tokens, _ = past_scores.sizes
+    _, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
+    # reduce_sizes: (n_seqs, n_heads_tp, n_active_tokens)
+
+    # How many cores should compute each head collectively
+    # All cores that hold the KV cache for the same head should communicate here
+    cores_per_kv_head = tp_degree // n_heads
+    if cores_per_kv_head > 1:
+        replica_groups = utils.build_replica_groups(num_groups=n_kv_heads,
+                                                    group_size=cores_per_kv_head)
+    else:
+        # MHA case, assume all cores will have all heads in cache and kv sharded by seq
+        replica_groups = utils.build_replica_groups(num_groups=1, group_size=tp_degree)
+        cores_per_kv_head = tp_degree
+    replica_groups = utils.build_replica_groups(num_groups=n_kv_heads,
+                                                group_size=cores_per_kv_head)
+    # Upcast to f32 before computation
+    past_scores = hlo.cast(past_scores, f32)
+    active_score = hlo.cast(active_score, f32)
+
+    # Compute maximum of both past_scores and active_scores
+    max_past_score = hlo.reduce_max(past_scores, dim=3)
+    max_active_score = hlo.reduce_max(active_score, dim=3)
+    max_score_per_core = hlo.maximum(max_past_score, max_active_score)
+    # We use the flashattention trick, compute the sum of scores locally and rescale later
+    # Shift the scores by the local max for now
+    max_score_per_core_br = hlo.broadcast(max_score_per_core, past_scores.sizes, broadcast_dimensions=[0, 1, 2])
+    max_score_per_core_br_active = hlo.broadcast(max_score_per_core, active_score_sizes, broadcast_dimensions=[0, 1, 2])
+    past_score_shifted = hlo.subtract(past_scores, max_score_per_core_br)
+    active_score_shifted = hlo.subtract(active_score, max_score_per_core_br_active)
+    # Compute the local sum: L_i = sum(exp(s_i - m_i))
+    exp = hlo.exp(past_score_shifted)
+    active_exp = hlo.exp(active_score_shifted)
+    past_denom = hlo.reduce_sum(exp, dim=3)
+    active_denom = hlo.reduce_sum(active_exp, dim=3)
+    denom_per_core = hlo.add(past_denom, active_denom)
+
+    # Communication 2: send the local max and local denom around
+    # First concatenate them together so we can use one all-gather for them both
+    # The two tensors are supposed to have the same shape
+    payload = hlo.concatenate((max_score_per_core, denom_per_core), dimension=1)
+    comm_res = hlo.all_gather(payload, dim=1, tp_degree=tp_degree, replica_groups=replica_groups)
+    comm_res_reshaped = hlo.reshape(comm_res, (n_seqs, cores_per_kv_head, 2, n_heads_tp, n_active_tokens))
+    all_max_scores = hlo.slice_along(comm_res_reshaped, dim=2, limit=1, start=0)
+    all_denoms = hlo.slice_along(comm_res_reshaped, dim=2, limit=2, start=1)
+    # Each core is now handling multiple Q heads, we constrain our reduce to be in the same Q head
+    # After this step we get the global max M on each core, and all the local sums on each core
+    all_max_scores = hlo.reshape(all_max_scores, (n_seqs, cores_per_kv_head, n_heads_tp, n_active_tokens))
+    max_score = hlo.reduce_max(all_max_scores, dim=1, keepdim=False) # (n_seqs, n_heads_tp, n_active_tokens)
+    max_score_br = hlo.broadcast(max_score, all_max_scores.sizes, broadcast_dimensions=[0, 2, 3])
+    all_denoms = hlo.reshape(all_denoms, (n_seqs, cores_per_kv_head, n_heads_tp, n_active_tokens))
+    # Compute the global denominator L = sum(exp(m_i - M) * L_i)
+    # Notice that the softmax has an additional 1 in the denominator
+    scaling_factor = hlo.exp(hlo.subtract(all_max_scores, max_score_br))
+    mult_res = hlo.multiply(all_denoms, scaling_factor)
+    denom = hlo.reduce_sum(mult_res, dim=1, keepdim=False) # (n_seqs, n_heads_tp, n_active_tokens)
+    # Recompute the scores with the updated max
+    # TODO: kgopalsw: can rescale the past_exp wth scaling factor
+    max_score_br = hlo.broadcast(max_score, past_scores.sizes, broadcast_dimensions=[0, 1, 2])
+    max_score_br_active = hlo.broadcast(max_score, active_score_sizes, broadcast_dimensions=[0, 1, 2])
+    past_score_shifted = hlo.subtract(past_scores, max_score_br)
+    active_score_shifted = hlo.subtract(active_score, max_score_br_active)
+    # Cast the scores back to the original datatype
+    exp = hlo.exp(past_score_shifted)
+    active_exp = hlo.exp(active_score_shifted)
+    past_prob = hlo.cast(exp, dtype)
+    active_prob = hlo.cast(active_exp, dtype)
+    # Add an additional step of masking after the exp
+    past_prob = attention.mask(past_prob, past_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch, constant_value=0)
+    active_prob = attention.mask(active_prob, active_mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch, constant_value=0)
+
+    # Ca = Pa @ Va
+    # Cp = Pp @ Vp
+    # C = Ca + Cp
+    # lhs (past_prob): (n_seqs, n_heads, n_active_tokens, n_positions)
+    # rhs (value): (n_positions, n_seqs, n_heads, d_head)
+    dot_dims = dict(lhs_contracting_dimensions=[3],
+                lhs_batch_dimensions=[0, 1],
+                rhs_contracting_dimensions=[0],
+                rhs_batch_dimensions=[1, 2])
+    n_repeats = n_heads_tp // n_kv_heads_tp
+    if n_repeats > 1:
+        _, n_heads_tp, *_ = past_prob.sizes
+        _, _, n_kv_heads_tp, *_ = past_values.sizes
+        n_repeats = n_heads_tp // n_kv_heads_tp
+        past_values = hlo.repeat_kv(past_values, n_repeats=n_repeats, repeat_dim=2)
+        active_values = hlo.repeat_kv(active_values, n_repeats=n_repeats, repeat_dim=2)
+    output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
+    active_output_dot = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
+    output = hlo.add(output_dot, active_output_dot)
+
+    sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
+    denom_br = hlo.broadcast(denom, sizes, broadcast_dimensions=[0, 1, 2])
+    denom_br = hlo.cast(denom_br, dtype)
+    output = hlo.divide(output, denom_br) # output is f16, denom_br is f32
+
+    # Communication 3: send the results of other Q heads back to their corresponding cores
+    # Also gather the results of the current Q head from other cores
+    # Ideally we should use a reduce-scatter here, but we don't have it yet
+    # Using an all-gather to do the job for now
+    # The replica group includes all cores handling the same KV head, same as above
+    all_outputs = hlo.all_gather(output, 1, tp_degree, replica_groups)
+    # Reshape and do the reduce
+    all_outputs = hlo.reshape(all_outputs, (n_seqs, cores_per_kv_head, n_heads_tp, n_active_tokens, d_head))
+    all_outputs_sum = hlo.reduce_sum(all_outputs, dim=1, keepdim=False)
+    # Choose the ones that corresponds to this core
+    # The order of tensors in the all-gather result is consistent with the order in the replica group
+    cores_per_q_head = tp_degree // n_heads
+    cores_per_kv_head = tp_degree // n_kv_heads
+    if cores_per_q_head:
+        # handle casese where we have single q per core or q is replicated 
+        group_size = cores_per_kv_head // cores_per_q_head
+        q_head_id = hlo.remainder(hlo.remainder(core_id, cores_per_kv_head), group_size)
+        size = 1
+    else:
+        # cases for mulitple q heads per core, group_size is equal to cores_per_kv_head
+        group_size = tp_degree // n_kv_heads  
+        q_head_id = hlo.multiply(hlo.remainder(core_id, group_size), group_size)
+        size = n_heads // tp_degree
+    # must reshape to a scalar
+    q_head_id = hlo.reshape(q_head_id,[])
+    if slice_output:
+        output = hlo.dynamic_slice_along(all_outputs_sum, dim=1, start=q_head_id, size=size)
+    else:
+        output = all_outputs_sum
+    output = hlo.permute(output, dimensions=[2, 0, 1, 3])
+    # Each core now has a partial result. In output projection, result for each head is
+    # multiplied with its corresponding weights, and then an all-reduce is used to sum
+    # results for all heads together.
+    # We need a scaling here because multiple cores hold the same result
+    if cores_per_q_head:
+        output = hlo.divide(output, cores_per_q_head)
+    return output
+
+
+def convert_attn_mask_and_cache_id(cache_ids, core_id, batch_size=1, is_context_encoding=False, config=None):
+    """
+    Convert normal cache IDs to the format suitable for sharded KV cache, and create proper attention
+    masks. Since each Q/KV head can be distributed to multiple cores, each core will have a
+    different mask and cache ID.
+
+    In this version, the KV cache of all KV heads is evenly split across all cores. Tokens are
+    written to the KV caches in a strided way: token 0 goes to core 0's cache, token 1 goes to core
+    1's cache, etc. When computing active tokens, each core is in charge of tokens that are written
+    to it's cache.
+
+    For tokens that should not be written to the current core's KV cache, the cache ID for this token
+    is set to cache_size. We need 1 or more garbage entries in the KV cache for this purpose.
+    """
+    assert len(cache_ids.sizes) == 1, "Assuming 1D cache IDs!"
+    
+    n_active_tokens = cache_ids.sizes[0]
+    cores_per_kv_head = config.tp_degree // config.num_key_value_heads
+    cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else config.tp_degree 
+    cache_size = config.n_positions // cores_per_kv_head
+    pred = cache_ids.scribe.pred
+    dtype = cache_ids.dtype
+    # Real cache ID = raw cache ID // the number of cores that hold a single head's KV cache
+    num_cache_splits = cores_per_kv_head
+    real_cache_ids = hlo.divide(cache_ids, num_cache_splits)
+    # Default cache ID = cache_size
+    default_cache_ids = hlo.full(cache_size, dtype, real_cache_ids.sizes)
+    # Now mask out the entries that should not go to this core's cache
+    target_core_ids = hlo.remainder(cache_ids, num_cache_splits)
+    core_id_cast = hlo.cast(core_id, dtype)
+    curr_core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
+    curr_core_id_in_head = hlo.broadcast(curr_core_id_in_head, target_core_ids.sizes, [0])
+    mask = hlo.compare(target_core_ids, curr_core_id_in_head, "EQ")
+    converted_cache_ids = hlo.masked_select(mask,real_cache_ids, default_cache_ids)
+
+    # Generate masks
+    if is_context_encoding:
+        # We don't need active mask for context encoding
+        converted_active_mask = None
+        # Prior mask is simpler for context encoding
+        converted_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
+        converted_mask = hlo.broadcast(converted_mask, (batch_size, n_active_tokens, n_active_tokens), [1, 2])
+        return (converted_cache_ids, converted_mask)
+    else:
+        converted_mask_size = batch_size, n_active_tokens, cache_size
+
+        # For prior mask, we compute how many tokens are there in this core's KV cache
+        num_processed_tokens = hlo.reduce_min(cache_ids, dim=0, keepdim=True)
+        core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
+        num_tokens_on_core = hlo.divide(hlo.subtract(hlo.add(num_processed_tokens, num_cache_splits-1), core_id_in_head), num_cache_splits)
+        # Use Iota to generate the mask
+        iota = dtype[converted_mask_size].Iota(dimensions=[2])
+        num_tokens_on_core_br = hlo.broadcast(num_tokens_on_core, converted_mask_size, [2])
+        converted_mask = hlo.less(iota, num_tokens_on_core_br)
+
+        # Construct the active mask based on the rule above, each core is in charge of tokens
+        # that are written to its own cache
+        converted_active_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
+        converted_active_mask = hlo.broadcast(converted_active_mask, (batch_size, n_active_tokens, n_active_tokens), broadcast_dimensions=[1, 2])
+        mask_br = hlo.broadcast(mask, converted_active_mask.sizes, [2])
+        converted_active_mask = hlo.logical_and(converted_active_mask, mask_br)
+
+        return converted_cache_ids, converted_mask, converted_active_mask
