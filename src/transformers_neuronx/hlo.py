@@ -2217,6 +2217,10 @@ def multiply(lhs, rhs):
     _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Multiply(lhs, rhs)
 
+def maximum(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
+    return lhs.dtype[lhs.sizes].Maximum(lhs, rhs)
 
 def remainder(lhs, rhs):
     lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
