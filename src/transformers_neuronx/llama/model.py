@@ -163,14 +163,6 @@ class LlamaForSampling(base.NeuronModelBase):
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
 
-
-    def _compute_logits(self, input_ids, *rst):
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        if self.neuron_config.attention_layout == LAYOUT_HSB:
-            hidden = hidden.transpose(0, -1).contiguous()
-        return self._forward(hidden, *rst)
-
-
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if not self.neuron_config.on_device_embedding:
@@ -181,9 +173,11 @@ class LlamaForSampling(base.NeuronModelBase):
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 
-
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        batch_size, *_ = input_ids.shape
+        if start_ids is None:
+            start_ids = torch.zeros(batch_size, dtype=torch.int32)
+        inputs, *args = input_ids, cache_ids, start_ids
 
         batch_size, seq_len = input_ids.shape
         if speculation_length is None:
