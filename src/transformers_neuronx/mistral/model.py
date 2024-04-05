@@ -66,7 +66,7 @@ class MistralForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
 
         # Track number of processed tokens for sliding window attention
-        if self.neuron_config.lhs_aligned:
+        if self.neuron_config and self.neuron_config.lhs_aligned:
             self.num_processed_tokens = torch.zeros(batch_size, dtype=torch.long)
         else:
             self.num_processed_tokens = torch.tensor(0, dtype=torch.long)

@@ -36,7 +36,7 @@ class MistralForSamplingNoEmbeddingHlo:
         hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        if self.neuron_config.lhs_aligned:
+        if self.neuron_config and self.neuron_config.lhs_aligned:
             curr_window_start = scribe.s32[batch_size].Parameter(parameter_number=4)
         else:
             curr_window_start = scribe.s32.Parameter(parameter_number=4)
