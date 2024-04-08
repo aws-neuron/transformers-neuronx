@@ -2393,6 +2393,22 @@ def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
         operands, scatter_indices, updates, scatter_dimension_numbers=scatter_dims, to_apply=to_apply)
     return updated
 
+def reduce_scatter(tensor, dim, replica_groups, to_apply, dtype=None):
+    size = list(tensor.sizes)
+    tensor_dtype = tensor.dtype
+    scribe = tensor.scribe
+
+    if dtype is None:
+        all_reduce_dtype = tensor_dtype
+    elif isinstance(dtype, str):
+        all_reduce_dtype = dtypes.to_pyhlo_type(scribe, dtype)
+    else:
+        all_reduce_dtype = dtype
+    tensor = cast(tensor, all_reduce_dtype)
+    size[dim] = size[dim]//len(replica_groups[0])
+    output = all_reduce_dtype[size].ReduceScatter(tensor,  dimensions = [dim],
+                                        replica_groups = replica_groups, to_apply=to_apply)
+    return output
 
 def sin(tensor):
     sizes = tensor.sizes

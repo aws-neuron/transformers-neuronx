@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from neuronxcc.nki.kernels.attention import flash_fwd, FlashConfig
+from neuronxcc.nki.kernels.attention import flash_fwd
 from dataclasses import dataclass
 
 
