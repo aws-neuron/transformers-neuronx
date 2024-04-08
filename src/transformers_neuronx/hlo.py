@@ -1879,6 +1879,9 @@ def topk(tensor, dim, k=50, tp_degree=1):
         index: The indices of the top-k values in the tensor.
     """
 
+    if not isinstance(k, int) or (k < 1):
+        raise ValueError(f"`k` has to be a positive integer, but is {k}")
+
     if k == 1:
         return argmax(tensor, dim, return_values=True, keepdim=True, tp_degree=tp_degree)
 
@@ -1941,9 +1944,49 @@ def topk(tensor, dim, k=50, tp_degree=1):
     return output(value, index)
 
 
+def topk_masked(tensor, dim, k=50, tp_degree=1, indices=None):
+    """
+    Get the top-k values and indices along a dimension. All other values
+    in the tensor are "masked out" and set to -30000.
+
+    When using a `tp_degree > 1`, this function assumes that the sharding
+    dimension is the same as the reduction dimension. In this mode, the
+    returned index is transformed into a global index by adding an offset
+    of `tensor.sizes[dim] * rank_id`.
+
+    Arguments:
+        tensor: The values to select the top-k from.
+        dim: The dimension along which to select the values from.
+        k: The number of values to select.
+        tp_degree: The number of ranks to collect across.
+        indices: Optional indices of the pre-sorted tensor in descending order.
+            If `indices` is provided it is assumed `tensor` is also sorted
+            in descending order.
+
+    Returns:
+        value: The top-k values in the tensor.
+        index: The indices of the top-k values in the tensor.
+        indices: Indices of the pre-sorted tensor in descending order.
+    """
+    if not isinstance(k, int) or (k < 1):
+        raise ValueError(f"`k` has to be a positive integer, but is {k}")
+
+    if indices is None:
+        if tp_degree > 1:
+            tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
+        tensor, indices = sort_with_indices(tensor, dim=dim, descending=True)
+
+    positions = iota(tensor.dtype, tensor.sizes, dims=dim)
+    keep_mask = less(positions, k)
+    value = masked_select(keep_mask, tensor, -30000)
+    index = masked_select(keep_mask, indices, -30000)
+    return value, index, indices
+
+
 def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
     """
-    Get the smallest set of tensor values that add up to top_p or higher.
+    Get the smallest set of tensor values that add up to top_p or higher
+    along dimension 0.
 
     Arguments:
         tensor: The values to select the top-p from.
@@ -1951,6 +1994,8 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
         top_p_min_tokens: The minimum number of tokens that cannot be filtered.
         tp_degree: The number of ranks to collect across.
         indices: Optional indices of the pre-sorted tensor in descending order.
+            If `indices` is provided it is assumed `tensor` is also sorted
+            in descending order.
 
     Returns:
         probs: The top-p values in the tensor.
