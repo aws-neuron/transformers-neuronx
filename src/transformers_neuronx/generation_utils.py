@@ -75,6 +75,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
         if self.model.neuron_config.use_2d_cache_ids:
             # 2D cache_ids
             batch_size, context_length = attention_mask.shape
+            start_ids = torch.arange(input_ids.shape[0])
             if (self.cur_len > 0).any().item():
                 # token generation (aka decoding) with 2D cache_ids
                 index_map = torch.arange(context_length).unsqueeze(0).expand(batch_size, context_length)
@@ -85,6 +86,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
                 cache_ids = torch.arange(context_length) * attention_mask
                 self.cur_len = cache_ids.max(dim=1).values
         else:
+            start_ids = None
             if (self.cur_len > 0).any().item():
                 # token generation (aka decoding) with 1D cache_ids
                 cache_ids = self.cur_len
@@ -94,12 +96,6 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
                 batch_size, context_length = input_ids.shape
                 cache_ids = torch.arange(context_length)
                 self.cur_len = torch.tensor([context_length], dtype=torch.long)
-
-        if self.model.neuron_config.continuous_batching:
-            if (self.cur_len > 0).any().item():
-                start_ids = None
-            else:
-                start_ids = torch.arange(input_ids.shape[0])
 
         model_inputs = {
             "input_ids": input_ids,
