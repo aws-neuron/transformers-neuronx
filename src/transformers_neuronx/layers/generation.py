@@ -45,7 +45,7 @@ def greedy_search(logits, *, tp_degree=1):
     return hlo.transpose(result, 0, 1) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, deterministic=False):
+def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, deterministic=False, dynamic=False):
     vocab_size, n_active_tokens, batch_size = logits.sizes
 
     # NOTE: Compiler failures can occur when batch != 1
@@ -59,7 +59,10 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
 
     # Perform Top-K
     if top_k is not None:
-        logits, indices = hlo.topk(logits, k=top_k, dim=0, tp_degree=tp_degree)
+        if dynamic:
+            logits, index, indices = hlo.topk_masked(logits, k=top_k, dim=0, tp_degree=tp_degree)
+        else:
+            logits, indices = hlo.topk(logits, k=top_k, dim=0, tp_degree=tp_degree)
 
     # Perform Top-P
     if top_p is not None and top_p < 1.0:
