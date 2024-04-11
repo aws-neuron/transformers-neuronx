@@ -67,6 +67,7 @@ class GenerationConfig:
         top_p_min_tokens = 1,   # Default: A minimum of 1 for Top-P sampling
         eos_token_id = None,    # Default: Ignore EOS token, otherwise enable early stop.
         temperature = None,     # Default: No temperature application
+        dynamic = False,        # Default: Do not support changing generation config at runtime
     ):
         self.max_length = max_length
         self.do_sample = do_sample
@@ -75,6 +76,7 @@ class GenerationConfig:
         self.top_p_min_tokens = top_p_min_tokens
         self.eos_token_id = eos_token_id
         self.temperature = temperature
+        self.dynamic = dynamic
 
 
 valid_dtypes = [
