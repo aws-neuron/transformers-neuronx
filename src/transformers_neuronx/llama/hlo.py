@@ -153,16 +153,28 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # In BSH cache layout, the output of QKV linear projection is still kept as SBH for all QKV.
         bsh_cache_layout = False
+        batch_dim = 1
         if self.neuron_config is not None:
             bsh_cache_layout = self.neuron_config.cache_layout == constants.LAYOUT_BSH
         if bsh_cache_layout:
             query, key, value = attention_utils.transpose_qkv(query, key, value)
+            batch_dim = 0
 
-        # Single Token Generation ("Prefetch"-style)
+        # Single Token Generation ("Prefetch"-style) ans speculative forward
         if active_mask is not None:
 
+            n_active_tokens = key.sizes[0]
+            if n_active_tokens > 1 and self.neuron_config and self.neuron_config.continuous_batching:
+                # For speculative forward + continuous batching, slice out samples in the batch size
+                # corresponding to the batch size of the speculative head
+                cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
+                cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
+            else:
+                cached_keys_s = cached_keys
+                cached_values_s = cached_values
+
             # Sp = Q @ Kp
-            prior_scores = attention.score(query, cached_keys, n_kv_heads=self.config.num_key_value_heads,
+            prior_scores = attention.score(query, cached_keys_s, n_kv_heads=self.config.num_key_value_heads,
                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
@@ -172,7 +184,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values, value,
+            context = attention.context(prior_scores, active_score, cached_values_s, value,
                                         n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
                                         neuron_config=self.neuron_config)
 

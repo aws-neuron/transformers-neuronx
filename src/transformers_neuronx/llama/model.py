@@ -188,10 +188,18 @@ class LlamaForSampling(base.NeuronModelBase):
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
         inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
+        batch_size, seq_len = input_ids.shape
         if speculation_length is None:
-            model=self.decoder_lm_head
+            model = self.decoder_lm_head
+        elif speculation_length not in self.decoder_lm_head_for_speculation.keys():
+            # auto-infer speculation bucket, if needed
+            speculation_buckets = [k for (k, batch_size) in self.decoder_lm_head_for_speculation.keys()]
+            speculation_length = bucket.find(speculation_buckets, seq_len)
+            model = self.decoder_lm_head_for_speculation[speculation_length, batch_size]
+            if input_ids.shape[-1] > speculation_length:
+                input_ids = input_ids[:, :speculation_length]
         else:
-            model=self.decoder_lm_head_for_speculation[speculation_length]
+            model = self.decoder_lm_head_for_speculation[speculation_length, batch_size]
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
@@ -202,6 +210,7 @@ class LlamaForSampling(base.NeuronModelBase):
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
         return logits
+
 
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):

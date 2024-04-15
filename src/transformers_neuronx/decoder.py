@@ -215,12 +215,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             decoder_lm_head.add_embedding_builder(self.hlo_builder.embedding)
         return decoder_lm_head
 
-    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens):
-        decoder_lm_head = DecoderLmHeadForSamplingNoEmbedding(
+    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None):
+        cls = type(self)
+        decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
             n_active_tokens=n_active_tokens,
-            batch_size=self.batch_size,
+            batch_size=self.batch_size if batch_size is None else batch_size,
             attention_head_size=self.attention_head_size,
             amp=self.amp,
             num_layers=self.num_layers,
@@ -400,9 +401,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         etc.
         """
         _, cache_ids, start_ids, *_ = inputs
-        batch_size, = start_ids.shape
-        # In continuous batching, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
-        if self.neuron_config and self.neuron_config.continuous_batching:
+        batch_size = start_ids.shape[0]
+        # With 2D cache_ids, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
+        if self.neuron_config and self.neuron_config.use_2d_cache_ids:
             bucket_id = 0
             batch_size, _ = cache_ids.shape
         else:
@@ -416,7 +417,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
-        batch_size, = start_ids.shape
+        batch_size = start_ids.shape[0]
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
@@ -459,8 +460,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             batch_size = self.batch_size[0]
         if start_ids is None:
             return position_ids, torch.zeros([batch_size], dtype=torch.int32)
-        position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
-        position_ids -= start_ids.unsqueeze(1)
+        if not self.neuron_config.use_2d_cache_ids:
+            position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
+            position_ids -= start_ids.unsqueeze(1)
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
 

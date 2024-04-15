@@ -2089,43 +2089,62 @@ def index_select(tensor, dim, index):
 
 
 def add(lhs, rhs):
-    assert lhs.sizes == rhs.sizes, (
-        "Tensor Size Mismatch. "
-        f"LHS shape={lhs.sizes} "
-        f"RHS shape={rhs.sizes}"
-    )
-    assert lhs.dtype == rhs.dtype
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Add(lhs, rhs)
 
 
 def subtract(lhs, rhs):
-    assert lhs.sizes == rhs.sizes, (
-        "Tensor Size Mismatch. "
-        f"LHS shape={lhs.sizes} "
-        f"RHS shape={rhs.sizes}"
-    )
-    assert lhs.dtype == rhs.dtype
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Subtract(lhs, rhs)
 
 
 def divide(lhs, rhs):
-    assert lhs.sizes == rhs.sizes, (
-        "Tensor Size Mismatch. "
-        f"LHS shape={lhs.sizes} "
-        f"RHS shape={rhs.sizes}"
-    )
-    assert lhs.dtype == rhs.dtype
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Divide(lhs, rhs)
 
 
 def multiply(lhs, rhs):
-    assert lhs.sizes == rhs.sizes, (
-        "Tensor Size Mismatch. "
-        f"LHS shape={lhs.sizes} "
-        f"RHS shape={rhs.sizes}"
-    )
-    assert lhs.dtype == rhs.dtype
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Multiply(lhs, rhs)
+
+
+def remainder(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
+    return lhs.dtype[lhs.sizes].Remainder(lhs, rhs)
+
+
+def iota(dtype, shape, dims):
+    if isinstance(dims, int):
+        dims = [dims]
+    for dim in dims:
+        assert dim < len(shape), f"Dimension {dim} is larger than tensor rank {len(shape)}"
+    return dtype[shape].Iota(dimensions=dims)
+
+
+def clamp(tensor, minimum=None, maximum=None):
+    if minimum is not None:
+        min = full_like(tensor, minimum)
+        condition = greater_equal(tensor, min)
+        tensor = masked_select(condition, tensor, min)
+
+    if maximum is not None:
+        maximum = full_like(tensor, maximum)
+        condition = less_equal(tensor, maximum)
+        tensor = masked_select(condition, tensor, maximum)
+
+    return tensor
+
+
+def random_uniform(dtype, shape, minimum=0, maximum=1):
+    minimum = dtype.Constant(constant_value=minimum)
+    maximum = dtype.Constant(constant_value=maximum)
+    return dtype[shape].Rng(minimum, maximum, distribution=1) # Uniform distribution
+
 
 
 def reshape(tensor, shape):
@@ -2204,6 +2223,20 @@ def repeat_kv(tensor, n_repeats, repeat_dim):
     return output
 
 
+def _binary_primitive_broadcast(lhs, rhs):
+    lhs_primitive = isinstance(lhs, (int, float, bool))
+    rhs_primitive = isinstance(rhs, (int, float, bool))
+
+    assert not (lhs_primitive and rhs_primitive), (
+        "HLO Operation cannot be performed on two primitives"
+    )
+    if rhs_primitive:
+        rhs = full(rhs, dtype=lhs.dtype, sizes=lhs.sizes)
+    if lhs_primitive:
+        lhs = full(lhs, dtype=rhs.dtype, sizes=rhs.sizes)
+
+    return lhs, rhs
+
 def _check_binary_arguments(lhs, rhs, dtype=None):
     assert lhs.sizes == rhs.sizes, (
         "Tensor Size Mismatch. "
@@ -2217,8 +2250,9 @@ def _check_binary_arguments(lhs, rhs, dtype=None):
 
 
 def compare(lhs, rhs, direction):
-    pred = lhs.scribe.pred
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
     _check_binary_arguments(lhs, rhs)
+    pred = lhs.scribe.pred
     return pred[lhs.sizes].Compare(lhs, rhs, comparison_direction=direction)
 
 
@@ -2243,9 +2277,17 @@ def greater_equal(lhs, rhs):
 
 
 def logical_and(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
     pred = lhs.scribe.pred
     _check_binary_arguments(lhs, rhs, dtype=pred)
     return pred[lhs.sizes].And(lhs, rhs)
+
+
+def logical_or(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    pred = lhs.scribe.pred
+    _check_binary_arguments(lhs, rhs, dtype=pred)
+    return pred[lhs.sizes].Or(lhs, rhs)
 
 
 def logical_not(lhs):
@@ -2684,6 +2726,7 @@ def log_softmax(scores, tp_degree=1, dim=None):
 
 # https://www.tensorflow.org/xla/operation_semantics#select
 def masked_select(mask, true_tensor, false_tensor):
+    true_tensor, false_tensor = _binary_primitive_broadcast(true_tensor, false_tensor)
     dtype = true_tensor.dtype
     assert mask.dtype == mask.scribe.pred, "Mask must be a boolean tensor."
     assert dtype == false_tensor.dtype
@@ -2734,3 +2777,101 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
     updated_values = reshape(updated_values, [n_blocks, block_size, n_head, d_head])
 
     return updated_keys, updated_values
+
+
+def speculative_token_selection(
+        draft_ids,           # shape: (k, batch_size)
+        target_ids,          # shape: (k + 1, batch_size)
+        draft_scores,        # shape: (vocab_size_tp, k, batch_size)
+        target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+        tp_degree=1,
+        deterministic=False,
+    ):
+    """
+    A speculative token acceptor based on original DeepMind paper.
+
+    Reference: https://arxiv.org/pdf/2302.01318.pdf
+
+    Note that this function does not perform initial sampling and assumes that
+    both target/draft token generation has before performed prior to executing
+    this function.
+
+    Args:
+        draft_ids: The sampled draft model tokens.
+        target_ids: The sampled target model tokens.
+        draft_scores: The raw draft model logit output.
+        target_scores: The raw target model logits output.
+        tp_degree: The number of ranks to collect across.
+        deterministic: Flag which enables using a constant 0.5 as token
+            acceptance threshold instead of a random normal. This is used for
+            debug/testing.
+
+    Returns:
+        tokens: The accepted tokens (with padding)
+        mask: The mask for the accepted tokens
+        accepted: The number of tokens accepted for each batche line.
+    """
+    s32 = draft_ids.scribe.s32
+
+    # For simplicity all-gather the scores
+    if tp_degree > 1:
+        draft_scores = all_gather(draft_scores, dim=0, tp_degree=tp_degree)
+        target_scores = all_gather(target_scores, dim=0, tp_degree=tp_degree)
+
+    vocab_size, k, batch_size = draft_scores.sizes
+
+    # Convert score into probabilities
+    draft_probabilities = softmax(draft_scores, dim=0)
+    target_probabilities = softmax(target_scores, dim=0)
+
+    # Gather the target/draft probabilities corresponding to draft sampling predictions
+    index = reshape(draft_ids, (1, k, batch_size))
+    target_probs = slice_along(target_probabilities, 1, limit=k)
+    target_probs = gather(target_probs, 0, index)
+    draft_probs = gather(draft_probabilities, 0, index)
+    target_probs = squeeze(target_probs, 0)              # shape: (k, batch_size)
+    draft_probs = squeeze(draft_probs, 0)                # shape: (k, batch_size)
+
+    # Compare ratio of probabilities at locations to a random sample
+    ratio = divide(target_probs, draft_probs) # shape: (k, batch_size)
+    ratio = clamp(ratio, maximum=1.0)
+    if deterministic:
+        random = full_like(ratio, 0.5)
+    else:
+        random = random_uniform(ratio.dtype, ratio.sizes)
+    accepted_mask = less(random, ratio) # shape: (k, batch_size)
+
+    # Mask out all tokens past the accepted token
+    accepted_mask = cast(accepted_mask, s32)
+    accepted_cumsum = cumsum(accepted_mask, dim=0)
+    positions = iota(s32, (k, batch_size), 0)
+    positions = add(positions, 1)
+    accepted_mask = equal(accepted_cumsum, positions) # shape: (k, batch_size)
+
+    # Compute number of accepted tokens per batch line
+    accepted = reduce_sum(cast(accepted_mask, s32), dim=0)
+    all_accepted = equal(accepted, k)
+
+    # If all draft tokens were accepted, update the mask
+    padded_mask = pad(accepted_mask, dim=0, size=1, value=False)
+
+    # Select the final tokens
+    draft_ids = pad(draft_ids, dim=0, size=1, value=0)
+    tokens = masked_select(padded_mask, draft_ids, target_ids)
+
+    # If all draft tokens were accepted, increment accepted
+    accepted = masked_select(all_accepted, k + 1, accepted)
+
+    # If all draft tokens were accepted, update the mask
+    accept_mask = broadcast(all_accepted, padded_mask.sizes, [1])
+    mask = logical_or(accept_mask, padded_mask)
+
+    # Transpose back to SB -> BS layout
+    tokens = transpose(tokens, 0, 1)
+    mask = transpose(mask, 0, 1)
+
+    return (
+        tokens,    # shape: (batch_size, k + 1)
+        mask,      # shape: (batch_size, k + 1)
+        accepted,  # shape: (batch_size,)
+    )
