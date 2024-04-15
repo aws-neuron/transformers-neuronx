@@ -406,13 +406,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return logits
 
         # token generation (aka decoding)
-        seq_ids = start_ids.flatten().tolist()
-        assert input_batch_size == len(seq_ids), f"expected seq_ids to be {input_batch_size} in length, but seq_ids={seq_ids}"
-        new_logits = torch.zeros(input_batch_size, n_embed, dtype=logits.dtype, device=logits.device)
-        for idx, seq_id in enumerate(seq_ids):
-            new_logits[idx, :] = logits[seq_id, :]
+        seq_ids = start_ids.flatten()
+        if torch.equal(seq_ids, torch.arange(input_batch_size)):
+            logits = logits[:input_batch_size]
+        else:
+            logits = logits[seq_ids]
 
-        return new_logits
+        return logits
 
     def _cast_logits(self, logits):
         # Cast logits to float32 or the dtype specified in the neuron config
