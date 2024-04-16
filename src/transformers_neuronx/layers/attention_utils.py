@@ -209,6 +209,7 @@ class FlashConfig:
   """
   seq_tile_size:int = 2048
   training:bool=False
+  should_transpose_v:bool=False
 
 def wrapper_flash_attention_nki(q, k, v, o, lse=None):
     softmax_scale = 1.0
