@@ -2431,6 +2431,11 @@ def transpose210(tensor):
     size0, size1, size2 = tensor.sizes
     return dtype[size2,size1,size0].Transpose(tensor, dimensions=[2, 1, 0])
 
+def transpose102(tensor):
+    dtype = tensor.dtype
+    size0, size1, size2 = tensor.sizes
+    return dtype[size1,size0,size2].Transpose(tensor, dimensions=[1, 0, 2])
+
 
 # credit: https://github.com/facebookresearch/llama/blob/8992dea3b2c98e82e335efef004534413f4f2d2e/llama/model.py#L164-L173
 def repeat_kv(tensor, n_repeats, repeat_dim):

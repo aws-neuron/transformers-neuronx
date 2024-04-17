@@ -37,10 +37,7 @@ class MistralForSamplingNoEmbeddingHlo:
         tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        if self.neuron_config.lhs_aligned:
-            curr_window_start = scribe.s32[batch_size].Parameter(parameter_number=4)
-        else:
-            curr_window_start = scribe.s32.Parameter(parameter_number=4)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
         return (*tensors, curr_window_start), (*dims, None)
 
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, embed_weight):

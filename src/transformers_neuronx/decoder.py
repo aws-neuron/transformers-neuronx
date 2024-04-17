@@ -747,7 +747,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         def ln_lm_head(scribe):
             dtype = getattr(scribe, self.amp)
             hidden = dtype[tuple(hidden_sizes)].Parameter(parameter_number=0)
-            next_tok_id = scribe.s32.Parameter(parameter_number=1)
+            if self.neuron_config and self.neuron_config.lhs_aligned:
+                next_tok_id = scribe.s32[batch_size].Parameter(parameter_number=1)
+            else:
+                next_tok_id = scribe.s32[1].Parameter(parameter_number=1)
             param_builder = DecoderParameterBuilder(scribe, 2)
             ln_f_weight, ln_f_bias, head_weight, head_bias = self._hlo_lm_head_params(param_builder)
             gneration_params = self._hlo_generation_params(param_builder)
