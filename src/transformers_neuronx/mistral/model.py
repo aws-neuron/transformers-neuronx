@@ -66,10 +66,7 @@ class MistralForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
 
         # Track number of processed tokens for sliding window attention
-        if self.neuron_config.lhs_aligned:
-            self.num_processed_tokens = torch.zeros(batch_size, dtype=torch.long)
-        else:
-            self.num_processed_tokens = torch.tensor(0, dtype=torch.long)
+        self.num_processed_tokens = torch.tensor([0], dtype=torch.int32)
 
     def load_weights(self):
 
@@ -136,16 +133,20 @@ class MistralForSampling(base.NeuronModelBase):
             curr_window_start = torch.max(torch.tensor(0, dtype=torch.long), self.num_processed_tokens - self.config.window_size)
         else:
             curr_window_start = self.num_processed_tokens
-        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        last_token_id = rst[-1]
+        rst = (*rst, curr_window_start)
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
-        logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+        logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
-        self.num_processed_tokens += (last_token_id+1)
+        # WARNING: Taking a single curr_window_start value for all sequences.
+        # TODO: Get curr_window_start out of cache_ids, instead of sending it from inputs.
+        self.num_processed_tokens += (last_token_id[:1]+1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,

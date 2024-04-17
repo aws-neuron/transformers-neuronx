@@ -171,7 +171,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Single Token Generation ("Prefetch"-style) ans speculative forward
         if active_mask is not None:
 
-            n_active_tokens = key.sizes[0]
+            n_active_tokens = key.sizes[1] if bsh_cache_layout else key.sizes[0]
             if n_active_tokens > 1 and self.neuron_config and self.neuron_config.continuous_batching:
                 # For speculative forward + continuous batching, slice out samples in the batch size
                 # corresponding to the batch size of the speculative head

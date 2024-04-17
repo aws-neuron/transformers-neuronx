@@ -160,7 +160,7 @@ class OPTForSampling(base.NeuronModelBase):
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
         result = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
         self.num_processed_tokens += (last_token_id+1)
@@ -279,7 +279,7 @@ class OPTForSamplingNoEmbeddingHlo:
         tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
         return (*tensors, curr_window_start), (*dims, None)
 
     def embed_positions_ids(self, position_ids, start_ids):
