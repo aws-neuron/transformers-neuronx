@@ -166,13 +166,13 @@ class OPTForSampling(base.NeuronModelBase):
         self.num_processed_tokens += (last_token_id+1)
         return result
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids=start_ids,
-                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
+                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation, streamer=streamer)
         else:
             return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):

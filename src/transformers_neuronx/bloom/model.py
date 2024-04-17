@@ -170,15 +170,15 @@ class BloomForSampling(base.NeuronModelBase):
                 inputs = inputs.transpose(0, -1).contiguous()
         return self._forward(inputs, *rst)
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         batch_size, *_  = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
         if self.neuron_config.on_device_generation:
             result = sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
-                                            config=self.neuron_config.on_device_generation)
+                                            config=self.neuron_config.on_device_generation, streamer=streamer)
         else:
             result = sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                            eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                            eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
         return result
