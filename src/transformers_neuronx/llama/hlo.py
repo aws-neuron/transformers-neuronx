@@ -175,8 +175,15 @@ class LlamaForSamplingNoEmbeddingHlo:
             if n_active_tokens > 1 and self.neuron_config and self.neuron_config.continuous_batching:
                 # For speculative forward + continuous batching, slice out samples in the batch size
                 # corresponding to the batch size of the speculative head
-                cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
-                cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
+                slice_sizes = [1] * len(cached_keys.sizes)
+                if cached_keys.sizes[batch_dim] == 1:
+                    # Use hlo.select for batch size 1 as index select is prohibitively slow
+                    # TODO: revert to hlo.index_select once its faster https://t.corp.amazon.com/P126527643
+                    cached_keys_s = hlo.select(cached_keys, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
+                    cached_values_s = hlo.select(cached_values, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
+                else:
+                    cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
+                    cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values

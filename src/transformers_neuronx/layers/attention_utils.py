@@ -100,6 +100,7 @@ def update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config=
     cache_ids_dtype = cache_ids.dtype
     if bsh_cache_layout:
         # start_ids * n_positions + iota
+        n_active_tokens, batch_size = cache_ids.sizes
         n_positions_br = hlo.full(n_positions, cache_ids_dtype, cache_ids.sizes)
         start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
         offset = hlo.multiply(start_ids_br, n_positions_br)

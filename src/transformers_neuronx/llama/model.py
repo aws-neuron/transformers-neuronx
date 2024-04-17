@@ -174,10 +174,13 @@ class LlamaForSampling(base.NeuronModelBase):
         return logits
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        batch_size, *_ = input_ids.shape
-        if start_ids is None:
-            start_ids = torch.zeros(batch_size, dtype=torch.int32)
-        inputs, *args = input_ids, cache_ids, start_ids
+        if self.neuron_config and self.neuron_config.continuous_batching:
+            inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        else:
+            batch_size, *_ = input_ids.shape
+            if start_ids is None:
+                start_ids = torch.zeros(batch_size, dtype=torch.int32)
+            inputs, *args = input_ids, cache_ids, start_ids
 
         batch_size, seq_len = input_ids.shape
         if speculation_length is None:
