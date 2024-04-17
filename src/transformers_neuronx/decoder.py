@@ -26,6 +26,7 @@ from transformers_neuronx import hlo
 from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import utils
+from transformers_neuronx import config
 from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx import global_debugger
@@ -63,6 +64,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.lm_head_weight = None
         self.lm_head_bias = None
         self.logits_indices = None
+        self.generation_inputs = []
+        self.top_k = None
+        self.top_p = None
+        self.temperature = None
+        self.top_p_min_tokens = None
         self.inputs_sdim = None
         self.inputs_builder = None
         self.embedding_builder = None
@@ -334,6 +340,18 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             logits_indices = torch.arange(lm_head_weight.shape[-1], dtype=torch.int32)
             self.logits_indices = manipulator.shard_along(logits_indices, dim=0)
             ln_lm_head_params.append(self.logits_indices)
+            if self.neuron_config.on_device_generation.dynamic:
+                config = self.neuron_config.on_device_generation
+                self.top_k = manipulator.duplicate(torch.tensor(config.top_k))
+                self.generation_inputs.append(self.top_k)
+                self.top_p = manipulator.duplicate(torch.tensor(config.top_p))
+                self.generation_inputs.append(self.top_p)
+                self.temperature = manipulator.duplicate(torch.tensor(config.temperature))
+                self.generation_inputs.append(self.temperature)
+                self.top_p_min_tokens = manipulator.duplicate(torch.tensor(config.top_p_min_tokens))
+                self.generation_inputs.append(self.top_p_min_tokens)
+                # FIXME: Use a better mechanism to pass extra params into the model
+                ln_lm_head_params += self.generation_inputs
         self.ln_lm_head_params = ln_lm_head_params
 
         self.program = self._build_program()
@@ -383,6 +401,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.neuron_config.on_device_generation:
             new.logits_indices = self.logits_indices
             ln_lm_head_params.append(self.logits_indices)
+            if self.neuron_config.on_device_generation.dynamic:
+                new.top_k = self.top_k
+                new.generation_inputs.append(self.top_k)
+                new.top_p = self.top_p
+                new.generation_inputs.append(self.top_p)
+                new.temperature = self.temperature
+                new.generation_inputs.append(self.temperature)
+                new.top_p_min_tokens = self.top_p_min_tokens
+                new.generation_inputs.append(self.top_p_min_tokens)
+                ln_lm_head_params += new.generation_inputs
         new.ln_lm_head_params = ln_lm_head_params
         new.program = new._build_program()
         return new
@@ -579,6 +607,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.builder.n_positions = n_positions
 
         def multi_layer(scribe):
+            # TODO: Add support for dynamic generation to multi layer
             dtype = getattr(scribe, self.amp)
             (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
                 scribe, dtype, self.n_active_tokens, batch_size)
@@ -644,6 +673,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         # Generation parameters
         parameters.append(self.logits_indices)
+        parameters.append(self.top_k)
+        parameters.append(self.top_p)
+        parameters.append(self.temperature)
+        parameters.append(self.top_p_min_tokens)
 
         return parameters
 
@@ -771,12 +804,25 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def _hlo_generation_params(self, param_builder):
         logits_indices = param_builder.from_tensor(self.logits_indices)
         logits_indices = maybe_transfer_with_static_ring(logits_indices)
-        return logits_indices
+        params = [logits_indices]
+        if self.neuron_config.on_device_generation is not None and self.neuron_config.on_device_generation.dynamic:
+            for param in self.generation_inputs:
+                param = param_builder.from_tensor(param)
+                param = maybe_transfer_with_static_ring(param)
+                params.append(param)
+        return params
 
-    def _hlo_generation(self, logits, logits_indices):
+    def _hlo_generation(self, logits, params):
         generation_config = self.neuron_config.on_device_generation
         if generation_config is None:
             return logits
+        logits_indices, *dynamic_generation_params = params
+        if generation_config.dynamic:
+            top_k, top_p, temperature, top_p_min_tokens  = dynamic_generation_params
+            self.neuron_config.on_device_generation.top_k = top_k
+            self.neuron_config.on_device_generation.top_p = top_p
+            self.neuron_config.on_device_generation.temperature = temperature
+            self.neuron_config.on_device_generation.top_p_min_tokens = top_p_min_tokens
         return generation.generate(
             logits,
             logits_indices,
@@ -788,6 +834,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     # Defines how to access all the kernels.
     def get_all_kernels(self):
         return self.program.get_kernels()
+
+    def update_generation_config(self, generation_config: config.GenerationConfig):
+        num_cores = self.neuron_config.get_local_tp(self.tp_degree)
+        duplicate = lambda tensor: [torch.tensor(tensor) for _ in range(num_cores)]
+        ops.parallel_write(self.top_k, duplicate(generation_config.top_k))
+        ops.parallel_write(self.top_p, duplicate(generation_config.top_p))
+        ops.parallel_write(self.temperature, duplicate(generation_config.temperature))
+        ops.parallel_write(self.top_p_min_tokens, duplicate(generation_config.top_p_min_tokens))
+
 
 def read_n_position(hlo_module, num_inputs):
     return hlo_module.host_program_shape.parameters[num_inputs].dimensions[0]

@@ -18,14 +18,17 @@ from transformers_neuronx import hlo, config
 def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1):
 
     logits = mask_logits(logits, logits_indices, config.vocab_size)
-    if config.do_sample:
+
+    if config.dynamic or config.do_sample:
         return sample(
             logits,
             top_k=config.top_k,
             top_p=config.top_p,
             temperature=config.temperature,
             top_p_min_tokens=config.top_p_min_tokens,
-            tp_degree=tp_degree
+            tp_degree=tp_degree,
+            dynamic=config.dynamic,
+            deterministic=config.deterministic
         )
     else:
         return greedy_search(logits, tp_degree=tp_degree)
@@ -45,7 +48,8 @@ def greedy_search(logits, *, tp_degree=1):
     return hlo.transpose(result, 0, 1) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, deterministic=False, dynamic=False):
+def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, dynamic=False, deterministic=False):
+
     vocab_size, n_active_tokens, batch_size = logits.sizes
 
     # NOTE: Compiler failures can occur when batch != 1
@@ -65,7 +69,7 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
             logits, indices = hlo.topk(logits, k=top_k, dim=0, tp_degree=tp_degree)
 
     # Perform Top-P
-    if top_p is not None and top_p < 1.0:
+    if dynamic or top_p is not None and top_p < 1.0:
         logits, indices = hlo.topp(logits, top_p=top_p, top_p_min_tokens=top_p_min_tokens, tp_degree=tp_degree, indices=indices)
 
     probs = hlo.softmax(logits, dim=0)
