@@ -48,10 +48,13 @@ class OPTForSampling(base.NeuronModelBase):
             self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
         # Check if input sequence length is allowed given position embedding dimensions
-        sequence_length = n_positions
+        if isinstance(n_positions, list) or isinstance(n_positions, tuple):
+            max_bucket = max(n_positions)
+        else:
+            max_bucket = n_positions
         max_allowed_sequence_length = config.max_position_embeddings
-        if sequence_length > max_allowed_sequence_length:
-            raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
+        if (max_bucket) > max_allowed_sequence_length:
+            raise ValueError(f"Sequence length ({max_bucket}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
 
         if unroll is None:
             unroll = config.num_hidden_layers

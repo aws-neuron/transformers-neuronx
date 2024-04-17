@@ -40,6 +40,8 @@ class MixtralForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
@@ -160,6 +162,10 @@ class MixtralForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
+
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
+                                            config=self.neuron_config.on_device_generation, streamer=streamer)
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()
