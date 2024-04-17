@@ -196,7 +196,8 @@ class LlamaForSampling(base.NeuronModelBase):
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
-        logits = model(inputs, *args)
+        with torch.inference_mode():
+            logits = model(inputs, *args)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)

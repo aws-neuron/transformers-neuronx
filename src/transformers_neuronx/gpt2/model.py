@@ -154,8 +154,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
-        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
+        last_token_id = torch.as_tensor([0], dtype=torch.int32)
 
         if not self.neuron_config.on_device_embedding:
             input_ids = self.chkpt_model.transformer.wte(input_ids)
@@ -455,7 +455,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
@@ -510,7 +510,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
                                       self.neuron_config.sparse_attn and \
                                       self.neuron_config.sparse_attn.skip_masking_decode
 
-        last_token_id = torch.as_tensor(0, dtype=torch.int32)
+        last_token_id = torch.as_tensor([0], dtype=torch.int32)
         batch_size, context_length = input_ids.shape
 
         if start_ids is None:
@@ -530,7 +530,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
         if start_ids.shape[0] != batch_size:
             start_ids = start_ids.repeat(batch_size)
 

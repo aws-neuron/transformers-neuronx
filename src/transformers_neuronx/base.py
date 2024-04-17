@@ -229,7 +229,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
             hidden_slice = hidden[:, current:current+estimate].contiguous()
             cache_ids = torch.as_tensor([i for i in range(current, current+estimate)], dtype=torch.int32)
-            last_token_id = torch.as_tensor(estimate - 1)
+            last_token_id = torch.as_tensor([estimate - 1])
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
             else:
@@ -266,7 +266,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if self.neuron_config.vectorize_last_token_id:
             last_token_id = torch.zeros(batch_size, dtype=torch.int32)
         else:
-            last_token_id = torch.as_tensor(0, dtype=torch.int32)
+            last_token_id = torch.as_tensor([0], dtype=torch.int32)
         if context_length == 1:
             return input_ids, cache_ids, last_token_id
 
@@ -281,14 +281,35 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             if self.neuron_config.vectorize_last_token_id:
                 last_token_id = cache_ids.max(dim=1).values
             else:
-                last_token_id = torch.as_tensor(min(context_length - 1, estimate-1), dtype=torch.int32)
+                last_token_id = torch.as_tensor([min(context_length - 1, estimate-1)], dtype=torch.int32)
             if context_length < estimate:
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
-                cache_ids = torch.arange(estimate, dtype=torch.int32)
-                if self.neuron_config.use_2d_cache_ids:
-                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
+                cache_ids = self._pad_cache_ids(cache_ids, batch_size, context_length, estimate)
 
         return input_ids, cache_ids, last_token_id
+
+    def _pad_cache_ids(self, cache_ids, batch_size, context_length, estimate):
+        if self.neuron_config.use_2d_cache_ids:
+            # TODO: fix cache_ids padding for batch speculative decoding
+            cache_ids = torch.arange(estimate, dtype=torch.int32)
+            cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
+        else:
+            if cache_ids is None:
+                cache_ids = torch.arange(estimate, dtype=torch.int32)
+            else:
+                # Inputs: cache_ids = [16, 17], estimate = 512
+                #
+                # Process:
+                # start_idx = 18, end_idx = 528 (= 512+16)
+                # padded_elements =       [18, 19, ..., 511, 512, 513, ..., 525, 526, 527]
+                # cache_ids_pad = [16, 17, 18, 19, ..., 511, 512, 513, ..., 525, 526, 527]
+                # cache_ids =     [16, 17, 18, 19, ..., 511, 511, 511, ..., 511, 511, 511]
+                start_idx = cache_ids[-1].item() + 1
+                end_idx = estimate + start_idx - context_length
+                pad_elements = torch.arange(start_idx, end_idx, dtype=torch.int32)
+                cache_ids_pad = torch.concat([cache_ids, pad_elements], dim=0)
+                cache_ids = torch.minimum(cache_ids_pad, torch.tensor(estimate-1, dtype=torch.int32))
+        return cache_ids
 
     def _prepare_for_continuous_batching(self, input_ids, cache_ids=None, seq_ids=None):
         n_seqs, n_active_tokens = input_ids.shape
@@ -335,14 +356,15 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return input_ids, cache_ids_pad, seq_ids
 
         # token generation
-        full_input_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype, device="cpu")
-        full_cache_ids = torch.zeros(batch_size, 1, dtype=cache_ids.dtype, device="cpu")
+        full_input_ids = torch.zeros(batch_size, 1, dtype=torch.int32)
+        full_cache_ids = torch.zeros(batch_size, 1, dtype=torch.int32)
+        full_seq_ids = torch.arange(batch_size, dtype=torch.int32)
         for idx, seq_id in enumerate(seq_ids.flatten()):
             seq_id = seq_id.item()
             full_input_ids[seq_id, :] = input_ids[idx, :]
             full_cache_ids[seq_id, :] = cache_ids[idx, :]
 
-        return full_input_ids, full_cache_ids, seq_ids
+        return full_input_ids, full_cache_ids, full_seq_ids
 
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
         # enable dynamic batch size feature for continuous batching
@@ -406,9 +428,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 "input batch size ({input_batch_size}) not divisible by running batch size ({running_batch_size})"
             n_iters = input_batch_size // running_batch_size
             all_logits = []
-            cache_ids, start_ids = args[0], args[1]
+            cache_ids, start_ids, last_token_id = args[0], args[1], args[2]
             for iter_id in range(n_iters):
-                # Assuming HSB layout
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
                 if is_bsh:
@@ -417,9 +438,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     hidden_per_batch = hidden[:, :, start_idx:end_idx]
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
-                last_token_id = cache_ids_per_batch.max()
+                last_token_id_per_batch = last_token_id[start_idx:end_idx]
                 logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
-                                                start_ids_per_batch, last_token_id)
+                                                start_ids_per_batch, last_token_id_per_batch)
                 all_logits.append(logits_per_batch)
             logits = torch.cat(all_logits, dim=2)
         else:
