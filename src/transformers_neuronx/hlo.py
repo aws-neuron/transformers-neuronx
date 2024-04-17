@@ -1968,8 +1968,19 @@ def topk_masked(tensor, dim, k=50, tp_degree=1, indices=None):
         index: The indices of the top-k values in the tensor.
         indices: Indices of the pre-sorted tensor in descending order.
     """
-    if not isinstance(k, int) or (k < 1):
-        raise ValueError(f"`k` has to be a positive integer, but is {k}")
+    k_is_hlo_scalar = _is_hlo_scalar(k)
+
+    if not k_is_hlo_scalar:
+        if not isinstance(k, int) or (k < 1):
+            raise ValueError(f"`k` has to be a positive integer, but is {k}")
+    else:
+        converter = compiler.DataTypeConverter()
+        k_torch_dtype = converter.hlo2torch(k.dtype.shape_proto.element_type)
+        assert k_torch_dtype in [
+            torch.int32,
+            torch.int64,
+        ], f"Expected `k` to be an integer, but `k` is {k_torch_dtype}"
+        k = cast(k, tensor.dtype)
 
     if indices is None:
         if tp_degree > 1:
@@ -2002,10 +2013,36 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
         indices: Indices of the pre-sorted tensor in descending order.
     """
 
-    if top_p < 0 or top_p > 1.0:
-        raise ValueError(f"`top_p` has to be a float > 0 and <= 1, but is {top_p}")
-    if not isinstance(top_p_min_tokens, int) or (top_p_min_tokens < 1):
-        raise ValueError(f"`top_p_min_tokens` has to be a positive integer, but is {top_p_min_tokens}")
+    p_is_hlo_scalar = _is_hlo_scalar(top_p)
+    top_p_min_tokens_is_hlo_scalar = _is_hlo_scalar(top_p_min_tokens)
+    converter = compiler.DataTypeConverter()
+
+    if not p_is_hlo_scalar:
+        if top_p < 0 or top_p > 1.0:
+            raise ValueError(f"`top_p` has to be a float > 0 and <= 1, but is {top_p}")
+        top_p = tensor.dtype.Constant(constant_value=top_p)
+    else:
+        top_p_torch_dtype = converter.hlo2torch(top_p.dtype.shape_proto.element_type)
+        assert top_p_torch_dtype == torch.float32, (
+            f"Expected `top_p` to be a float, but `top_p` is {top_p_torch_dtype}."
+        )
+        top_p = cast(top_p, tensor.dtype)
+
+    if not top_p_min_tokens_is_hlo_scalar:
+        if not isinstance(top_p_min_tokens, int) or (top_p_min_tokens < 1):
+            raise ValueError(
+                f"`top_p_min_tokens` has to be a positive integer, but is {top_p_min_tokens}"
+            )
+        top_p_min_tokens = tensor.dtype.Constant(constant_value=top_p_min_tokens)
+    else:
+        top_p_min_tokens_torch_dtype = converter.hlo2torch(
+            top_p_min_tokens.dtype.shape_proto.element_type
+        )
+        assert top_p_min_tokens_torch_dtype in [torch.int32, torch.int64], (
+            "Expected `top_p_min_tokens` to be an integer,"
+            f"but `top_p_min_tokens` is {top_p_min_tokens_torch_dtype}"
+        )
+        top_p_min_tokens = cast(top_p_min_tokens, tensor.dtype)
 
     if indices is None:
         if tp_degree > 1:
@@ -2019,7 +2056,8 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
     #   the long tail of small probababilitiess.
     probs = softmax(tensor_ascending, dim=0)
     cumulative_prob = cumsum(probs, dim=0)
-    remove_probs = less_equal(cumulative_prob, 1 - top_p)
+    criteria = subtract(1, top_p)
+    remove_probs = less_equal(cumulative_prob, criteria)
     keep_probs = logical_not(remove_probs)
     keep_probs = flip(keep_probs, dims=0)
 
@@ -2393,6 +2431,7 @@ def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
         operands, scatter_indices, updates, scatter_dimension_numbers=scatter_dims, to_apply=to_apply)
     return updated
 
+
 def reduce_scatter(tensor, dim, replica_groups, to_apply, dtype=None):
     size = list(tensor.sizes)
     tensor_dtype = tensor.dtype
@@ -2451,9 +2490,15 @@ def repeat_kv(tensor, n_repeats, repeat_dim):
     return output
 
 
+def _is_hlo_scalar(value):
+    return hasattr(value, 'sizes') and value.sizes == ()
+
+
 def _binary_primitive_broadcast(lhs, rhs):
     lhs_primitive = isinstance(lhs, (int, float, bool))
     rhs_primitive = isinstance(rhs, (int, float, bool))
+    lhs_scalar = _is_hlo_scalar(lhs)
+    rhs_scalar = _is_hlo_scalar(rhs)
 
     assert not (lhs_primitive and rhs_primitive), (
         "HLO Operation cannot be performed on two primitives"
@@ -2462,8 +2507,13 @@ def _binary_primitive_broadcast(lhs, rhs):
         rhs = full(rhs, dtype=lhs.dtype, sizes=lhs.sizes)
     if lhs_primitive:
         lhs = full(lhs, dtype=rhs.dtype, sizes=rhs.sizes)
+    if rhs_scalar:
+        rhs = broadcast(rhs, lhs.sizes, [])
+    if lhs_scalar:
+        lhs = broadcast(lhs, rhs.sizes, [])
 
     return lhs, rhs
+
 
 def _check_binary_arguments(lhs, rhs, dtype=None):
     assert lhs.sizes == rhs.sizes, (

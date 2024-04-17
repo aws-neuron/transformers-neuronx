@@ -24,6 +24,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import module
 from transformers_neuronx.compiler import ParallelKernel
 from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.config import GenerationConfig
 from concurrent.futures import ProcessPoolExecutor
 
 
@@ -506,6 +507,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for kernel in kernels:
             if isinstance(kernel, ParallelKernel):
                 kernel.profile(profile_dir, ntff_count_limit)
+
+    def update_generation_config(self, generation_config: GenerationConfig):
+        self.decoder_lm_head.update_generation_config(generation_config)
+
 
 # Base class for all "Serializable Objects"
 class NeuronBaseSerializer:
