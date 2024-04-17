@@ -272,7 +272,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return input_ids, cache_ids, last_token_id
 
         # TODO: check context_buckets for compatibility with OPT
-        if hasattr(self, "context_buckets"):
+        if cache_ids is not None and cache_ids.flatten()[0].item() > 0:
+            # speculative forward: n_active_tokens > 1 and cache_ids start from position > 0
+            speculation_buckets = list(set([k for k, batch_size in self.decoder_lm_head_for_speculation.keys()]))
+            estimate = bucket.find(speculation_buckets, context_length)
+        elif hasattr(self, "context_buckets"):
             estimate = bucket.find(self.context_buckets, context_length)
         else:
             estimate = self.context_length_estimate
@@ -351,7 +355,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 cache_ids = cache_ids.unsqueeze(0)
             assert cache_ids.shape[0] == n_active_seqs, \
                     f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]}) in speculative forward"
-            cache_ids_pad = torch.zeros(n_active_seqs, speculative_n_positions, dtype=cache_ids.dtype, device='cpu')
+            cache_ids_pad = torch.zeros(n_active_seqs, speculation_bucket, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
