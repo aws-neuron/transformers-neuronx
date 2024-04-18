@@ -57,6 +57,8 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
         return greedy_search(logits, tp_degree=tp_degree)
 
     if temperature is not None and temperature != 1.0:
+        if hlo._is_hlo_scalar(temperature):
+            temperature = hlo.cast(temperature, logits.dtype)
         logits = hlo.divide(logits, temperature)
 
     indices = None
