@@ -355,15 +355,11 @@ class Executor:
             result: The output tensors from each rank concatenated along dim 0.
         """
         casted = []
-        # IMPORTANT: Check shape consistency between HLO and runtime inputs
-        # NOTE:
-        # - 1) We only check first three inputs for now, which are input_ids, cache_ids and start_ids
-        # - 2) Multi-layer program takes inputs directly from previous execution, with an empty input list.
-        # TODO: Extend the shape consistency check among all inputs, after removing curr_window_start
-        if len(inputs) > 0:
-            assert [_.shape for _ in inputs[:3]] == [_.shape for _ in self.inputs[:3]], \
-                f"input shape mismatch: expected {[_.shape for _ in self.inputs]}, but got {[_.shape for _ in inputs]}"
         for cpu, buf in zip(inputs, self.inputs):
+            if cpu.shape != buf.shape:
+                raise AssertionError(
+                    f"Input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
+                )
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)
             casted.append(cpu)
