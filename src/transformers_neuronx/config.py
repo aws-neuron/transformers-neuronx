@@ -80,6 +80,11 @@ class GenerationConfig:
         self.dynamic = dynamic
         self.deterministic = deterministic
 
+    def __eq__(self, value: object) -> bool:
+        if not isinstance(value, GenerationConfig):
+            return False
+        return self.__dict__ == value.__dict__
+
 
 valid_dtypes = [
     "float32",
