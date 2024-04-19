@@ -2044,29 +2044,39 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
         )
         top_p_min_tokens = cast(top_p_min_tokens, tensor.dtype)
 
+    scribe = tensor.scribe
+    s32 = scribe.s32
+
     if indices is None:
         if tp_degree > 1:
             tensor = all_gather(tensor, dim=0, tp_degree=tp_degree)
         tensor, indices = sort_with_indices(tensor, dim=0, descending=True)
 
-    tensor_ascending = flip(tensor, dims=0)
-
     # Probability mask - Keep only the positions whose cumulative
     #   probability is less than the user-provided threshold. This removes
     #   the long tail of small probababilitiess.
-    probs = softmax(tensor_ascending, dim=0)
+    probs = softmax(tensor, dim=0)
     cumulative_prob = cumsum(probs, dim=0)
-    criteria = subtract(1, top_p)
-    remove_probs = less_equal(cumulative_prob, criteria)
-    keep_probs = logical_not(remove_probs)
-    keep_probs = flip(keep_probs, dims=0)
+
+    # This gives us one position before the total set of top_p tokens we want to keep
+    keep_probs = less(cumulative_prob, top_p)
+
+    # Get the "cutoff" position
+    keep_probs = cast(keep_probs, s32)
+    keep_positions = reduce_sum(keep_probs, dim=0)
+    positions = iota(probs.dtype, probs.sizes, dims=0)
 
     # Positional mask - Support minimum number of positions.
     # Reference: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/generation/logits_process.py#L409-L410
-    positions = iota(probs.dtype, probs.sizes, dims=0)
-    keep_positions = less(positions, top_p_min_tokens)
+    criteria = subtract(top_p_min_tokens, 1)
+    limit = maximum(criteria, keep_positions)
+    dims = list(range(len(positions.sizes)))
+    dims.pop(0)
+    limit = broadcast(limit, positions.sizes, dims)
+    limit = cast(limit, positions.dtype)
 
-    keep_mask = logical_or(keep_probs, keep_positions)
+    # Keep all required values and mask out the rest with -30000
+    keep_mask = less_equal(positions, limit)
     probs = masked_select(keep_mask, tensor, -30000)
 
     return probs, indices
@@ -2509,8 +2519,10 @@ def _binary_primitive_broadcast(lhs, rhs):
         lhs = full(lhs, dtype=rhs.dtype, sizes=rhs.sizes)
     if rhs_scalar:
         rhs = broadcast(rhs, lhs.sizes, [])
+        rhs = cast(rhs, lhs.dtype)
     if lhs_scalar:
         lhs = broadcast(lhs, rhs.sizes, [])
+        lhs = cast(lhs, rhs.dtype)
 
     return lhs, rhs
 
