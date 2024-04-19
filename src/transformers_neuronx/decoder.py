@@ -1177,11 +1177,28 @@ class DecoderLayer(torch.nn.Module):
                     shape = weight.shape[:-2] + (weight.shape[-1] * weight.shape[-2],)
                     return weight.view(shape)
 
-                self.attn_k_weight = repeat(self.attn_k_weight)
-                self.attn_v_weight = repeat(self.attn_v_weight)
-                self.attn_k_bias = repeat(self.attn_k_bias)
-                self.attn_v_bias = repeat(self.attn_v_bias)
-                self.n_kv_head *= ratio
+                def pad_kv_no_repeat(weight, pad_size):
+                    if weight is None:
+                        return weight
+                    shape = weight.shape[:-1] + (self.n_kv_head, weight.shape[-1] // self.n_kv_head)
+                    weight = weight.view(shape)
+                    weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_size))
+                    shape = weight.shape[:-2] + (weight.shape[-1] * weight.shape[-2],)
+                    return weight.view(shape)
+
+                if ratio == 0:
+                    # in case no replication is needed, pad kv based on n_kv_heads_padded calculated above
+                    self.attn_k_weight = pad_kv_no_repeat(self.attn_k_weight, n_kv_heads_padded - self.n_kv_head)
+                    self.attn_v_weight = pad_kv_no_repeat(self.attn_v_weight, n_kv_heads_padded - self.n_kv_head)
+                    self.attn_k_bias = pad_kv_no_repeat(self.attn_k_bias, n_kv_heads_padded - self.n_kv_head)
+                    self.attn_v_bias = pad_kv_no_repeat(self.attn_v_bias, n_kv_heads_padded - self.n_kv_head)
+                    self.n_kv_head = n_kv_heads_padded
+                else:
+                    self.attn_k_weight = repeat(self.attn_k_weight)
+                    self.attn_v_weight = repeat(self.attn_v_weight)
+                    self.attn_k_bias = repeat(self.attn_k_bias)
+                    self.attn_v_bias = repeat(self.attn_v_bias)
+                    self.n_kv_head *= ratio
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = qkv_maybe_pad(self.attn_k_weight, dim=1)

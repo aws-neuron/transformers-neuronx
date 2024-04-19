@@ -320,8 +320,18 @@ def get_qkv_padding(
             )
         ):
             ratio = int(tp_degree / n_kv_head)
+        # In case the number of Q heads that share same KV head (i.e. n_head / n_kv_head) is equal to
+        # the number of Q heads (after padding) assigned to each core (i.e. n_head_padded / tp_degree),
+        # we only need to allocate one KV head to each core
+        # (e.g. TP = 32, Q heads = 72 (96 after padding), KV heads = 24)
+        elif n_head_padded / tp_degree == n_head / n_kv_head:
+            ratio = 1
 
         n_kv_head_padded = n_kv_head * ratio
+
+        # Ensure KV heads are at least padded to TP degree
+        if n_kv_head_padded < tp_degree:
+            n_kv_head_padded = tp_degree
 
         # Full Replication - If fully replicated but needed to pad Q heads, then
         # also pad KV heads.
