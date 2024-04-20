@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
 import functools
 import operator
 from typing import Optional, List, Callable, Union
@@ -26,6 +27,7 @@ from transformers_neuronx import utils
 from transformers_neuronx import compiler
 from transformers_neuronx import constants
 from transformers_neuronx import dtypes
+from transformers_neuronx.nki.compile import nki_call
 
 def ax_plus_by(a, x, b, y):
     """
@@ -1574,6 +1576,11 @@ def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
 
 def cumsum(tensor, dim):
 
+    # NOTE: This is behind a flag because support of the required
+    #       instructions are not yet fully available.
+    if os.environ.get('NEURON_INTERNAL_FAST_CUMSUM', None) == '1':
+        return _cumsum_fast(tensor, dim)
+
     scribe = tensor.scribe
     s32 = scribe.s32
     pred = scribe.pred
@@ -1601,6 +1608,52 @@ def cumsum(tensor, dim):
         lhs_contracting_dimensions=[last],
         rhs_contracting_dimensions=[0]
     ))
+    if dim != last:
+        result = transpose(result, dim, last)
+
+    return result
+
+
+def _cumsum_fast(tensor, dim):
+
+    from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
+
+    scribe = tensor.scribe
+    last = len(tensor.sizes) - 1
+    dtype = tensor.dtype
+    f32 = scribe.f32
+    bf16 = scribe.bf16
+
+    if dim < 0:
+        dim %= len(tensor.sizes)
+
+    # Note: NKI kernel must do accumulation on the last dim
+    if dim != last:
+        tensor = transpose(tensor, dim, last)
+
+    # Note: NKI kernel only supports 2d tensors
+    reshaped = False
+    shape = tensor.sizes
+    if len(shape) != 2:
+        sizes = list(tensor.sizes)
+        sizes.pop(last)
+        elements = functools.reduce(operator.mul, sizes, 1)
+        tensor = reshape(tensor, (elements, tensor.sizes[last]))
+        reshaped = True
+
+    # Note: NKI kernel does not support bf16
+    if dtype == bf16:
+        tensor = cast(tensor, f32)
+
+    def _cumsum(inputs, output):
+        return nki_cumsum(inputs, output, axis=1)
+    result = nki_call(_cumsum, tensor, output_HloShapes=tensor.dtype[tensor.sizes])
+
+    result = cast(result, dtype)
+
+    if reshaped:
+        result = reshape(result, shape)
+
     if dim != last:
         result = transpose(result, dim, last)
 
