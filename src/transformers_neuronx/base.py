@@ -442,7 +442,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def _context_dynamic_batching(self, hidden, *args):
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        input_batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
+        input_batch_size = hidden.shape[0] if is_bsh or self.neuron_config.on_device_embedding else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
         running_batch_size = self.context_batch_sizes[-1]
@@ -455,10 +455,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             for iter_id in range(n_iters):
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
-                if is_bsh:
-                    hidden_per_batch = hidden[start_idx:end_idx, :, :]
+                if is_bsh or self.neuron_config.on_device_embedding:
+                    hidden_per_batch = hidden[start_idx:end_idx, ...]
                 else:
-                    hidden_per_batch = hidden[:, :, start_idx:end_idx]
+                    hidden_per_batch = hidden[..., start_idx:end_idx]
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id_per_batch = last_token_id[start_idx:end_idx]
