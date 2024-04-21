@@ -1622,7 +1622,6 @@ def _cumsum_fast(tensor, dim):
     last = len(tensor.sizes) - 1
     dtype = tensor.dtype
     f32 = scribe.f32
-    bf16 = scribe.bf16
 
     if dim < 0:
         dim %= len(tensor.sizes)
@@ -1641,9 +1640,8 @@ def _cumsum_fast(tensor, dim):
         tensor = reshape(tensor, (elements, tensor.sizes[last]))
         reshaped = True
 
-    # Note: NKI kernel does not support bf16
-    if dtype == bf16:
-        tensor = cast(tensor, f32)
+    # Note: NKI kernel does not yet have broad type support
+    tensor = cast(tensor, f32)
 
     def _cumsum(inputs, output):
         return nki_cumsum(inputs, output, axis=1)
