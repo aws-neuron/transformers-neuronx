@@ -1574,11 +1574,12 @@ def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
     return global_mean
 
 
+
 def cumsum(tensor, dim):
 
     # NOTE: This is behind a flag because support of the required
     #       instructions are not yet fully available.
-    if os.environ.get('NEURON_INTERNAL_FAST_CUMSUM', None) == '1':
+    if is_floating_point(tensor) and os.environ.get('NEURON_INTERNAL_FAST_CUMSUM', None) == '1':
         return _cumsum_fast(tensor, dim)
 
     scribe = tensor.scribe
@@ -2553,6 +2554,16 @@ def repeat_kv(tensor, n_repeats, repeat_dim):
 
 def _is_hlo_scalar(value):
     return hasattr(value, 'sizes') and value.sizes == ()
+
+
+def is_floating_point(value):
+    scribe = value.scribe
+    return value.dtype in [
+        scribe.f64,
+        scribe.f32,
+        scribe.f16,
+        scribe.bf16,
+    ]
 
 
 def _binary_primitive_broadcast(lhs, rhs):
