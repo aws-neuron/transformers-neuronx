@@ -25,6 +25,7 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
             top_p=config.top_p,
             temperature=config.temperature,
             top_p_min_tokens=config.top_p_min_tokens,
+            global_top_k=config.global_top_k,
             tp_degree=tp_degree,
             dynamic=config.dynamic,
             deterministic=config.deterministic
@@ -48,10 +49,19 @@ def greedy_search(logits, *, tp_degree=1, permute=True):
     return hlo.argmax(logits, 2, tp_degree=tp_degree) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, dynamic=False, deterministic=False):
+def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, global_top_k=None, tp_degree=1, dynamic=False, deterministic=False):
+
+    if global_top_k is not None:
+        assert dynamic is True, "Dynamic on device generation must be enabled when global_top_k is set."
 
     logits = hlo.permute(logits, (2, 1, 0))
     batch_size, n_active_tokens, vocab_size = logits.sizes
+
+    indices = None
+
+    # Perform global top-k
+    if global_top_k is not None:
+        logits, indices = hlo.topk(logits, k=global_top_k, dim=2, tp_degree=tp_degree)
 
     # NOTE: Compiler failures can occur when batch != 1
     if top_k == 1 and batch_size == 1:
@@ -62,12 +72,10 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
             temperature = hlo.cast(temperature, logits.dtype)
         logits = hlo.divide(logits, temperature)
 
-    indices = None
-
     # Perform Top-K
     if top_k is not None:
         if dynamic:
-            logits, index, indices = hlo.topk_masked(logits, k=top_k, dim=2, tp_degree=tp_degree)
+            logits, index, indices = hlo.topk_masked(logits, k=top_k, dim=2, tp_degree=tp_degree, indices=indices)
         else:
             logits, indices = hlo.topk(logits, k=top_k, dim=2, tp_degree=tp_degree)
 
