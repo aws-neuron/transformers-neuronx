@@ -65,6 +65,7 @@ class GenerationConfig:
         top_k = 50,             # Default: Top 50 (when sampling)
         top_p = 1.0,            # Default: Use all tokens
         top_p_min_tokens = 1,   # Default: A minimum of 1 for Top-P sampling
+        global_top_k = None,    # Default: Do not use a global top-k value
         eos_token_id = None,    # Default: Ignore EOS token, otherwise enable early stop.
         temperature = 1.0,      # Default: No temperature application
         dynamic = False,        # Default: Do not support changing generation config at runtime
@@ -75,6 +76,7 @@ class GenerationConfig:
         self.top_k = top_k
         self.top_p = float(top_p)
         self.top_p_min_tokens = top_p_min_tokens
+        self.global_top_k = global_top_k
         self.eos_token_id = eos_token_id
         self.temperature = float(temperature)
         self.dynamic = dynamic
