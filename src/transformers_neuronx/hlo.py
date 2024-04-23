@@ -2020,6 +2020,9 @@ def topk_masked(tensor, dim, k=50, tp_degree=1, indices=None):
         index: The indices of the top-k values in the tensor.
         indices: Indices of the pre-sorted tensor in descending order.
     """
+    scribe = tensor.scribe
+    s32 = scribe.s32
+
     k_is_hlo_scalar = _is_hlo_scalar(k)
 
     if not k_is_hlo_scalar:
@@ -2039,17 +2042,23 @@ def topk_masked(tensor, dim, k=50, tp_degree=1, indices=None):
             tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
         tensor, indices = sort_with_indices(tensor, dim=dim, descending=True)
 
+    indices_dtype = indices.dtype
+    indices = cast(indices, s32) # Cast to signed int32 to avoid creating a uint -30000 value
+
     positions = iota(tensor.dtype, tensor.sizes, dims=dim)
     keep_mask = less(positions, k)
     value = masked_select(keep_mask, tensor, -30000)
     index = masked_select(keep_mask, indices, -30000)
+
+    indices = cast(indices, indices_dtype)
+
     return value, index, indices
 
 
 def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None, dim=0):
     """
     Get the smallest set of tensor values that add up to top_p or higher
-    along dimension 0.
+    along a specified dimension.
 
     Arguments:
         tensor: The values to select the top-p from.
@@ -2059,6 +2068,7 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None, dim=0
         indices: Optional indices of the pre-sorted tensor in descending order.
             If `indices` is provided it is assumed `tensor` is also sorted
             in descending order.
+        dim: The dimension along which to select the values from.
 
     Returns:
         probs: The top-p values in the tensor.
