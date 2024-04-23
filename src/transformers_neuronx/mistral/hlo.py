@@ -202,9 +202,10 @@ class MistralForSamplingNoEmbeddingHlo:
 
             if self.config.window_size:
                 if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
-                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
+                    curr_window_start_scalar = hlo.reshape(curr_window_start, [])
+                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
+                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
+                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start_scalar, size=self.config.window_size)
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,
