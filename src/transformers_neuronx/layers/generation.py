@@ -18,7 +18,6 @@ from transformers_neuronx import hlo, config
 def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1):
 
     logits = mask_logits(logits, logits_indices, config.vocab_size)
-
     if config.dynamic or config.do_sample:
         return sample(
             logits,
@@ -42,19 +41,21 @@ def mask_logits(logits, indices, model_vocab_size):
     return logits
 
 
-def greedy_search(logits, *, tp_degree=1):
-    vocab_size, n_active_tokens, batch_size = logits.sizes
-    result = hlo.argmax(logits, 0, tp_degree=tp_degree) # shape: n_active_tokens, batch_size
-    return hlo.transpose(result, 0, 1) # shape: batch_size, n_active_tokens
+def greedy_search(logits, *, tp_degree=1, permute=True):
+    if permute:
+        logits = hlo.permute(logits, (2, 1, 0))
+    batch_size, n_active_tokens, vocab_size = logits.sizes
+    return hlo.argmax(logits, 2, tp_degree=tp_degree) # shape: batch_size, n_active_tokens
 
 
 def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, tp_degree=1, dynamic=False, deterministic=False):
 
-    vocab_size, n_active_tokens, batch_size = logits.sizes
+    logits = hlo.permute(logits, (2, 1, 0))
+    batch_size, n_active_tokens, vocab_size = logits.sizes
 
     # NOTE: Compiler failures can occur when batch != 1
     if top_k == 1 and batch_size == 1:
-        return greedy_search(logits, tp_degree=tp_degree)
+        return greedy_search(logits, tp_degree=tp_degree, permute=False)
 
     if temperature is not None and temperature != 1.0:
         if hlo._is_hlo_scalar(temperature):
@@ -66,18 +67,17 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
     # Perform Top-K
     if top_k is not None:
         if dynamic:
-            logits, index, indices = hlo.topk_masked(logits, k=top_k, dim=0, tp_degree=tp_degree)
+            logits, index, indices = hlo.topk_masked(logits, k=top_k, dim=2, tp_degree=tp_degree)
         else:
-            logits, indices = hlo.topk(logits, k=top_k, dim=0, tp_degree=tp_degree)
+            logits, indices = hlo.topk(logits, k=top_k, dim=2, tp_degree=tp_degree)
 
     # Perform Top-P
     if dynamic or top_p is not None and top_p < 1.0:
-        logits, indices = hlo.topp(logits, top_p=top_p, top_p_min_tokens=top_p_min_tokens, tp_degree=tp_degree, indices=indices)
+        logits, indices = hlo.topp(logits, top_p=top_p, top_p_min_tokens=top_p_min_tokens, tp_degree=tp_degree, indices=indices, dim=2)
 
-    probs = hlo.softmax(logits, dim=0)
+    probs = hlo.softmax(logits, dim=2)
 
     # Final sample after filtering TopP/TopK
-    samples = hlo.multinomial(probs, dim=0, deterministic=deterministic)
-    tokens = hlo.gather(indices, 0, samples)
-    tokens = hlo.squeeze(tokens, 0)
-    return hlo.transpose(tokens, 0, 1)
+    samples = hlo.multinomial(probs, dim=2, deterministic=deterministic)
+    tokens = hlo.gather(indices, 2, samples)
+    return hlo.squeeze(tokens, 2)

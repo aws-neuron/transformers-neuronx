@@ -2046,7 +2046,7 @@ def topk_masked(tensor, dim, k=50, tp_degree=1, indices=None):
     return value, index, indices
 
 
-def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
+def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None, dim=0):
     """
     Get the smallest set of tensor values that add up to top_p or higher
     along dimension 0.
@@ -2101,29 +2101,29 @@ def topp(tensor, top_p=1.0, top_p_min_tokens=1, tp_degree=1, indices=None):
 
     if indices is None:
         if tp_degree > 1:
-            tensor = all_gather(tensor, dim=0, tp_degree=tp_degree)
-        tensor, indices = sort_with_indices(tensor, dim=0, descending=True)
+            tensor = all_gather(tensor, dim=dim, tp_degree=tp_degree)
+        tensor, indices = sort_with_indices(tensor, dim=dim, descending=True)
 
     # Probability mask - Keep only the positions whose cumulative
     #   probability is less than the user-provided threshold. This removes
     #   the long tail of small probababilitiess.
-    probs = softmax(tensor, dim=0)
-    cumulative_prob = cumsum(probs, dim=0)
+    probs = softmax(tensor, dim=dim)
+    cumulative_prob = cumsum(probs, dim=dim)
 
     # This gives us one position before the total set of top_p tokens we want to keep
     keep_probs = less(cumulative_prob, top_p)
 
     # Get the "cutoff" position
     keep_probs = cast(keep_probs, s32)
-    keep_positions = reduce_sum(keep_probs, dim=0)
-    positions = iota(probs.dtype, probs.sizes, dims=0)
+    keep_positions = reduce_sum(keep_probs, dim=dim)
+    positions = iota(probs.dtype, probs.sizes, dims=dim)
 
     # Positional mask - Support minimum number of positions.
     # Reference: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/generation/logits_process.py#L409-L410
     criteria = subtract(top_p_min_tokens, 1)
     limit = maximum(criteria, keep_positions)
     dims = list(range(len(positions.sizes)))
-    dims.pop(0)
+    dims.pop(dim)
     limit = broadcast(limit, positions.sizes, dims)
     limit = cast(limit, positions.dtype)
 
