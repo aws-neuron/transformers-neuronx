@@ -181,7 +181,7 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     raise NotImplementedError("BSH GroupNorm is not currently implemented, use HSB")
 
 
-def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None):
+def rms_norm(hidden, weight, eps=1e-6, dim=2):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     size = hidden.sizes
@@ -189,6 +189,12 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
     batch_dims.pop(dim)
     batch_shapes = list(size)
     batch_shapes.pop(dim)
+
+    # For batch == 1, token generation use triton implementation. The batch > 1
+    # context encoding implementation is in development
+    num_tokens = functools.reduce(operator.mul, batch_shapes, 1)
+    if num_tokens == 1:
+        return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
 
     dtype = hidden.dtype
     scribe = hidden.scribe
@@ -216,13 +222,10 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
     return result
 
 
-def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None):
+def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
 
     dtype = hidden.dtype
     shape = hidden.sizes
-    # Fallback on generic HLO implementation when norm dimension is 1
-    if shape[dim] == 1:
-        return rms_norm_legacy(hidden, weight, eps, dim, neuron_config, tp_degree)
     scribe = hidden.scribe
     backend_config = str(dim).encode()
     eps = hidden.scribe.f32.Constant(constant_value=eps)
