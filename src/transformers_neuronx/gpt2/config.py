@@ -16,7 +16,7 @@ import transformers
 from transformers_neuronx import utils
 
 
-# (bowenc): inherit from transformer.GPT2Config as we need to inherit from
+# inherit from transformer.GPT2Config as we need to inherit from
 # transformers.PreTrainedModel to call transformers generation API
 class GPT2HuggingFaceConfig(transformers.GPT2Config):
 
@@ -24,11 +24,12 @@ class GPT2HuggingFaceConfig(transformers.GPT2Config):
         kwargs.update(config.to_dict())
         super().__init__(**kwargs)
         self.activation_function = config.activation_function
-        self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
         self.n_head = config.n_head
+        self.n_kv_head = config.to_dict().get("n_kv_head", config.n_head)
         self.n_layer = config.n_layer
         self.n_positions = config.n_positions
+        self.max_position_embeddings = config.max_position_embeddings
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
         utils.maybe_override_attributes(self, kwargs)
@@ -38,15 +39,17 @@ class GPT2HuggingFaceConfig(transformers.GPT2Config):
         self.tp_degree = tp_degree
 
 
+
 class GPT2Config:
 
     def __init__(self, config, batch_size, amp, tp_degree, **kwargs):
         self.activation_function = config.activation_function
-        self.n_ctx = config.n_ctx
         self.n_embd = config.n_embd
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head if hasattr(config, "n_kv_head") else config.n_head
         self.n_layer = config.n_layer
         self.n_positions = config.n_positions
+        self.max_position_embeddings = config.max_position_embeddings
         self.vocab_size = config.vocab_size
         self.eos_token_id = config.eos_token_id
         utils.maybe_override_attributes(self, kwargs)

@@ -13,7 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import hlo
-from transformers_neuronx.layers import attention, transformer, alibi
+from transformers_neuronx.constants import LAYOUT_BSH
+from transformers_neuronx.layers import transformer, alibi, attention
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -21,33 +22,32 @@ class BloomForSamplingNoEmbeddingHlo:
     def __init__(self, config: BloomConfig, neuron_config=None):
         self.config = config
         self.neuron_config = neuron_config
+        self.n_positions = None
 
-    def inputs(self, scribe, hidden_dtype, n_positions, n_active_tokens, batch_size):
-        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
-        hidden = hidden_dtype[hidden_sizes].Parameter(parameter_number=0)
-        cache_ids = scribe.s32[n_active_tokens].Parameter(parameter_number=1)
-        start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
-
-        # NOTE: When using token generation network, we generate a mask for the
-        #       past tokens and the current tokens separately. This allows us
-        #       use the split "prefetch" attention layer.
-        token_generation = n_active_tokens == 1
-        triu_comparison = 'LT' if token_generation else 'LE'
-        mask, active_mask = hlo.decoder_attention_mask(
-            start_ids,
-            cache_ids,
-            n_positions,
-            triu_comparison=triu_comparison,
-            allow_kv_dot_prefetch=token_generation,
-            start_mask=True
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        return (hidden, cache_ids, mask, active_mask), (1, 0, None)
+        return tensors, dims
 
-    def pre_layer(self, hidden, cache_ids, mask, active_mask, slopes):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, slopes, word_embeddings, ln_weight, ln_bias):
+        dtype = getattr(input_ids.scribe, self.config.amp)
+        hidden = hlo.embedding(word_embeddings, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
+        if self.config.hidden_size % self.config.tp_degree != 0:
+            hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
+        is_bsh = self.neuron_config.attention_layout == LAYOUT_BSH
+        if not is_bsh:
+            hidden = hlo.transpose210(hidden)
+        return hlo.layer_norm_bsh(hidden, ln_weight, ln_bias) if is_bsh \
+               else hlo.layer_norm(hidden, ln_weight, ln_bias)
+
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *pre_layer_weights):
+        slopes, *rest = pre_layer_weights
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
-        return hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi
+        return hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
-    def layer(self, hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
+    def layer(self, hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
@@ -60,7 +60,9 @@ class BloomForSamplingNoEmbeddingHlo:
               post_mlp_ln_weight, post_mlp_ln_bias):
 
         dtype = hidden.dtype
-        ln_hidden = hlo.layer_norm_bsh(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        layer_norm = hlo.layer_norm_bsh if is_bsh else hlo.layer_norm
+        ln_hidden = layer_norm(hidden, pre_attn_ln_weight, pre_attn_ln_bias)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
             attn_k_cache, attn_v_cache,
@@ -71,21 +73,25 @@ class BloomForSamplingNoEmbeddingHlo:
             neuron_config=self.neuron_config
         )
         hidden = dtype[hidden.sizes].Add(attn_output, hidden)
-        ln_hidden = hlo.layer_norm_bsh(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
-        mlp_hidden = hlo.mlp_bsh(
+        ln_hidden = layer_norm(hidden, pre_mlp_ln_weight, pre_mlp_ln_bias)
+        mlp = hlo.mlp_bsh if is_bsh else hlo.mlp
+        mlp_hidden = mlp(
             ln_hidden,
             mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
             activation_function='gelu_new',
             tp_degree=self.config.tp_degree,
             in_scales=mlp_in_scales, out_scales=mlp_out_scales,
-            neuron_config=self.neuron_config
+            neuron_config=self.neuron_config,
+            transposed=True,
         )
 
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias):
-        return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias)
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
+        logits = transformer.ln_lm_head(self.config.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight,
+                                        lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
+        return logits
 
     def attention(self,
         hidden, cache_ids, mask, active_mask, prior_alibi, active_alibi,
@@ -142,6 +148,11 @@ class BloomForSamplingNoEmbeddingHlo:
             # C = softmax(Sa, Sp) @ (Va, Vp)
             context = attention.context(prior_scores, active_score, cached_values, value)
 
+            # KCache[I] = K
+            # VCache[I] = V
+            updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+            updated_values = attention.update_cache(cached_values, cache_ids, value)
+
         # Multi-Token Context Encoding
         else:
 
@@ -160,12 +171,11 @@ class BloomForSamplingNoEmbeddingHlo:
             # C = softmax(S) @ V
             context = attention.context_combined(score, value)
 
+            # KCache = K
+            # VCache = V
+            updated_keys = key
+            updated_values = value
+
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, self.config.tp_degree, neuron_config)
-
-        # KCache[I] = K
-        # VCache[I] = V
-        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-        updated_values = attention.update_cache(cached_values, cache_ids, value)
-
         return output, updated_keys, updated_values

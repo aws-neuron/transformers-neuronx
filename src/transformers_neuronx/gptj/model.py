@@ -20,6 +20,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
@@ -32,14 +33,14 @@ class GPTJForSampling(module.PretrainedModel):
         super().__init__()
         config = GPTJConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         # Check if input sequence length is allowed given position embedding dimensions
         sequence_length = kwargs.get("n_positions", None)
         if sequence_length:
             max_allowed_sequence_length = config.n_ctx
             if sequence_length > max_allowed_sequence_length:
                 raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
-        if neuron_config and neuron_config.quant:
+        if self.neuron_config.quant:
             raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is None:
             unroll = config.n_layer
@@ -55,6 +56,12 @@ class GPTJForSampling(module.PretrainedModel):
         self.program = None
         self.init_program = program.DoNothingDecoder()
         self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
+
+    def get_tied_parameters(self):
+        return [(self.transformer.wte.weight, self.lm_head.weight)]
+
+    def get_base_model(self):
+        return self.transformer
 
     def to_neuron(self):
         ops.init()
@@ -77,6 +84,9 @@ class GPTJForSampling(module.PretrainedModel):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
+        batch_size, context_length = input_ids.shape
+        if cache_offset is None:
+            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -91,7 +101,7 @@ class GPTJForSampling(module.PretrainedModel):
             inputs = input_ids[:, slicing], cache_offset[slicing]
             logits = self._run_program(self.program, bucket_id, *inputs)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
+        logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size]
         logits = logits.transpose(0, -1)
         logits = logits[:, -1, :]
@@ -118,9 +128,9 @@ class GPTJForSampling(module.PretrainedModel):
             ops.parallel_write(in_buffer, in_tensor)
         return program.run(bucket_id)
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         return simple_sample(self, input_ids, start_ids, sequence_length,
-                             eos_token_id=self.config.eos_token_id, top_k=top_k)
+                             eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
     def _fixed_pos_embedding(self, dim, head_dim, offset):
         # TODO: init_n_active > 1
@@ -141,6 +151,13 @@ class GPTJForSampling(module.PretrainedModel):
         pos_embd = torch.eye(head_dim)
         pos_embd[:dim, :dim] = sincos
         return pos_embd
+
+    def _cast_logits(self, logits):
+        # Cast logits to float32 or  the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        return logits.to(logits_dtype)
 
 
 class GPTJBuffers:
@@ -168,7 +185,7 @@ class GPTJBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    return next(idx for idx, val in enumerate(values) if val >= target + 1)
 
 
 class GPTJTransformer(module.LowMemoryModule):
@@ -312,7 +329,7 @@ class GPTJLnLmHead:
         # Pad the lm_head_weight and lm_head_bias if vocab_size % tp_degree != 0
         lm_head_weight = self.lm_head.weight.detach().T
         _, vocab_size = lm_head_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         lm_head_weight = torch.nn.functional.pad(lm_head_weight, (0, vocab_pad, 0, 0))
         self.lm_head_weight = shard_along(lm_head_weight, dim=1)
         lm_head_bias = self.lm_head.bias.detach()

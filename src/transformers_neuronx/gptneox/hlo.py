@@ -13,8 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 from transformers_neuronx import compiler
+from transformers_neuronx import constants
 from transformers_neuronx import hlo
 from transformers_neuronx.layers import attention, transformer
+from transformers_neuronx.config import NeuronConfig
+
 
 def build_gptneox_hlo_module(config, n_active_tokens, n_positions, debugger=None):
     gptneox = gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions)
@@ -24,7 +27,7 @@ def build_gptneox_hlo_module(config, n_active_tokens, n_positions, debugger=None
 
 def gptneox_attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias,
               out_weight, out_bias, pos_embd, cached_keys, cached_values,
-              cache_ids, mask, active_mask, tp_degree, d_head):
+              cache_ids, mask, active_mask, tp_degree, d_head, neuron_config):
 
     # Q = (hidden @ wQ) + bQ
     # K = (hidden @ wK) + bK
@@ -35,6 +38,8 @@ def gptneox_attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_we
         k_weight, None, k_bias,
         v_weight, None, v_bias,
         d_head,
+        tp_degree=tp_degree,
+        neuron_config=neuron_config,
     )
 
     # Q = Q @ E
@@ -58,6 +63,11 @@ def gptneox_attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_we
         # C = softmax(Sa, Sp) @ (Va, Vp)
         context = attention.context(prior_scores, active_score, cached_values, value)
 
+        # KCache[I] = K
+        # VCache[I] = V
+        updated_keys = attention.update_cache(cached_keys, cache_ids, key)
+        updated_values = attention.update_cache(cached_values, cache_ids, value)
+
     # Multi-Token Context Encoding
     else:
 
@@ -66,15 +76,13 @@ def gptneox_attention(debugger, hidden, q_weight, q_bias, k_weight, k_bias, v_we
         score = attention.mask(score, mask)
         context = attention.context_combined(score, value)
 
+        # KCache = K
+        # VCache = V
+        updated_keys = key
+        updated_values = value
 
     # O = (C @ wO) + bO
-    output = attention.output(context, out_weight, None, out_bias, tp_degree)
-
-    # KCache[I] = K
-    # VCache[I] = V
-    updated_keys = attention.update_cache(cached_keys, cache_ids, key)
-    updated_values = attention.update_cache(cached_values, cache_ids, value)
-
+    output = attention.output(context, out_weight, None, out_bias, tp_degree, neuron_config=neuron_config)
     return output, updated_keys, updated_values
 
 def block(debugger, hidden, ln_1_weight, ln_1_bias,
@@ -82,7 +90,7 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
           attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
           pos_embd, key_cache, value_cache, cache_offset, mask, active_mask, ln_2_weight, ln_2_bias,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-          config):
+          config, neuron_config):
     dtype = hidden.dtype
     ln_1_weight = hlo.transfer_with_static_ring(ln_1_weight)
     ln_1_bias = hlo.transfer_with_static_ring(ln_1_bias)
@@ -98,13 +106,14 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     in_value_cache = hlo.transfer_with_static_ring(value_cache)
     # Parallel Attention + FF Layers pseudocode:
     #   x = x + attn(ln1(x)) + mlp(ln2(x))
+    hidden = hlo.transpose210(hidden)
     ln_hidden = hlo.layer_norm_bsh(hidden, ln_1_weight, ln_1_bias)  # input_layernorm
     attn_output, out_key_cache, out_value_cache = gptneox_attention(
         debugger,
         hidden=ln_hidden, q_weight=attn_q_weight, q_bias=attn_q_bias, k_weight=attn_k_weight, k_bias=attn_k_bias,
         v_weight=attn_v_weight, v_bias=attn_v_bias, out_weight=attn_out_weight, out_bias=attn_out_bias, pos_embd=pos_embd,
         cached_keys=in_key_cache, cached_values=in_value_cache, cache_ids=cache_offset, mask=mask, active_mask=active_mask,
-        tp_degree=config.tp_degree, d_head=config.n_embd // config.n_head
+        tp_degree=config.tp_degree, d_head=config.n_embd // config.n_head, neuron_config=neuron_config,
     )
     out_hidden = dtype[hidden.sizes].Add(attn_output, hidden)
     ln_2_weight = hlo.transfer_with_static_ring(ln_2_weight)
@@ -117,19 +126,20 @@ def block(debugger, hidden, ln_1_weight, ln_1_bias,
     mlp_hidden = hlo.mlp_bsh(out_ln_hidden, mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
                              activation_function=config.activation_function, tp_degree=config.tp_degree)
     out_hidden = dtype[hidden.sizes].Add(mlp_hidden, out_hidden)
+    out_hidden = hlo.transpose210(out_hidden)
     out_key_cache.set_alias_to(key_cache, must=True)
     out_value_cache.set_alias_to(value_cache, must=True)
     return out_hidden, out_key_cache, out_value_cache
 
 
-def ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight):
+def ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight, config):
     ln_f_weight = hlo.transfer_with_static_ring(ln_f_weight)
     ln_f_bias = hlo.transfer_with_static_ring(ln_f_bias)
     lm_head_weight = hlo.transfer_with_static_ring(lm_head_weight)
-    return transformer.ln_lm_head(hidden, ln_f_weight, ln_f_bias, lm_head_weight, None)
+    return transformer.ln_lm_head(config.tp_degree, hidden, None, ln_f_weight, ln_f_bias, lm_head_weight, None)
 
 
-def gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_caches, blocks_params, ln_lm_head_params, config):
+def gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_caches, blocks_params, ln_lm_head_params, config, neuron_config):
     scribe = hidden.scribe
     dtype = hidden.dtype
     outputs = []
@@ -145,13 +155,13 @@ def gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_
           attn_v_weight, attn_v_bias, attn_out_weight, attn_out_bias,
           pos_embd, key_cache, value_cache, cache_offset, mask, active_mask, ln_2_weight, ln_2_bias,
           mlp_in_weight, mlp_in_bias, mlp_out_weight, mlp_out_bias,
-          config)
+          config, neuron_config)
         outputs.append(out_key_cache)
         outputs.append(out_value_cache)
     outputs.extend(debugger.get_tensors())
 
     ln_f_weight, ln_f_bias, lm_head_weight = ln_lm_head_params
-    logits = ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight)
+    logits = ln_lm_head(debugger, hidden, ln_f_weight, ln_f_bias, lm_head_weight, config)
     outputs.insert(0, logits)
     root_shapes = [shape.dtype[shape.sizes] for shape in outputs]
     return scribe.tuple(*root_shapes).Tuple(*outputs)
@@ -176,7 +186,7 @@ def gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions):
 
     def scribable(scribe):
         pbuilder = hlo.ParameterBuilder(getattr(scribe, amp))
-        hidden = pbuilder([batch_size, n_active_tokens, embed_dim])
+        hidden = pbuilder([embed_dim, n_active_tokens, batch_size])
         pos_embd = pbuilder([n_active_tokens, head_dim, head_dim])
         cache_offset = pbuilder([n_active_tokens], dtype=scribe.s32)
         start_ids = pbuilder([batch_size], dtype=scribe.s32)
@@ -196,7 +206,7 @@ def gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions):
             attn_k_bias = pbuilder([attn_dim_tp])
             attn_v_weight = pbuilder([embed_dim, attn_dim_tp])
             attn_v_bias = pbuilder([attn_dim_tp])
-            attn_out_weight = pbuilder([attn_dim_tp, embed_dim])
+            attn_out_weight = pbuilder([embed_dim, attn_dim_tp])
             attn_out_bias = pbuilder([embed_dim])
             ln_2_weight = pbuilder([embed_dim], dtype=scribe.f32)
             ln_2_bias = pbuilder([embed_dim], dtype=scribe.f32)
@@ -232,6 +242,10 @@ def gen_scribable_gptneox(debugger, config, n_active_tokens, n_positions):
             start_mask=True,
         )
 
-        return gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_caches, blocks_params, ln_lm_head_params, config)
+        neuron_config = NeuronConfig(
+            attention_layout=constants.LAYOUT_BSH,
+        )
+
+        return gptneox(debugger, hidden, pos_embd, cache_offset, mask, active_mask, blocks_caches, blocks_params, ln_lm_head_params, config, neuron_config)
 
     return scribable

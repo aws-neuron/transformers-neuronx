@@ -22,6 +22,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptneox import hlo
 from transformers_neuronx.gptneox.config import GPTNeoXConfig
 from transformers_neuronx.sampling import simple_sample
@@ -35,13 +36,13 @@ class GPTNeoXForSampling(module.PretrainedModel):
         config = GPTNeoXConfig(config, batch_size, amp, tp_degree, **kwargs)
         self.debug = kwargs.get('debug', False)
         self.config = config
-        self.neuron_config = neuron_config
+        self.neuron_config = neuron_config if neuron_config else NeuronConfig()
         if self.config.activation_function not in ["gelu_new"]: # TODO see if we actually need to implement any other activation func variants
             warnings.warn(f'hidden_act="{self.config.activation_function}" ignored in favor of hidden_act="gelu_new"')
             self.config.activation_function = "gelu_new"
         if not self.config.use_parallel_residual: # TODO implement use_parallel_residual = False
             raise NotImplementedError(f'use_parallel_residual=False is not yet implemented')
-        if neuron_config and neuron_config.quant:
+        if self.neuron_config.quant:
             raise NotImplementedError(f'Support for quantization is not yet implemented')
         if unroll is not None: # TODO add support for unroll
             raise NotImplementedError(f'unroll={unroll} is not yet implemented')
@@ -59,6 +60,12 @@ class GPTNeoXForSampling(module.PretrainedModel):
         self.program = None
         self.init_program = program.DoNothingDecoder()
         self.manipulator = parallel.ParallelTensorManipulator(config.tp_degree)
+
+    def get_tied_parameters(self):
+        return [(self.gpt_neox.embed_in.weight, self.embed_out.weight)]
+
+    def get_base_model(self):
+        return self.gpt_neox
 
     def to_neuron(self):
         ops.init()
@@ -78,10 +85,11 @@ class GPTNeoXForSampling(module.PretrainedModel):
             block.reset()
 
     def forward(self, input_ids, cache_offset, start_ids=None):
-
+        batch_size, context_length = input_ids.shape
         if start_ids is None:
             start_ids = torch.zeros([self.config.batch_size], dtype=torch.int32)
-
+        if cache_offset is None:
+            cache_offset = torch.arange(context_length, dtype=torch.int32)
         last_offset = cache_offset[-1].item()
         bucket_id = find_first_ge_index(self.n_positions_list, last_offset)
         this_length = input_ids.shape[-1]
@@ -102,14 +110,19 @@ class GPTNeoXForSampling(module.PretrainedModel):
                     print(f"Var name: {name}\nTensor:\n{tensor}")
                 logits_cpu = self.manipulator.unshard_along(logits, dim=0)
         logits = self.manipulator.unshard_along(logits, dim=0)
-        logits = logits.to(torch.float32)
-        logits = logits[:self.config.vocab_size, :, -1]
+        # Cast logits to float32 or the dtype specified in the neuron config
+        logits_dtype = torch.float32
+        if self.neuron_config:
+            logits_dtype = getattr(torch, self.neuron_config.cast_logits_dtype)
+        logits = logits.to(logits_dtype)
+        logits = logits[:self.config.vocab_size, -1, :]
         logits = logits.transpose(0, 1)
         return logits
 
     def _run_program(self, program, bucket_id, input_ids, cache_offset, start_ids):
         active_n_positions = self.n_positions_list[bucket_id]
         hidden = self.gpt_neox.embed_in(input_ids)
+        hidden = hidden.transpose(0, -1).contiguous()
         input_buffers = program.buffers.get_input_buffers(bucket_id)
         hidden_buffer, pos_embd_buffer, *_ = input_buffers
         hidden = hidden.to(hidden_buffer.dtype)
@@ -120,17 +133,15 @@ class GPTNeoXForSampling(module.PretrainedModel):
         pos_embd = self._fixed_pos_embedding(rotary_dim, s_head, offset=last_offset)
         pos_embd = pos_embd.unsqueeze(0)
         pos_embd = pos_embd.to(pos_embd_buffer.dtype)
-        hidden = self.manipulator.duplicate_on_cpu(hidden)
-        pos_embd = self.manipulator.duplicate_on_cpu(pos_embd)
-        cache_offset = self.manipulator.duplicate_on_cpu(cache_offset)
-        start_ids = self.manipulator.duplicate_on_cpu(start_ids)
         for in_buffer, in_tensor in zip(input_buffers, [hidden, pos_embd, cache_offset, start_ids]):
-            ops.parallel_write(in_buffer, in_tensor)
+            in_tensor = in_tensor.to(in_buffer.dtype)
+            duplicated_tensor = self.manipulator.duplicate_on_cpu(in_tensor)
+            ops.parallel_write(in_buffer, duplicated_tensor)
         return program.run(bucket_id)
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         return simple_sample(self, input_ids, start_ids, sequence_length,
-                             eos_token_id=self.config.eos_token_id, top_k=top_k)
+                             eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
     def _fixed_pos_embedding(self, dim, head_dim, offset):
         """
@@ -210,7 +221,7 @@ class GPTNeoXBuffers:
 
 
 def find_first_ge_index(values, target):
-    return next(idx for idx, val in enumerate(values) if val >= target)
+    return next(idx for idx, val in enumerate(values) if val >= target + 1)
 
 
 class GPTNeoXTransformer(module.LowMemoryModule):
@@ -294,7 +305,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.attn_k_bias = shard_along(k_bias, dim=0)
         self.attn_v_weight = shard_along(v, dim=1)
         self.attn_v_bias = shard_along(v_bias, dim=0)
-        self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
+        self.attn_out_weight = shard_along(attention.dense.weight.detach(), dim=1)
         self.attn_out_bias = primary_only(attention.dense.bias.detach())
 
         self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())
@@ -396,7 +407,7 @@ class GPTNeoXLnLmHead:
         # Pad the lm_head_weight if vocab_size % tp_degree != 0
         embed_out_weight = self.embed_out.weight.detach().T
         _, vocab_size = embed_out_weight.shape
-        vocab_pad = utils.pad_vocab_size(vocab_size, self.tp_degree)
+        vocab_pad = utils.get_pad_size(vocab_size, self.tp_degree)
         embed_out_weight = torch.nn.functional.pad(embed_out_weight, (0, vocab_pad, 0, 0))
         self.embed_out_weight = shard_along(embed_out_weight, dim=1)
         self.embed_out.nullify()
