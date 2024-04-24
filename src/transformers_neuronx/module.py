@@ -407,9 +407,9 @@ class PretrainedModel(LowMemoryModule):
                 batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
                 expected_batch_size = kwargs.get("batch_size")
                 assert batch_size_for_shared_caches == expected_batch_size, \
-                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"   
+                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"
+                assert isinstance(n_positions, list) and len(n_positions) == 1
                 if bsh_cache_layout:
-                    assert isinstance(n_positions, list) and len(n_positions) == 1
                     assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1, \
                     	"BSH cache layout does not support multi-bucketing"
             else:

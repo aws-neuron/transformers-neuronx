@@ -306,10 +306,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def _pad_cache_ids(self, cache_ids, batch_size, context_length, estimate):
         if self.neuron_config.use_2d_cache_ids:
             # TODO: fix cache_ids padding for batch speculative decoding
-            # for now, use cache_ids without change for speculative_forward
-            is_speculative_forward = cache_ids.flatten()[0].item() > 0
-            if is_speculative_forward:
-                return cache_ids
             cache_ids = torch.arange(estimate, dtype=torch.int32)
             cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
         else:
@@ -369,10 +365,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 cache_ids = cache_ids.unsqueeze(0)
             assert cache_ids.shape[0] == n_active_seqs, \
                     f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]}) in speculative forward"
-            # pad cache IDs with max(n_positions) - 1
-            # unlike context encoding, padding with 0
-            # during speculative_forward will contaminate kv-cache history
-            cache_ids_pad = torch.full((n_active_seqs, speculation_bucket), max(self.context_buckets) - 1, dtype=cache_ids.dtype, device="cpu")
+            cache_ids_pad = torch.zeros(n_active_seqs, speculation_bucket, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
@@ -442,7 +435,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def _context_dynamic_batching(self, hidden, *args):
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        input_batch_size = hidden.shape[0] if is_bsh or self.neuron_config.on_device_embedding else hidden.shape[2]
+        input_batch_size = hidden.shape[0] if is_bsh else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
         running_batch_size = self.context_batch_sizes[-1]
@@ -455,17 +448,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             for iter_id in range(n_iters):
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
-                if is_bsh or self.neuron_config.on_device_embedding:
-                    hidden_per_batch = hidden[start_idx:end_idx, ...]
+                if is_bsh:
+                    hidden_per_batch = hidden[start_idx:end_idx, :, :]
                 else:
-                    hidden_per_batch = hidden[..., start_idx:end_idx]
+                    hidden_per_batch = hidden[:, :, start_idx:end_idx]
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id_per_batch = last_token_id[start_idx:end_idx]
                 logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
                                                 start_ids_per_batch, last_token_id_per_batch)
                 all_logits.append(logits_per_batch)
-            logits = torch.cat(all_logits, dim=-1)
+            logits = torch.cat(all_logits, dim=2)
         else:
             assert input_batch_size == running_batch_size, \
                 "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"

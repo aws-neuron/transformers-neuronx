@@ -189,7 +189,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                 slice_sizes = [1] * len(cached_keys.sizes)
                 if cached_keys.sizes[batch_dim] == 1:
                     # Use hlo.select for batch size 1 as index select is prohibitively slow
-                    # TODO: revert to hlo.index_select once its faster P126527643
+                    # TODO: revert to hlo.index_select once its faster https://t.corp.amazon.com/P126527643
                     cached_keys_s = hlo.select(cached_keys, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
                     cached_values_s = hlo.select(cached_values, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
                 else:
@@ -234,13 +234,8 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # Multi-Token Context Encoding
         else:
-            _, batch_size, _, _ = query.sizes
-            if self.neuron_config.lhs_aligned or batch_size == 1:
-                context = attention.flash_attention(query, key, value)
-            else:
-                # do not use flash attention for lhs padded (right aligned) batch > 1 case
-                # because it does not correctly take mask into account 
-                context = None
+
+            context = attention.flash_attention(query, key, value)
 
             if context is None:
                 # S = Q @ K
