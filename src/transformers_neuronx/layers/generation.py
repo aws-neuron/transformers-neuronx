@@ -83,9 +83,16 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
     if dynamic or top_p is not None and top_p < 1.0:
         logits, indices = hlo.topp(logits, top_p=top_p, top_p_min_tokens=top_p_min_tokens, tp_degree=tp_degree, indices=indices, dim=2)
 
+    if indices is None:
+        if tp_degree > 1:
+            logits = hlo.all_gather(logits, dim=2, tp_degree=tp_degree)
+
     probs = hlo.softmax(logits, dim=2)
 
     # Final sample after filtering TopP/TopK
     samples = hlo.multinomial(probs, dim=2, deterministic=deterministic)
-    tokens = hlo.gather(indices, 2, samples)
+    if indices is not None:
+        tokens = hlo.gather(indices, 2, samples)
+    else:
+        tokens = samples
     return hlo.squeeze(tokens, 2)
