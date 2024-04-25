@@ -21,10 +21,22 @@ from transformers_neuronx.layers import attention
     Helper functions for shard over sequence / Flash decoding implementaions
 """
 
+def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree):
+
+    # Communication 1: all-gather query from cores
+    # Notice that this is not necessary for context encoding because we don't read from the KV cache
+    cores_per_q_head = tp_degree // n_heads
+    group_size = cores_per_kv_head // cores_per_q_head if cores_per_q_head else cores_per_kv_head
+    num_groups = tp_degree // group_size
+    replica_groups = utils.build_replica_groups(num_groups, group_size)
+    # Query shape: n_active_tokens, n_seqs, n_heads_tp, d_head
+    query = hlo.all_gather(query, 2, tp_degree, replica_groups)
+    return query
+
 def context(past_scores, active_score, past_values, active_values,
                         core_id, past_mask, active_mask, n_kv_heads=0, n_heads=None, 
                         sparse_mask=None, dtype=None, shard_over_batch=False, tp_degree=None, 
-                        neuron_config=None, slice_output=False):
+                        neuron_config=None):
     """
     Context method with sharding over sequence under a GQA scenario.
     """
@@ -48,7 +60,7 @@ def context(past_scores, active_score, past_values, active_values,
 
     # How many cores should compute each head collectively
     # All cores that hold the KV cache for the same head should communicate here
-    cores_per_kv_head = tp_degree // n_heads
+    cores_per_kv_head = tp_degree // n_kv_heads
     if cores_per_kv_head > 1:
         replica_groups = utils.build_replica_groups(num_groups=n_kv_heads,
                                                     group_size=cores_per_kv_head)
@@ -138,35 +150,25 @@ def context(past_scores, active_score, past_values, active_values,
     denom_br = hlo.cast(denom_br, dtype)
     output = hlo.divide(output, denom_br) # output is f16, denom_br is f32
 
-    # Communication 3: send the results of other Q heads back to their corresponding cores
-    # Also gather the results of the current Q head from other cores
-    # Ideally we should use a reduce-scatter here, but we don't have it yet
-    # Using an all-gather to do the job for now
-    # The replica group includes all cores handling the same KV head, same as above
-    all_outputs = hlo.all_gather(output, 1, tp_degree, replica_groups)
-    # Reshape and do the reduce
-    all_outputs = hlo.reshape(all_outputs, (n_seqs, cores_per_kv_head, n_heads_tp, n_active_tokens, d_head))
-    all_outputs_sum = hlo.reduce_sum(all_outputs, dim=1, keepdim=False)
-    # Choose the ones that corresponds to this core
-    # The order of tensors in the all-gather result is consistent with the order in the replica group
     cores_per_q_head = tp_degree // n_heads
     cores_per_kv_head = tp_degree // n_kv_heads
     if cores_per_q_head:
         # handle casese where we have single q per core or q is replicated 
         group_size = cores_per_kv_head // cores_per_q_head
-        q_head_id = hlo.remainder(hlo.remainder(core_id, cores_per_kv_head), group_size)
         size = 1
     else:
         # cases for mulitple q heads per core, group_size is equal to cores_per_kv_head
-        group_size = tp_degree // n_kv_heads  
-        q_head_id = hlo.multiply(hlo.remainder(core_id, group_size), group_size)
+        group_size = tp_degree // n_kv_heads
+        group_size = group_size if group_size > 1 else tp_degree # case when kv_heads > tp_degree
         size = n_heads // tp_degree
-    # must reshape to a scalar
-    q_head_id = hlo.reshape(q_head_id,[])
-    if slice_output:
-        output = hlo.dynamic_slice_along(all_outputs_sum, dim=1, start=q_head_id, size=size)
-    else:
-        output = all_outputs_sum
+
+    # Communication 3: send the results of other Q heads back to their corresponding cores
+    # Also gather the results of the current Q head from other cores
+    assert output.sizes[1] == group_size*size , f"n_heads {n_heads} after gather not matching kv_replication x n_heads_tp {group_size}x {size}"
+    apply_fn = hlo.gen_add_func(output.dtype)
+    output = hlo.reduce_scatter(output, dim=1, replica_groups=replica_groups, to_apply=apply_fn)
+    assert output.sizes[1] == size , f"n_heads post scatter size mismatch, check replica_groups {replica_groups}"
+
     output = hlo.permute(output, dimensions=[2, 0, 1, 3])
     # Each core now has a partial result. In output projection, result for each head is
     # multiplied with its corresponding weights, and then an all-reduce is used to sum
@@ -177,7 +179,7 @@ def context(past_scores, active_score, past_values, active_values,
     return output
 
 
-def convert_attn_mask_and_cache_id(cache_ids, core_id, batch_size=1, is_context_encoding=False, config=None):
+def convert_attn_mask_and_cache_id(cache_ids, core_id, n_positions, batch_size=1, cores_per_kv_head=1):
     """
     Convert normal cache IDs to the format suitable for sharded KV cache, and create proper attention
     masks. Since each Q/KV head can be distributed to multiple cores, each core will have a
@@ -194,16 +196,16 @@ def convert_attn_mask_and_cache_id(cache_ids, core_id, batch_size=1, is_context_
     assert len(cache_ids.sizes) == 1, "Assuming 1D cache IDs!"
     
     n_active_tokens = cache_ids.sizes[0]
-    cores_per_kv_head = config.tp_degree // config.num_key_value_heads
-    cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else config.tp_degree 
-    cache_size = config.n_positions // cores_per_kv_head
+    is_context_encoding = not(n_active_tokens != n_positions)
+
+    cache_size = n_positions // cores_per_kv_head
     pred = cache_ids.scribe.pred
     dtype = cache_ids.dtype
     # Real cache ID = raw cache ID // the number of cores that hold a single head's KV cache
     num_cache_splits = cores_per_kv_head
     real_cache_ids = hlo.divide(cache_ids, num_cache_splits)
-    # Default cache ID = cache_size
-    default_cache_ids = hlo.full(cache_size, dtype, real_cache_ids.sizes)
+    # Default cache ID = cache_size -1
+    default_cache_ids = hlo.full(cache_size-1, dtype, real_cache_ids.sizes)
     # Now mask out the entries that should not go to this core's cache
     target_core_ids = hlo.remainder(cache_ids, num_cache_splits)
     core_id_cast = hlo.cast(core_id, dtype)
@@ -219,7 +221,7 @@ def convert_attn_mask_and_cache_id(cache_ids, core_id, batch_size=1, is_context_
         # Prior mask is simpler for context encoding
         converted_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
         converted_mask = hlo.broadcast(converted_mask, (batch_size, n_active_tokens, n_active_tokens), [1, 2])
-        return (converted_cache_ids, converted_mask)
+        return (converted_cache_ids, converted_mask, converted_active_mask)
     else:
         converted_mask_size = batch_size, n_active_tokens, cache_size
 
@@ -240,3 +242,25 @@ def convert_attn_mask_and_cache_id(cache_ids, core_id, batch_size=1, is_context_
         converted_active_mask = hlo.logical_and(converted_active_mask, mask_br)
 
         return converted_cache_ids, converted_mask, converted_active_mask
+    
+def select_values_within_bound(cache_ids, values, keys, cores_per_kv_head, core_id, dim):
+    dtype = cache_ids.dtype
+
+    core_id = hlo.reshape(core_id,[])
+    num_cache_splits = cores_per_kv_head
+    sizes = list(values.sizes)
+
+    # don't slice for token gen
+    if cache_ids.sizes[-1] > 1:
+        slice_size = sizes[dim] - (num_cache_splits - 1)
+        curr_core_id_in_head = hlo.remainder(core_id, num_cache_splits)
+        stride = num_cache_splits
+        values = hlo.dynamic_slice_along(values,dim,curr_core_id_in_head, slice_size)
+        keys = hlo.dynamic_slice_along(keys,dim,curr_core_id_in_head, slice_size)
+        cache_ids = hlo.dynamic_slice_along(cache_ids,dim,curr_core_id_in_head, slice_size)
+    
+        values =  hlo.slice_along(values, dim=dim,limit=slice_size,stride=stride)
+        keys =  hlo.slice_along(keys, dim=dim,limit=slice_size,stride=stride)
+        cache_ids = hlo.slice_along(cache_ids, dim=dim,limit=slice_size, stride=stride)
+        
+    return cache_ids, values, keys

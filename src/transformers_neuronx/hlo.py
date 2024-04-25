@@ -1701,17 +1701,17 @@ def cast(value, dtype):
     return value
 
 
-def slice_along(tensor, dim, limit, start=0):
+def slice_along(tensor, dim, limit, start=0, stride=1):
     """
     Slice along a dimension.
     """
     dimensions = [
         dict(start=0, limit=size, stride=1) for size in tensor.sizes
     ]
-    dimensions[dim] = dict(start=start, limit=limit, stride=1)
+    dimensions[dim] = dict(start=start, limit=limit, stride=stride)
 
     sizes = list(tensor.sizes)
-    sizes[dim] = limit - start
+    sizes[dim] = (limit - start)//stride
 
     return tensor.dtype[sizes].Slice(
         tensor,
