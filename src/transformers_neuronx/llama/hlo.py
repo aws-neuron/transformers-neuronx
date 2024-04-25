@@ -14,10 +14,10 @@
 # ==============================================================================
 from typing import Optional
 
-from transformers_neuronx import hlo
+from transformers_neuronx import hlo, utils
 from transformers_neuronx import constants
 from transformers_neuronx import utils
-from transformers_neuronx.layers import transformer, rotary, attention, attention_utils
+from transformers_neuronx.layers import transformer, rotary, attention, attention_utils, flash_decoding
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -64,10 +64,20 @@ class LlamaForSamplingNoEmbeddingHlo:
             interpolation_factor=self.config.position_interpolation_factor
         )
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
+        core_id = None
+        if self.neuron_config.shard_over_sequence:
+            core_id,*rst  = weights
+            n_kv_heads = self.config.num_key_value_heads if self.config.num_attention_heads else self.config.num_attention_heads
+            cores_per_kv_head = self.config.tp_degree // n_kv_heads
+            self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree 
+            cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, 
+                                                                        core_id, self.n_positions,
+                                                                        cores_per_kv_head=self.cores_per_kv_head)
+
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id
 
     def layer(
-            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -87,7 +97,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
+            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
@@ -118,7 +128,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def attention(
         self,
-        hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
+        hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -168,6 +178,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             query, key, value = attention_utils.transpose_qkv(query, key, value)
             batch_dim = 0
 
+
         # Single Token Generation ("Prefetch"-style) ans speculative forward
         if active_mask is not None:
 
@@ -187,6 +198,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
+            # Communication 1: all-gather query from cores
+            if (n_active_tokens != self.n_positions) and self.neuron_config.shard_over_sequence:
+                query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, 
+                                                  self.config.num_attention_heads,
+                                                  tp_degree)
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys_s, n_kv_heads=self.config.num_key_value_heads,
@@ -199,9 +215,18 @@ class LlamaForSamplingNoEmbeddingHlo:
             active_score = attention.mask(active_score, active_mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # C = softmax(Sa, Sp) @ (Va, Vp)
-            context = attention.context(prior_scores, active_score, cached_values_s, value,
-                                        n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
-                                        neuron_config=self.neuron_config)
+            if self.neuron_config.shard_over_sequence:
+                dtype = query.dtype
+                context = flash_decoding.context(prior_scores, active_score, cached_values_s, value, core_id, mask, active_mask,
+                                        n_kv_heads=self.config.num_key_value_heads, n_heads=self.config.num_attention_heads, dtype=dtype, 
+                                        tp_degree=tp_degree, neuron_config=self.neuron_config,
+                                        shard_over_batch=self.shard_over_batch)
+                cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,value, key,self.cores_per_kv_head,core_id,dim=0)
+
+            else:
+                context = attention.context(prior_scores, active_score, cached_values_s, value,
+                                            n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
+                                            neuron_config=self.neuron_config)
 
             # KCache[I], VCache[I] = K, V
             updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
@@ -221,6 +246,12 @@ class LlamaForSamplingNoEmbeddingHlo:
                 context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
                                                     tp_degree=tp_degree, neuron_config=self.neuron_config)
 
+            if self.neuron_config.shard_over_sequence:
+                cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,
+                                                            value, 
+                                                            key,
+                                                            self.cores_per_kv_head,
+                                                            core_id,dim=0)
             # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
                 updated_keys, updated_values = key, value
@@ -232,70 +263,3 @@ class LlamaForSamplingNoEmbeddingHlo:
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
 
-
-
-
-    def convert_attn_mask_and_cache_id(self, cache_ids, core_id, n_heads_tp,
-                                    batch_size=1, is_context_encoding=False):
-        """
-        Convert normal cache IDs to the format suitable for sharded KV cache, and create proper attention
-        masks. Since each Q/KV head can be distributed to multiple cores, each core will have a
-        different mask and cache ID.
-
-        In this version, the KV cache of all KV heads is evenly split across all cores. Tokens are
-        written to the KV caches in a strided way: token 0 goes to core 0's cache, token 1 goes to core
-        1's cache, etc. When computing active tokens, each core is in charge of tokens that are written
-        to it's cache.
-
-        For tokens that should not be written to the current core's KV cache, the cache ID for this token
-        is set to cache_size. We need 1 or more garbage entries in the KV cache for this purpose.
-        """
-        assert len(cache_ids.sizes) == 1, "Assuming 1D cache IDs!"
-        assert n_heads_tp == 1, "Assuming each core only process 1 Q head!"
-
-        n_active_tokens = cache_ids.sizes[0]
-        cores_per_kv_head = self.config.tp_degree // self.config.num_kv_heads
-        cache_size = self.n_positions // cores_per_kv_head
-        pred = cache_ids.scribe.pred
-        dtype = cache_ids.dtype
-
-        # Real cache ID = raw cache ID // the number of cores that hold a single head's KV cache
-        num_cache_splits = cores_per_kv_head
-        real_cache_ids = hlo.divide(cache_ids, num_cache_splits)
-        # Default cache ID = cache_size
-        default_cache_ids = hlo.full(cache_size, dtype, real_cache_ids.sizes)
-        # Now mask out the entries that should not go to this core's cache
-        target_core_ids = hlo.remainder(cache_ids, num_cache_splits)
-        core_id_cast = hlo.cast(core_id, dtype)
-        curr_core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
-        curr_core_id_in_head = hlo.broadcast(curr_core_id_in_head, target_core_ids.sizes, [0])
-        mask = hlo.compare(target_core_ids, curr_core_id_in_head, "EQ")
-        converted_cache_ids = dtype[cache_ids.sizes].Select(mask, real_cache_ids, default_cache_ids)
-
-        # Generate masks
-        if is_context_encoding:
-            # We don't need active mask for context encoding
-            converted_active_mask = None
-            # Prior mask is simpler for context encoding
-            converted_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
-            converted_mask = hlo.broadcast(converted_mask, (batch_size, n_active_tokens, n_active_tokens), [1, 2])
-        else:
-            converted_mask_size = batch_size, n_active_tokens, cache_size
-
-            # For prior mask, we compute how many tokens are there in this core's KV cache
-            num_processed_tokens = hlo.reduce_min(cache_ids, dim=0, keepdim=True)
-            core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
-            num_tokens_on_core = hlo.divide(hlo.subtract(hlo.add(num_processed_tokens, num_cache_splits-1), core_id_in_head), num_cache_splits)
-            # Use Iota to generate the mask
-            iota = dtype[converted_mask_size].Iota(dimensions=[2])
-            num_tokens_on_core_br = hlo.broadcast(num_tokens_on_core, converted_mask_size, [2])
-            converted_mask = hlo.less(iota, num_tokens_on_core_br)
-
-            # Construct the active mask based on the rule above, each core is in charge of tokens
-            # that are written to its own cache
-            converted_active_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
-            converted_active_mask = hlo.broadcast(converted_active_mask, (batch_size, n_active_tokens, n_active_tokens), broadcast_dimensions=[1, 2])
-            mask_br = hlo.broadcast(mask, converted_active_mask.sizes, [2])
-            converted_active_mask = hlo.logical_and(converted_active_mask, mask_br)
-
-        return converted_cache_ids, converted_mask, converted_active_mask

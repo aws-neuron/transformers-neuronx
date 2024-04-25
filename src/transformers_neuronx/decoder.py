@@ -107,6 +107,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if gqa is None:
             # MHA Early exit - This avoids emitting irrelevant GQA warnings
             if self.n_head == self.n_kv_head:
+                warnings.warn(
+                        f'Cannot enable shard_over_sequence when a n_heads ({self.n_head}) == n_kv_heads ({self.n_kv_head})'
+                        f'disabling shard over sequence'
+                    )
+                self.neuron_config.shard_over_sequence = False
                 return
             self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
 
@@ -385,6 +390,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         for layer in self.layers:
             new_layer = new.new_layer()
             new_layer.assign_parameters(layer)
+            if self.neuron_config.shard_over_sequence:
+                new_layer.kv_replication = layer.kv_replication
             if share_caches:
                 buckets_from_src = self.neuron_config and self.neuron_config.continuous_batching
                 new_layer.assign_caches(layer, buckets_from_src=buckets_from_src)
@@ -715,6 +722,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
         for layer in layers:
             layer_caches = []
+            if self.neuron_config.shard_over_sequence:
+                dim_size = {k:n_positions//layer.kv_replication for k in dim_size.keys()}
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
                 par = param_builder.from_tensor(cache, dim_size=dim_size)
                 layer_caches.append(par)
@@ -1061,6 +1070,7 @@ class DecoderLayer(torch.nn.Module):
         self.attn_out_transposed = True
         self.mlp_out_sharding = 0
         self.mlp_out_transposed = True
+        self.kv_replication  = 1 # default value to denote weight replication factor
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1, allow_transform=False):
@@ -1199,6 +1209,7 @@ class DecoderLayer(torch.nn.Module):
                     self.attn_k_bias = repeat(self.attn_k_bias)
                     self.attn_v_bias = repeat(self.attn_v_bias)
                     self.n_kv_head *= ratio
+                self.kv_replication = ratio
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = qkv_maybe_pad(self.attn_k_weight, dim=1)
@@ -1383,6 +1394,15 @@ class DecoderLayer(torch.nn.Module):
                 self.cache_shape[batch_size] = [self.n_positions, batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+            elif self.neuron_config.shard_over_sequence:
+                # note here we use kv_replication since self.n_kv_head is replicated
+                # for SOS we need original n_kv_head before replication
+                kv_replication = self.kv_replication
+                cache_shape = [self.n_positions*self.tp_degree//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+                self.cache_shape[batch_size] = [self.n_positions//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
             else:
                 assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
                     f"cannot shard along kv_heads dimension: n_kv_head={n_heads_kv_cache}, tp_degree={self.tp_degree}"
