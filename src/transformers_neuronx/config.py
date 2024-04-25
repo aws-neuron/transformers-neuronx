@@ -135,6 +135,7 @@ class NeuronConfig():
         qkv_tiling: Splits attention QKV to introduce "free" 128 dimensions.
         weight_tiling: Splits model MLP to introduce "free" 128 dimensions.
         log_softmax_scores: Return log-softmax scores along with logits.
+        shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
     """
     def __init__(self, *,
         sparse_attn: Optional[SparseAttnConfig] = None,
@@ -153,6 +154,7 @@ class NeuronConfig():
         qkv_tiling: bool = False,
         weight_tiling: bool = False,
         log_softmax_scores: bool = False,
+        shard_over_sequence: bool = False, 
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -226,6 +228,8 @@ class NeuronConfig():
         self.dist = None
 
         self.layer_partition = {}
+        
+        self.shard_over_sequence = shard_over_sequence
 
     @property
     def use_2d_cache_ids(self):

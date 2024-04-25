@@ -110,7 +110,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
             new_layer.to_neuron()
             layer.nullify()
-
+            if self.neuron_config.shard_over_sequence:
+                self.decoder_lm_head.add_pre_layer_parameter(torch.arange(self.config.tp_degree), sharding=0)
         # For pipeline parallel, we need to load ln and lm_head for now even if the pipeline stage doesn't compute the, because
         # 1) we need the ln_lm_head hlo for pp0 to get the logits shape and dtype
         # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
