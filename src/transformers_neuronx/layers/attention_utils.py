@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from neuronxcc.nki.kernels.attention import flash_fwd
+from neuronxcc.nki.kernels.attention import flash_fwd, attention_isa_kernel
 from dataclasses import dataclass
 
 
@@ -218,3 +218,5 @@ def wrapper_flash_attention_nki(q, k, v, o, lse=None):
     seed = None
     flash_fwd(q, k, v, seed, o, lse, softmax_scale=softmax_scale, use_causal_mask=True, mixed_precision=True, dropout_p=0.0, config=config)
 
+def wrapper_flash_attention_bir(q, k, v, out, scale=1.0, kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap"):
+  attention_isa_kernel(q, k, v, scale, out, kernel_name)
