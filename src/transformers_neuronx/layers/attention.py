@@ -789,28 +789,38 @@ def output(
 
 
 def flash_attention(query, key, value):
+    n_active_tokens, batch_size, n_q_heads_tp, d_head = query.sizes
 
-    n_active_tokens, batch_size, n_kv_heads_tp, d_head = query.sizes
+    if n_active_tokens < 4096:
+        # kernel gives minimal benefit for smaller sequence lengths
+        return None
 
-    flash_attention_nki_compatiblilty = (n_active_tokens % 2048 == 0 and n_active_tokens >= 8192 and query.sizes[2] == key.sizes[2])
-    context = None
+    if n_active_tokens <= d_head:
+        # kernel assumes n_active_tokens > d_head and uses this fact to determine i/o layout
+        return None
 
-    if flash_attention_nki_compatiblilty:
+    # handle GQA by broadcasting kv
+    if query.sizes[2] != key.sizes[2]:
+        n_repeats = query.sizes[2] // key.sizes[2]
+        key = hlo.repeat_kv(key, n_repeats=n_repeats, repeat_dim=2)
+        value = hlo.repeat_kv(value, n_repeats=n_repeats, repeat_dim=2)
 
-        # query shape is (n_active_tokens, n_seqs, n_kv_heads_tp, d_head)
-        # expected by nki flash_fwd (batch_size, n_kv_heads_tp, d_head, n_active_tokens)
-        n_kv_heads_tp = query.sizes[2]
+    if query.sizes[2] != key.sizes[2]: # condition required by kernel
+        return None
 
-        query_nki = hlo.permute(query, [1, 2, 3, 0])
-        key_nki = hlo.permute(key, [1, 2, 3, 0])
-        value_nki = hlo.permute(value, [1, 2, 0, 3]) # shape (batch_size, n_kv_heads_tp, n_active_tokens, d_head)
-
-        context_nki_shape = nki_call(attention_utils.wrapper_flash_attention_nki, query_nki, key_nki, value_nki, grid=[batch_size, n_kv_heads_tp], output_HloShapes=[query.dtype[batch_size, n_kv_heads_tp, n_active_tokens, d_head]])
-
-        # nki flash_fwd output shape (n_seqs, n_kv_heads_tp, n_active_tokens, d_head)
-        context = hlo.permute(context_nki_shape, [2, 0, 1, 3])
-
-    elif n_active_tokens >= 8192 and n_active_tokens % 2048 != 0:
-        logging.warning("Flash Attention is not active. context length should be a multiple of 2k tokens and larger than 8k in order to use flash attention.")
+    # incoming qkv has shape: (n_active_tokens, batch_size, n_q_heads_tp, d_head)
+    # we transpose to match expected shape by kernel
+    # we also need a reshape since kernel combines batch and n heads into single dim
+    query_nki = hlo.reshape(hlo.permute(query, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
+    key_nki = hlo.reshape(hlo.permute(key, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
+    value_nki = hlo.reshape(hlo.permute(value, [1, 2, 0, 3]), (batch_size*n_q_heads_tp, n_active_tokens, d_head))
+    nki_output = nki_call(attention_utils.wrapper_flash_attention_bir, 
+                          query_nki, key_nki, value_nki, 
+                          output_HloShapes=[query.dtype[batch_size*n_q_heads_tp, n_active_tokens, d_head]])
+    # kernel output (after separating batch and n heads dims) has shape: 
+    # (batch_size, n_q_heads_tp, n_active_tokens, d_head)
+    # we permute it to (n_active_tokens, batch_size, n_q_heads_tp, d_head)
+    context = hlo.permute(hlo.reshape(nki_output, (batch_size, n_q_heads_tp, n_active_tokens, d_head)), 
+                          [2, 0, 1, 3])
 
     return context
