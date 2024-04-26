@@ -176,13 +176,13 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.num_processed_tokens += 1
         return logits
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
-                                          config=self.neuron_config.on_device_generation)
+                                          config=self.neuron_config.on_device_generation, streamer=streamer)
         else:
             return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                      eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                      eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
     def beam_search(self, input_ids, num_beams, sequence_length, start_ids=None):
         batch_size, start = input_ids.shape
