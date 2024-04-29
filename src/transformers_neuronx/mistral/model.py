@@ -126,6 +126,12 @@ class MistralForSampling(base.NeuronModelBase):
                         model.use_executor = True
                     self.decoder_lm_head_for_context[context_length_estimate,batch_size] = model
 
+    def reset(self):
+        self.decoder_lm_head.reset()
+        # Reset the token counter for context encoding
+        # num_processed_tokens tracks number of processed tokens for sliding window attention
+        self.num_processed_tokens = torch.tensor([0], dtype=torch.int32)
+
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
