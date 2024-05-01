@@ -181,84 +181,51 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     raise NotImplementedError("BSH GroupNorm is not currently implemented, use HSB")
 
 
-def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2):
-    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
-
-    size = hidden.sizes
-    batch_dims = list(range(len(size)))
-    batch_dims.pop(dim)
-    batch_shapes = list(size)
-    batch_shapes.pop(dim)
-
-    dtype = hidden.dtype
-    scribe = hidden.scribe
-    f32 = scribe.f32
-
-    hidden = cast(hidden, f32)
-
-    square = multiply(hidden, hidden)
-    variance = reduce_mean(square, dim)
-    eps = full(eps, f32, batch_shapes)
-    mean_eps = add(variance, eps)
-    mean_rsqrt = rsqrt(mean_eps)
-    rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
-    scaled = multiply(hidden, rsqrt_br)
-
-    if weight is None:
-        scaled = cast(scaled, dtype)
-        return scaled
-
-    weight = cast(weight, f32)
-    weight_br = broadcast(weight, size, [dim])
-    result = multiply(scaled, weight_br)
-    result = cast(result, dtype)
-
-    return result
-
-
-def sharded_rms_norm(hidden, weight, tp_degree, eps=1e-6, dim=2):
-    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
-
-    size = hidden.sizes
-    batch_dims = list(range(len(size)))
-    batch_dims.pop(dim)
-    batch_shapes = list(size)
-    batch_shapes.pop(dim)
-
-    dtype = hidden.dtype
-    scribe = hidden.scribe
-    f32 = scribe.f32
-
-    hidden = cast(hidden, f32)
-
-    square = multiply(hidden, hidden)
-    variance = reduce_mean(square, dim)
-    variance = all_reduce_mean(variance, tp_degree)
-    eps = full(eps, f32, batch_shapes)
-    mean_eps = add(variance, eps)
-    mean_rsqrt = rsqrt(mean_eps)
-    rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
-    scaled = multiply(hidden, rsqrt_br)
-
-    if weight is None:
-        scaled = cast(scaled, dtype)
-        return scaled
-
-    weight = cast(weight, f32)
-    weight_br = broadcast(weight, size, [dim])
-    result = multiply(scaled, weight_br)
-    result = cast(result, dtype)
-
-    return result
-
-
 def rms_norm(hidden, weight, eps=1e-6, dim=2):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
+
+    size = hidden.sizes
+    batch_dims = list(range(len(size)))
+    batch_dims.pop(dim)
+    batch_shapes = list(size)
+    batch_shapes.pop(dim)
+
+    # For batch == 1, token generation use triton implementation. The batch > 1
+    # context encoding implementation is in development
+    num_tokens = functools.reduce(operator.mul, batch_shapes, 1)
+    if num_tokens == 1:
+        return rms_norm_triton(hidden, weight, eps=eps, dim=dim)
+
+    dtype = hidden.dtype
+    scribe = hidden.scribe
+    f32 = scribe.f32
+
+    hidden = cast(hidden, f32)
+
+    square = multiply(hidden, hidden)
+    variance = reduce_mean(square, dim)
+    eps = full(eps, f32, batch_shapes)
+    mean_eps = add(variance, eps)
+    mean_rsqrt = rsqrt(mean_eps)
+    rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
+    scaled = multiply(hidden, rsqrt_br)
+
+    if weight is None:
+        scaled = cast(scaled, dtype)
+        return scaled
+
+    weight = cast(weight, f32)
+    weight_br = broadcast(weight, size, [dim])
+    result = multiply(scaled, weight_br)
+    result = cast(result, dtype)
+
+    return result
+
+
+def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
 
     dtype = hidden.dtype
     shape = hidden.sizes
-    # Fallback on generic HLO implementation when norm dimension is 1
-    if shape[dim] == 1:
-        return rms_norm_legacy(hidden, weight, eps, dim)
     scribe = hidden.scribe
     backend_config = str(dim).encode()
     eps = hidden.scribe.f32.Constant(constant_value=eps)
