@@ -181,6 +181,12 @@ class LlamaForSampling(base.NeuronModelBase):
             batch_size, *_ = input_ids.shape
             if start_ids is None:
                 start_ids = torch.zeros(batch_size, dtype=torch.int32)
+            if cache_ids is None:
+                batch_size, context_length = input_ids.shape
+                cache_ids = torch.arange(context_length, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, context_length)
+
             inputs, *args = input_ids, cache_ids, start_ids
 
         batch_size, seq_len = input_ids.shape
