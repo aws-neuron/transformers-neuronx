@@ -69,9 +69,7 @@ class MistralForSampling(base.NeuronModelBase):
         self.num_processed_tokens = torch.tensor([0], dtype=torch.int32)
 
     def load_weights(self):
-
-        # Materialize the embedding to CPU
-        self.chkpt_model.model.embed_tokens.materialize()
+        self.materialize_embeddings()
 
         ops.init()
 
@@ -114,6 +112,13 @@ class MistralForSampling(base.NeuronModelBase):
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+
+    def materialize_embeddings(self):
+        # Materialize the embedding to CPU
+        self.chkpt_model.model.embed_tokens.materialize()
+    
+    def init_rest_of_model(self):
         self.decoder_lm_head.use_executor = True
 
         if self.context_buckets:

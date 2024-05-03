@@ -44,3 +44,4 @@ class BloomConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
+        self.model_type = 'bloom'

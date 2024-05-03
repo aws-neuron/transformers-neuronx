@@ -69,11 +69,8 @@ class MixtralForSampling(base.NeuronModelBase):
         # Track number of processed tokens for sliding window attention
         self.num_processed_tokens = 0
 
-
     def load_weights(self):
-
-        # Materialize the embedding to CPU
-        self.chkpt_model.model.embed_tokens.materialize()
+        self.materialize_embeddings()
 
         ops.init()
 
@@ -113,8 +110,9 @@ class MixtralForSampling(base.NeuronModelBase):
             new_layer.add_parameter(w3_concat, sharding=1, allow_pad=True,  # up_proj
                                     allow_quantize=True, allow_transform=True)
 
-
+            
             new_layer.to_neuron()
+            
             layer.nullify()
 
         ln_f = self.chkpt_model.model.norm
@@ -129,8 +127,15 @@ class MixtralForSampling(base.NeuronModelBase):
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
-        self.decoder_lm_head.use_executor = True
+        
+        self.init_rest_of_model()
 
+    def materialize_embeddings(self):
+        # Materialize the embedding to CPU
+        self.chkpt_model.model.embed_tokens.materialize()
+    
+    def init_rest_of_model(self):
+        self.decoder_lm_head.use_executor = True
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.context_batch_sizes:

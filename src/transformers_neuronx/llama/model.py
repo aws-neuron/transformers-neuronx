@@ -95,9 +95,7 @@ class LlamaForSampling(base.NeuronModelBase):
         self.decoder_lm_head_for_window_context = {}
 
     def load_weights(self):
-        # Materialize the embedding to CPU
-        self.chkpt_model.model.embed_tokens.materialize()
-
+        self.materialize_embeddings()
         ops.init()
 
         for layer_id, layer in enumerate(self.chkpt_model.model.layers):
@@ -128,7 +126,6 @@ class LlamaForSampling(base.NeuronModelBase):
             else:
                 new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True,
                                         allow_quantize=True, out_feature_dim=0)
-
             new_layer.to_neuron()
             layer.nullify()
         if self.neuron_config.shard_over_sequence:
@@ -153,7 +150,14 @@ class LlamaForSampling(base.NeuronModelBase):
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
-        # Pipeline parallel deosn't support executor right now
+        self.init_rest_of_model()
+    
+    def materialize_embeddings(self):
+        # Materialize the embedding to CPU
+        self.chkpt_model.model.embed_tokens.materialize()
+    
+    def init_rest_of_model(self):
+        # Pipeline sparallel deosn't support executor right now
         if not self.neuron_config.is_pp():
             self.decoder_lm_head.use_executor = True
 

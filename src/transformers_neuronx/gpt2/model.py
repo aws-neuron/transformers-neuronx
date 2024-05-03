@@ -73,8 +73,7 @@ class GPT2ForSampling(base.NeuronModelBase):
 
     def load_weights(self):
         ops.init()
-        self.chkpt_model.transformer.wte.materialize()
-        self.chkpt_model.transformer.wpe.materialize()
+        self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:
             layer.materialize()
@@ -133,6 +132,13 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+
+    def materialize_embeddings(self):
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+    
+    def init_rest_of_model(self):
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.
         self.reset()
@@ -318,8 +324,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
 
     def load_weights(self):
         ops.init()
-        self.chkpt_model.transformer.wte.materialize()
-        self.chkpt_model.transformer.wpe.materialize()
+        self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:
             layer.materialize()
@@ -369,6 +374,13 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+    
+    def materialize_embeddings(self):
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+    
+    def init_rest_of_model(self):
         config = self.config
         # Since GPT2 does not support compilation for multiple batch sizes yet,
         # assert the invariant

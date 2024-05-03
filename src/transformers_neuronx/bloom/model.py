@@ -67,9 +67,7 @@ class BloomForSampling(base.NeuronModelBase):
         self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
 
     def load_weights(self):
-        # Materialize the embedding to CPU
-        self.chkpt_model.transformer.word_embeddings.materialize()
-        self.chkpt_model.transformer.word_embeddings_layernorm.materialize()
+        self.materialize_embeddings()
 
         ops.init()
 
@@ -154,7 +152,14 @@ class BloomForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.weight)
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.bias)
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
 
+    def materialize_embeddings(self):
+        # Materialize the embedding to CPU
+        self.chkpt_model.transformer.word_embeddings.materialize()
+        self.chkpt_model.transformer.word_embeddings_layernorm.materialize()
+    
+    def init_rest_of_model(self):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
