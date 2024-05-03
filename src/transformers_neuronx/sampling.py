@@ -316,7 +316,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
     for cur_len in range(start, sequence_length):
 
-        if ngram_size:
+        if ngram_size and tokens != []:
             next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, cur_len)
 
         next_len = cur_len + 1
@@ -389,4 +389,3 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
-
