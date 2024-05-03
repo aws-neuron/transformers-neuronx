@@ -87,7 +87,6 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
                 cache_ids = torch.arange(context_length) * attention_mask
                 self.cur_len = cache_ids.max(dim=1).values
         else:
-            start_ids = None
             if (self.cur_len > 0).any().item():
                 # token generation (aka decoding) with 1D cache_ids
                 cache_ids = self.cur_len
