@@ -113,9 +113,15 @@ class ParallelTensorManipulator:
         else:
             slice_start = 0
             slice_end = size
-            for start in range(slice_start, slice_end, shard_size):
+            slice_range = range(slice_start, slice_end, shard_size)
+            for start in slice_range:
                 slices[dim] = slice(start, start+shard_size, 1)
                 shard = tensor[tuple(slices)].contiguous()
+                if len(slice_range) == 1:
+                    # edge case for save_presharded flow where something is "sharded"
+                    # but in reality is a no-op causing some tensors to share memory
+                    # safetensors cannot share memory so we make a copy
+                    shard = shard.clone()
                 tensors.append(shard)
         if len(tensors) != self.local_tp_degree:
             raise ValueError(

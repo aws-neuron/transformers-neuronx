@@ -53,6 +53,7 @@ class MixtralConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
+        self.model_type = 'mixtral'
 
         # Check values of tp_degree
         # The MoE implementation supports 1) tp_degree is divisible by num_local_experts or 2) num_local_experts is divisible by tp_degree

@@ -34,6 +34,9 @@ from transformers_neuronx.layers import generation
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.utils import interleave_qkv
 
+from safetensors.torch import save_file
+from safetensors import safe_open
+
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
 
@@ -311,7 +314,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         *_, n_positions = self.n_positions_list
         layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
                              amp=self.amp, neuron_config=self.neuron_config, allow_pad=self.allow_pad, n_active_tokens=self.n_active_tokens,
-                             n_head=self.n_head, n_kv_head=self.n_kv_head)
+                             n_head=self.n_head, n_kv_head=self.n_kv_head, layer_num=len(self.layers))
         self.layers.append(layer)
         return layer
 
@@ -366,6 +369,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 ln_lm_head_params += self.generation_inputs
         self.ln_lm_head_params = ln_lm_head_params
 
+        self.finish_program_setup()
+
+
+    def finish_program_setup(self):
         self.program = self._build_program()
         # setup_reorder_cache needs to be able to be called before compilation
         # and after compilation for backwards compatability.
@@ -375,10 +382,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         # serialization logic and will be compiled normally.
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
-
+            
         if self.neuron_config.shard_over_sequence:
             assert self.tp_degree%self.n_kv_head == 0, f"tp_degree {self.tp_degree} not divisble by n_kv_heads {self.n_kv_head} shard_over_sequence is not supported"
             self.kv_replication = self.tp_degree//self.n_kv_head
+
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
                             unroll=None, share_caches=False, new=None):
         if new == None:
@@ -708,6 +716,49 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         return parameters
 
+    def save_presharded_weights(self, directory):
+        save_dict = {}
+        for key, value in self.__dict__.items():
+            if isinstance(value, torch.Tensor) and value.device.type == 'xla':
+                cpu_tensor = ops.parallel_cpu(value)
+                for i in range(len(cpu_tensor)):
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i]
+        
+        for i, param in enumerate(self.pre_layer_parameters):
+            cpu_tensor = ops.parallel_cpu(param)
+            for j in range(len(cpu_tensor)):
+                save_dict[f'pre_layer_parameter{i}*{j}'] = cpu_tensor[j]
+            
+        save_file(save_dict, os.path.join(directory, 'DecoderLMHead.safetensors'))
+    
+    def load_presharded_weights(self, ps_dir):
+        with safe_open(os.path.join(ps_dir, f"DecoderLMHead.safetensors"), framework='pt') as f:
+            lm_head_attr_names = get_attribute_names(f)
+            presharded_weights_to_neuron(f, self, lm_head_attr_names)
+
+        self.format_pre_layer_parameters()
+        self.format_ln_lm_head_params_and_generation_inputs()
+        self.finish_program_setup()
+    
+    def format_pre_layer_parameters(self):
+        # deal with the pre_layer_parameters (decoder_lm_head only)
+        i = 0
+        self.pre_layer_parameters = []
+        while True:
+            pre_layer_parameter = getattr(self, f"pre_layer_parameter{i}", None)
+            if pre_layer_parameter is None:
+                break
+            self.pre_layer_parameters.append(pre_layer_parameter)
+            i+=1
+    
+    def format_ln_lm_head_params_and_generation_inputs(self):
+        ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight, self.lm_head_bias, self.logits_indices]
+        generation_inputs = [self.top_k, self.top_p, self.temperature, self.top_p_min_tokens]
+        ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
+        generation_inputs = [param for param in generation_inputs if param is not None]
+        self.generation_inputs = generation_inputs
+        self.ln_lm_head_params = ln_lm_head_params + generation_inputs
+
     def valid_parameters(self, n_positions, batch_size):
         parameters = self.all_parameters(n_positions, batch_size)
         return [par for par in parameters if par is not None]
@@ -1029,7 +1080,7 @@ class MaybePadder:
 class DecoderLayer(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, n_head, amp,
-                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None):
+                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, layer_num=None):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -1092,6 +1143,7 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_sharding = 0
         self.mlp_out_transposed = True
         self.kv_replication  = 1 # default value to denote weight replication factor
+        self.layer_num = layer_num
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1, allow_transform=False):
@@ -1145,7 +1197,6 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = bias
 
     def to_neuron(self):
-
         # If we allow padding then we need to pad non-sharded QKV weight dimensions
         if self.allow_pad:
             # Hidden size padding
@@ -1355,8 +1406,8 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_scales = maybe_shard_along(fused_qkv_scales, dim=0)
         else:
             self.attn_q_weight = qkv_weight_sharder(self.attn_q_weight, dim=1, weight_tiling=qkv_tiling)
-            self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
             self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
+            self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
         self.attn_k_weight = qkv_weight_sharder(self.attn_k_weight, dim=1, weight_tiling=qkv_tiling)
         self.attn_k_scales = maybe_shard_along(self.attn_k_scales, dim=0)
         self.attn_k_bias = maybe_shard_along(self.attn_k_bias, dim=0)
@@ -1412,8 +1463,50 @@ class DecoderLayer(torch.nn.Module):
                 extras.append(scales)
 
         self.extra_parameters = extras
-
         self.init_caches()
+    
+    def save_presharded_weights(self, directory):
+        save_dict = {}
+        for key, value in self.__dict__.items():
+            if isinstance(value, torch.Tensor) and value.device.type == 'xla':
+                cpu_tensor = ops.parallel_cpu(value)
+                for i in range(len(cpu_tensor)):
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i]
+        
+        for i, param in enumerate(self.extra_parameters):
+            if param is None:
+                # save an empty tensor
+                cpu_tensor = [torch.tensor([])]
+            else:
+                cpu_tensor = ops.parallel_cpu(param)
+            for j in range(len(cpu_tensor)):
+                save_dict[f'extra_parameter{i}*{j}'] = cpu_tensor[j]
+            
+        save_file(save_dict, os.path.join(directory, f"decoder_layer_{self.layer_num}.safetensors"))
+    
+    def load_presharded_weights(self, ps_dir):
+        # only need to get names for first layer  
+        with safe_open(os.path.join(ps_dir, f"decoder_layer_{self.layer_num}.safetensors"), framework='pt') as f:
+            layer_attr_names = get_attribute_names(f)
+            presharded_weights_to_neuron(f, self, layer_attr_names)
+            self.format_extra_parameters()
+            for batch_size in self.batch_sizes:
+                self.init_caches()
+
+    def format_extra_parameters(self):
+        # deal with the extra_parameters (decoder_layer only)
+        i = 0
+        self.extra_parameters = []
+        while True:
+            extra_param = getattr(self, f"extra_parameter{i}", None)
+            if extra_param is not None:
+                if extra_param is 'None':
+                    self.extra_parameters.append(None)
+                else:
+                    self.extra_parameters.append(extra_param)
+            else: # Previous parameter was the last one
+                break
+            i+=1
 
     @property
     def shard_over_batch(self):
@@ -1705,6 +1798,7 @@ class MaybeParallelTensorManipulator:
         tensors = self.transform_and_tile_weight_layout(tensors, weight_tiling)
         tensor = ops.parallel_to_nc(tensors)
         return tensor
+
 
 class DecoderParameterBuilder:
 
@@ -2304,5 +2398,29 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
 
     def get_all_kernels(self):
         return [self.cache_broadcast_kernel]
+
+# loads weights from safetensors files and puts them on neuron while assigning
+# them to the corresponding attribute of decoder_layer_or_head
+def presharded_weights_to_neuron(safetensors_file, decoder_layer_or_head, attr_names):
+    for attr_name in attr_names:
+        shards = []
+        i = 0
+        while True:
+            if f"{attr_name}*{i}" not in safetensors_file.keys():
+                break
+            shards.append(safetensors_file.get_tensor(f"{attr_name}*{i}"))                        
+            i+=1
+        if all([torch.numel(shard) == 0 for shard in shards]):
+            setattr(decoder_layer_or_head, attr_name, 'None')
+        else:
+            setattr(decoder_layer_or_head, attr_name, ops.parallel_to_nc(shards))
+
+def get_attribute_names(safetensors_file):
+    attr_names = set()
+    for key in safetensors_file.keys():
+        attr_name, shard_id = key.split('*')
+        attr_names.add(attr_name)
+    
+    return attr_names
 
 
