@@ -808,7 +808,7 @@ def flash_attention(query, key, value):
         context_nki_shape = nki_call(attention_utils.wrapper_flash_attention_nki, query_nki, key_nki, value_nki, grid=[batch_size, n_kv_heads_tp], output_HloShapes=[query.dtype[batch_size, n_kv_heads_tp, n_active_tokens, d_head]])
 
         # nki flash_fwd output shape (n_seqs, n_kv_heads_tp, n_active_tokens, d_head)
-        context = hlo.permute(context_nki_shape, [0, 2, 1, 3])
+        context = hlo.permute(context_nki_shape, [2, 0, 1, 3])
 
     elif n_active_tokens >= 8192 and n_active_tokens % 2048 != 0:
         logging.warning("Flash Attention is not active. context length should be a multiple of 2k tokens and larger than 8k in order to use flash attention.")
