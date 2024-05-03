@@ -157,7 +157,7 @@ class MistralForSampling(base.NeuronModelBase):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=3):
 
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
@@ -176,7 +176,7 @@ class MistralForSampling(base.NeuronModelBase):
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
-            stopping_criteria_list=stopping_criteria_list
+            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size
         )
 
         return result
