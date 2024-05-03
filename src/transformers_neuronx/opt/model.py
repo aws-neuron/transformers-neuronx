@@ -91,8 +91,7 @@ class OPTForSampling(base.NeuronModelBase):
 
     def load_weights(self):
         ops.init()
-        self.chkpt_model.model.decoder.embed_tokens.materialize()
-        self.chkpt_model.model.decoder.embed_positions.materialize()
+        self.materialize_embeddings()
         for layer in self.chkpt_model.model.decoder.layers:
             layer.materialize()
             attn = layer.self_attn
@@ -128,7 +127,13 @@ class OPTForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_positions.weight.detach(), sharding=1, allow_pad=True)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
-
+        self.init_rest_of_model()
+    
+    def materialize_embeddings(self):
+        self.chkpt_model.model.decoder.embed_tokens.materialize()
+        self.chkpt_model.model.decoder.embed_positions.materialize()
+    
+    def init_rest_of_model(self):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
