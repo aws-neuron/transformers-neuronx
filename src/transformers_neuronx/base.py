@@ -175,6 +175,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         context_length = hidden.shape[1]
         batch_size = start_ids.shape[0]
 
+        all_logits = [] # Collect all logits if neuron_config.output_all_logits is True
+
         if self.is_fid:
             # Fusion-In-Decoder context encoding
             fused_context_length = hidden.shape[1]
@@ -183,7 +185,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         current = 0
 
         estimate = bucket.find(self.context_buckets, context_length)
-
 
         if estimate is not None:
             hidden_context = hidden
@@ -211,6 +212,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
                 else:
                     logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
+                if self.neuron_config.output_all_logits:
+                    all_logits.append(logits[:, :last_token_id + 1, :])
 
         # process the leftovers context
         while current < context_length:
@@ -226,6 +229,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     cache_ids = torch.as_tensor([i], dtype=torch.int32)
                     hidden_slice = hidden[:, i:i+1].contiguous()
                     logits = self.decoder_lm_head(hidden_slice, cache_ids, start_ids, last_token_id, *rest)
+                    if self.neuron_config.output_all_logits:
+                        all_logits.append(logits)
                 break
 
             hidden_slice = hidden[:, current:current+estimate].contiguous()
@@ -235,8 +240,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 logits, scores = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
             else:
                 logits = self.decoder_lm_head_for_window_context[estimate](hidden_slice, cache_ids, start_ids, last_token_id, *rest)
+            if self.neuron_config.output_all_logits:
+                all_logits.append(logits)
 
             current += estimate
+
+        if all_logits:
+            logits = torch.cat(all_logits, dim=1)
 
         if self.is_fid:
             logits[:] = float('-inf')
@@ -395,7 +405,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return input_ids, cache_ids, start_ids, last_token_id
 
     def _postprocess(self, logits, start_ids=None):
-        if start_ids is None:
+
+        if start_ids is None or (self.neuron_config.output_all_logits and logits.shape[1] > 1):
             return logits
 
         running_batch_size, n_embed = logits.shape
@@ -470,8 +481,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return logits
 
         logits = self._cast_logits(logits)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
+        if self.neuron_config.output_all_logits and context_length > 1:
+            logits = logits.permute(2, 1, 0)
+        else:
+            logits = logits[:self.config.vocab_size, -1, :]
+            logits = logits.transpose(0, 1)
         return logits
 
 
