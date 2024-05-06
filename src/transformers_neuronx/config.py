@@ -136,6 +136,7 @@ class NeuronConfig():
         weight_tiling: Splits model MLP to introduce "free" 128 dimensions.
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
+        output_all_logits: Return all logits from each model invocation.
     """
     def __init__(self, *,
         sparse_attn: Optional[SparseAttnConfig] = None,
@@ -154,7 +155,8 @@ class NeuronConfig():
         qkv_tiling: bool = False,
         weight_tiling: bool = False,
         log_softmax_scores: bool = False,
-        shard_over_sequence: bool = False, 
+        shard_over_sequence: bool = False,
+        output_all_logits: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -210,7 +212,7 @@ class NeuronConfig():
                 "To enable weight tiling, please use `NeuronConfig(weight_tiling=True)` instead.",
             )
             self.weight_tiling = True
-
+        self.output_all_logits = output_all_logits
 
         assert len(kwargs) == 0, (
             f"Unexpected NeuronConfig keyword arguments: {kwargs}"

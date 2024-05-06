@@ -243,6 +243,10 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.unroll=unroll
         self.prompt_batch_size = prompt_batch_size
         attention_head_size = config.n_embd // config.n_head
+        assert context_length_estimate != 0, (
+            "context_length_estimate cannot be set to 0 in the "
+            "GPT2ForSamplingWithContextBroadcasting class."
+        )
         if context_length_estimate is None:
             context_length_estimate = config.n_positions
         self.context_unroll = context_unroll
@@ -490,8 +494,11 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         # If running decode mode then last_token_id = 0
         self.num_processed_tokens += (last_token_id + 1)
         logits = self._cast_logits(logits)
-        logits = logits[:self.config.vocab_size, -1, :]
-        logits = logits.transpose(0, 1)
+        if self.neuron_config.output_all_logits and context_length > 1:
+            logits = logits.permute(2, 1, 0)
+        else:
+            logits = logits[:self.config.vocab_size, -1, :]
+            logits = logits.transpose(0, 1)
         if self.neuron_config.log_softmax_scores:
             scores = scores[:self.config.vocab_size, -1, :]
             scores = scores.transpose(0, 1)
