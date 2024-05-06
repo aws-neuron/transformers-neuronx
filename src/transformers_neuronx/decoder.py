@@ -176,6 +176,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.context_batch_sizes = [1]
         else:
             self.context_batch_sizes = self.batch_size
+        return_all_outputs = False
+        if self.neuron_config and self.neuron_config.output_all_logits:
+            return_all_outputs = True
         for context_length_estimate in buckets:
             for batch_size in self.context_batch_sizes:
                 decoder_lm_head[context_length_estimate, batch_size] = cls(
@@ -191,7 +194,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                     unroll=unroll,
                     neuron_config=self.neuron_config,
                     allow_pad=self.allow_pad,
-                    return_all_outputs=False,
+                    return_all_outputs=return_all_outputs,
                     builder=self.builder,
                     tag="context"
                 )
@@ -252,6 +255,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def init_window_context_decoder(self, unroll, buckets, model_obj, n_active_tokens):
         cls = type(self)
+        return_all_outputs = False
+        if self.neuron_config and self.neuron_config.output_all_logits:
+            return_all_outputs = True
         decoder_lm_head = cls(
             tp_degree=self.tp_degree,
             n_positions_list=buckets,
@@ -265,7 +271,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             unroll=unroll,
             neuron_config=self.neuron_config,
             allow_pad=True,
-            return_all_outputs=False,
+            return_all_outputs=return_all_outputs,
             builder=self.builder,
             tag=f"window-width{n_active_tokens}",
         )
