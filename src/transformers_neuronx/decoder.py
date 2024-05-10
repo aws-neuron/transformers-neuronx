@@ -375,7 +375,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
 
-
+        if self.neuron_config.shard_over_sequence:
+            assert self.tp_degree%self.n_kv_head == 0, f"tp_degree {self.tp_degree} not divisble by n_kv_heads {self.n_kv_head} shard_over_sequence is not supported"
+            self.kv_replication = self.tp_degree//self.n_kv_head
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
                             unroll=None, share_caches=False, new=None):
         if new == None:
@@ -453,6 +455,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.neuron_config and self.neuron_config.use_2d_cache_ids:
             bucket_id = 0
             batch_size, _ = cache_ids.shape
+        elif self.neuron_config and self.neuron_config.shard_over_sequence:
+             bucket_id = self.program.find_bucket_id(cache_ids.item() + self.kv_replication - 1)
         else:
             bucket_id = self.program.find_bucket_id(cache_ids.item())
         if self.use_executor:
