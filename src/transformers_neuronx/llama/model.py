@@ -227,6 +227,13 @@ class LlamaForSampling(base.NeuronModelBase):
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
         prefixed_length = self.prefixed_length
+        if self.neuron_config.shard_over_sequence:
+            n_kv_head = self.config.num_key_value_heads
+            assert self.config.tp_degree %  n_kv_head == 0 , f"tp_degree {self.config.tp_degree} not divisble by n_kv_heads {n_kv_head} shard_over_sequence is not supported"
+            kv_sharding = self.config.tp_degree // n_kv_head
+            if  (sequence_length + kv_sharding) >= self.config.n_positions:
+                sequence_length -= kv_sharding
+
         if context_length < prefixed_length:
             self.prefixed_length = 0
         else:

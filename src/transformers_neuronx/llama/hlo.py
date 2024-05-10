@@ -67,7 +67,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         core_id = None
         if self.neuron_config.shard_over_sequence:
             core_id,*rst  = weights
-            n_kv_heads = self.config.num_key_value_heads if self.config.num_attention_heads else self.config.num_attention_heads
+            n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
             cores_per_kv_head = self.config.tp_degree // n_kv_heads
             self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree 
             cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, 
@@ -143,7 +143,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.config.num_key_value_heads is not None:
             n_head = self.config.num_attention_heads
             n_kv_head = self.config.num_key_value_heads
-            _, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_head, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
             n_kv_heads_tp = n_kv_head_padded // tp_degree
 
         # Q = (hidden @ wQ) + bQ
@@ -201,7 +201,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             # Communication 1: all-gather query from cores
             if (n_active_tokens != self.n_positions) and self.neuron_config.shard_over_sequence:
                 query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, 
-                                                  self.config.num_attention_heads,
+                                                  n_head,
                                                   tp_degree)
 
             # Sp = Q @ Kp
@@ -218,7 +218,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             if self.neuron_config.shard_over_sequence:
                 dtype = query.dtype
                 context = flash_decoding.context(prior_scores, active_score, cached_values_s, value, core_id, mask, active_mask,
-                                        n_kv_heads=self.config.num_key_value_heads, n_heads=self.config.num_attention_heads, dtype=dtype, 
+                                        n_kv_heads=self.config.num_key_value_heads, n_heads=n_head, dtype=dtype, 
                                         tp_degree=tp_degree, neuron_config=self.neuron_config,
                                         shard_over_batch=self.shard_over_batch)
                 cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,value, key,self.cores_per_kv_head,core_id,dim=0)
