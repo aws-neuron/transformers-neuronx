@@ -45,8 +45,6 @@ def context(past_scores, active_score, past_values, active_values,
     assert sparse_mask is None, "Not supposed to be used for context encoding for now!"
     assert n_kv_heads > 0 and n_heads > 0 , "n_kv_heads and n_heads has to be non-zero"
 
-    if neuron_config: 
-        assert neuron_config.attention_layout != constants.LAYOUT_BSH, "flash decoding not support for BSH layout"
 
     if dtype == None:
         dtype = active_score.dtype
