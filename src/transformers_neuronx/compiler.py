@@ -17,14 +17,15 @@ import shlex
 import subprocess
 import hashlib
 import tarfile
-import tempfile
-from contextlib import contextmanager
-import numpy as np
+from contextlib import contextmanager, nullcontext
 from textwrap import dedent
-import torch
 import logging
 import json
 import math
+
+import numpy as np
+import torch
+
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -34,6 +35,7 @@ from transformers_neuronx import parallel
 from libneuronxla import neuron_xla_compile
 from libneuronxla.neuron_cc_cache import CacheUrl, create_compile_cache
 from neuronxcc import __version__ as compiler_version
+
 
 def get_hash_module(hlo_module, flags):
     # Hashing is pretty fast and neglegible compared to compilation time
@@ -45,8 +47,29 @@ def get_hash_module(hlo_module, flags):
     hash = str(hash_gen.hexdigest())[:20]
     return hash
 
+
+@contextmanager
+def envvar(key, value):
+    prior = os.environ.pop(key, None)
+    if value is not None:
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        os.environ.pop(key, None)
+        if prior is not None:
+            os.environ[key] = prior
+
+
 def compile_py_func(py_func):
-    return HloScribe(serialize_torch)(py_func).module_proto
+
+    # Adds file/scope metadata during debug dump
+    context = nullcontext()
+    if "NEURONX_DUMP_TO" in os.environ and 'ENABLE_PYHLO_FILE_METADATA' not in os.environ:
+        context = envvar('ENABLE_PYHLO_FILE_METADATA', '1')
+
+    with context:
+        return HloScribe(serialize_torch)(py_func).module_proto
 
 
 def build_kernel(py_func, tp_degree):
@@ -97,8 +120,6 @@ def compile_hlo_module(hlo_module, tag=None):
         hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
 
     if dump:
-
-
         dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
         dump_to = os.path.join(dump_to, hlo_module_name)
         os.makedirs(dump_to, exist_ok=True)
