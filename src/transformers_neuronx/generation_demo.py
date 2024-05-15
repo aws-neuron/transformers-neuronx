@@ -226,6 +226,7 @@ def main():
 
     run_parser.add_argument('--gqa', type=str, default=None)
     run_parser.add_argument('--quant', action='store_true')
+    run_parser.add_argument('--attention_layout', type=str, default='HSB')
     run_parser.add_argument('--fuse_qkv', action='store_true')
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
@@ -499,15 +500,19 @@ def run(args, hf_model_name, model_cls):
             suffix = f"{neuronxcc.__version__}_{model_cls.__name__}_{hf_model_name.replace('/', '_')}_b{compile_batch_size}_np{args.n_positions}_nobucket1np_{args.no_bucketing_n_positions}_amp{args.amp}_tp{args.tp_degree}_ul{args.unroll}_cul{args.context_unroll}_wcul{args.window_context_unroll}_ctx{args.context_length_estimate}_wctx{args.window_context_length_estimate}" if args.suffix is None else args.suffix
             dump_path = f"neuronx_dump_{suffix}"
             snapshot_path = f"neuronx_snapshot_{suffix}"
-            if args.snapshot or args.pack_artifacts:
-                os.environ["NEURONX_DUMP_TO"] = dump_path
+            if args.snapshot:
                 os.environ["HLO_SNAPSHOT_PATH"] = snapshot_path
-                print(f"Set snapshot path {snapshot_path}, dump_path: {dump_path}")
+                print(f"Set snapshot path {snapshot_path}")
+            if args.pack_artifacts:
+                os.environ["NEURONX_DUMP_TO"] = dump_path
+                print(f"Set dump_path: {dump_path}")
 
 
             neuron_config = NeuronConfig(
                 group_query_attention=args.gqa,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
+                attention_layout=args.attention_layout,
+                fuse_qkv=args.fuse_qkv
             )
 
             if args.no_bucketing_n_positions:
