@@ -68,6 +68,11 @@ class LlamaForSampling(base.NeuronModelBase):
 
         self.token_buckets = bucket.token_sizes(n_positions)
         self.context_buckets = bucket.context_sizes(context_length_estimate, self.token_buckets)
+        # input length should be  divisable by tp_degree to activate seq paralle
+        if neuron_config and neuron_config.sequence_parallel_norm:
+            for bucket_size in self.context_buckets:
+                if bucket_size > neuron_config.sequence_parallel_norm_threshold and bucket_size % self.config.tp_degree != 0:
+                    raise ValueError(f"Sequence parallel normalization requires the bucket size ({bucket_size}) to be divisible by the tensor parallel degree ({self.config.tp_degree})")
         self.window_context_buckets = []
         if prefixed_length:
             if prefixed_length not in self.context_buckets:
@@ -138,7 +143,10 @@ class LlamaForSampling(base.NeuronModelBase):
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         if self.neuron_config.on_device_embedding:
-            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
+            if self.neuron_config.sequence_parallel_norm:
+                self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=None, allow_pad=True)
+            else:
+                self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)        
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
@@ -306,3 +314,4 @@ class FIDLlamaForSampling(LlamaForSampling):
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
         return result
+

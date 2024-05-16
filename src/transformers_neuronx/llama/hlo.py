@@ -43,13 +43,16 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def inputs(self, scribe, dtype, n_active_tokens, batch_size):
         tensors, dims = transformer.inputs(
-            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config)
+            scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config, self.config.tp_degree)
 
         return tensors, dims
 
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
-        hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
+        if self.neuron_config.on_device_embedding and self.neuron_config.sequence_parallel_norm:
+            hidden = hlo.embedding(embed_weight, input_ids, tp_degree=1, dtype=dtype)
+        else:
+            hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
             hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
@@ -95,7 +98,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
+        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
@@ -107,7 +110,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
-        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim)
+        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
         mlp_hidden = gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
@@ -262,4 +265,5 @@ class LlamaForSamplingNoEmbeddingHlo:
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
         return output, updated_keys, updated_values
+
 

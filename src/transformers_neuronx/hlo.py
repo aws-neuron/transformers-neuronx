@@ -181,7 +181,7 @@ def group_norm_bsh(hidden, weight, bias, num_groups):
     raise NotImplementedError("BSH GroupNorm is not currently implemented, use HSB")
 
 
-def rms_norm(hidden, weight, eps=1e-6, dim=2):
+def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None):
     # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     size = hidden.sizes
@@ -219,6 +219,9 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
     result = multiply(scaled, weight_br)
     result = cast(result, dtype)
 
+    if neuron_config and neuron_config.is_sequence_parallel:
+        result = all_gather(result, 1, tp_degree, replica_groups=None)
+
     return result
 
 
@@ -233,7 +236,6 @@ def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
     hidden = cast(hidden, f32)
 
     return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
-
 
 def dot_general(lhs, rhs, dimension_numbers):
     # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
@@ -636,6 +638,8 @@ def gated_mlp_bsh(
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        if neuron_config.is_sequence_parallel:
+            return reduce_scatter(result, dim=1, replica_groups=replica_groups, to_apply=gen_add_func(result.dtype), dtype=dtype)
         result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
     return result
 
@@ -723,6 +727,8 @@ def gated_mlp(
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
+        if neuron_config.is_sequence_parallel:
+            return reduce_scatter(result, dim=1, replica_groups=replica_groups, to_apply=gen_add_func(result.dtype), dtype=dtype) 
         result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
@@ -3301,3 +3307,6 @@ def flip(tensor, dims):
     if isinstance(dims, int):
         dims = [dims]
     return tensor.dtype[tensor.sizes].Reverse(tensor, dimensions=dims)
+
+
+

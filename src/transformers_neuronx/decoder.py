@@ -328,7 +328,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         extras = []
         for param, dim, allow_pad in self.pre_layer_parameters:
-            if allow_pad:
+            if allow_pad and dim is not None:
                 if param.shape[dim] % self.tp_degree != 0:
                     size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
                     param = utils.pad(param, dim, size)
@@ -499,6 +499,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # 1st n_active_tokens.
             bucket_id = self.program.find_bucket_id(max_id)
             if self.use_executor:
+                if self.neuron_config and self.neuron_config.is_sequence_parallel:
+                    self.program.inputs_host_to_device(input_tensors, batch_size)
+                    input_tensors = []
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
             else:
                 self.program.inputs_host_to_device(input_tensors, batch_size)
@@ -525,6 +528,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def _build_program(self):
         hlo_modules = dict()
         debug_tensors = dict()
+        
         # for pipeline parallel: only do FullyUnrolled when there is valid ln_lm_head
         if self.unroll == self.num_layers and self.neuron_config.is_valid_lm_head() and not self.neuron_config.is_pp():
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
@@ -1750,14 +1754,22 @@ class DecoderProgram:
 
     def inputs_host_to_device(self, input_tensors, batch_size):
         # This means there is a separate neff for embedding so the inputs will be the input_ids
+        def process_input_tensor(tensor, idx):
+            if idx == 0 and self.neuron_config.sequence_parallel_norm:
+                n_active_tokens = tensor.shape[1]
+                if n_active_tokens > self.neuron_config.sequence_parallel_norm_threshold:
+                    return self.manipulator.shard_along_on_cpu(tensor, 1)
+ 
+            return self.manipulator.duplicate_on_cpu(tensor)
+ 
         if self.neuron_config.on_device_embedding and isinstance(self, DecoderProgramMultiLayer):
             input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
         else:
             input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
-        for buf, tensor in zip(input_buffers, input_tensors):
-            assert buf.shape == tensor.shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor.shape}) have different shapes!"
+        for idx, (buf, tensor) in enumerate(zip(input_buffers, input_tensors)):
             tensor = tensor.to(buf.dtype)
-            tensor = self.manipulator.duplicate_on_cpu(tensor)
+            tensor = process_input_tensor(tensor, idx)
+            assert buf.shape == tensor[0].shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor[0].shape}) have different shapes!"
             ops.parallel_write(buf, tensor)
 
     def run(self, bucket_id):
@@ -2255,3 +2267,5 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
 
     def get_all_kernels(self):
         return [self.cache_broadcast_kernel]
+
+
