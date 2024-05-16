@@ -120,6 +120,10 @@ class NeuronConfig():
         group_query_attention: The sharding configuration to use when the number
             of query attention heads is not equal to the number of key/value
             heads. Neuron attempts to select the best configuration by default.
+        sequence_parallel_norm: Enables sharding input sequences for rms_norm parallel
+	        execution. Supported for llama models.
+        sequence_parallel_norm_threshold: Sets the minimum threshold to shard rms_norm
+            sequences. Use with sequence_parallel_norm.
         on_device_embedding: Enables the input embedding to be performed on
             Neuron. By default, the embedding is computed on CPU.
         on_device_generation: Enables token generation to be performed on Neuron
@@ -147,6 +151,8 @@ class NeuronConfig():
         cache_layout: Layout = Layout.SBH,
         padding_side: str = 'left',
         group_query_attention: Optional[GQA] = None,
+        sequence_parallel_norm: bool = False,
+        sequence_parallel_norm_threshold: int = 2048,
         on_device_embedding: bool = False,
         on_device_generation: Optional[GenerationConfig] = None,
         all_reduce_dtype: Optional[str] = None,
@@ -197,6 +203,11 @@ class NeuronConfig():
         self.group_query_attention = group_query_attention
         if self.group_query_attention is not None:
             self.group_query_attention = GQA(self.group_query_attention)
+        self.sequence_parallel_norm = sequence_parallel_norm
+        self.sequence_parallel_norm_threshold = sequence_parallel_norm_threshold
+        assert sequence_parallel_norm_threshold > 0, (
+            f"sequence_parallel_norm_threshold={sequence_parallel_norm_threshold} must be greater than zero"
+        ) 
         self.on_device_embedding = on_device_embedding
         self.on_device_generation = on_device_generation
         self.qkv_tiling = qkv_tiling
@@ -232,6 +243,8 @@ class NeuronConfig():
         self.layer_partition = {}
         
         self.shard_over_sequence = shard_over_sequence
+
+        self.is_sequence_parallel = False
 
     @property
     def use_2d_cache_ids(self):
@@ -296,3 +309,4 @@ class NeuronConfig():
 
     def get_g_start_device_id(self, tp):
         return self.rank_id*self.get_local_tp(tp)
+
