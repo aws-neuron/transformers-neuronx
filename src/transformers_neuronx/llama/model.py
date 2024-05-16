@@ -21,12 +21,12 @@ from transformers_neuronx import sampling
 from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB, KV_SHARD_PAD
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
-
+import warnings
 
 class LlamaForSampling(base.NeuronModelBase):
 
@@ -39,6 +39,19 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.shard_over_sequence:
+            n_kv_head = self.config.num_key_value_heads
+            kv_shard_degree = self.config.tp_degree // n_kv_head
+            assert kv_shard_degree <= KV_SHARD_PAD, f"increase kv_shard degree is higher than default 128"
+            warnings.warn(f"shard over sequence enabled, increasing n_positions {n_positions} by 128")
+            if isinstance(n_positions, list):
+                npos = sorted(n_positions)
+                npos[-1] += KV_SHARD_PAD
+            else:
+                npos = n_positions + KV_SHARD_PAD
+            self.config.n_positions = npos
+            config.n_positions = npos
+            n_positions = npos
         if self.neuron_config.on_device_generation:
             self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
@@ -110,8 +123,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
             new_layer.to_neuron()
             layer.nullify()
-            if self.neuron_config.shard_over_sequence:
-                self.decoder_lm_head.add_pre_layer_parameter(torch.arange(self.config.tp_degree), sharding=0)
+        if self.neuron_config.shard_over_sequence:
+            self.decoder_lm_head.add_pre_layer_parameter(torch.arange(self.config.tp_degree), sharding=0)
         # For pipeline parallel, we need to load ln and lm_head for now even if the pipeline stage doesn't compute the, because
         # 1) we need the ln_lm_head hlo for pp0 to get the logits shape and dtype
         # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
@@ -227,12 +240,6 @@ class LlamaForSampling(base.NeuronModelBase):
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
         prefixed_length = self.prefixed_length
-        if self.neuron_config.shard_over_sequence:
-            n_kv_head = self.config.num_key_value_heads
-            assert self.config.tp_degree %  n_kv_head == 0 , f"tp_degree {self.config.tp_degree} not divisble by n_kv_heads {n_kv_head} shard_over_sequence is not supported"
-            kv_sharding = self.config.tp_degree // n_kv_head
-            if  (sequence_length + kv_sharding) >= self.config.n_positions:
-                sequence_length -= kv_sharding
 
         if context_length < prefixed_length:
             self.prefixed_length = 0
