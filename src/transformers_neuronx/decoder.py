@@ -107,11 +107,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if gqa is None:
             # MHA Early exit - This avoids emitting irrelevant GQA warnings
             if self.n_head == self.n_kv_head:
-                warnings.warn(
-                        f'Cannot enable shard_over_sequence when a n_heads ({self.n_head}) == n_kv_heads ({self.n_kv_head})'
-                        f'disabling shard over sequence'
-                    )
-                self.neuron_config.shard_over_sequence = False
+                if self.neuron_config.shard_over_sequence:
+                    warnings.warn(
+                            f'Cannot enable shard_over_sequence when a n_heads ({self.n_head}) == n_kv_heads ({self.n_kv_head})'
+                            f'disabling shard over sequence'
+                        )
+                    self.neuron_config.shard_over_sequence = False
                 return
             self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
 
