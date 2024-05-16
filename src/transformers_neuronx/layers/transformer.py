@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import logging
 from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
 
 
-def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_config=None):
+def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_config=None, tp_degree=None):
     """
     Defines the set of required inputs for all decoder models.
 
@@ -52,6 +53,9 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     """
     s32 = scribe.s32
 
+    if neuron_config and neuron_config.sequence_parallel_norm and n_active_tokens > neuron_config.sequence_parallel_norm_threshold:
+        neuron_config.is_sequence_parallel = True
+
     # Multilayer on device embedding will use the already-embedded inputs for the layers NEFF
     # because there is a separate neff for embedding.
     if neuron_config and neuron_config.on_device_embedding:
@@ -59,8 +63,13 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     else:
         if neuron_config and neuron_config.attention_layout == LAYOUT_BSH:
             hidden_sizes = batch_size, n_active_tokens, hidden_size
-        else:
+        else: # HASB LAyout
             hidden_sizes = hidden_size, n_active_tokens, batch_size
+    
+    if neuron_config.is_sequence_parallel:
+        hidden_sizes = list(hidden_sizes)
+        hidden_sizes[1] = hidden_sizes[1] // tp_degree
+        hidden_sizes = tuple(hidden_sizes)
 
     hidden = (
         s32[hidden_sizes].Parameter(parameter_number=0) if neuron_config and neuron_config.on_device_embedding
@@ -87,6 +96,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         0 if cache_2d else None   # last_token_id | Scalar, no slicing required
     )
 
+    inputs = (hidden, cache_ids, start_ids, last_token_id)
     return (hidden, cache_ids, start_ids, last_token_id), sequence_slice_dimensions
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
@@ -164,13 +174,17 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     else:
         hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
-
+	
+    if neuron_config.is_sequence_parallel:
+        hidden = hlo.all_gather(hidden, 1, tp_degree)
+ 
     # Check and perform slicing if needed
     if not return_all_outputs:
         hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
         n_active_tokens = 1
 
-    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0)
+    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, neuron_config=None, tp_degree=tp_degree) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0, neuron_config=None, tp_degree=tp_degree)
+
     if is_bsh:
         rms_hidden = hlo.transpose210(rms_hidden)
     rms_hidden = hlo.reshape(rms_hidden, (hidden_size, n_active_tokens*batch_size))
@@ -214,3 +228,5 @@ def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
         hidden = hlo.index_select(hidden, dim=0, index=last_token_id)
         hidden = hlo.transpose102(hidden)
     return hidden
+
+
