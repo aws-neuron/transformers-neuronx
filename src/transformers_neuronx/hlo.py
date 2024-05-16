@@ -1711,7 +1711,7 @@ def slice_along(tensor, dim, limit, start=0, stride=1):
     dimensions[dim] = dict(start=start, limit=limit, stride=stride)
 
     sizes = list(tensor.sizes)
-    sizes[dim] = (limit - start)//stride
+    sizes[dim] = (limit - start + stride - 1)//stride
 
     return tensor.dtype[sizes].Slice(
         tensor,
