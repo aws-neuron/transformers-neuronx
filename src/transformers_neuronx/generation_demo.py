@@ -228,6 +228,12 @@ def main():
     run_parser.add_argument('--quant', action='store_true')
     run_parser.add_argument('--attention_layout', type=str, default='HSB')
     run_parser.add_argument('--fuse_qkv', action='store_true')
+    run_parser.add_argument('--attention_layout', type=str, default='HSB')
+    run_parser.add_argument('--sequence_parallel_norm', action='store_true')
+    run_parser.add_argument('--sequence_parallel_norm_threshold', type=int, default=2048)
+    # logging
+    run_parser.add_argument('--debug', action='store_true')
+
     # simple_sample
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--simple_sample_eos_token_override', type=int, default=None, help="override eos token, set to -1 to always generate exactly as many tokens as desired.")
@@ -486,6 +492,11 @@ def run(args, hf_model_name, model_cls):
 
     print("input_ids", input_ids, " len:", input_ids.shape[-1])
     print("attention_mask:", attention_mask,)
+    if args.debug:
+        from imp import reload
+ 
+        reload(logging)
+        logging.basicConfig(level=logging.DEBUG)
 
 
     forward_func = None
@@ -511,8 +522,10 @@ def run(args, hf_model_name, model_cls):
             neuron_config = NeuronConfig(
                 group_query_attention=args.gqa,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
-                attention_layout=args.attention_layout,
                 fuse_qkv=args.fuse_qkv
+                sequence_parallel_norm=args.sequence_parallel_norm,
+                sequence_parallel_norm_threshold=args.sequence_parallel_norm_threshold,
+                attention_layout=args.attention_layout,
             )
 
             if args.no_bucketing_n_positions:
@@ -650,5 +663,6 @@ def run(args, hf_model_name, model_cls):
 
 if __name__ == "__main__":
     main()
+
 
 
