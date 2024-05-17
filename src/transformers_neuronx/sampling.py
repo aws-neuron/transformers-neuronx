@@ -303,19 +303,20 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
     stopping_criteria_list = stopping_criteria_list if stopping_criteria_list is not None else StoppingCriteriaList()
 
-# Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
+    # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
     tokens = [input_ids]
-    _, start = input_ids.shape
-    if cache_ids:
-        start = cache_ids.item()+1
+    _, start_length = input_ids.shape
 
-    for cur_len in range(start, sequence_length):
+    if cache_ids is None:
+        cache_ids = torch.as_tensor([start_length - 1], dtype=torch.int32)
+    else:
+        start_length = max(cache_ids.flatten()).item() + 1
+
+    for current_length in range(start_length, sequence_length):
 
         if ngram_size:
-            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, cur_len)
-
-        next_len = cur_len + 1
+            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, current_length)
 
         if temperature != 1.0:
             next_token_scores /= temperature
@@ -342,14 +343,15 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         elif streamer:
             streamer.put(token)
 
-        if next_len >= sequence_length or done_flags.all():
+        next_length = current_length + 1
+        if next_length > sequence_length or done_flags.all():
             break
 
         if stopping_criteria_list(input_ids, probs):
             break
 
         # forward pass to get next token
-        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        cache_ids = cache_ids + 1
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
@@ -364,8 +366,10 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
     
     # populate key/value caches according to the prompt text
-    _, start = input_ids.shape
     next_token_scores = model(input_ids, cache_ids, start_ids)
+    if cache_ids is not None:
+        cache_ids = cache_ids.max(dim=1, keepdim=True).values
+
     if model.context_hook is not None:
         model.context_hook()
     return sample_loop_llama(
@@ -382,4 +386,3 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
-
