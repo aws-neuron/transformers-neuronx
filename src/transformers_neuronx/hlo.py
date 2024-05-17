@@ -1580,12 +1580,9 @@ def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
     return global_mean
 
 
-
 def cumsum(tensor, dim):
 
-    # NOTE: This is behind a flag because support of the required
-    #       instructions are not yet fully available.
-    if is_floating_point(tensor) and os.environ.get('NEURON_INTERNAL_FAST_CUMSUM', None) == '1':
+    if is_floating_point(tensor):
         return _cumsum_fast(tensor, dim)
 
     scribe = tensor.scribe
@@ -1647,14 +1644,9 @@ def _cumsum_fast(tensor, dim):
         tensor = reshape(tensor, (elements, tensor.sizes[last]))
         reshaped = True
 
-    # Note: NKI kernel does not yet have broad type support
-    tensor = cast(tensor, f32)
-
     def _cumsum(inputs, output):
         return nki_cumsum(inputs, output, axis=1)
     result = nki_call(_cumsum, tensor, output_HloShapes=tensor.dtype[tensor.sizes])
-
-    result = cast(result, dtype)
 
     if reshaped:
         result = reshape(result, shape)
@@ -3307,6 +3299,3 @@ def flip(tensor, dims):
     if isinstance(dims, int):
         dims = [dims]
     return tensor.dtype[tensor.sizes].Reverse(tensor, dimensions=dims)
-
-
-
