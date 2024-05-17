@@ -451,7 +451,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         batch_size = start_ids.shape[0]
         # With 2D cache_ids, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            bucket_id = 0
+            # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH]. 
+            if self.neuron_config.cache_layout == constants.LAYOUT_SBH:
+                bucket_id = self.program.find_bucket_id(cache_ids.max().item())
+            else:
+                bucket_id = 0     
             batch_size, _ = cache_ids.shape
         else:
             bucket_id = self.program.find_bucket_id(cache_ids.item())

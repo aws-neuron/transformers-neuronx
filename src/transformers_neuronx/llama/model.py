@@ -93,7 +93,10 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
-            new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
+            if self.neuron_config and self.neuron_config.attn_output_transposed:
+                new_layer.add_attention_output(attn.o_proj.weight.T.detach(), None, sharding=0, transposed=True)
+            else:
+                new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
