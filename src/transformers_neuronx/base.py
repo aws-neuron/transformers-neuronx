@@ -306,6 +306,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def _pad_cache_ids(self, cache_ids, batch_size, context_length, estimate):
         if self.neuron_config.use_2d_cache_ids:
             # TODO: fix cache_ids padding for batch speculative decoding
+            # for now, use cache_ids without change for speculative_forward
+            is_speculative_forward = cache_ids.flatten()[0].item() > 0
+            if is_speculative_forward:
+                return cache_ids
             cache_ids = torch.arange(estimate, dtype=torch.int32)
             cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
         else:
@@ -365,7 +369,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 cache_ids = cache_ids.unsqueeze(0)
             assert cache_ids.shape[0] == n_active_seqs, \
                     f"invalid n_active_seqs ({n_active_seqs} vs {cache_ids.shape[0]}) in speculative forward"
-            cache_ids_pad = torch.zeros(n_active_seqs, speculation_bucket, dtype=cache_ids.dtype, device='cpu')
+            # pad cache IDs with max(n_positions) - 1
+            # unlike context encoding, padding with 0
+            # during speculative_forward will contaminate kv-cache history
+            cache_ids_pad = torch.full((n_active_seqs, speculation_bucket), max(self.context_buckets) - 1, dtype=cache_ids.dtype, device="cpu")
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
             return input_ids, cache_ids_pad, seq_ids
