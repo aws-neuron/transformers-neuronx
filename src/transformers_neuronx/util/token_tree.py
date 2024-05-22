@@ -69,7 +69,7 @@ def generate_attention_mask(token_tree: Dict[int, List[int]])->torch.Tensor:
     def populate_mask():
         top = buffer[-1]
         for node in buffer:
-            attn_mask[node][top] = 1
+            attn_mask[top][node] = 1
     # DFS on a tree.
     def DFS(node: int):
         buffer.append(node)
