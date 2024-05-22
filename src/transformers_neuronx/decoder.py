@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import os
+import copy
 import itertools
 import warnings
 import logging
@@ -33,6 +34,7 @@ from transformers_neuronx import global_debugger
 from transformers_neuronx.layers import generation
 from transformers_neuronx.config import NeuronConfig, GenerationConfig
 from transformers_neuronx.utils import interleave_qkv
+from transformers_neuronx.util.token_tree import generate_attention_mask
 
 from safetensors.torch import save_file
 from safetensors import safe_open
@@ -43,7 +45,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 return_all_outputs=True, builder=None, tag=None, prompt_batch_size=None):
+                 return_all_outputs=True, builder=None, tag=None, prompt_batch_size=None, token_tree=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -87,6 +89,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = False
         self.builder = builder
         self.check_gqa_fallback()
+        self.token_tree = token_tree
         self.tag = tag
 
     @property
@@ -235,7 +238,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             decoder_lm_head.add_embedding_builder(self.builder.embedding)
         return decoder_lm_head
 
-    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None):
+    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None, token_tree=None):
         cls = type(self)
         decoder_lm_head = cls(
             tp_degree=self.tp_degree,
@@ -252,6 +255,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             allow_pad=True,
             return_all_outputs=True,
             builder=self.builder,
+            token_tree=token_tree,
             tag=f"speculation-k{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -402,7 +406,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 prefixed_length=self.prefixed_length, return_all_outputs=self.return_all_outputs
             )
         new.add_inputs_builder(self.inputs_builder)
-        new.add_pre_layer_builder(self.pre_layer_builder)
+        if new.token_tree is not None:
+            new.add_pre_layer_builder(self.builder.token_tree_pre_layer)
+        else:
+            new.add_pre_layer_builder(self.pre_layer_builder)
         new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
         new.add_embedding_builder(self.embedding_builder)
@@ -419,7 +426,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             else:
                 new_layer.init_caches()
             new_layer.extra_parameters = layer.extra_parameters
-        new.pre_layer_parameters = self.pre_layer_parameters
+        if new.token_tree is not None:
+            manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
+            new.pre_layer_parameters = copy.deepcopy(self.pre_layer_parameters)
+            new.pre_layer_parameters.append(manipulator.duplicate(generate_attention_mask(new.token_tree)))
+        else:
+            new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
         new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
         ln_lm_head_params = [new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
