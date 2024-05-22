@@ -835,6 +835,35 @@ def transfer_with_static_ring(shape):
     custom_call_target = 'AwsNeuronTransferWithStaticRing'
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
+def token_tree_attention_mask(full_token_tree_attention_mask, active_mask):
+    """
+    The full_token_tree_attention_mask is loaded as a weight of the speculation model and contains
+    the attention mask for the whole tree structure.
+    This method is used to extract the active attention mask corresponding to a tree structure
+    that is a sub tree of the full token tree but only till a given level.
+    So this is extracting a top left prefix of the full_token_tree_attention_mask based on the
+    number of nodes in the sub tree which is determined by the size of active_mask.
+
+    Eg:
+
+       Full token tree : {0:[1], 1:[2], 2:[3]}
+       Corresponding full_token_tree_attention_mask : [[1, 0, 0, 0],[1, 1, 0, 0],[1, 1, 1, 0], [1, 1, 1, 1]]
+       sub tree as part of draft speculation loop : {0:[1], 1:[2]}
+       So the shape of the active_mask will be (B = 1, SL = 3, SL = 3)
+       Final mask returned will then be [[[True, False, False],[True, True, False],[True, True, True]]]
+       of shape (B=1, SL=3, SL=3) which is the upper left 3x3 matrix of the full_token_tree_attention_mask matrix
+    """
+    batch, seq_len, *_ = active_mask.sizes
+    # Keep required rows
+    row_sliced_token_tree_active_mask = slice_along(full_token_tree_attention_mask, 0, seq_len)
+    # Keep required columns
+    col_sliced_token_tree_active_mask = slice_along(row_sliced_token_tree_active_mask, 1, seq_len)
+    # Broadcast to accomodate correct shape of the mask
+    token_tree_active_mask = broadcast(col_sliced_token_tree_active_mask, active_mask.sizes, [1,2])
+    # Convert to pred
+    pred_token_tree_active_mask = equal(token_tree_active_mask, 1)
+    return pred_token_tree_active_mask
+
 
 def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, neuron_config=None):
     """
