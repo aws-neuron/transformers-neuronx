@@ -717,6 +717,7 @@ def output(
     """
     dtype = context.dtype
     n_active_tokens, n_seqs, n_heads_tp, d_head = context.sizes
+    transposed = neuron_config and neuron_config.attn_output_transposed
 
     if transposed:
         *_, hidden_size = out_weight.sizes

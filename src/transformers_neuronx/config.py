@@ -141,6 +141,7 @@ class NeuronConfig():
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
         output_all_logits: Return all logits from each model invocation.
+        attn_output_transposed: Transposes the attention output projection weight tensor.
     """
     def __init__(self, *,
         sparse_attn: Optional[SparseAttnConfig] = None,
@@ -163,6 +164,7 @@ class NeuronConfig():
         log_softmax_scores: bool = False,
         shard_over_sequence: bool = False,
         output_all_logits: bool = False,
+        attn_output_transposed: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -245,6 +247,8 @@ class NeuronConfig():
         self.shard_over_sequence = shard_over_sequence
 
         self.is_sequence_parallel = False
+
+        self.attn_output_transposed = attn_output_transposed
 
     @property
     def use_2d_cache_ids(self):
