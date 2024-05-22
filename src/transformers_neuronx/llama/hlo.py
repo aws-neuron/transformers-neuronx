@@ -59,6 +59,12 @@ class LlamaForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
+    def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
+        hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
+        token_tree_mask, *rst = weights
+        active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id
+
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(

@@ -18,7 +18,7 @@ import torch
 import logging
 import hashlib
 import warnings
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Dict
 from transformers_neuronx import bucket
 from transformers_neuronx import utils
 from transformers_neuronx import module
@@ -26,6 +26,7 @@ from transformers_neuronx import ops
 from transformers_neuronx.compiler import ParallelKernel
 from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.config import GenerationConfig
+from transformers_neuronx.util.token_tree import validate_token_tree
 from concurrent.futures import ProcessPoolExecutor
 import json
 
@@ -101,8 +102,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for layer in self.decoder_lm_head.layers:
             layer.save_presharded_weights(directory)
 
+    def enable_token_tree_decoder(self, token_tree: Dict[int, List[int]], batch_sizes: Optional[Union[List[int], int]]=None):
+        speculation_length = validate_token_tree(token_tree)
+        self.enable_speculative_decoder(speculation_length, batch_sizes, token_tree)
+
     # top level api
-    def enable_speculative_decoder(self, speculation_length: Optional[Union[List[int], int]], batch_sizes: Optional[Union[List[int], int]]=None):
+    def enable_speculative_decoder(self, speculation_length: Optional[Union[List[int], int]], batch_sizes: Optional[Union[List[int], int]]=None, token_tree=None):
         if isinstance(speculation_length, int):
             speculation_length = [speculation_length]
         if batch_sizes is None:
@@ -112,7 +117,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for k in speculation_length:
             for batch_size in batch_sizes:
                 self.decoder_lm_head_for_speculation[k, batch_size] = \
-                    self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k, batch_size=batch_size)
+                    self.decoder_param_set.init_speculative_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self, n_active_tokens=k, batch_size=batch_size, token_tree=token_tree)
 
     def enable_window_context_decoder(self, window_context_length:Optional[Union[List[int], int]], unroll: Optional[int] = None):
         if isinstance(window_context_length, int):
