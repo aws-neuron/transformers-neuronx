@@ -150,7 +150,7 @@ class NeuronConfig():
         quant: Optional[QuantizationConfig] = None,
         continuous_batching: Optional[ContinuousBatchingConfig] = None,
         attention_layout: Layout = Layout.HSB,
-        collectives_layout: Layout = Layout.HSB,
+        collectives_layout: Optional[Layout] = None,
         cache_layout: Layout = Layout.SBH,
         padding_side: str = 'left',
         group_query_attention: Optional[GQA] = None,
@@ -203,7 +203,16 @@ class NeuronConfig():
             self.lhs_aligned = True
 
         self.attention_layout = attention_layout
-        self.collectives_layout = collectives_layout
+        
+        if collectives_layout:
+            warnings.warn(
+                "NeuronConfig `collectives_layout` is deprecated and will be removed in future versions."
+                "collective_layout will always be BSH."
+            )
+
+        self.collectives_layout = collectives_layout if collectives_layout else Layout.BSH
+
+
         self.cache_layout = cache_layout
         self.log_softmax_scores = log_softmax_scores
         self.group_query_attention = group_query_attention
