@@ -410,14 +410,6 @@ def dot_1220_add1(lhs, rhs, bias, scales=None, neuron_config=None):
                                      bias_dimension=1,
                                      scales=scales, neuron_config=neuron_config)
 
-def dot_xxxx_addx(lhs, rhs, bias, lhs_contracting_dimensions, rhs_contracting_dimensions, bias_dimension,  scales=None, neuron_config=None):
-     return dot_with_tiled_weight_add(lhs, rhs, bias,
-                                     lhs_contracting_dimensions=lhs_contracting_dimensions,
-                                     rhs_contracting_dimensions=rhs_contracting_dimensions,
-                                     bias_dimension=bias_dimension,
-                                     scales=scales, neuron_config=neuron_config)
-
-
 def dot_0120_add1(lhs, rhs, bias, scales=None, neuron_config=None):
     return dot_with_tiled_weight_add(lhs, rhs, bias,
                                      lhs_contracting_dimensions=[0, 1],
@@ -502,20 +494,21 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         assert hidden_size % constants.TILE_SIZE == 0, \
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
             f"in order to use weight tiling."
-        assert neuron_config.weight_tiling_permute_order.index(2) < neuron_config.weight_tiling_permute_order.index(3), \
-            "original dim 2 has to be front of dim 3 after applying `weight_tiling_permute_order`"
-
-        rhs_contracting_dimensions = [neuron_config.weight_tiling_permute_order.index(0), neuron_config.weight_tiling_permute_order.index(1)]
 
         bias_dimension = 1
 
         hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
         hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden = dot_xxxx_addx(hidden, in_weight, in_bias, [0,1], rhs_contracting_dimensions, bias_dimension, in_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(
+            hidden, in_weight, in_bias, [0,1],
+            [neuron_config.mlp_in_weight_tiling_permute_order.index(0), neuron_config.mlp_in_weight_tiling_permute_order.index(1)],
+            bias_dimension, in_scales, neuron_config)
         hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden = get_activation(activation_function)(hidden)
-        hidden = dot_xxxx_addx(hidden, out_weight, out_bias, [1,2], rhs_contracting_dimensions, bias_dimension, out_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, out_weight, out_bias, [1,2],
+            [neuron_config.mlp_out_weight_tiling_permute_order.index(0), neuron_config.mlp_out_weight_tiling_permute_order.index(1)],
+            bias_dimension, out_scales, neuron_config)
     else:
         # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
         hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
@@ -571,21 +564,22 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
             f"in order to use weight tiling."
 
-        assert neuron_config.weight_tiling_permute_order.index(2) < neuron_config.weight_tiling_permute_order.index(3), \
-            "original dim 2 has to be front of dim 3 after applying `weight_tiling_permute_order`"
-
         lhs_contracting_dimensions = [1,2]
-        rhs_contracting_dimensions = [neuron_config.weight_tiling_permute_order.index(0), neuron_config.weight_tiling_permute_order.index(1)]
 
         bias_dimension = 1
-
         hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden = dot_xxxx_addx(hidden, in_weight, in_bias, lhs_contracting_dimensions, rhs_contracting_dimensions, bias_dimension, in_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, in_weight, in_bias,
+            lhs_contracting_dimensions,
+            [neuron_config.mlp_in_weight_tiling_permute_order.index(0), neuron_config.mlp_in_weight_tiling_permute_order.index(1)],
+            bias_dimension, in_scales, neuron_config)
         hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden = get_activation(activation_function)(hidden)
-        hidden = dot_xxxx_addx(hidden, out_weight, out_bias, lhs_contracting_dimensions, rhs_contracting_dimensions, bias_dimension, out_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, out_weight, out_bias,
+            lhs_contracting_dimensions,
+            [neuron_config.mlp_out_weight_tiling_permute_order.index(0), neuron_config.mlp_out_weight_tiling_permute_order.index(1)],
+            bias_dimension, out_scales, neuron_config)
     else:
         hidden = dot10_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
         hidden = get_activation(activation_function)(hidden)
