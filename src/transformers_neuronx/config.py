@@ -138,6 +138,8 @@ class NeuronConfig():
         fuse_qkv: Fuses the QKV projection into a single matrix multiplication.
         qkv_tiling: Splits attention QKV to introduce "free" 128 dimensions.
         weight_tiling: Splits model MLP to introduce "free" 128 dimensions.
+        mlp_in_weight_tiling_permute_order: permute order to permute the mlp input weight tiling split [K/128, 128, N/128, 128]. default=[1,2,0,3].
+        mlp_out_weight_tiling_permute_order: permute order to permute the mlp output weight tiling split [K/128, 128, N/128, 128]. default=[1,2,0,3].
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
         output_all_logits: Return all logits from each model invocation.
@@ -161,7 +163,8 @@ class NeuronConfig():
         fuse_qkv: bool = False,
         qkv_tiling: bool = False,
         weight_tiling: bool = False,
-        weight_tiling_permute_order: List[int] = [1,2,0,3],
+        mlp_in_weight_tiling_permute_order: List[int] = [1,2,0,3],
+        mlp_out_weight_tiling_permute_order: List[int] = [1,2,0,3],
         log_softmax_scores: bool = False,
         shard_over_sequence: bool = False,
         output_all_logits: bool = False,
@@ -220,8 +223,14 @@ class NeuronConfig():
             )
 
         self.weight_tiling = weight_tiling
-        self.weight_tiling_permute_order = weight_tiling_permute_order
+        self.mlp_in_weight_tiling_permute_order = mlp_in_weight_tiling_permute_order
+        self.mlp_out_weight_tiling_permute_order = mlp_out_weight_tiling_permute_order
 
+        assert self.mlp_in_weight_tiling_permute_order.index(2) < self.mlp_in_weight_tiling_permute_order.index(3), \
+            "original dim 2 has to be front of dim 3 after applying `mlp_in_weight_tiling_permute_order`"
+
+        assert self.mlp_out_weight_tiling_permute_order.index(2) < self.mlp_out_weight_tiling_permute_order.index(3), \
+            "original dim 2 has to be front of dim 3 after applying `mlp_out_weight_tiling_permute_order`"
 
         if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", False):
             warnings.warn(
