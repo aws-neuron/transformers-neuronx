@@ -791,7 +791,7 @@ def output(
         neuron_config=neuron_config,
     )
 
-    bsh_collective = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
+    bsh_collective = not neuron_config or neuron_config.collectives_layout == LAYOUT_BSH
     bsh_output = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
 
     if bsh_output or bsh_collective:
