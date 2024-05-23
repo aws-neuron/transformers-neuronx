@@ -454,11 +454,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         batch_size = start_ids.shape[0]
         # With 2D cache_ids, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH]. 
+            # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH].
             if self.neuron_config.cache_layout == constants.LAYOUT_SBH:
                 bucket_id = self.program.find_bucket_id(cache_ids.max().item())
             else:
-                bucket_id = 0     
+                bucket_id = 0
             batch_size, _ = cache_ids.shape
         elif self.neuron_config and self.neuron_config.shard_over_sequence:
              bucket_id = self.program.find_bucket_id(cache_ids.item() + self.kv_replication - 1)
@@ -532,7 +532,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def _build_program(self):
         hlo_modules = dict()
         debug_tensors = dict()
-        
+
         # for pipeline parallel: only do FullyUnrolled when there is valid ln_lm_head
         if self.unroll == self.num_layers and self.neuron_config.is_valid_lm_head() and not self.neuron_config.is_pp():
             for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
@@ -1641,7 +1641,7 @@ class MaybeParallelTensorManipulator:
             return self.duplicate(tensor)
         return self.shard_along(tensor, dim)
 
-    def transform_and_tile_weight_layout(self, tensors, weight_tiling=False):
+    def transform_and_tile_weight_layout(self, tensors, weight_tiling=False, permute_order=[1, 2, 0, 3]):
         if tensors is None:
             return None
 
@@ -1658,7 +1658,7 @@ class MaybeParallelTensorManipulator:
                                  N // constants.TILE_SIZE,
                                  constants.TILE_SIZE]
                 tensor = tensor.reshape(reshape_sizes) \
-                               .permute([1, 2, 0, 3])
+                               .permute(permute_order)
                 tensor = tensor.contiguous()
                 new_tensors.append(tensor)
             return new_tensors
@@ -1763,9 +1763,9 @@ class DecoderProgram:
                 n_active_tokens = tensor.shape[1]
                 if n_active_tokens > self.neuron_config.sequence_parallel_norm_threshold:
                     return self.manipulator.shard_along_on_cpu(tensor, 1)
- 
+
             return self.manipulator.duplicate_on_cpu(tensor)
- 
+
         if self.neuron_config.on_device_embedding and isinstance(self, DecoderProgramMultiLayer):
             input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
         else:

@@ -16,7 +16,7 @@ import os
 import math
 import logging
 import warnings
-from typing import Optional
+from typing import Optional, List
 
 from transformers_neuronx import GQA, Layout, SparseAttnConfig
 
@@ -161,6 +161,7 @@ class NeuronConfig():
         fuse_qkv: bool = False,
         qkv_tiling: bool = False,
         weight_tiling: bool = False,
+        weight_tiling_permute_order: List[int] = [1,2,0,3],
         log_softmax_scores: bool = False,
         shard_over_sequence: bool = False,
         output_all_logits: bool = False,
@@ -209,7 +210,7 @@ class NeuronConfig():
         self.sequence_parallel_norm_threshold = sequence_parallel_norm_threshold
         assert sequence_parallel_norm_threshold > 0, (
             f"sequence_parallel_norm_threshold={sequence_parallel_norm_threshold} must be greater than zero"
-        ) 
+        )
         self.on_device_embedding = on_device_embedding
         self.on_device_generation = on_device_generation
         self.qkv_tiling = qkv_tiling
@@ -219,6 +220,9 @@ class NeuronConfig():
             )
 
         self.weight_tiling = weight_tiling
+        self.weight_tiling_permute_order = weight_tiling_permute_order
+
+
         if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", False):
             warnings.warn(
                 "NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT is deprecated. "
@@ -243,7 +247,7 @@ class NeuronConfig():
         self.dist = None
 
         self.layer_partition = {}
-        
+
         self.shard_over_sequence = shard_over_sequence
 
         self.is_sequence_parallel = False
