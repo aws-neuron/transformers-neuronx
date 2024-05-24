@@ -175,7 +175,8 @@ class LlamaForSampling(base.NeuronModelBase):
         if self.decoder_lm_head_for_speculation:
             for i,k in enumerate(self.decoder_lm_head_for_speculation):
                 model= self.decoder_lm_head.build_weight_shared(share_caches=True,
-                                                                      new=self.decoder_lm_head_for_speculation[k])
+                                                                      new=self.decoder_lm_head_for_speculation[k],
+                                                                      embed_weight=self.chkpt_model.model.embed_tokens.weight)
                 self.decoder_lm_head_for_speculation[k]=model
 
         if self.decoder_lm_head_for_window_context:

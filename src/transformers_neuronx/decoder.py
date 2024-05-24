@@ -336,15 +336,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.validate_generation_configs(self.neuron_config.on_device_generation)
 
         manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
-
-        extras = []
-        for param, dim, allow_pad in self.pre_layer_parameters:
-            if allow_pad and dim is not None:
-                if param.shape[dim] % self.tp_degree != 0:
-                    size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
-                    param = utils.pad(param, dim, size)
-            extras.append(manipulator.duplicate_or_shard_along(param, dim))
-        self.pre_layer_parameters = extras
+        self.pre_layer_parameters = self._prepare_pre_layer_params(manipulator, self.pre_layer_parameters)
 
         self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
         self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
@@ -396,7 +388,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.kv_replication = self.tp_degree//self.n_kv_head
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
-                            unroll=None, share_caches=False, new=None):
+                            unroll=None, share_caches=False, new=None, embed_weight=None):
         if new == None:
             cls = type(self)
             new = cls(
@@ -427,9 +419,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 new_layer.init_caches()
             new_layer.extra_parameters = layer.extra_parameters
         if new.token_tree is not None:
-            manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
-            new.pre_layer_parameters = copy.deepcopy(self.pre_layer_parameters)
-            new.pre_layer_parameters.append(manipulator.duplicate(generate_attention_mask(new.token_tree)))
+            if self.neuron_config.on_device_embedding:
+                new.add_pre_layer_parameter(embed_weight, sharding=1, allow_pad=True)
+            new.add_pre_layer_parameter(generate_attention_mask(new.token_tree))
+            manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(new.tp_degree))
+            new.pre_layer_parameters = self._prepare_pre_layer_params(manipulator, new.pre_layer_parameters)
         else:
             new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
@@ -552,6 +546,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             position_ids -= start_ids.unsqueeze(1)
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
+
+    def _prepare_pre_layer_params(self, manipulator, pre_layer_parameters):
+        extras = []
+        for param, dim, allow_pad in pre_layer_parameters:
+            if allow_pad and dim is not None:
+                if param.shape[dim] % self.tp_degree != 0:
+                    size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                    param = utils.pad(param, dim, size)
+            extras.append(manipulator.duplicate_or_shard_along(param, dim))
+        return extras
 
     def _build_program(self):
         hlo_modules = dict()

@@ -47,7 +47,8 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         return tensors, dims
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, embed_weight):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, *weights):
+        embed_weight, *rst = weights
         dtype = getattr(input_ids.scribe, self.config.amp)
         if self.neuron_config.on_device_embedding and self.neuron_config.sequence_parallel_norm:
             hidden = hlo.embedding(embed_weight, input_ids, tp_degree=1, dtype=dtype)
@@ -62,6 +63,10 @@ class LlamaForSamplingNoEmbeddingHlo:
     def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
         hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
         token_tree_mask, *rst = weights
+        if self.neuron_config.on_device_embedding:
+            embed_weight, token_tree_mask = weights
+        else:
+            token_tree_mask, *rst = weights
         active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id
 
