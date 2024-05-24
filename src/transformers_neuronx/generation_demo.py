@@ -228,7 +228,6 @@ def main():
     run_parser.add_argument('--quant', action='store_true')
     run_parser.add_argument('--attention_layout', type=str, default='HSB')
     run_parser.add_argument('--fuse_qkv', action='store_true')
-    run_parser.add_argument('--attention_layout', type=str, default='HSB')
     run_parser.add_argument('--sequence_parallel_norm', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm_threshold', type=int, default=2048)
     # logging
@@ -522,7 +521,7 @@ def run(args, hf_model_name, model_cls):
             neuron_config = NeuronConfig(
                 group_query_attention=args.gqa,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
-                fuse_qkv=args.fuse_qkv
+                fuse_qkv=args.fuse_qkv,
                 sequence_parallel_norm=args.sequence_parallel_norm,
                 sequence_parallel_norm_threshold=args.sequence_parallel_norm_threshold,
                 attention_layout=args.attention_layout,
