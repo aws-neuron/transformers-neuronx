@@ -20,7 +20,7 @@ from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.layers import attention_utils
+from transformers_neuronx.layers import attention, attention_utils
 from transformers_neuronx.nki.compile import nki_call
 import logging
 
@@ -462,7 +462,8 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
     return score
 
 
-def context(past_scores, active_score, past_values, active_values, sparse_mask=None,
+def context(past_scores, active_score, past_values, active_values,
+            sparse_mask=None, past_mask=None, active_mask=None,
             n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None):
     """
     Compute "context" output from the QK score and value projection.
@@ -473,9 +474,14 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
 
     C = softmax(S) @ V
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
-    If dtype is None, uses values datatype.
-    If sparse_mask or active_sparse_mask is not None, use sparse attention on the corresponding values.
+    Implementation details:
+        - If n_kv_heads != 0, uses multi-query, multi-group attention.
+        - If dtype is None, uses values datatype.
+        - If sparse_mask or active_sparse_mask is not None, use sparse attention
+            on the corresponding values.
+        - If past_mask or active_mask is provided, apply the mask to the result
+            of the softmax exp as an optimization to help with compiler
+            constant propagation.
     """
 
     if dtype == None:
@@ -520,13 +526,30 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     # Pp = softmax(Sp)
     score_shifted = f32[past_scores.sizes].Subtract(past_scores, reduce_max_br)
     exp = f32[past_scores.sizes].Exp(score_shifted)
+    if past_mask is not None:
+        exp = attention.mask(
+            exp,
+            past_mask,
+            tp_degree=tp_degree,
+            shard_over_batch=shard_over_batch,
+            constant_value=0,
+        )
     zero = f32.Constant(constant_value=0)
     add_func = hlo.gen_add_func(f32)
     denom = f32[reduce_sizes].Reduce(exp, zero, dimensions=[3], to_apply=add_func)
     past_prob = dtype[exp.sizes].Convert(exp)
+
     reduce_max_bra = f32[active_score_sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
     active_score_shifted = f32[active_score_sizes].Subtract(active_score, reduce_max_bra)
     active_prob = f32[active_score_sizes].Exp(active_score_shifted)
+    if active_mask is not None:
+        active_prob = attention.mask(
+            active_prob,
+            active_mask,
+            tp_degree=tp_degree,
+            shard_over_batch=shard_over_batch,
+            constant_value=0,
+        )
     active_denom = f32[reduce_sizes].Reduce(active_prob, zero, dimensions=[3], to_apply=add_func)
     denom = f32[reduce_sizes].Add(denom, active_denom)
     active_prob = dtype[active_prob.sizes].Convert(active_prob)
@@ -818,13 +841,13 @@ def flash_attention(query, key, value):
     query_nki = hlo.reshape(hlo.permute(query, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
     key_nki = hlo.reshape(hlo.permute(key, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
     value_nki = hlo.reshape(hlo.permute(value, [1, 2, 0, 3]), (batch_size*n_q_heads_tp, n_active_tokens, d_head))
-    nki_output = nki_call(attention_utils.wrapper_flash_attention_bir, 
-                          query_nki, key_nki, value_nki, 
+    nki_output = nki_call(attention_utils.wrapper_flash_attention_bir,
+                          query_nki, key_nki, value_nki,
                           output_HloShapes=[query.dtype[batch_size*n_q_heads_tp, n_active_tokens, d_head]])
-    # kernel output (after separating batch and n heads dims) has shape: 
+    # kernel output (after separating batch and n heads dims) has shape:
     # (batch_size, n_q_heads_tp, n_active_tokens, d_head)
     # we permute it to (n_active_tokens, batch_size, n_q_heads_tp, d_head)
-    context = hlo.permute(hlo.reshape(nki_output, (batch_size, n_q_heads_tp, n_active_tokens, d_head)), 
+    context = hlo.permute(hlo.reshape(nki_output, (batch_size, n_q_heads_tp, n_active_tokens, d_head)),
                           [2, 0, 1, 3])
 
     return context
