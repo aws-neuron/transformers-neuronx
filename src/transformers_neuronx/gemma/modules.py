@@ -36,7 +36,7 @@ class GemmaModel(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
-        self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size, padding_idx=0) #changed for gemma
+        self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id) #added padding_idx for gemma
         self.layers = module.LowMemoryModuleList([GemmaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = GemmaRMSNorm(config)
 
@@ -71,7 +71,6 @@ class GemmaAttention(module.LowMemoryModule):
         self.k_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.v_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
         self.o_proj = module.LowMemoryLazyLinear(self.hidden_size, bias=False, dtype=dtype)
-        # self.rotary_emb = module.LowMemoryRotaryEmbedding(self.head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta)
 
 class GemmaMLP(module.LowMemoryModule):
 

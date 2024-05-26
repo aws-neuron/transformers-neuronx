@@ -218,6 +218,47 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
     return result
 
+def gemma_rms_norm(hidden, weight, eps=1e-6, dim=2):
+    # Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma/modeling_gemma.py#L95C1-L97C54
+
+    size = hidden.sizes
+    batch_dims = list(range(len(size)))
+    batch_dims.pop(dim)
+    batch_shapes = list(size)
+    batch_shapes.pop(dim)
+
+    # For batch == 1, token generation use triton implementation. The batch > 1
+    # context encoding implementation is in development
+    num_tokens = functools.reduce(operator.mul, batch_shapes, 1)
+    if num_tokens == 1:
+        return gemma_rms_norm_triton(hidden, weight, eps=eps, dim=dim)
+
+    dtype = hidden.dtype
+    scribe = hidden.scribe
+    f32 = scribe.f32
+
+    hidden = cast(hidden, f32)
+
+    square = multiply(hidden, hidden)
+    variance = reduce_mean(square, dim)
+    eps = full(eps, f32, batch_shapes)
+    mean_eps = add(variance, eps)
+    mean_rsqrt = rsqrt(mean_eps)
+    rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
+    scaled = multiply(hidden, rsqrt_br)
+
+    if weight is None:
+        scaled = cast(scaled, dtype)
+        return scaled
+    
+
+    weight = add(weight, 1)
+    weight = cast(weight, f32)
+    weight_br = broadcast(weight, size, [dim])
+    result = multiply(scaled, weight_br)
+    result = cast(result, dtype)
+
+    return result
 
 def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
 
@@ -229,6 +270,19 @@ def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
     f32 = scribe.f32
     hidden = cast(hidden, f32)
 
+    return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+
+def gemma_rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
+
+    dtype = hidden.dtype
+    shape = hidden.sizes
+    scribe = hidden.scribe
+    backend_config = str(dim).encode()
+    eps = hidden.scribe.f32.Constant(constant_value=eps)
+    f32 = scribe.f32
+    hidden = cast(hidden, f32)
+    weight = add(weight, 1)
+    
     return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
 
 
