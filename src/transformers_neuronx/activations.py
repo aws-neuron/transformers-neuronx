@@ -15,7 +15,7 @@
 import math
 
 def gelu_new(hidden):
-    return hidden.dtype[hidden.sizes].CustomCall(hidden, custom_call_target="AwsNeuronGelu")
+    return hidden.dtype[hidden.sizes].CustomCall(hidden, custom_call_target="AwsNeuronGeluApprxTanh")
 
 def gelu_new_legacy(hidden):
     dtype = hidden.dtype
