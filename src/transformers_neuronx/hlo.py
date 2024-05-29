@@ -1667,7 +1667,10 @@ def cumsum(tensor, dim):
 
 def _cumsum_fast(tensor, dim):
 
-    from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
+    try:
+        from neuronxcc.nki._private_kernels.cumsum import cumsum as nki_cumsum
+    except ImportError:
+        from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
 
     scribe = tensor.scribe
     last = len(tensor.sizes) - 1
