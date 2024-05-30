@@ -305,25 +305,18 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
     # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
-
-    batch_size, context_length = input_ids.shape
-    tokens = torch.empty((batch_size, sequence_length), dtype=input_ids.dtype)
-    tokens[:, :context_length] = input_ids
-
+    tokens = [input_ids]
     _, start_length = input_ids.shape
+
     if cache_ids is None:
         cache_ids = torch.as_tensor([start_length - 1], dtype=torch.int32)
     else:
         start_length = max(cache_ids.flatten()).item() + 1
 
-    current_tokens = tokens[:, :start_length]
-
     for current_length in range(start_length, sequence_length):
-        
-        if ngram_size:
-            next_token_scores = filter_ngrams(ngram_size, current_tokens, next_token_scores, current_length)
 
-        next_len = current_length + 1
+        if ngram_size:
+            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, current_length)
 
         if temperature != 1.0:
             next_token_scores /= temperature
@@ -343,12 +336,10 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # of eos_token_id.
 
         token = torch.where(done_flags.eq(True), eos_token_id, inputs)
-
-        tokens[:, current_length] = token.reshape([batch_size,])
-        current_tokens = tokens[:, :next_len]
+        tokens.append(token)
 
         if streamer is not None and hasattr(streamer, 'response_with_prefix') and streamer.response_with_prefix:
-             streamer.put(current_tokens)
+             streamer.put(torch.cat(tokens, dim=-1))
         elif streamer:
             streamer.put(token)
 
@@ -356,7 +347,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         if next_length > sequence_length or done_flags.all():
             break
 
-        if stopping_criteria_list(current_tokens, probs):
+        if stopping_criteria_list(input_ids, probs):
             break
 
         # forward pass to get next token
@@ -366,7 +357,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     if streamer:
         streamer.end()
 
-    return current_tokens
+    return torch.cat(tokens, dim=-1)
 
 
 @torch.no_grad()
@@ -395,4 +386,3 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
-
