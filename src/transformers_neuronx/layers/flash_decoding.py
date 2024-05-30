@@ -14,7 +14,6 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import utils
-from transformers_neuronx import constants
 from transformers_neuronx.layers import attention
 
 """
@@ -27,8 +26,11 @@ def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree):
     # Notice that this is not necessary for context encoding because we don't read from the KV cache
     cores_per_q_head = tp_degree // n_heads
     group_size = cores_per_kv_head // cores_per_q_head if cores_per_q_head else cores_per_kv_head
-    num_groups = tp_degree // group_size
-    replica_groups = utils.build_replica_groups(num_groups, group_size)
+    num_groups = tp_degree // group_size 
+    interleave=False
+    n_kv_heads = tp_degree // cores_per_kv_head
+    interleave = utils.is_attn_node_interleaved(n_heads, n_kv_heads, tp_degree)
+    replica_groups = utils.build_replica_groups(num_groups, group_size, interleave=interleave)
     # Query shape: n_active_tokens, n_seqs, n_heads_tp, d_head
     query = hlo.all_gather(query, 2, tp_degree, replica_groups)
     return query
@@ -60,14 +62,16 @@ def context(past_scores, active_score, past_values, active_values,
     # All cores that hold the KV cache for the same head should communicate here
     cores_per_kv_head = tp_degree // n_kv_heads
     if cores_per_kv_head > 1:
-        replica_groups = utils.build_replica_groups(num_groups=n_kv_heads,
-                                                    group_size=cores_per_kv_head)
+        group_size = cores_per_kv_head
+        num_groups = n_kv_heads
     else:
         # MHA case, assume all cores will have all heads in cache and kv sharded by seq
-        replica_groups = utils.build_replica_groups(num_groups=1, group_size=tp_degree)
-        cores_per_kv_head = tp_degree
-    replica_groups = utils.build_replica_groups(num_groups=n_kv_heads,
-                                                group_size=cores_per_kv_head)
+        num_groups = 1
+        group_size = tp_degree
+
+    interleave = utils.is_attn_node_interleaved(n_heads=n_heads, n_kv_heads=n_kv_heads,tp_degree=tp_degree)
+    replica_groups = utils.build_replica_groups(num_groups=num_groups,
+                                                group_size=group_size, interleave=interleave)
     # Upcast to f32 before computation
     past_scores = hlo.cast(past_scores, f32)
     active_score = hlo.cast(active_score, f32)
