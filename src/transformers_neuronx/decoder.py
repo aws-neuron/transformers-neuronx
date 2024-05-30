@@ -1192,6 +1192,14 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_weight = qkv_maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = qkv_maybe_pad(self.attn_q_bias, dim=0)
 
+            node_interleaving = False
+            if self.neuron_config.shard_over_sequence:
+                node_interleaving = utils.is_attn_node_interleaved(n_heads, self.n_kv_head, self.tp_degree)
+                if node_interleaving:
+                    replica_groups = utils.build_replica_groups(group_size=self.kv_replication,
+                                                                 num_groups=self.tp_degree//self.kv_replication, interleave=True)
+                    warnings.warn(f"[SOS] qkv node_inerleaving enabled with replica {replica_groups}")
+
             if n_kv_heads_padded != self.n_kv_head:
 
                 if n_kv_heads_padded % self.n_kv_head == 0:
@@ -1239,6 +1247,27 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_weight = qkv_maybe_pad(self.attn_v_weight, dim=1)
                 self.attn_v_bias = qkv_maybe_pad(self.attn_v_bias, dim=0)
 
+            def interleave_by_node(tensor, dim, n_nodes):
+                if tensor is None:
+                    return tensor
+                shape = tensor.shape
+                assert shape[dim] % n_nodes == 0 , f"cannot interleave across node for tensor shape {shape}"\
+                                                     f" and n_nodes {n_nodes}"
+                stride = constants.TRN1_WORLD_SIZE
+                view_shape = (stride, shape[0]//stride,shape[1]) if dim == 0 else (shape[0],stride, shape[1]//stride)
+                return (tensor.reshape(view_shape).permute(1, 0, 2).reshape(shape) if dim == 0 
+                                else tensor.reshape(view_shape).permute(0, 2, 1).reshape(shape))
+            
+            if node_interleaving:
+                n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE
+                self.attn_q_weight = interleave_by_node(self.attn_q_weight, dim=1, n_nodes=n_nodes)
+                self.attn_k_weight = interleave_by_node(self.attn_k_weight, dim=1, n_nodes=n_nodes)
+                self.attn_v_weight = interleave_by_node(self.attn_v_weight, dim=1, n_nodes=n_nodes)
+                self.attn_q_bias = interleave_by_node(self.attn_q_bias, dim=0, n_nodes=n_nodes)
+                self.attn_k_bias = interleave_by_node(self.attn_k_bias, dim=0, n_nodes=n_nodes)
+                self.attn_v_bias = interleave_by_node(self.attn_v_bias, dim=0, n_nodes=n_nodes)
+
+
             if self.neuron_config and self.neuron_config.fuse_qkv:
                 fused_qkv_weight = interleave_qkv(self.attn_q_weight, self.attn_k_weight, self.attn_v_weight, self.tp_degree, dim=1)
                 if self.attn_q_bias is not None:
@@ -1254,6 +1283,8 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_bias = None
             if self.attn_out_pad:
                 self.attn_out_weight = attn_out_maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
+            if node_interleaving:
+                self.attn_out_weight = interleave_by_node(self.attn_out_weight, dim=self.attn_out_sharding, n_nodes=n_nodes)
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
                 _, intermediate_size = self.mlp_in_weight.shape
