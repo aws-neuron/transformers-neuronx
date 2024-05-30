@@ -23,6 +23,9 @@ FUSED_QKV_TP_FACTOR = 3
 # KV sharding pad for flash decoding
 KV_SHARD_PAD = 128
 
+# Number of chips on Trn
+TRN1_WORLD_SIZE = 32
+
 # Layout for attention
 LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
