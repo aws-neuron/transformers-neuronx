@@ -14,7 +14,11 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from neuronxcc.nki.kernels.attention import flash_fwd, attention_isa_kernel
+from neuronxcc.nki.kernels.attention import flash_fwd
+try:
+    from neuronxcc.nki.kernels.attention import attention_isa_kernel
+except ImportError:
+    from neuronxcc.nki._private_kernels.attention import attention_isa_kernel
 from dataclasses import dataclass
 
 
