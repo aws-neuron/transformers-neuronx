@@ -511,7 +511,7 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
             # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
             hidden = dot10_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
 
-    is_bsh = not neuron_config or neuron_config.collectives_layout == LAYOUT_BSH
+    is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
     if is_bsh:
         # (b * s, h) => (b, s, h)
         hidden = reshape(hidden, (batch_size, n_active_tokens, hidden_size))
@@ -711,7 +711,7 @@ def gated_mlp(
         # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
         result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
 
-    is_bsh = not neuron_config or neuron_config.collectives_layout == LAYOUT_BSH
+    is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
     if is_bsh:
         # (b * s, h) => (b, s, h)
