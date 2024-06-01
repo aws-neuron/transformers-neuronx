@@ -38,7 +38,6 @@ class GemmaConfig:
         self.pad_token_id = config.pad_token_id #added for gemma
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
-        self.tie_word_embeddings = config.tie_word_embeddings #added for gemma
         self.max_position_embeddings = config.max_position_embeddings
         self.rms_norm_eps = config.rms_norm_eps
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)

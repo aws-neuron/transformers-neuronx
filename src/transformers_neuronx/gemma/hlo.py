@@ -51,10 +51,6 @@ class GemmaForSamplingNoEmbeddingHlo:
     def embedding(self, input_ids, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
-        # normalized for gemma
-        # hidden = hlo.multiply(hidden, self.config.hidden_size ** 0.5)
-        hidden_size = hlo.cast(self.config.hidden_size ** 0.5, dtype=hidden.dtype)
-        hidden = hlo.multiply(hidden, hidden_size)
         if self.config.hidden_size % self.config.tp_degree != 0:
             hidden = hlo.slice_along(hidden, dim=-1, limit=self.config.hidden_size, start=0)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
@@ -81,7 +77,7 @@ class GemmaForSamplingNoEmbeddingHlo:
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
+        ln_hidden = hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps, dim=0) #rms_norm needs w+1 for gemma
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
@@ -93,14 +89,14 @@ class GemmaForSamplingNoEmbeddingHlo:
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
-        norm_hidden = hlo.gemma_rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim)
+        norm_hidden = hlo.gemma_rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim) #rms_norm needs w+1 for gemma
         mlp_hidden = gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,
             in1_scales=in1_scales,
             out_scales=out_scales,
-            activation_function='gelu_new',
+            activation_function='gelu_new', #use gelu_new for gemma
             tp_degree=self.config.tp_degree,
             neuron_config=self.neuron_config
         )
@@ -108,7 +104,7 @@ class GemmaForSamplingNoEmbeddingHlo:
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
-        logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
+        logits = transformer.gemma_rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config) #use gemma_rms_norm in gemma_rms_lm_head
         if self.neuron_config.on_device_generation is not None:
             return generation.generate(logits, logits_indices,
                                        config=self.neuron_config.on_device_generation,

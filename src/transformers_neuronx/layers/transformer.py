@@ -186,6 +186,54 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
 
     return result
 
+def gemma_rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6, neuron_config=None):
+    """
+    Language model head with rms normalization.
+
+    Context encoding network:
+    n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
+    In this case we slice the hidden input and compute the next token logits only for the last context token.
+
+    Normal token gen network:
+    n_active_tokens will be 1 and return_all_outputs will be True.
+    No slicing required. Will return the next token logits for the current active token.
+
+    Speculative network:
+    n_active_tokens will be equal to "k" (k value is passed by user) and return_all_outputs will be True.
+    No slicing required. Will return next token logits for "k" active tokens.
+
+    Models: LLaMa.
+
+    logits = (rms_norm(H) @ W) + B
+    """
+    is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+    if is_bsh:
+        batch_size, n_active_tokens, hidden_size = hidden.sizes
+    else:
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
+    dtype = hidden.dtype
+
+    # Check and perform slicing if needed
+    if not return_all_outputs:
+        hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
+        n_active_tokens = 1
+
+    rms_hidden = hlo.gemma_rms_norm(hidden, rms_weight, eps) if is_bsh else hlo.gemma_rms_norm(hidden, rms_weight, eps, dim=0)
+    if is_bsh:
+        rms_hidden = hlo.transpose210(rms_hidden)
+    rms_hidden = hlo.reshape(rms_hidden, (hidden_size, n_active_tokens*batch_size))
+    logits = hlo.dot00(lm_head_weight, rms_hidden)
+    if lm_head_bias is not None:
+        lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
+        logits = dtype[logits.sizes].Add(logits, lm_head_bias)
+    vocab_size, _ = logits.sizes
+    result = hlo.reshape(logits, (vocab_size, n_active_tokens, batch_size))
+
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+        result = hlo.all_gather(result, 0, tp_degree)
+
+    return result
+
 def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
     is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
     if is_bsh:

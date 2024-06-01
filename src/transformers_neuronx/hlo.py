@@ -219,7 +219,7 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
     return result
 
 def gemma_rms_norm(hidden, weight, eps=1e-6, dim=2):
-    # Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma/modeling_gemma.py#L95C1-L97C54
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
 
     size = hidden.sizes
     batch_dims = list(range(len(size)))
@@ -250,15 +250,15 @@ def gemma_rms_norm(hidden, weight, eps=1e-6, dim=2):
     if weight is None:
         scaled = cast(scaled, dtype)
         return scaled
-    
 
-    weight = add(weight, 1)
     weight = cast(weight, f32)
     weight_br = broadcast(weight, size, [dim])
     result = multiply(scaled, weight_br)
+    result = add(result, scaled)
     result = cast(result, dtype)
 
     return result
+
 
 def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
 
@@ -281,10 +281,17 @@ def gemma_rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
     eps = hidden.scribe.f32.Constant(constant_value=eps)
     f32 = scribe.f32
     hidden = cast(hidden, f32)
-    weight = add(weight, 1)
-    
-    return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
 
+    scaled = dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+
+    weight = cast(weight, f32)
+    weight_br = broadcast(weight, shape, [dim])
+
+    scaled = divide(scaled, weight_br)
+    result = multiply(scaled, weight_br)
+    result = add(result, scaled)
+    result = cast(result, dtype)
+    return result
 
 def dot_general(lhs, rhs, dimension_numbers):
     # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral

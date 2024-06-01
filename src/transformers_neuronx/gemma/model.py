@@ -169,9 +169,6 @@ class GemmaForSampling(base.NeuronModelBase):
 
     def _compute_logits(self, input_ids, *rst):
         hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        # normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden.dtype)
-        # hidden = hidden * normalizer
-        # print("compute_logits_hidden", hidden)
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hidden.transpose(0, -1).contiguous()
         return self._forward(hidden, *rst)
@@ -183,7 +180,6 @@ class GemmaForSampling(base.NeuronModelBase):
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=inputs.dtype)
             inputs = inputs * normalizer
-            print("forward_inputs", inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, *rst)
@@ -209,9 +205,6 @@ class GemmaForSampling(base.NeuronModelBase):
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
-            # normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=inputs.dtype)
-            # inputs = inputs * normalizer
-            # print("speculative_forward_inputs", inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
         logits = model(inputs, *args)
@@ -219,7 +212,6 @@ class GemmaForSampling(base.NeuronModelBase):
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
         return logits
-
 
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
