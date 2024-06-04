@@ -382,7 +382,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         # serialization logic and will be compiled normally.
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
-            
+
         if self.neuron_config.shard_over_sequence:
             assert self.tp_degree%self.n_kv_head == 0, f"tp_degree {self.tp_degree} not divisble by n_kv_heads {self.n_kv_head} shard_over_sequence is not supported"
             self.kv_replication = self.tp_degree//self.n_kv_head
@@ -723,14 +723,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 cpu_tensor = ops.parallel_cpu(value)
                 for i in range(len(cpu_tensor)):
                     save_dict[f'{key}*{i}'] = cpu_tensor[i]
-        
+
         for i, param in enumerate(self.pre_layer_parameters):
             cpu_tensor = ops.parallel_cpu(param)
             for j in range(len(cpu_tensor)):
                 save_dict[f'pre_layer_parameter{i}*{j}'] = cpu_tensor[j]
-            
+
         save_file(save_dict, os.path.join(directory, 'DecoderLMHead.safetensors'))
-    
+
     def load_presharded_weights(self, ps_dir):
         with safe_open(os.path.join(ps_dir, f"DecoderLMHead.safetensors"), framework='pt') as f:
             lm_head_attr_names = get_attribute_names(f)
@@ -739,7 +739,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.format_pre_layer_parameters()
         self.format_ln_lm_head_params_and_generation_inputs()
         self.finish_program_setup()
-    
+
     def format_pre_layer_parameters(self):
         # deal with the pre_layer_parameters (decoder_lm_head only)
         i = 0
@@ -750,7 +750,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 break
             self.pre_layer_parameters.append(pre_layer_parameter)
             i+=1
-    
+
     def format_ln_lm_head_params_and_generation_inputs(self):
         ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight, self.lm_head_bias, self.logits_indices]
         generation_inputs = [self.top_k, self.top_p, self.temperature, self.top_p_min_tokens]
@@ -1306,9 +1306,9 @@ class DecoderLayer(torch.nn.Module):
                                                      f" and n_nodes {n_nodes}"
                 stride = constants.TRN1_WORLD_SIZE
                 view_shape = (stride, shape[0]//stride,shape[1]) if dim == 0 else (shape[0],stride, shape[1]//stride)
-                return (tensor.reshape(view_shape).permute(1, 0, 2).reshape(shape) if dim == 0 
+                return (tensor.reshape(view_shape).permute(1, 0, 2).reshape(shape) if dim == 0
                                 else tensor.reshape(view_shape).permute(0, 2, 1).reshape(shape))
-            
+
             if node_interleaving:
                 n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE
                 self.attn_q_weight = interleave_by_node(self.attn_q_weight, dim=1, n_nodes=n_nodes)
@@ -1464,7 +1464,7 @@ class DecoderLayer(torch.nn.Module):
 
         self.extra_parameters = extras
         self.init_caches()
-    
+
     def save_presharded_weights(self, directory):
         save_dict = {}
         for key, value in self.__dict__.items():
@@ -1472,7 +1472,7 @@ class DecoderLayer(torch.nn.Module):
                 cpu_tensor = ops.parallel_cpu(value)
                 for i in range(len(cpu_tensor)):
                     save_dict[f'{key}*{i}'] = cpu_tensor[i]
-        
+
         for i, param in enumerate(self.extra_parameters):
             if param is None:
                 # save an empty tensor
@@ -1481,11 +1481,11 @@ class DecoderLayer(torch.nn.Module):
                 cpu_tensor = ops.parallel_cpu(param)
             for j in range(len(cpu_tensor)):
                 save_dict[f'extra_parameter{i}*{j}'] = cpu_tensor[j]
-            
+
         save_file(save_dict, os.path.join(directory, f"decoder_layer_{self.layer_num}.safetensors"))
-    
+
     def load_presharded_weights(self, ps_dir):
-        # only need to get names for first layer  
+        # only need to get names for first layer
         with safe_open(os.path.join(ps_dir, f"decoder_layer_{self.layer_num}.safetensors"), framework='pt') as f:
             layer_attr_names = get_attribute_names(f)
             presharded_weights_to_neuron(f, self, layer_attr_names)
@@ -1884,22 +1884,24 @@ class DecoderProgram:
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
 
     def inputs_host_to_device(self, input_tensors, batch_size):
-        # This means there is a separate neff for embedding so the inputs will be the input_ids
-        def process_input_tensor(tensor, idx):
+
+        def process_input_tensors(tensor, idx):
+            # process input_ids
             if idx == 0 and self.neuron_config.sequence_parallel_norm:
                 n_active_tokens = tensor.shape[1]
                 if n_active_tokens > self.neuron_config.sequence_parallel_norm_threshold:
                     return self.manipulator.shard_along_on_cpu(tensor, 1)
-
+            # handle the rest of the inputs
             return self.manipulator.duplicate_on_cpu(tensor)
 
+        # This means there is a separate neff for embedding so the inputs will be the input_ids
         if self.neuron_config.on_device_embedding and isinstance(self, DecoderProgramMultiLayer):
             input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
         else:
             input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
         for idx, (buf, tensor) in enumerate(zip(input_buffers, input_tensors)):
             tensor = tensor.to(buf.dtype)
-            tensor = process_input_tensor(tensor, idx)
+            tensor = process_input_tensors(tensor, idx)
             assert buf.shape == tensor[0].shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor[0].shape}) have different shapes!"
             ops.parallel_write(buf, tensor)
 
@@ -2408,7 +2410,7 @@ def presharded_weights_to_neuron(safetensors_file, decoder_layer_or_head, attr_n
         while True:
             if f"{attr_name}*{i}" not in safetensors_file.keys():
                 break
-            shards.append(safetensors_file.get_tensor(f"{attr_name}*{i}"))                        
+            shards.append(safetensors_file.get_tensor(f"{attr_name}*{i}"))
             i+=1
         if all([torch.numel(shard) == 0 for shard in shards]):
             setattr(decoder_layer_or_head, attr_name, 'None')
@@ -2420,7 +2422,7 @@ def get_attribute_names(safetensors_file):
     for key in safetensors_file.keys():
         attr_name, shard_id = key.split('*')
         attr_names.add(attr_name)
-    
+
     return attr_names
 
 
