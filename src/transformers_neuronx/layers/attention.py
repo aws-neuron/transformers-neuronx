@@ -805,7 +805,7 @@ def output(
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
     if neuron_config.is_sequence_parallel:
-        result = hlo.reduce_scatter(result, dim=1, replica_groups=replica_groups, to_apply=hlo.gen_add_func(result.dtype), dtype=dtype)
+        result = hlo.reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
     else:
         result = hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
@@ -851,4 +851,3 @@ def flash_attention(query, key, value):
                           [2, 0, 1, 3])
 
     return context
-
