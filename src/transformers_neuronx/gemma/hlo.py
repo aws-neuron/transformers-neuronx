@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import functools
+import operator
 from typing import Optional
 
 from transformers_neuronx import hlo
@@ -20,6 +22,116 @@ from transformers_neuronx.gemma.config import GemmaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx import constants
+
+def gemma_rms_norm(hidden, weight, eps=1e-6, dim=2):
+    # Reference: https://github.com/huggingface/transformers/blob/v4.29.2/src/transformers/models/t5/modeling_t5.py#L238-L260
+
+    size = hidden.sizes
+    batch_dims = list(range(len(size)))
+    batch_dims.pop(dim)
+    batch_shapes = list(size)
+    batch_shapes.pop(dim)
+
+    # For batch == 1, token generation use triton implementation. The batch > 1
+    # context encoding implementation is in development
+    num_tokens = functools.reduce(operator.mul, batch_shapes, 1)
+    if num_tokens == 1:
+        return gemma_rms_norm_triton(hidden, weight, eps=eps, dim=dim)
+
+    dtype = hidden.dtype
+    scribe = hidden.scribe
+    f32 = scribe.f32
+
+    hidden = hlo.cast(hidden, f32)
+
+    square = hlo.multiply(hidden, hidden)
+    variance = hlo.reduce_mean(square, dim)
+    eps = hlo.full(eps, f32, batch_shapes)
+    mean_eps = hlo.add(variance, eps)
+    mean_rsqrt = hlo.rsqrt(mean_eps)
+    rsqrt_br = hlo.broadcast(mean_rsqrt, size, batch_dims)
+    scaled = hlo.multiply(hidden, rsqrt_br)
+
+    if weight is None:
+        scaled = hlo.cast(scaled, dtype)
+        return scaled
+
+    weight = hlo.cast(weight, f32)
+    weight_br = hlo.broadcast(weight, size, [dim])
+    result = hlo.multiply(scaled, weight_br)
+    result = hlo.add(result, scaled)
+    result = hlo.cast(result, dtype)
+
+    return result
+
+def gemma_rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
+
+    dtype = hidden.dtype
+    shape = hidden.sizes
+    scribe = hidden.scribe
+    backend_config = str(dim).encode()
+    eps = hidden.scribe.f32.Constant(constant_value=eps)
+    f32 = scribe.f32
+    hidden = hlo.cast(hidden, f32)
+
+    scaled = dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+
+    weight = hlo.cast(weight, f32)
+    weight_br = hlo.broadcast(weight, shape, [dim])
+
+    scaled = hlo.divide(scaled, weight_br)
+    result = hlo.multiply(scaled, weight_br)
+    result = hlo.add(result, scaled)
+    result = hlo.cast(result, dtype)
+    return result
+
+def gemma_rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs=True, eps=1e-6, neuron_config=None):
+    """
+    Language model head with rms normalization.
+
+    Context encoding network:
+    n_active_tokens will be equal to context_length_estimate and return_all_outputs will be False.
+    In this case we slice the hidden input and compute the next token logits only for the last context token.
+
+    Normal token gen network:
+    n_active_tokens will be 1 and return_all_outputs will be True.
+    No slicing required. Will return the next token logits for the current active token.
+
+    Speculative network:
+    n_active_tokens will be equal to "k" (k value is passed by user) and return_all_outputs will be True.
+    No slicing required. Will return next token logits for "k" active tokens.
+
+    Models: LLaMa.
+
+    logits = (rms_norm(H) @ W) + B
+    """
+    is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
+    if is_bsh:
+        batch_size, n_active_tokens, hidden_size = hidden.sizes
+    else:
+        hidden_size, n_active_tokens, batch_size = hidden.sizes
+    dtype = hidden.dtype
+
+    # Check and perform slicing if needed
+    if not return_all_outputs:
+        hidden = transformer._dynamic_logits_slice(hidden, last_token_id, neuron_config)
+        n_active_tokens = 1
+
+    rms_hidden = gemma_rms_norm(hidden, rms_weight, eps) if is_bsh else gemma_rms_norm(hidden, rms_weight, eps, dim=0)
+    if is_bsh:
+        rms_hidden = hlo.transpose210(rms_hidden)
+    rms_hidden = hlo.reshape(rms_hidden, (hidden_size, n_active_tokens*batch_size))
+    logits = hlo.dot00(lm_head_weight, rms_hidden)
+    if lm_head_bias is not None:
+        lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
+        logits = dtype[logits.sizes].Add(logits, lm_head_bias)
+    vocab_size, _ = logits.sizes
+    result = hlo.reshape(logits, (vocab_size, n_active_tokens, batch_size))
+
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+        result = hlo.all_gather(result, 0, tp_degree)
+
+    return result
 
 class GemmaForSamplingNoEmbeddingHlo:
 
@@ -77,7 +189,7 @@ class GemmaForSamplingNoEmbeddingHlo:
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.gemma_rms_norm(hidden, pre_attn_ln_weight, eps, dim=0) #rms_norm needs w+1 for gemma
+        ln_hidden = gemma_rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else gemma_rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
@@ -89,14 +201,14 @@ class GemmaForSamplingNoEmbeddingHlo:
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
-        norm_hidden = hlo.gemma_rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim) #rms_norm needs w+1 for gemma
+        norm_hidden = gemma_rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim)
         mlp_hidden = gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,
             in0_scales=in0_scales,
             in1_scales=in1_scales,
             out_scales=out_scales,
-            activation_function='gelu_new', #use gelu_new for gemma
+            activation_function='gelu_new',
             tp_degree=self.config.tp_degree,
             neuron_config=self.neuron_config
         )
@@ -104,7 +216,7 @@ class GemmaForSamplingNoEmbeddingHlo:
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
-        logits = transformer.gemma_rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config) #use gemma_rms_norm in gemma_rms_lm_head
+        logits = gemma_rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
         if self.neuron_config.on_device_generation is not None:
             return generation.generate(logits, logits_indices,
                                        config=self.neuron_config.on_device_generation,
