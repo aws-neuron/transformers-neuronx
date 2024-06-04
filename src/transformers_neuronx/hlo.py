@@ -218,6 +218,7 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2):
 
     return result
 
+
 def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
 
     dtype = hidden.dtype
@@ -229,6 +230,7 @@ def rms_norm_triton(hidden, weight, eps=1e-6, dim=2):
     hidden = cast(hidden, f32)
 
     return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+
 
 def dot_general(lhs, rhs, dimension_numbers):
     # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
