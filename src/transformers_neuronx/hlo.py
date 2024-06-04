@@ -81,47 +81,55 @@ def batch_norm(tensor, feature_index, epsilon=1e-5):
     return bn_tuple
 
 
-def layer_norm(hidden, weight, bias):
+def layer_norm(hidden, weight, bias, neuron_config=None, tp_degree=None):
     scribe = hidden.scribe
     dtype = hidden.dtype
     f32 = scribe.f32
     hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
     norm_size = n_active_tokens * batch_size
     sizes = hidden_size, norm_size
-    hidden = dtype[sizes].Reshape(hidden)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = reshape(hidden, sizes)
+    hidden = cast(hidden, f32)
     bn_tuple = batch_norm(hidden, feature_index=1)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-    weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
-    output = f32[sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
-    output = f32[sizes].Add(output, bias_br)
-    output = dtype[sizes].Convert(output)
-    output = dtype[input_sizes].Reshape(output)
+    weight_br = broadcast(weight, sizes, [0])
+    output = multiply(bn_output, weight_br)
+    bias_br = broadcast(bias, sizes, [0])
+    output = add(output, bias_br)
+    output = cast(output, dtype)
+    output = reshape(output, input_sizes)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 1, tp_degree, replica_groups=None)
+
     return output
 
 
-def layer_norm_bsh(hidden, weight, bias):
+def layer_norm_bsh(hidden, weight, bias, neuron_config=None, tp_degree=None):
     scribe = hidden.scribe
     dtype = hidden.dtype
     f32 = scribe.f32
     batch_size, n_active_tokens, hidden_size = input_sizes = hidden.sizes
     norm_size = n_active_tokens * batch_size
     sizes = norm_size, hidden_size
-    hidden = dtype[sizes].Reshape(hidden)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = reshape(hidden, sizes)
+    hidden = cast(hidden, f32)
     bn_tuple = batch_norm(hidden, feature_index=0)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-    weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
-    output = f32[sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[sizes].Broadcast(bias, dimensions=[1])
-    output = f32[sizes].Add(output, bias_br)
-    output = dtype[sizes].Convert(output)
-    output = dtype[input_sizes].Reshape(output)
+    weight_br = broadcast(weight, sizes, [1])
+    output = multiply(bn_output, weight_br)
+    bias_br = broadcast(bias, sizes, [1])
+    output = add(output, bias_br)
+    output = cast(output, dtype)
+    output = reshape(output, input_sizes)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 0, tp_degree, replica_groups=None)
+
     return output
 
 
-def group_norm(hidden, weight, bias, num_groups = 1):
+def group_norm(hidden, weight, bias, num_groups=1, neuron_config=None, tp_degree=None):
     """
     Perform GroupNorm on input with shape (H, S, B).
     """
@@ -164,6 +172,10 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     bias_br = broadcast(bias, input_sizes, broadcast_dimensions=[0])
     output = add(output, bias_br)
     output = cast(output, dtype)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 1, tp_degree, replica_groups=None)
+
     return output
 
 
@@ -467,8 +479,11 @@ def get_activation(activation_function: Union[str, Callable]) -> Callable:
     return activation
 
 
-def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
+def mlp(hidden, in_weight, in_bias, out_weight, out_bias,
+        activation_function, tp_degree,
+        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None,
+        neuron_config=None, transposed=False,
+):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
@@ -531,13 +546,20 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         hidden = reshape(hidden, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if neuron_config is not None and neuron_config.is_sequence_parallel:
+        hidden = reduce_scatter_sum(hidden, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+    else:
+        hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+
     # Transpose back to HSB if applicable
     return permute(hidden, (2, 1, 0)) if is_bsh else hidden
 
 
-def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
+def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias,
+            activation_function, tp_degree,
+            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None,
+            neuron_config=None, transposed=False,
+):
     # single:
     #   hidden: [b, a, h]
     #   in_weight: [h, 4h]
@@ -587,7 +609,12 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     hidden = reshape(hidden, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    return all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if neuron_config is not None and neuron_config.is_sequence_parallel:
+        hidden = reduce_scatter_sum(hidden, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+    else:
+        hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+
+    return hidden
 
 
 def gated_mlp_bsh(
@@ -656,9 +683,10 @@ def gated_mlp_bsh(
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-        if neuron_config.is_sequence_parallel:
-            return reduce_scatter(result, dim=1, replica_groups=replica_groups, to_apply=gen_add_func(result.dtype), dtype=dtype)
-        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+        if neuron_config is not None and neuron_config.is_sequence_parallel:
+            result = reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+        else:
+            result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
     return result
 
 
@@ -745,9 +773,10 @@ def gated_mlp(
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-        if neuron_config.is_sequence_parallel:
-            return reduce_scatter(result, dim=1, replica_groups=replica_groups, to_apply=gen_add_func(result.dtype), dtype=dtype)
-        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+        if neuron_config is not None and neuron_config.is_sequence_parallel:
+            result = reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+        else:
+            result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return permute(result, (2, 1, 0)) if is_bsh else result
@@ -2536,6 +2565,26 @@ def reduce_scatter(tensor, dim, replica_groups, to_apply, dtype=None):
     output = all_reduce_dtype[size].ReduceScatter(tensor,  dimensions = [dim],
                                         replica_groups = replica_groups, to_apply=to_apply)
     return output
+
+
+def reduce_scatter_sum(tensor, tp_degree, dim, dtype=None, replica_groups=None):
+
+    if tp_degree == 1:
+        return tensor
+
+    to_apply = gen_add_func(tensor.dtype)
+
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+
+    return reduce_scatter(
+        tensor,
+        dim=dim,
+        replica_groups=replica_groups,
+        to_apply=to_apply,
+        dtype=dtype,
+    )
+
 
 def sin(tensor):
     sizes = tensor.sizes

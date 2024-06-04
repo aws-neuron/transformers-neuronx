@@ -65,7 +65,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
             hidden_sizes = batch_size, n_active_tokens, hidden_size
         else: # HASB LAyout
             hidden_sizes = hidden_size, n_active_tokens, batch_size
-    
+
     if neuron_config.is_sequence_parallel:
         hidden_sizes = list(hidden_sizes)
         hidden_sizes[1] = hidden_sizes[1] // tp_degree
@@ -96,8 +96,8 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         0 if cache_2d else None   # last_token_id | Scalar, no slicing required
     )
 
-    inputs = (hidden, cache_ids, start_ids, last_token_id)
     return (hidden, cache_ids, start_ids, last_token_id), sequence_slice_dimensions
+
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
@@ -124,23 +124,28 @@ def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head
         batch_size, n_active_tokens, hidden_size = hidden.sizes
     else:
         hidden_size, n_active_tokens, batch_size = hidden.sizes
-    dtype = hidden.dtype
+
+    if neuron_config is not None and neuron_config.is_sequence_parallel:
+        hidden = hlo.all_gather(hidden, 1, tp_degree)
 
     # Check and perform slicing if needed
     if not return_all_outputs:
         hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
         n_active_tokens = 1
 
-    ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias) if is_bsh else hlo.layer_norm(hidden, ln_f_weight, ln_f_bias)
     if is_bsh:
+        ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias, neuron_config=None, tp_degree=tp_degree)
         ln_hidden = hlo.transpose210(ln_hidden)
-    ln_hidden = dtype[hidden_size,n_active_tokens*batch_size].Reshape(ln_hidden)
+    else:
+        ln_hidden = hlo.layer_norm(hidden, ln_f_weight, ln_f_bias, neuron_config=None, tp_degree=tp_degree)
+    ln_hidden = hlo.reshape(ln_hidden, shape=(hidden_size, n_active_tokens * batch_size))
+
     logits = hlo.dot00(lm_head_weight, ln_hidden)
     if lm_head_bias is not None:
-        lm_head_bias = dtype[logits.sizes].Broadcast(lm_head_bias, dimensions=[0])
-        logits = dtype[logits.sizes].Add(logits, lm_head_bias)
+        lm_head_bias = hlo.broadcast(lm_head_bias, out_dim_size=logits.sizes, broadcast_dimensions=[0])
+        logits = hlo.add(logits, lm_head_bias)
     vocab_size, _ = logits.sizes
-    result = dtype[vocab_size,n_active_tokens,batch_size].Reshape(logits)
+    result = hlo.reshape(logits, shape=(vocab_size, n_active_tokens, batch_size))
 
     if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
         result = hlo.all_gather(result, 0, tp_degree)
@@ -174,10 +179,10 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     else:
         hidden_size, n_active_tokens, batch_size = hidden.sizes
     dtype = hidden.dtype
-	
+
     if neuron_config.is_sequence_parallel:
         hidden = hlo.all_gather(hidden, 1, tp_degree)
- 
+
     # Check and perform slicing if needed
     if not return_all_outputs:
         hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
@@ -199,6 +204,7 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
         result = hlo.all_gather(result, 0, tp_degree)
 
     return result
+
 
 def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
     is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
@@ -228,5 +234,3 @@ def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
         hidden = hlo.index_select(hidden, dim=0, index=last_token_id)
         hidden = hlo.transpose102(hidden)
     return hidden
-
-
