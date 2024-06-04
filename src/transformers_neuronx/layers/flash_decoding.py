@@ -68,6 +68,7 @@ def context(past_scores, active_score, past_values, active_values,
         # MHA case, assume all cores will have all heads in cache and kv sharded by seq
         num_groups = 1
         group_size = tp_degree
+        cores_per_kv_head = tp_degree
 
     interleave = utils.is_attn_node_interleaved(n_heads=n_heads, n_kv_heads=n_kv_heads,tp_degree=tp_degree)
     replica_groups = utils.build_replica_groups(num_groups=num_groups,
