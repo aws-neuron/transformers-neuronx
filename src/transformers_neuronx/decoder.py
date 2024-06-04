@@ -1500,7 +1500,7 @@ class DecoderLayer(torch.nn.Module):
         while True:
             extra_param = getattr(self, f"extra_parameter{i}", None)
             if extra_param is not None:
-                if extra_param is 'None':
+                if extra_param == 'None':
                     self.extra_parameters.append(None)
                 else:
                     self.extra_parameters.append(extra_param)
