@@ -462,13 +462,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return input_ids, cache_ids_pad, seq_ids
 
         # token generation
-        full_input_ids = torch.zeros(batch_size, 1, dtype=torch.int32)
-        full_cache_ids = torch.zeros(batch_size, 1, dtype=torch.int32)
+        full_input_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype)
+        full_cache_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype)
         full_seq_ids = torch.arange(batch_size, dtype=torch.int32)
-        for idx, seq_id in enumerate(seq_ids.flatten()):
-            seq_id = seq_id.item()
-            full_input_ids[seq_id, :] = input_ids[idx, :]
-            full_cache_ids[seq_id, :] = cache_ids[idx, :]
+
+        seq_ids_int64 = seq_ids.unsqueeze(-1).to(torch.int64)
+        full_input_ids.scatter_(dim=0, index=seq_ids_int64, src=input_ids)
+        full_cache_ids.scatter_(dim=0, index=seq_ids_int64, src=cache_ids)
 
         return full_input_ids, full_cache_ids, full_seq_ids
 
@@ -513,7 +513,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if torch.equal(seq_ids, torch.arange(input_batch_size)):
             logits = logits[:input_batch_size]
         else:
-            logits = logits[seq_ids]
+            logits = logits[seq_ids.to(torch.long)]
 
         return logits
 
