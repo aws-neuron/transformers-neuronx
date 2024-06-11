@@ -2525,7 +2525,10 @@ def reshape(tensor, shape):
     )
     return tensor.dtype[shape].Reshape(tensor)
 
-
+def get_hlo_scalar_by_index(tensor, index):
+    assert index < tensor.sizes[0]
+    return reshape(slice_along(tensor, 0, start=index, limit=index+1), [])
+    
 def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
     operand_rank = len(operands.sizes)
     index_vector_dim = scatter_dims.get("index_vector_dim", [])
