@@ -31,7 +31,7 @@ from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx import global_debugger
 from transformers_neuronx.layers import generation
-from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.config import NeuronConfig, GenerationConfig
 from transformers_neuronx.utils import interleave_qkv
 
 from safetensors.torch import save_file
@@ -327,6 +327,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.lm_head_bias = bias
 
     def to_neuron(self):
+        # validate on device generation params
+        if self.neuron_config.on_device_generation:
+            self.validate_generation_configs(self.neuron_config.on_device_generation)
+
         manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
 
         extras = []
@@ -916,7 +920,50 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def get_all_kernels(self):
         return self.program.get_kernels()
 
+    def validate_generation_configs(self, generation_config: GenerationConfig):       
+        current_generation_config = self.neuron_config.on_device_generation
+        if  current_generation_config:
+            assert generation_config.per_batch_line == current_generation_config.per_batch_line, f"Invalid new generation config. \n \
+            Recieved new generation config with per_batch_line = {generation_config.per_batch_line},\n \
+            while current generation config has per_batch_line = {current_generation_config.per_batch_line}"
+
+        batch_size = self.batch_size if isinstance(self.batch_size,int) else self.batch_size[0]
+
+        if generation_config.per_batch_line:
+            if not isinstance(generation_config.top_k, list):
+                generation_config.top_k = [generation_config.top_k] * batch_size
+            
+            if not isinstance(generation_config.top_p, list):
+                generation_config.top_p = [generation_config.top_p] * batch_size
+            
+            if not isinstance(generation_config.temperature, list):
+                generation_config.temperature = [generation_config.temperature] * batch_size
+            
+            if not isinstance(generation_config.top_p_min_tokens, list):
+                generation_config.top_p_min_tokens = [generation_config.top_p_min_tokens] * batch_size
+
+            # check all sampling parameters lists are of same size
+        
+            assert len(generation_config.top_k) \
+                   == len(generation_config.top_p) \
+                   == len(generation_config.temperature)  \
+                   == len(generation_config.top_p_min_tokens)  \
+                   == batch_size, f"For per batch-line sampling, sampling parameters top_k, top_p, \
+                   top_p_min_tokens, temperature must be of same size as bach_size. \n \
+                   Recieved len(top_k):  {len(generation_config.top_k)} \n \
+                   len(top_p): {len(generation_config.top_p)} \n \
+                   len(top_p_min_tokens): {len(generation_config.top_p_min_tokens)} \n \
+                   len(temperature): {len(generation_config.temperature)} \n \
+                   batch_size: {batch_size}"
+        else:
+            assert not isinstance(generation_config.top_k, list) \
+               and not isinstance(generation_config.top_p, list) \
+               and not isinstance(generation_config.top_p_min_tokens, list) \
+               and not isinstance(generation_config.temperature, list) \
+               , f"Sampling parameters cannot be of type list when per_batch_line = False"
+
     def update_generation_config(self, generation_config: config.GenerationConfig):
+        self.validate_generation_configs(generation_config)
         num_cores = self.neuron_config.get_local_tp(self.tp_degree)
         duplicate = lambda tensor: [torch.tensor(tensor) for _ in range(num_cores)]
         ops.parallel_write(self.top_k, duplicate(generation_config.top_k))

@@ -57,6 +57,7 @@ class ContinuousBatchingConfig:
         self.batch_size_for_shared_caches = batch_size_for_shared_caches
 
 
+
 class GenerationConfig:
 
     def __init__(self, *,
@@ -70,15 +71,17 @@ class GenerationConfig:
         temperature = 1.0,      # Default: No temperature application
         dynamic = False,        # Default: Do not support changing generation config at runtime
         deterministic = False,  # Default: Do not use a constant 0.5 as token acceptance threshold during sampling
+        per_batch_line = False, # Default: Do not use different sampling paramerters for each batch line
     ):
         self.max_length = max_length
         self.do_sample = do_sample
+        self.per_batch_line = per_batch_line
         self.top_k = top_k
-        self.top_p = float(top_p)
+        self.top_p = float(top_p) if not isinstance(top_p, list) else self._convert_list_to_float(top_p)
+        self.temperature = float(temperature) if not isinstance(temperature, list) else self._convert_list_to_float(temperature)
         self.top_p_min_tokens = top_p_min_tokens
         self.global_top_k = global_top_k
         self.eos_token_id = eos_token_id
-        self.temperature = float(temperature)
         self.dynamic = dynamic
         self.deterministic = deterministic
 
@@ -86,7 +89,9 @@ class GenerationConfig:
         if not isinstance(value, GenerationConfig):
             return False
         return self.__dict__ == value.__dict__
-
+    
+    def _convert_list_to_float(self, params):
+        return [float(p) for p in params]
 
 valid_dtypes = [
     "float32",
