@@ -32,7 +32,7 @@ class MixtralForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
-                 neuron_config=None, **kwargs):
+                 neuron_config=NeuronConfig(), **kwargs):
         config = MixtralConfig(config, n_positions, batch_size, amp, tp_degree)
         super().__init__(MixtralForCausalLM, config)
 
@@ -63,11 +63,8 @@ class MixtralForSampling(base.NeuronModelBase):
             unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
-        self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
-        self.decoder_lm_head= self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
-
-        # Track number of processed tokens for sliding window attention
-        self.num_processed_tokens = 0
+        self.decoder_lm_head = self.decoder_param_set.init_token_decoder(unroll=self.unroll, buckets=self.token_buckets, model_obj=self)
+        self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
 
     def load_weights(self):
         self.materialize_embeddings()
@@ -122,12 +119,11 @@ class MixtralForSampling(base.NeuronModelBase):
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
-        if self.neuron_config and self.neuron_config.on_device_embedding:
+        if self.neuron_config.on_device_embedding:
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
-        
         self.init_rest_of_model()
 
     def materialize_embeddings(self):
@@ -136,6 +132,7 @@ class MixtralForSampling(base.NeuronModelBase):
     
     def init_rest_of_model(self):
         self.decoder_lm_head.use_executor = True
+
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.context_batch_sizes:
@@ -149,22 +146,14 @@ class MixtralForSampling(base.NeuronModelBase):
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
-        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
-        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
-
         inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        _, _, last_token_id = rst  # To avoid overriding start_ids input.
-        rst.append(curr_window_start)
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
-                inputs = inputs.permute(2, 1, 0).contiguous()
-
+                inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
 
-        # Increment the token counter, last_token_id = 0 when in decoder mode
-        self.num_processed_tokens += (last_token_id+1)
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
