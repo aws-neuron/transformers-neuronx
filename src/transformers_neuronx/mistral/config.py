@@ -42,7 +42,7 @@ class MistralConfig:
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
-        self.window_size = getattr(config, "sliding_window", None)
+        self.sliding_window = getattr(config, "sliding_window", None)
 
         utils.maybe_override_attributes(self, kwargs)
 
