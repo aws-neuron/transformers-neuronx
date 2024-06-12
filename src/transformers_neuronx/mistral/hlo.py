@@ -37,10 +37,9 @@ class MistralForSamplingNoEmbeddingHlo:
         tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
-        return (*tensors, curr_window_start), (*dims, None)
+        return tensors, dims
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, embed_weight):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -49,7 +48,7 @@ class MistralForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(
             hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
@@ -58,10 +57,10 @@ class MistralForSamplingNoEmbeddingHlo:
         )
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
                                                last_token_id=last_token_id, neuron_config=self.neuron_config)
-        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
-            self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             fused_pre_attn_ln_qkv_weight,
@@ -82,7 +81,7 @@ class MistralForSamplingNoEmbeddingHlo:
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, curr_window_start, cache_ids, start_ids, pos_embed, mask, active_mask,
+            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
@@ -112,7 +111,7 @@ class MistralForSamplingNoEmbeddingHlo:
 
     def attention(
         self,
-        hidden, curr_window_start, cache_ids, start_ids, pos_embed, mask, active_mask,
+        hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -143,9 +142,9 @@ class MistralForSamplingNoEmbeddingHlo:
         if n_active_tokens == 1:
             sparse_mask = None
         else:
-            if self.config.window_size:
+            if self.config.sliding_window:
                 # Generate sliding-window mask
-                sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.window_size, causal=True)
+                sparse_mask = build_sliding_window_mask(n_active_tokens, n_positions, self.config.sliding_window, causal=True)
                 sparse_mask = hlo.literal(mask.scribe.pred, sparse_mask)
             else:
                 sparse_mask = None
@@ -198,16 +197,11 @@ class MistralForSamplingNoEmbeddingHlo:
             # Since GPT uses left padding, we always pick the right-most side of the KV cache
             # KV cache layout: (n_positions, bs, n_heads, head_size)
             # Mask layout: (bs, n_active_tokens, n_positions)
-            useful_cached_keys = cached_keys
-            useful_cached_values = cached_values
-            useful_mask = mask
 
-            if self.config.window_size:
-                if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
-                    curr_window_start_scalar = hlo.reshape(curr_window_start, [])
-                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
-                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
-                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start_scalar, size=self.config.window_size)
+            if self.config.sliding_window:
+                useful_cached_keys, useful_cached_values, useful_mask = hlo.sliding_window_slice(cached_keys, cached_values, mask, cache_ids, self.config.sliding_window, n_positions, self.neuron_config.cache_layout, self.neuron_config.lhs_aligned)
+            else:
+                useful_cached_keys, useful_cached_values, useful_mask = cached_keys, cached_values, mask
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,
@@ -235,7 +229,7 @@ class MistralForSamplingNoEmbeddingHlo:
             score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
                                     tp_degree=tp_degree, neuron_config=self.neuron_config)
             score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=shard_over_batch)
-            if self.config.window_size:
+            if self.config.sliding_window:
                 score = attention.sparse_attn_mask(score, sparse_mask)
             context = attention.context_combined(score, value, sparse_mask=sparse_mask, n_kv_heads=self.config.num_key_value_heads,
                                                  tp_degree=tp_degree, neuron_config=self.neuron_config)

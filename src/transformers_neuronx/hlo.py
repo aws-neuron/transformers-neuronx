@@ -3739,3 +3739,173 @@ def diff(tensor, dim):
     b = slice_along(tensor, dim, limit=o_sizes[dim], start=1)
     output = subtract(b, a)
     return output
+
+
+def get_window_indices_from_cache_ids(cache_ids, window_size, n_positions):
+    """
+    Get the sliding-window indices from cache_ids
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    Given a cache_id, the indices would be [cache_id-(w-1), cache_id-(w-2), ..., cache_id-1], w is the window size
+    When cache_id < w-1, the indices would be [0, 1, ..., w-2], we rely on the attention mask to remove the cache with indices of [cache_id, ..., w-1]
+    Arguments:
+        cache_ids: shape (b, s), b is batch size, s is the number of active tokens, s = 1 in token generation
+        window_size: window size in sliding-window attention
+        n_positions: sequence length of k/v cache
+    Return:
+        indices: indices for element in k/v cache corresponding to the sliding window, shape (b, w-1)
+    Example:
+        Denote n as n_positions and w as window_size
+        cache_ids = [[5], [15], [35]], batch size is 3
+        window_size = 8
+        indices = [[0, 1, ..., 6],
+                    [8+n, 9+n, ..., 14+n],
+                    [28+2n, 29+2n, ..., 34+2n]]
+    """
+    dtype = cache_ids.dtype
+    b, s = cache_ids.sizes # s = 1 for token generation
+    sizes = (b, window_size-1)
+
+    # generate matrix of shape (b, w-1)
+    #  [[0, 0, ..., 0],
+    #   [n, n, ..., n],
+    #   [2n, 2n, ..., 2n]]
+    offset = iota(dtype, sizes, [0])
+    offset = multiply(offset, n_positions)
+
+    # cacluate win_start from cache_ids and then broadcast to shape (b, w)
+    # cache_ids = [[5], [15], [35]]
+    # window_size = 8
+    # win_start = [[0], [8], [28]]
+    # after broadcast
+    #  [[0, 0, ..., 0],
+    #   [8, 8, ..., 8],
+    #   [28, 28, ..., 28]]
+    win_start = subtract(cache_ids, window_size-1)
+    win_start = maximum(win_start, 0)
+    win_start = broadcast(win_start, out_dim_size=sizes, broadcast_dimensions=[0, 1])
+
+    # calculate the indices of shape (b, w)
+    # win_indices = win_start + offset
+    #  [[0, 1, ..., 6],
+    #   [8+n, 9+n, ..., 14+n],
+    #   [28+2n, 28+2n, ..., 34+2n]]
+    win_indices = iota(dtype, sizes, [1])
+    win_indices = add(win_start, win_indices)
+    win_indices = add(win_indices, offset)
+
+    return win_indices
+
+
+def window_slice_kv(cache, indices):
+    """
+    Apply sliding-window slicing over k/v cache with provided indices
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    k/v cache layout shall be (b, s, k, h), b: batch size, s: sequence length, k: num of kv heads per tp, h: hidden size
+    For k/v cache of (s, b, k, h) layout, cache needs to be transposed to (b, s, k, h) before calling this function
+    and transposed back to (s, b, k, h) afterwards
+    Arguments:
+        cache: key/value cache, shape (b, s, k, h)
+        indices: (b, w)
+    Return:
+        result: sliced k/v cache, shape (b, w-1, k, h)
+    """
+    sizes = cache.sizes # (b, s, k, h)
+    ind_sizes = indices.sizes # (b, w-1)
+
+    # (b, s, k, h) -> (b*s, k, h)
+    cache = reshape(cache, (sizes[0]*sizes[1], sizes[2], sizes[3]))
+
+    # (b, w-1) -> (b*(w-1),)
+    indices = reshape(indices, (ind_sizes[0]*ind_sizes[1]))
+
+    # (b*s, k, h) -> (b*(w-1), k, h)
+    result = index_select(cache, 0, indices)
+
+    # (b*(w-1), k, h) -> (b, w-1, k, h)
+    result = reshape(result, (ind_sizes[0], ind_sizes[1], sizes[2], sizes[3]))
+
+    return result
+
+
+def window_slice_mask(mask, indices):
+    """
+    Apply sliding-window slice over mask with provided indices
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    mask layout shall be (b, n_active_tokens, s), n_active_tokens=1 for token generation
+    Arguments:
+        mask: (b, 1, s)
+        indices: (b, w)
+    Return:
+        result: sliced mask, shape (b, 1, w-1)
+    """
+    sizes = mask.sizes # (b, 1, s)
+    ind_sizes = indices.sizes # (b, w-1)
+
+    assert sizes[1] == 1, f"window_slice_mask works only for mask dim (b, 1, s), but mask dim[1]: {sizes[1]} != 1"
+
+    # (b, 1, s) -> (b*s,)
+    mask = reshape(mask, (sizes[0]*sizes[2]))
+
+    # (b, w-1) -> (b*(w-1),)
+    indices = reshape(indices, (ind_sizes[0]*ind_sizes[1]))
+
+    # (b*s,) -> (b*(w-1),)
+    result = index_select(mask, 0, indices)
+
+    # (b*(w-1),) -> (b, 1, w-1)
+    result = reshape(result, (ind_sizes[0], 1, ind_sizes[1]))
+
+    return result
+
+
+def sliding_window_slice(cached_keys, cached_values, mask, cache_ids, window_size, n_positions, cache_layout, lhs_aligned):
+        # slice the portion of kv cache and mask inside the sliding window
+        # this function is used in token generation only
+        # for continuous batcing, cache_ids is 2d, shape (b, s), s=1 for token gen
+        # for static batching, cache_ids is 1d, shape (s,), s=1 for token gen
+        use_2d_cache_ids = len(cache_ids.sizes) > 1
+
+        # continuous batching
+        if use_2d_cache_ids:
+            if cache_layout == constants.LAYOUT_BSH:
+                batch_size = list(cached_keys.sizes)[0]
+                seq_len = list(cached_keys.sizes)[1]
+                assert list(cached_keys.sizes)[1] == list(cached_values.sizes)[1] == list(mask.sizes)[2], \
+                    f"Sequence length not equal for K/V cache and mask"
+            elif cache_layout == constants.LAYOUT_SBH:
+                batch_size = list(cached_keys.sizes)[1]
+                seq_len = list(cached_keys.sizes)[0]
+                assert list(cached_keys.sizes)[0] == list(cached_values.sizes)[0] == list(mask.sizes)[2], \
+                    f"Sequence length not equal for K/V cache and mask"
+            else:
+                raise RuntimeError(f"Unsupported cache layout: {cache_layout}")
+
+            if seq_len > window_size:
+                indices = get_window_indices_from_cache_ids(cache_ids, window_size, n_positions)
+                useful_cached_keys = window_slice_kv(cached_keys, indices)
+                useful_cached_values = window_slice_kv(cached_values, indices)
+                useful_mask = window_slice_mask(mask, indices)
+            else:
+                useful_cached_keys, useful_cached_values, useful_mask = cached_keys, cached_values, mask
+        # static batching
+        else:
+            # slice when seq len > window size
+            # cache layout is (s, b, k, h), k is the num of kv heads per tp
+            curr_window_start = subtract(cache_ids, window_size - 1)
+            curr_window_start = maximum(curr_window_start, 0)
+            assert list(cached_keys.sizes)[0] == list(cached_values.sizes)[0] == list(mask.sizes)[2], \
+                f"Sequence length not equal for K/V cache and mask"
+            seq_len = list(cached_keys.sizes)[0]
+            if seq_len > window_size:
+                batch_size = list(cached_keys.sizes)[1]
+                assert (lhs_aligned and batch_size == 1) or (not lhs_aligned), \
+                    f"Sliding-window attention under static batching with lhs alignment only works for batch size 1, but get {batch_size}"
+
+                curr_window_start_scalar = reshape(curr_window_start, [])
+                useful_cached_keys = dynamic_slice_along(cached_keys, dim=0, start=curr_window_start_scalar, size=window_size-1)
+                useful_cached_values = dynamic_slice_along(cached_values, dim=0, start=curr_window_start_scalar, size=window_size-1)
+                useful_mask = dynamic_slice_along(mask, dim=2, start=curr_window_start_scalar, size=window_size-1)
+            else:
+                useful_cached_keys, useful_cached_values, useful_mask = cached_keys, cached_values, mask
+
+        return useful_cached_keys, useful_cached_values, useful_mask

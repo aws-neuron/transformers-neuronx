@@ -55,6 +55,7 @@ def build_dense_mask(q_seq_len, k_seq_len, mask, blk_size=128, causal=False):
 def build_sliding_window_mask(q_seq_len, kv_seq_len, window_size, causal=True):
     """
     Build a sliding window 2D mask shape {n_active_tokens, n_positions}
+    This funciton is used in context encoding with sliding window attention, aka, mistral-7b-v0.1
     """ 
     dense_mask = torch.ones((q_seq_len, kv_seq_len), dtype=torch.bool)
 
