@@ -147,7 +147,7 @@ def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head
     vocab_size, _ = logits.sizes
     result = hlo.reshape(logits, shape=(vocab_size, n_active_tokens, batch_size))
 
-    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree) and not neuron_config.on_device_generation:
         result = hlo.all_gather(result, 0, tp_degree)
 
     return result
@@ -200,7 +200,7 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     vocab_size, _ = logits.sizes
     result = hlo.reshape(logits, (vocab_size, n_active_tokens, batch_size))
 
-    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree):
+    if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree) and not neuron_config.on_device_generation:
         result = hlo.all_gather(result, 0, tp_degree)
 
     return result
