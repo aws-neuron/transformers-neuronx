@@ -4,7 +4,7 @@ from typing import Dict, List, Set
 
 ROOT_NODE = 0
 
-def _validate_level_dict(level_dict: Dict[int, List[int]])-> int:
+def _validate_level_dict(level_dict: Dict[int, List[int]])-> (int, int):
     """
     For a level, validate that all nodes are indexed from 
     [all_nodes_till_precious_level, all_nodes_till_precious_level+nodes_in_curr_level)
@@ -19,7 +19,7 @@ def _validate_level_dict(level_dict: Dict[int, List[int]])-> int:
             assert node in expected_nodes, f"Node {node} not indexed correctly in a leveled order for level {lvl}"
             expected_nodes.remove(node)
         nodes_counter = nodes_counter + nodes_in_level
-    return nodes_counter
+    return nodes_counter, tree_depth
 
 
 def _validate_all_nodes_discovered(visited: Set[int], token_tree: Dict[int, List[int]])-> None:
@@ -31,7 +31,7 @@ def _validate_all_nodes_discovered(visited: Set[int], token_tree: Dict[int, List
         assert k in visited, f"Invalid token tree with node {k}."
 
 
-def validate_token_tree(token_tree: Dict[int, List[int]])-> int:
+def validate_token_tree(token_tree: Dict[int, List[int]])-> (int, int):
     """
     Assume index 0 to be the root node (no incoming edges) and start level order traversal from it.
     Validate tree structure (not graph) while doing level order traversal
@@ -63,7 +63,7 @@ def generate_attention_mask(token_tree: Dict[int, List[int]])->torch.Tensor:
     """
     Generate attention mask based on the token tree.
     """
-    total_nodes = validate_token_tree(token_tree)
+    total_nodes, depth = validate_token_tree(token_tree)
     attn_mask = torch.zeros(total_nodes, total_nodes, dtype=torch.int32)
     buffer = []
     def populate_mask():

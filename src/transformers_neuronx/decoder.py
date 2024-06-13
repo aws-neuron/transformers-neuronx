@@ -13,7 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 import os
-import copy
 import itertools
 import warnings
 import logging
@@ -397,14 +396,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
                 prefixed_length=self.prefixed_length, return_all_outputs=self.return_all_outputs
             )
-        new.add_inputs_builder(self.inputs_builder)
         if new.token_tree is not None:
+            new.add_inputs_builder(self.builder.token_tree_inputs)
+            new.add_embedding_builder(self.builder.token_tree_embedding)
             new.add_pre_layer_builder(self.builder.token_tree_pre_layer)
+            new.add_layer_builder(self.builder.token_tree_layer)
         else:
+            new.add_inputs_builder(self.inputs_builder)
+            new.add_embedding_builder(self.embedding_builder)
             new.add_pre_layer_builder(self.pre_layer_builder)
-        new.add_layer_builder(self.layer_builder)
+            new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
-        new.add_embedding_builder(self.embedding_builder)
         if self.neuron_config.log_softmax_scores:
             new.add_post_layer_builder(self.post_layer_builder)
         for layer in self.layers:
@@ -1962,6 +1964,9 @@ class DecoderProgram:
             input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
         else:
             input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
+        # TODO: Check how to handle this corner condition.
+        if len(input_tensors) == 5 and len(input_buffers) == 6:
+            input_buffers.pop(3)
         for idx, (buf, tensor) in enumerate(zip(input_buffers, input_tensors)):
             tensor = tensor.to(buf.dtype)
             tensor = process_input_tensors(tensor, idx)
