@@ -103,7 +103,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             layer.save_presharded_weights(directory)
 
     def enable_token_tree_decoder(self, token_tree: Dict[int, List[int]], batch_sizes: Optional[Union[List[int], int]]=None):
-        speculation_length = validate_token_tree(token_tree)
+        speculation_length, depth = validate_token_tree(token_tree)
         self.enable_speculative_decoder(speculation_length, batch_sizes, token_tree)
 
     # top level api
