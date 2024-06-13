@@ -344,6 +344,46 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
     return updated_keys, updated_vals
 
 
+def reorder_kv_cache(cached_keys, cached_values, priv_cache_ids, reorder_mapping, neuron_config=None):
+    """
+    Reordering of the KV cache is required for tree based attention. While speculating using a tree based
+    attention, the model decodes multiple tokens (flattened token tree) and updates the kv cache linearly 
+    based on the cache_ids. Post accceptance, the KV cache needs to be reordered as the cache might not have
+    accepted tokens in the very beginning of the previous cache_ids window. So this step brings those
+    accepted token index to the very beginning of the previous kv cache_ids window.
+    """
+
+    bsh_cache_layout = False
+    batch_dim = 1
+    seq_dim = 0
+    if neuron_config is not None:
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+    if bsh_cache_layout:
+        batch_dim = 0
+        seq_dim = 1
+
+    use_2d_cache_ids = len(priv_cache_ids.sizes) > 1
+    # For 1D caches
+    if not use_2d_cache_ids:
+        cache_start_id = hlo.reduce_min(priv_cache_ids, 0)
+        cache_size = priv_cache_ids.sizes[0]
+        # Dynamic Slice to get the previous KV cache window that needs to be updated.
+        keys_slice_to_update = hlo.dynamic_slice_along(cached_keys, seq_dim, cache_start_id, cache_size)
+        value_slice_to_update = hlo.dynamic_slice_along(cached_values, seq_dim, cache_start_id, cache_size)
+        # Broadcast the reorder mapping to the same size as the KV cache window.
+        gather_index = hlo.broadcast(reorder_mapping, keys_slice_to_update.sizes, [seq_dim])
+        # Gather is used to reorder the KV cache window based on the reorder mapping
+        #updated_key_slice = hlo.gather(keys_slice_to_update, seq_dim, gather_index)
+        #updated_value_slice = hlo.gather(value_slice_to_update, seq_dim, gather_index)
+        updated_key_slice = hlo.gather_select_reduce(keys_slice_to_update, seq_dim, gather_index)
+        updated_value_slice = hlo.gather_select_reduce(value_slice_to_update, seq_dim, gather_index)
+        # Scatter is used to update the KV cache with the updated window.
+        reordered_keys = update_cache(cached_keys, priv_cache_ids, updated_key_slice)
+        reordered_values = update_cache(cached_values, priv_cache_ids, updated_value_slice)
+        return reordered_keys, reordered_values
+
+    raise NotImplementedError("Token Tree based decoding is not available for 2D cache ids.")
+
 def update_cache(cache, cache_ids, values):
     """
     Cache[I] = X

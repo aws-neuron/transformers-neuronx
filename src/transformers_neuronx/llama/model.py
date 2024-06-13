@@ -243,6 +243,56 @@ class LlamaForSampling(base.NeuronModelBase):
         return logits
 
 
+    def tree_speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None, previous_cache_ids=None, reorder_mapping=None):
+        if self.neuron_config and self.neuron_config.continuous_batching:
+            inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        else:
+            batch_size, *_ = input_ids.shape
+            if start_ids is None:
+                start_ids = torch.zeros(batch_size, dtype=torch.int32)
+            if cache_ids is None:
+                batch_size, context_length = input_ids.shape
+                cache_ids = torch.arange(context_length, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, context_length)
+            if previous_cache_ids is None:
+                batch_size, context_length = input_ids.shape
+                previous_cache_ids = torch.arange(context_length, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    previous_cache_ids = previous_cache_ids.unsqueeze(0).expand(batch_size, context_length)
+            if reorder_mapping is None:
+                batch_size, context_length = input_ids.shape
+                reorder_mapping = torch.arange(context_length, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    reorder_mapping = reorder_mapping.unsqueeze(0).expand(batch_size, context_length)
+            inputs, *args = input_ids, cache_ids, start_ids, previous_cache_ids, reorder_mapping
+
+        batch_size, seq_len = input_ids.shape
+        if speculation_length is None:
+            model = self.decoder_lm_head
+            inputs, *args = input_ids, cache_ids, start_ids
+        elif speculation_length not in self.decoder_lm_head_for_speculation.keys():
+            # auto-infer speculation bucket, if needed
+            speculation_buckets = [k for (k, batch_size) in self.decoder_lm_head_for_speculation.keys()]
+            speculation_length = bucket.find(speculation_buckets, seq_len)
+            model = self.decoder_lm_head_for_speculation[speculation_length, batch_size]
+            if input_ids.shape[-1] > speculation_length:
+                input_ids = input_ids[:, :speculation_length]
+        else:
+            model = self.decoder_lm_head_for_speculation[speculation_length, batch_size]
+
+        if not self.neuron_config.on_device_embedding:
+            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        with torch.inference_mode():
+            logits = model(inputs, *args)
+        logits = self._cast_logits(logits)
+        logits = logits[:self.config.vocab_size, -speculation_length:, :]
+        logits = logits.transpose(0, 1)
+        return logits
+
+
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
 

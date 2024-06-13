@@ -1248,6 +1248,54 @@ def unsqueeze(tensor, dim):
     return dtype[size].Reshape(tensor)
 
 
+def gather_select_reduce(tensor, dim, index):
+    """
+    Gather elements from a `tensor` along `dim` at the given `index`
+    using select and reduce op.
+    """
+    assert dim <= len(tensor.sizes)
+
+    # Must have the same rank
+    tensor_sizes = list(tensor.sizes)
+    index_sizes = list(index.sizes)
+    assert len(tensor_sizes) == len(index_sizes)
+
+    index_broadcast_dims = list()
+    input_broadcast_dims = list()
+    sizes = list()
+
+    for i in range(0, len(index_sizes)):
+        if i < dim:
+            input_broadcast_dims.append(i)
+            index_broadcast_dims.append(i)
+        elif i == dim:
+            sizes.append(tensor_sizes[i])
+            input_broadcast_dims.append(i)
+            index_broadcast_dims.append(i + 1)
+        else:
+            input_broadcast_dims.append(i + 1)
+            index_broadcast_dims.append(i + 1)
+        sizes.append(index_sizes[i])
+
+    cast_index = broadcast(index, sizes, index_broadcast_dims)
+    ref_iota = iota(index.dtype, sizes, dim)
+    mask = equal(cast_index, ref_iota)
+
+    cast_input = broadcast(tensor, sizes, input_broadcast_dims)
+    zero_full = full(0, cast_input.dtype, cast_input.sizes)
+    masked_input = cast_input.dtype[cast_input.sizes].Select(mask, cast_input, zero_full)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    dtype = masked_input.dtype
+    zero = dtype.Constant(constant_value=0)
+    result = dtype[tensor_sizes].Reduce(masked_input, zero, dimensions=[dim], to_apply=reducer)
+    return result
+
+
 def gather(tensor, dim, index):
     """
     Gather elements from a `tensor` along `dim` at the given `index`

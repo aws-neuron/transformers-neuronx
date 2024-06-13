@@ -1,10 +1,48 @@
 import torch
 import transformers
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, List
 
 from transformers_neuronx import base
 from transformers_neuronx import sampling
+from transformers_neuronx.util.token_tree import validate_token_tree
 
+
+class TokenTreeAcceptor:
+    """
+    Abstract base class for token tree acceptor that is used in Speculative Sampling loop,
+    to check which draft tokens should be accepted.
+    Note-1: Batch size > 1 is not yet supported for Speculative Decoding.
+    """
+
+    def __call__(
+        self,
+        draft_ids: torch.Tensor,
+        draft_scores: torch.Tensor,
+        target_scores: torch.Tensor,
+        token_tree: Dict[int, List[int]],
+    ) -> (torch.Tensor, List[int]):
+        """
+        Args:
+            draft_input_ids (`torch.Tensor` of shape `(speculated_token_length)`):
+                Tokens ids from the draft model.
+
+            draft_scores (`torch.Tensor` of shape `(speculated_token_length, vocab)`):
+                Prediction scores of the draft model.
+
+            target_scores (`torch.Tensor` of shape `(speculated_token_length, vocab)`):
+                Token scores from the target model.
+
+            token_tree Token tree structure being used for speculation.
+
+        Return:
+            accepted_token_ids (`torch.Tensor` of shape `(accepted_speculated_token)`):
+                The accepted draft predicted token ids. Length of accepted_speculated_tokens <= speculated_token_length.
+
+            accepted_indices List of node ids that were accepted as tokens.
+
+        """
+        raise NotImplementedError(f"{self.__class__} is an abstract class. Only"
+                                  f" classes inheriting this class can be called.")
 
 class TokenAcceptor:
     """
@@ -153,6 +191,43 @@ class ReferenceTokenAcceptor(TokenAcceptor):
         return accepted_tokens.view(1, -1)
 
 
+class DefaultTokenTreeAcceptor(TokenTreeAcceptor):
+    """
+    A simple greedy Token Tree Acceptor where we use argmax to pick the token with the largest scores.
+    """
+    def __call__(
+            self,
+            draft_ids: torch.Tensor,
+            draft_scores: torch.Tensor,
+            target_scores: torch.Tensor,
+            token_tree: Dict[int, List[int]],
+    ):
+        draft_token_len, draft_vocab = draft_scores.shape
+        target_token_len, target_vocab = target_scores.shape
+        assert draft_vocab == target_vocab
+        assert draft_token_len == target_token_len
+        accepted_tokens = []
+        accepted_indices = [0] # Root node always accepted
+        def discover_acceptance(node: int):
+            if node in token_tree and len(token_tree[node]) != 0:
+                # Not leaf
+                new_draft_accepted_node = None
+                target_token = torch.argmax(target_scores[node:node+1, :],keepdim=True, dim=1)
+                for child in token_tree[node]:
+                    if target_token == draft_ids[:, child]:
+                        new_draft_accepted_node = child
+                accepted_tokens.append(target_token)
+                if new_draft_accepted_node is not None:
+                    accepted_indices.append(new_draft_accepted_node)
+                    discover_acceptance(new_draft_accepted_node)
+            else:
+                # Leaf, generate extra token by target model
+                target_token = torch.argmax(target_scores[node:node+1, :],keepdim=True, dim=1)
+                accepted_tokens.append(target_token)
+        discover_acceptance(0)
+        return torch.cat(accepted_tokens, dim=1), accepted_indices
+
+
 class DefaultTokenAcceptor(TokenAcceptor):
     """
     Optimized TokenAcceptor based on original DeepMind paper: https://arxiv.org/pdf/2302.01318.pdf
@@ -272,6 +347,277 @@ class DraftModelForSpeculation(DraftProvider):
             torch.cat(scores, dim=0)
         )
 
+
+class DraftModelForTreeSpeculation(DraftProvider):
+    """
+    Implementation of Draft model provider that uses tree based speculates to populate the
+    whole token tree structure. For every depth of the tree, a speculation call is forwarded.
+    """
+
+    def __init__(self, model, **kwargs) -> None:
+        self.model = model
+        self.kwargs = kwargs
+
+    def _context_block(self, input_ids, start_ids):
+        """
+        Run context encoding network of the given model.
+
+        Args:
+            input_ids: The initial input tokens passed to the model
+            start_ids: The offset from the beginning of each input in a batch.
+
+        Returns:
+            token: predicted next token
+            score: predicted token score
+        """
+        next_token_scores = self.model(input_ids, None, start_ids)
+        inputs = torch.argmax(next_token_scores, dim=1, keepdim=True)
+        return inputs, next_token_scores
+
+    def _fetch_inputs(self, next_token_scores, previous_inputs, token_tree):
+        """
+        From the next_token_scores of shape [k, vocab, bs], this fills up the
+        tokens for the whole tree structure.
+        """
+        for i in range(previous_inputs.shape[1]):
+            if i in token_tree and len(token_tree[i]) != 0:
+                # Non Leaf
+                count_of_child = len(token_tree[i])
+                vals, indices = torch.topk(next_token_scores[i:i+1, :, :], count_of_child, dim=1)
+                for i, child_index in enumerate(token_tree[i]):
+                    previous_inputs[:, child_index] = indices[:, i:i+1, :]
+        return previous_inputs
+
+    def __call__(
+            self,
+            input_ids: torch.Tensor,
+            k: int,
+            depth: int,
+            token_tree: Dict[int, List[int]],
+            pad_token: int = 1,
+            cache_ids: Optional[torch.Tensor] = None,
+            start_ids: Optional[torch.Tensor] = None,
+            previous_cache_ids: Optional[torch.Tensor] = None,
+            reorder_mapping: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Perform standard auto-regressive token generation using the draft model, to speculate k-tokens
+        using the provided token-tree structure.
+
+        Args:
+            input_ids: Either context, next token, or draft tokens. shape=(batch, seqlen)
+            k: Total nodes in the token tree
+            depth: Total levels in the token tree
+            token_tree: The token tree used for generating tokens
+            pad_token: Token used to pad the draft speculation inputs.
+            cache_ids: The positions in the KV cache that should be updated. shape=(seqlen,)
+            start_ids: The offset from the beginning of each input in a batch. shape=(batch,)
+            previous_cache_ids: The previous cache ids used with the draft speculation.
+            reorder_mapping: The reorder mapping corresponding to previous cache ids based on acceptance.
+
+        Returns:
+            tokens: The next token prediction(s) of shape [BS, K]
+            probabilities: The next token probability(s) of shape [K, VOCAB]
+        """
+        if cache_ids is None:
+            return self._context_block(input_ids, start_ids)
+
+        if pad_token is None:
+            pad_token = 1
+        inputs = torch.full((1, k), pad_token, dtype=torch.int32)
+        inputs[:, 0] = input_ids
+        next_token_scores = self.model.tree_speculative_forward(input_ids=inputs, cache_ids=cache_ids,
+                                                           start_ids=start_ids, speculation_length=k,
+                                                           previous_cache_ids=previous_cache_ids, reorder_mapping=reorder_mapping)
+
+        for _ in range(depth-1):
+            inputs = self._fetch_inputs(next_token_scores, inputs, token_tree)
+            next_token_scores = self.model.tree_speculative_forward(input_ids=inputs, cache_ids=cache_ids,
+                                                           start_ids=start_ids, speculation_length=k,
+                                                           previous_cache_ids=None, reorder_mapping=None)
+
+        return (
+            inputs,
+            next_token_scores.squeeze(dim=-1)
+        )
+
+
+class TreeSpeculativeGenerator:
+    def __init__(
+        self,
+        draft: Union[DraftProvider, base.NeuronModelBase],
+        target: base.NeuronModelBase,
+        token_tree: Dict[int, List[int]] = None,
+        acceptor: Optional[TokenTreeAcceptor] = None
+    ):
+        """
+        Args:
+            draft :
+                DraftProvider model that provides the speculated token tree.
+            target:
+                Target model that is derived from NeuronModelBase.
+            token_tree:
+                Token tree definition used for speculation.
+            acceptor:
+                TokenTreeAcceptor that accepts the draft predicted tokens based on draft and target scores.
+                This is default to greedy implementation.
+            
+        """
+        if isinstance(draft, base.NeuronModelBase):
+            draft = DraftModelForTreeSpeculation(draft)
+        self.draft = draft
+        self.target = target
+        self.token_tree = token_tree
+        self.k, self.depth = validate_token_tree(token_tree)
+        self.acceptor = acceptor or DefaultTokenTreeAcceptor()
+
+    def _generate_reorder_mapping(
+        self,
+        accepted_indices
+    ):
+        """
+        Generates the reorder_mapping which is used to reorder the KV cache during speculation
+        for the previous cache_id window based on the accepted_indices returned by the acceptor.
+        """
+        result = [x for x in range(self.k)]
+        for i, index in enumerate(accepted_indices):
+            temp = result[i]
+            result[i] = index
+            result[index] = temp
+        return torch.tensor(result, dtype=torch.int32)
+            
+
+    def sample(
+        self,
+        input_ids: torch.Tensor,
+        sequence_length: int,
+        start_ids: Optional[torch.Tensor] = None,
+        eos_token_id: Optional[int] = None,
+        streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+    ):
+        """
+        Speculative sampling loop:
+        This is where the draft model speculates token tree and target model verifies them
+        using an acceptance/rejection criteria. This happens in a loop either till
+        end of sequence generation length or early stop is detected (based on eos_token_id).
+
+        Args:
+            input_ids:
+                The input token ids passed to the model to generate
+                next predicted tokens (sequence_length - len(input_ids)).
+            sequence_length:
+                The total length of inputs + outputs
+            start_ids:
+                The offset from the beginning of each input in a batch.
+            eos_token_id:
+                The id for the end of sentence token
+            streamer:
+                The streamer to be used for streaming generated tokens.
+
+        Returns:
+            tokens (tensor of shape (batch, sequence_length)):
+                Input and output tokens predicted by the model via Speculative decoding.
+        """
+        batch_size, start = input_ids.shape
+        if batch_size > 1:
+            raise NotImplementedError("Current speculative sampling loop supported only with batch size = 1.")
+
+        # run model context network blocks
+        _draft_id, _draft_score = self.draft(input_ids, self.k, self.depth, self.token_tree, eos_token_id, None, start_ids)
+        target_score = self.target(input_ids, None, start_ids)
+        target_next_id = sampling.select_tokens(target_score)  # TODO add generation args
+
+        if streamer:
+            streamer.put(target_next_id)
+        
+        # Set up early stopping
+        early_stop = False
+        if eos_token_id is not None:
+            done_flags = torch.full((batch_size, 1), False)
+            eos_token = torch.tensor(eos_token_id, dtype=torch.int32)
+            early_stop = True
+
+        tokens: list[torch.Tensor] = [input_ids, target_next_id]
+
+        current = start
+        reorder_mapping = None
+        previous_cache_ids = None
+        while True:
+
+            if early_stop:
+                done_flags |= (target_next_id == eos_token)
+                if batch_size > 1:  # Avoid writing tokens to completed sequences
+                    target_next_id[done_flags] = eos_token
+                if done_flags.all():
+                    break
+
+            # Build draft cache
+            draft_cache_id = torch.arange(current, current+self.k, dtype=torch.int32)
+
+            # returns auto-regressive k speculated tokens (first token was already predicted by target)
+            # draft_ids is of shape: (bs, k)
+            # draft_next_scores has k scores and of shape: (k, vocab)
+            draft_ids, draft_next_scores = self.draft(target_next_id, self.k, self.depth, self.token_tree, eos_token_id, draft_cache_id, start_ids, previous_cache_ids, reorder_mapping)
+
+            # Execute target model with draft tokens
+            cache_ids = torch.arange(current, current + draft_ids.shape[1])
+            # Target model fwd pass returns results of shape [k , vocab, bs]
+            target_next_scores = self.target.tree_speculative_forward(input_ids=draft_ids, cache_ids=cache_ids,
+                                                                 start_ids=start_ids, speculation_length=self.k,
+                                                                 previous_cache_ids=previous_cache_ids, reorder_mapping=reorder_mapping)
+            previous_cache_ids = cache_ids
+
+            # TODO FixMe: to support batching as current support is only with bs=1
+            target_next_scores = target_next_scores.squeeze(dim=-1)
+
+            # Select which tokens will be used
+            accepted_tokens, accepted_indices = self.acceptor(draft_ids, draft_next_scores, target_next_scores, self.token_tree)
+            
+            # NOTE: Required for backwards compatibility since the Acceptor did not return batched inputs
+            if accepted_tokens.dim() != 2:
+                accepted_tokens = accepted_tokens.view(1, -1)
+
+            # Reorder mapping computation logic here
+            reorder_mapping = self._generate_reorder_mapping(accepted_indices)
+
+            _, num_accepted = accepted_tokens.shape
+            if sequence_length - num_accepted < self.depth:
+                accepted_tokens = accepted_tokens[:, :sequence_length - len(tokens)]
+
+            for index in range(num_accepted):
+                token = accepted_tokens[:, index:index + 1]
+
+                # Update done flags.
+                if early_stop:
+                    done_flags |= (token == eos_token)
+                current = current + 1
+
+                tokens.append(token)
+
+                # Stream generated tokens
+                if streamer:
+                    streamer.put(token)
+
+                if current >= sequence_length - 1 or (early_stop and done_flags.all()):
+                    if streamer:
+                        streamer.end()
+                    return torch.cat(tokens, dim=-1)
+            # accepted_tokens = 1 means, no draft token accepted
+            # accepted_tokens = 2 means, 1 draft token accepted
+            # accepted_tokens = K means, all draft tokens accepted 
+            #                   along a tree path from root to leaf + target model predicted token
+            target_next_id = accepted_tokens[:, -1:]
+
+            # Boundary condition: If we overflow the boundary then step generating more tokens.
+            if current >= sequence_length:
+                # TODO: Right now there might be an overflow in generated tokens
+                # to be more than seq len. We can fix this up by trimming the extra generated tokens.
+                break
+        if streamer:
+            streamer.end()
+        
+        return torch.cat(tokens, dim=-1)
+        
 
 class SpeculativeGenerator:
 
