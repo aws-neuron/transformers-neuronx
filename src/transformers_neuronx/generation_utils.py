@@ -79,8 +79,7 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
             start_ids = torch.arange(input_ids.shape[0])
             if (self.cur_len > 0).any().item():
                 # token generation (aka decoding) with 2D cache_ids
-                index_map = torch.arange(context_length).unsqueeze(0).expand(batch_size, context_length)
-                cache_ids = (index_map * attention_mask).max(dim=1).values.unsqueeze(-1)
+                cache_ids = self.cur_len.unsqueeze(-1) + 1
                 self.cur_len = cache_ids.squeeze(-1)
             else:
                 # context encoding (aka prefill) with 2D cache_ids
@@ -102,5 +101,4 @@ class HuggingFaceGenerationModelAdapter(PreTrainedModel):
             "cache_ids": cache_ids,
             "start_ids": start_ids,
         }
-
         return model_inputs

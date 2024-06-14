@@ -201,7 +201,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         Other arguments that are required by the model are contained in `rest`.
         """
         context_length = hidden.shape[1]
-        batch_size = start_ids.shape[0]
+        batch_size = 1 if self.neuron_config.use_1d_query else start_ids.shape[0]
 
         all_logits = [] # Collect all logits if neuron_config.output_all_logits is True
 
@@ -284,7 +284,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             return logits, scores
         return logits
 
-    def _prepare_for_par_ctx_rhs_padding(self, input_ids, cache_ids):
+    def _prepare_for_par_ctx_rhs_padding(self, input_ids, cache_ids, start_ids=None):
         """A helper to do rhs padding on prompt for parallel context encoding model
         i.e.
             input_ids = [[111, 222, 333]]
@@ -322,7 +322,27 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if estimate:
             # when context length is larger than estimate, last_token_id=estimate-1
             if self.neuron_config.vectorize_last_token_id:
-                last_token_id = cache_ids.max(dim=1).values
+                if self.neuron_config.use_1d_query:
+                    max_num_seqs = self.neuron_config.continuous_batching.batch_size_for_shared_caches
+                    prompt_lens = cache_ids.max(dim=1).values + 1
+                    context_length = prompt_lens.sum().item()
+
+                    # input_ids and cache_ids
+                    new_input_ids = torch.tensor([], dtype=input_ids.dtype)
+                    new_cache_ids = torch.tensor([], dtype=cache_ids.dtype)
+                    for idx, prompt_len in enumerate(prompt_lens):
+                        new_input_ids = torch.concat([new_input_ids, input_ids[idx, :prompt_len]])
+                        new_cache_ids = torch.concat([new_cache_ids, cache_ids[idx, :prompt_len]])
+                    input_ids = new_input_ids.unsqueeze(0)
+                    cache_ids = new_cache_ids.unsqueeze(0)
+
+                    # last_token_id
+                    last_token_id = prompt_lens
+                    last_token_id_pad = torch.zeros(max_num_seqs, dtype=last_token_id.dtype)
+                    last_token_id_pad[start_ids] = last_token_id
+                    last_token_id = last_token_id_pad
+                else:
+                    last_token_id = cache_ids.max(dim=1).values
             else:
                 last_token_id = torch.as_tensor([min(context_length - 1, estimate-1)], dtype=torch.int32)
             if context_length < estimate:
@@ -333,13 +353,20 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def _pad_cache_ids(self, cache_ids, batch_size, context_length, estimate):
         if self.neuron_config.use_2d_cache_ids:
-            # TODO: fix cache_ids padding for batch speculative decoding
-            # for now, use cache_ids without change for speculative_forward
-            is_speculative_forward = cache_ids.flatten()[0].item() > 0
-            if is_speculative_forward:
-                return cache_ids
-            cache_ids = torch.arange(estimate, dtype=torch.int32)
-            cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
+            if self.neuron_config.use_1d_query:
+                start_idx = cache_ids[0, -1].item() + 1
+                end_idx = estimate + start_idx - context_length
+                pad_elements = torch.arange(start_idx, end_idx, dtype=torch.long).unsqueeze(0)
+                cache_ids_pad = torch.concat([cache_ids, pad_elements], dim=1)
+                cache_ids = torch.minimum(cache_ids_pad, torch.tensor(estimate-1, dtype=torch.long))
+            else:
+                # TODO: fix cache_ids padding for batch speculative decoding
+                # for now, use cache_ids without change for speculative_forward
+                is_speculative_forward = cache_ids.flatten()[0].item() > 0
+                if is_speculative_forward:
+                    return cache_ids
+                cache_ids = torch.arange(estimate, dtype=torch.int32)
+                cache_ids = cache_ids.unsqueeze(0).expand(batch_size, estimate)
         else:
             if cache_ids is None:
                 cache_ids = torch.arange(estimate, dtype=torch.int32)
@@ -378,6 +405,20 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             cache_ids_pad = torch.zeros(n_active_seqs, continuous_batching_n_positions, dtype=cache_ids.dtype, device='cpu')
             for seq_id in range(n_active_seqs):
                 cache_ids_pad[seq_id, :n_active_tokens] = cache_ids[seq_id, :n_active_tokens]
+            if self.neuron_config.use_1d_query:
+                # For concatenated prompt encoding, we rely on slot_mapping for KV cache placement.
+                prompt_lens = cache_ids_pad.max(dim=1).values + 1
+                new_seq_ids = torch.tensor([], dtype=seq_ids.dtype)
+                for idx, (prompt_len, seq_id) in enumerate(zip(prompt_lens, seq_ids)):
+                    offset = continuous_batching_n_positions * seq_id
+                    new_seq_ids = torch.concat([new_seq_ids, cache_ids[idx, :prompt_len] + offset], dim=0)
+                n_active_tokens = len(new_seq_ids)
+                continuous_batching_n_positions = bucket.find(self.context_buckets, n_active_tokens)
+
+                # Pad seq_ids to context bucket size
+                start_idx = new_seq_ids[-1].item() + 1
+                end_idx = (continuous_batching_n_positions - n_active_tokens) + start_idx
+                seq_ids = torch.concat([new_seq_ids, torch.arange(start_idx, end_idx)])
             return input_ids, cache_ids_pad, seq_ids
 
         elif n_active_tokens > 1 and cache_ids.flatten()[0].item() > 0:
@@ -418,10 +459,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def _preprocess(self, input_ids, start_ids=None, cache_ids=None):
         # enable dynamic batch size feature for continuous batching
-        input_ids, cache_ids, start_ids = self._prepare_for_continuous_batching(input_ids, cache_ids, start_ids)
+        input_ids, cache_ids, new_start_ids = self._prepare_for_continuous_batching(input_ids, cache_ids, start_ids)
 
         # right pad the input_ids if neccessary
-        input_ids, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
+        input_ids, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids, start_ids)
+        start_ids = new_start_ids
 
         # note: this context_length is after right padded
         batch_size, context_length = input_ids.shape

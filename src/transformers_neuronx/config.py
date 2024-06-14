@@ -206,7 +206,7 @@ class NeuronConfig():
         if self.continuous_batching:
             # Force left alignment for continuous batching.
             self.lhs_aligned = True
-
+            self.padding_side = "right"
         self.attention_layout = attention_layout
         self.collectives_layout = collectives_layout
         self.cache_layout = cache_layout
@@ -271,6 +271,10 @@ class NeuronConfig():
     @property
     def use_2d_cache_ids(self):
         return self.lhs_aligned
+
+    @property
+    def use_1d_query(self):
+        return self.cache_layout == Layout.BSH and self.padding_side == 'right'
 
     @property
     def vectorize_last_token_id(self):

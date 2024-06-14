@@ -66,7 +66,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             base=self.config.rope_theta,
             interpolation_factor=self.config.position_interpolation_factor
         )
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
+                                               last_token_id=last_token_id, neuron_config=self.neuron_config)
         core_id = None
         if self.neuron_config.shard_over_sequence:
             core_id,*rst  = weights

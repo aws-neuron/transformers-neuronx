@@ -220,7 +220,8 @@ def query_key_projection(query, key, qk_weight):
     return query, key
 
 
-def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None, neuron_config=None):
+def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None,
+                          neuron_config=None):
     """
     The fused K/V cache update is intended for reducing replicated index value calculation for both keys and values,
     since we are updating K/V with the same index offset.
@@ -229,8 +230,10 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
     """
     # Check K/V cache layout
     bsh_cache_layout = False
+    use_1d_query = False
     if neuron_config is not None:
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+        use_1d_query = neuron_config and neuron_config.use_1d_query
 
     dtype = cached_keys.dtype
     cache_ids_dtype = cache_ids.dtype
@@ -261,7 +264,7 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
     cached_keys_r = hlo.reshape(cached_keys, [n_positions * n_seqs, kv_hidden_size])
     cached_vals_r = hlo.reshape(cached_vals, [n_positions * n_seqs, kv_hidden_size])
 
-    if n_active_tokens == 1 and n_seqs == n_active_seqs:
+    if n_active_tokens == 1 and ((n_seqs == n_active_seqs) or (n_seqs >= n_active_seqs and use_1d_query)):
         # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
         #        +---------3-4-----6-7------9-10-----------------
         # seq 0  |                [A,B]
@@ -273,8 +276,8 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         # seq 1          [3,4],                                   [C,D],
         # seq 2          [9,10]]                                  [E,F]]
         #
-        keys_r = hlo.reshape(keys, [n_seqs, kv_hidden_size])
-        vals_r = hlo.reshape(vals, [n_seqs, kv_hidden_size])
+        keys_r = hlo.reshape(keys, [n_active_seqs, kv_hidden_size])
+        vals_r = hlo.reshape(vals, [n_active_seqs, kv_hidden_size])
 
         indices = attention_utils.update_indices_decode(cached_keys, cache_ids, neuron_config)
         indices = hlo.transpose(indices, 0, 1)
@@ -295,20 +298,24 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         #        +-----------------------------------------------
         # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
         # seq 1         [[0,1,2,3,4,5]]                          [[A,B,C,D,E,F]]
-        keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
-        vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
+        if use_1d_query:
+            indices = start_ids
+            updated_keys, updated_vals = hlo.reshape_and_cache(keys, vals, cached_keys, cached_vals, slot_mapping=start_ids)
+        else:
+            keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
+            vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
 
-        indices = attention_utils.update_indices_context(cached_keys, cache_ids, start_ids, neuron_config)
+            indices = attention_utils.update_indices_context(cached_keys, cache_ids, start_ids, neuron_config)
 
-        # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
-        assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
+            # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
+            assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
 
-        scatter_dims = dict(update_window_dims=[1],
-                            inserted_window_dims=[0],
-                            scatter_dims_to_operand_dims=[0],
-                            index_vector_dim=1)
-        updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
-        updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            scatter_dims = dict(update_window_dims=[1],
+                                inserted_window_dims=[0],
+                                scatter_dims_to_operand_dims=[0],
+                                index_vector_dim=1)
+            updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
     elif n_active_tokens > 1 and n_active_tokens < n_positions:
         # Speculative forward: n_active_tokens > 1 and < n_positions
@@ -322,8 +329,8 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
         # seq 1         [[45,46,47,48,49,50]]                    [[A,B,C,D,E,F]]
         n_active_tokens, batch_size, n_head, d_head = keys.sizes
-        keys_r = hlo.reshape(keys, [n_active_tokens * batch_size, n_head, d_head])
-        vals_r = hlo.reshape(vals, [n_active_tokens * batch_size, n_head, d_head])
+        keys_r = hlo.reshape(keys, [1, n_active_tokens * batch_size, n_head, d_head])
+        vals_r = hlo.reshape(vals, [1, n_active_tokens * batch_size, n_head, d_head])
 
         indices = attention_utils.update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config)
 
