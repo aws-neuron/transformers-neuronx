@@ -43,7 +43,8 @@ class BloomForSamplingNoEmbeddingHlo:
 
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *pre_layer_weights):
         slopes, *rest = pre_layer_weights
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
+                                               last_token_id=last_token_id, neuron_config=self.neuron_config)
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
         return hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
