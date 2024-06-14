@@ -836,7 +836,7 @@ def transfer_with_static_ring(shape):
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
 
-def attention_mask(cache_ids, start_ids, n_positions):
+def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, neuron_config=None):
     """
     Create decomposed prior/active attention masks.
 
@@ -879,6 +879,8 @@ def attention_mask(cache_ids, start_ids, n_positions):
         return decoder_attention_mask_lhs_aligned(
             cache_ids,
             n_positions,
+            last_token_id=last_token_id,
+            neuron_config=neuron_config,
         )
     else:
         n_active_tokens, = cache_ids.sizes
@@ -2889,7 +2891,7 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned(cache_ids, n_positions):
+def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, neuron_config=None):
     """
     Create attention masks for LHS-aligned sequences.
 
@@ -2905,7 +2907,10 @@ def decoder_attention_mask_lhs_aligned(cache_ids, n_positions):
     batch_size, n_active_tokens = cache_ids.sizes
     if n_active_tokens == n_positions:
         # Context Encoding
-        return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
+        if neuron_config and neuron_config.use_1d_query:
+            return decoder_attention_block_diagonal_causal_mask(last_token_id, n_positions)
+        else:
+            return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
     else:
         # Token generation
         return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions)
@@ -3190,7 +3195,7 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
     """
     dtype = key.dtype
     assign_func = gen_assign_func(dtype)
-    n_active_tokens, n_head, d_head = key.sizes
+    _, n_active_tokens, n_head, d_head = key.sizes
     n_blocks, block_size, _, _ = key_cache.sizes
     hidden_size = n_head * d_head
 
