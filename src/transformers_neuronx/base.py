@@ -191,6 +191,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
     def reset(self):
         self.decoder_lm_head.reset()
 
+    def decode(self, hidden, *args):
+        """A helper function for decoding (token-generation)
+        This function simply called decoder_lm_head. 
+        It is defined as a function to enable wrapping with a decorator and measuring its runtime.
+        """ 
+        return self.decoder_lm_head(hidden, *args)
+
     def context(self, hidden, cache_ids, start_ids, last_token_id, *rest):
         """A helper to process context (prompt)
         1) if there is available context encoding model (infered from self.context_buckets)
@@ -557,7 +564,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             else:
                 logits = self.context(hidden, *args)
         else:
-            logits = self.decoder_lm_head(hidden, *args)
+            logits = self.decode(hidden, *args)
 
         if self.neuron_config.on_device_generation:
             return logits
