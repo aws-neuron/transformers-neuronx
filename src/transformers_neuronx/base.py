@@ -426,6 +426,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     new_seq_ids = torch.concat([new_seq_ids, cache_ids[idx, :prompt_len] + offset], dim=0)
                 n_active_tokens = len(new_seq_ids)
                 continuous_batching_n_positions = bucket.find(self.context_buckets, n_active_tokens)
+                assert continuous_batching_n_positions >= n_active_tokens, \
+                    f"n_active_tokens ({n_active_tokens}) is expected to be less than n_positions " \
+                    f"({continuous_batching_n_positions}) for concatenated prompt encoding"
 
                 # Pad seq_ids to context bucket size
                 start_idx = new_seq_ids[-1].item() + 1
