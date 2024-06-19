@@ -152,13 +152,15 @@ class MixtralForSampling(base.NeuronModelBase):
         curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
         curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
-        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        _, _, last_token_id = rst  # To avoid overriding start_ids input.
+        rst.append(curr_window_start)
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.permute(2, 1, 0).contiguous()
 
-        logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+        logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
 
         # Increment the token counter, last_token_id = 0 when in decoder mode
