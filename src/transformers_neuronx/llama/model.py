@@ -193,12 +193,24 @@ class LlamaForSampling(base.NeuronModelBase):
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
 
-    def forward(self, input_ids, cache_ids=None, start_ids=None):
-        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+    def preprocess_and_embed(self, input_ids, cache_ids=None, start_ids=None):
+        padded_inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if not self.neuron_config.on_device_embedding:
-            inputs = self.chkpt_model.model.embed_tokens(inputs)
+            input_embeddings = self.chkpt_model.model.embed_tokens(padded_inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
-                inputs = inputs.transpose(0, -1).contiguous()
+                input_embeddings = input_embeddings.transpose(0, -1).contiguous()
+        else:
+            # embedding layer is on device and will be computed as part of self._forward(), so don't compute here
+            input_embeddings = None
+        return padded_inputs, input_embeddings, *rst
+
+    def forward(self, input_ids, cache_ids=None, start_ids=None, last_token_id=None, input_embeddings=None):
+        if last_token_id is not None: # preprocess_and_embed() has already been invoked
+            rst = cache_ids, start_ids, last_token_id
+        else: # invoke preprocess_and_embed()
+            input_ids, input_embeddings, *rst = self.preprocess_and_embed(input_ids, cache_ids, start_ids)
+        # either input_embeddings are generated (off device embedding), or input_ids will be padded from preprocess_and_embed (on device embedding)
+        inputs = input_embeddings if input_embeddings is not None else input_ids
         logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
@@ -372,4 +384,5 @@ class FIDLlamaForSampling(LlamaForSampling):
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
         return result
+
 
