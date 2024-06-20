@@ -684,8 +684,12 @@ def gated_mlp_bsh(
         hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
                                scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
-        result = dot11_add1(hidden_states, out_weight, out_bias,
-                        scales=out_scales, neuron_config=neuron_config)
+        if neuron_config is not None and neuron_config.mlp_out_weight_transpose:
+            result = dot10_add1(hidden_states, out_weight, out_bias,
+                            scales=out_scales, neuron_config=neuron_config)
+        else:
+            result = dot11_add1(hidden_states, out_weight, out_bias,
+                            scales=out_scales, neuron_config=neuron_config)
     result = reshape(result, hidden_sizes)
 
     if not return_partial:
@@ -765,8 +769,12 @@ def gated_mlp(
         hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
 
-        # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
-        result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+        if neuron_config is not None and neuron_config.mlp_out_weight_transpose:
+            # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
+            result = dot10_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+        else:
+            # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+            result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
 
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
@@ -2625,7 +2633,7 @@ def reshape(tensor, shape):
 def get_hlo_scalar_by_index(tensor, index):
     assert index < tensor.sizes[0]
     return reshape(slice_along(tensor, 0, start=index, limit=index+1), [])
-    
+
 def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
     operand_rank = len(operands.sizes)
     index_vector_dim = scatter_dims.get("index_vector_dim", [])

@@ -124,7 +124,11 @@ class LlamaForSampling(base.NeuronModelBase):
                 new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
                                         allow_quantize=True, allow_transform=True)
             else:
-                new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True,
+                if self.neuron_config.mlp_out_weight_transpose:
+                    new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
+                                        allow_quantize=True)
+                else:
+                    new_layer.add_parameter(mlp.down_proj.weight, sharding=1, allow_pad=True,
                                         allow_quantize=True, out_feature_dim=0)
             new_layer.to_neuron()
             layer.nullify()
@@ -146,16 +150,16 @@ class LlamaForSampling(base.NeuronModelBase):
             if self.neuron_config.sequence_parallel_norm:
                 self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=None, allow_pad=True)
             else:
-                self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)        
+                self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1, allow_pad=True)
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
-    
+
     def materialize_embeddings(self):
         # Materialize the embedding to CPU
         self.chkpt_model.model.embed_tokens.materialize()
-    
+
     def init_rest_of_model(self):
         # Pipeline sparallel deosn't support executor right now
         if not self.neuron_config.is_pp():
