@@ -154,6 +154,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
                 prior_ids.append(cache_ids)
  
             # Execute final iteration in case all tokens are accepted.
+            tensors = cache_ids, *rest
             _, caches = draft._hlo_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params)
             draft._hlo_cache_aliases(in_caches, caches)
  
