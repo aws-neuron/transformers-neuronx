@@ -223,6 +223,7 @@ def main():
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
     run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
+    run_parser.add_argument('--mlp_out_weight_transpose', action='store_true', default=False)
 
     run_parser.add_argument('--gqa', type=str, default=None)
     run_parser.add_argument('--quant', action='store_true')
@@ -493,7 +494,7 @@ def run(args, hf_model_name, model_cls):
     print("attention_mask:", attention_mask,)
     if args.debug:
         from imp import reload
- 
+
         reload(logging)
         logging.basicConfig(level=logging.DEBUG)
 
@@ -525,6 +526,7 @@ def run(args, hf_model_name, model_cls):
                 sequence_parallel_norm=args.sequence_parallel_norm,
                 sequence_parallel_norm_threshold=args.sequence_parallel_norm_threshold,
                 attention_layout=args.attention_layout,
+                mlp_out_weight_transpose=args.mlp_out_weight_transpose,
             )
 
             if args.no_bucketing_n_positions:
@@ -544,7 +546,7 @@ def run(args, hf_model_name, model_cls):
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
                                                 unroll=args.unroll, context_unroll=args.context_unroll)
-                
+
             print('running model.to_neuron')
             begin = time.time()
             neuron_model.to_neuron()
