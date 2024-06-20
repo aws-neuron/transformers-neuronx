@@ -124,7 +124,7 @@ class GenerationConfig:
         if not isinstance(value, GenerationConfig):
             return False
         return self.__dict__ == value.__dict__
-    
+
     def _convert_list_to_float(self, params):
         return [float(p) for p in params]
 
@@ -181,6 +181,7 @@ class NeuronConfig():
         weight_tiling: Splits model MLP to introduce "free" 128 dimensions.
         mlp_in_weight_tiling_permute_order: permute order to permute the mlp input weight tiling split [K/128, 128, N/128, 128]. default=[1,2,0,3].
         mlp_out_weight_tiling_permute_order: permute order to permute the mlp output weight tiling split [K/128, 128, N/128, 128]. default=[1,2,0,3].
+        mlp_out_weight_transpose: transpose the mlp output weight layout from [H, F] into [F, H]. `default=False`
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
         output_all_logits: Return all logits from each model invocation.
@@ -213,6 +214,7 @@ class NeuronConfig():
         output_all_logits: bool = False,
         attn_output_transposed: bool = False,
         fused_rmsnorm_qkv: bool = False,
+        mlp_out_weight_transpose: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -314,6 +316,7 @@ class NeuronConfig():
             assert self.attention_layout == Layout.BSH, "Fused RMSnorm QKV kernel requires BSH attention layout"
             assert self.group_query_attention == GQA.REPLICATED_HEADS, "Fused RMSnorm QKV kernel requires replicated GQA heads"
             assert not self.is_sequence_parallel and not self.sequence_parallel_norm, "Cannot use sequence parallel with fused RMSnorm QKV kernel"
+        self.mlp_out_weight_transpose = mlp_out_weight_transpose
 
     @property
     def use_2d_cache_ids(self):
