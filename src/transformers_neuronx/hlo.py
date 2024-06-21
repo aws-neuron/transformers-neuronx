@@ -1435,15 +1435,13 @@ def _embedding(weight, index, dtype=None):
     )
 
     n_embedding, embedding_dim = weight.sizes
-    if dtype is None:
-        dtype = weight.dtype
 
     # Linearize index tensor to gather from 0th dimension
     n_index = functools.reduce(operator.mul, index.sizes, 1)
     linear_index = reshape(index, n_index)
 
     # Gather
-    result = dtype[n_index, embedding_dim].Gather(
+    result = weight.dtype[n_index, embedding_dim].Gather(
         weight,
         linear_index,
         gather_dimension_numbers=dict(
@@ -1454,6 +1452,8 @@ def _embedding(weight, index, dtype=None):
         ),
         gather_slice_sizes=[1, embedding_dim],
     )
+    if dtype != result.dtype:
+        result = cast(result, dtype)
 
     # Reshape embedding tensor to look like the original index shape
     return reshape(result, (*index.sizes, embedding_dim))
