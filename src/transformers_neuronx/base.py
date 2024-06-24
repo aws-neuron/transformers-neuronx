@@ -550,7 +550,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
                                                 start_ids_per_batch, last_token_id_per_batch)
                 all_logits.append(logits_per_batch)
-            logits = torch.cat(all_logits, dim=-1)
+            if self.neuron_config.on_device_generation:
+                logits = torch.cat(all_logits, dim=0)
+            else:
+                logits = torch.cat(all_logits, dim=-1)
         else:
             assert input_batch_size == running_batch_size, \
                 "input batch size ({input_batch_size}) not equal to running batch size ({running_batch_size})"
