@@ -1203,7 +1203,10 @@ class DecoderLayer(torch.nn.Module):
         self.tp_degree = tp_degree
         self.amp = amp
         dtype, _, _ = utils.parse_amp(amp)
-        self.cache_dtype = dtypes.to_torch_dtype(dtype)
+        if neuron_config and neuron_config.kv_cache_quant:
+            self.cache_dtype = dtypes.to_torch_dtype(neuron_config.kv_cache_quant.quant_dtype)
+        else:
+            self.cache_dtype = dtypes.to_torch_dtype(dtype)
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.extra_parameters = []
         self.allow_pad = allow_pad
@@ -1607,7 +1610,11 @@ class DecoderLayer(torch.nn.Module):
             else:
                 cache_shape = [block_size, num_blocks, n_heads_kv_cache, self.attention_head_size]
                 self.cache_shape[batch_size] = [block_size, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
-            cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+            if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn:
+                int8_cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8) #Cannot directly use fp8: *** RuntimeError: "fill_cpu" not implemented for 'Float8_e4m3fn'
+                cpu_cache= int8_cpu_cache.to(torch.float8_e4m3fn)
+            else:
+                cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
             if self.shard_over_batch:
                 assert not self.bsh_cache_layout, "shard-over-batch for GQA with BSH cache layout is not supported."
                 self.cache_shape[batch_size] = [block_size, num_blocks // self.tp_degree, n_heads_kv_cache, self.attention_head_size]

@@ -222,7 +222,10 @@ class DataTypeConverter:
             F32     FLOAT       float32
             F64     DOUBLE      float64
             BF16    BFLOAT16    bfloat16
+            F8E4M3FN INT8     float8_e4m3fn
         '''
+        # Note that for FP8 we map metaneff datatype to int8, since from the runtime perspective these datatypes are functionally equivalent (for fp8 storage only)
+        # Within Tnx, we no longer use the metaneff flow, so this would not matter anyway. 
         name_mapping = dedent(name_mapping)
         name_mapping = name_mapping.lstrip().strip()
         self.hlo2metaneff_mapping = {}
@@ -232,6 +235,8 @@ class DataTypeConverter:
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
             pname, dname, tname = line.split()
+            if not hasattr(torch, tname):
+                continue
             primitive_type = getattr(xla_data_pb2.PrimitiveType, pname)
             metaneff_dtype = getattr(metaneff_pb2.MetaTensor.DataType, dname)
             torch_dtype = getattr(torch, tname)

@@ -1614,6 +1614,17 @@ def dequantize(tensor, scales, neuron_config: NeuronConfig, scales_dim):
     tensor = dtype[tensor.sizes].Convert(tensor)
     return tensor
 
+def quantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
+    scribe = tensor.scribe
+    quant_dtype = getattr(scribe, neuron_config.kv_cache_quant.quant_dtype)
+    quantized_tensor = quant_dtype[tensor.sizes].Convert(tensor)
+    return quantized_tensor
+  
+def dequantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
+    scribe = tensor.scribe
+    dequant_dtype = getattr(scribe, neuron_config.kv_cache_quant.dequant_dtype)
+    dequantized_tensor = dequant_dtype[tensor.sizes].Convert(tensor)
+    return dequantized_tensor
 
 def reduce_mean(tensor, dims, keepdim=False):
 
