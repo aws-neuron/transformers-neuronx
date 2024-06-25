@@ -22,6 +22,7 @@ from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.layers import attention, attention_utils
 from transformers_neuronx.nki.compile import nki_call
+from transformers_neuronx.hlo import quantize_kv_cache_direct_cast
 import logging
 
 
@@ -228,6 +229,10 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
 
     KeyCache[I], ValueCache[I] = Keys, Values
     """
+    if neuron_config and neuron_config.kv_cache_quant:
+        keys = quantize_kv_cache_direct_cast(keys, neuron_config)
+        vals = quantize_kv_cache_direct_cast(vals, neuron_config)
+
     # Check K/V cache layout
     bsh_cache_layout = False
     use_1d_query = False
