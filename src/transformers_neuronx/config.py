@@ -47,6 +47,21 @@ class QuantizationConfig:
         # Decide whether the attention layer needs be quantized
         self.quantize_attn = quantize_attn
 
+class KVCacheQuantizationConfig:
+    """ The config class that contains all KV cache quantization related settings """
+    def __init__(self, quant_dtype='s8', dequant_dtype='bf16', quantize_method='direct_cast'):
+        QUANT_DTYPE_LIST = ['s8', 'f16', 'bf16', 'f8e4m3fn']
+        # TODO: add vector_dynamic/absmax quantization support
+        QUANTIZE_METHOD_LIST = ['direct_cast',]
+        self.quant_dtype = quant_dtype
+        if self.quant_dtype not in QUANT_DTYPE_LIST:
+            raise NotImplementedError(f"{self.quant_dtype} is not implemented. "
+                                    f"Available options are {','.join(QUANT_DTYPE_LIST)}")
+        self.dequant_dtype = dequant_dtype
+        self.quantize_method = quantize_method
+        if self.quantize_method not in QUANTIZE_METHOD_LIST:
+            raise NotImplementedError(f"{self.quantize_method} is not implemented. "
+                                    f" Available options are {','.join(QUANTIZE_METHOD_LIST)}")
 
 class ContinuousBatchingConfig:
     """
@@ -128,6 +143,7 @@ class NeuronConfig():
         sparse_attn: Enables attention sparsity with the given
             configurations.
         quant: Enables quantization with the given configurations.
+        kv_cache_quant: Enables KV cache quantization with the given configurations.
         continuous_batching: Enables the model to be used with continuous
             batching using the given configurations.
         attention_layout: Layout to be used for attention computation.
@@ -174,6 +190,7 @@ class NeuronConfig():
     def __init__(self, *,
         sparse_attn: Optional[SparseAttnConfig] = None,
         quant: Optional[QuantizationConfig] = None,
+        kv_cache_quant: Optional[KVCacheQuantizationConfig] = None,
         continuous_batching: Optional[ContinuousBatchingConfig] = None,
         attention_layout: Layout = Layout.HSB,
         collectives_layout: Layout = Layout.HSB,
@@ -201,6 +218,7 @@ class NeuronConfig():
         self.all_reduce_dtype = all_reduce_dtype
         self.sparse_attn = sparse_attn
         self.quant = quant
+        self.kv_cache_quant = kv_cache_quant
         self.cast_logits_dtype = cast_logits_dtype
         assert cast_logits_dtype in valid_dtypes, (
             f"The `cast_logits_dtype={cast_logits_dtype}` argument must be one of {valid_dtypes}"

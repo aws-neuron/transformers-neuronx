@@ -21,6 +21,8 @@ from transformers_neuronx.layers import transformer, rotary, attention, attentio
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.hlo import quantize_kv_cache_direct_cast, dequantize_kv_cache_direct_cast
+
 from transformers_neuronx.nki.compile import nki_call
 
 
@@ -364,10 +366,16 @@ class LlamaForSamplingNoEmbeddingHlo:
                 else:
                     cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
                     cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
+                if self.neuron_config and self.neuron_config.kv_cache_quant:
+                    cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys_s, self.neuron_config)
+                    cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)
             elif self.neuron_config.paged_attention:
                 # For decoding with multiple KV cache blocks, start_ids are used as block_tables
                 cached_keys_s = attention_utils.gather_blocks(cached_keys, block_tables=last_token_id)
                 cached_values_s = attention_utils.gather_blocks(cached_values, block_tables=last_token_id)
+            elif self.neuron_config and self.neuron_config.kv_cache_quant:
+                cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys, self.neuron_config)
+                cached_values_s = dequantize_kv_cache_direct_cast(cached_values, self.neuron_config)   
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
@@ -432,7 +440,11 @@ class LlamaForSamplingNoEmbeddingHlo:
                                                             core_id,dim=0)
             # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
-                updated_keys, updated_values = key, value
+                if self.neuron_config and self.neuron_config.kv_cache_quant:
+                    updated_keys = quantize_kv_cache_direct_cast(key, self.neuron_config)
+                    updated_values = quantize_kv_cache_direct_cast(value, self.neuron_config)
+                else:
+                    updated_keys, updated_values = key, value
             else:
                 updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
                                                                                key, value, start_ids, neuron_config=self.neuron_config)
