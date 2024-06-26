@@ -45,6 +45,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
             attn_k_cache, attn_v_cache,
             # weights in layer_builder (from decoder.py)
             pre_attn_ln_weight, pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
             # attention
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,

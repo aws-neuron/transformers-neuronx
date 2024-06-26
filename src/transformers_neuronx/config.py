@@ -168,6 +168,7 @@ class NeuronConfig():
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
         output_all_logits: Return all logits from each model invocation.
+        fused_rmsnorm_qkv: Use the fused RMS norm and QKV input projection kernel.
         attn_output_transposed: Transposes the attention output projection weight tensor.
     """
     def __init__(self, *,
@@ -194,6 +195,7 @@ class NeuronConfig():
         shard_over_sequence: bool = False,
         output_all_logits: bool = False,
         attn_output_transposed: bool = False,
+        fused_rmsnorm_qkv: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -287,6 +289,13 @@ class NeuronConfig():
         self.is_sequence_parallel = False
 
         self.attn_output_transposed = attn_output_transposed
+
+        self.fused_rmsnorm_qkv = fused_rmsnorm_qkv
+        if self.fused_rmsnorm_qkv:
+            assert self.fuse_qkv, "Fused RMSnorm QKV kernel requires fused QKV weights"
+            assert self.attention_layout == Layout.BSH, "Fused RMSnorm QKV kernel requires BSH attention layout"
+            assert self.group_query_attention == GQA.REPLICATED_HEADS, "Fused RMSnorm QKV kernel requires replicated GQA heads"
+            assert not self.is_sequence_parallel and not self.sequence_parallel_norm, "Cannot use sequence parallel with fused RMSnorm QKV kernel"
 
     @property
     def use_2d_cache_ids(self):

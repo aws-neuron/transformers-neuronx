@@ -1152,6 +1152,7 @@ class DecoderLayer(torch.nn.Module):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
+        self.fused_pre_attn_ln_qkv_weight = None
         self.attn_q_weight = None
         self.attn_q_scales = None
         self.attn_q_bias = None
@@ -1456,6 +1457,8 @@ class DecoderLayer(torch.nn.Module):
                     contract_dims=self.attn_out_contract_dims,
                 )
 
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
+            self.fused_pre_attn_ln_qkv_weight = (fused_qkv_weight.T * self.pre_attn_ln_weight.to(dtype=fused_qkv_weight.dtype)).T
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
@@ -1470,6 +1473,7 @@ class DecoderLayer(torch.nn.Module):
             qkv_weight_sharder = maybe_shard_along
         if self.neuron_config and self.neuron_config.fuse_qkv:
             self.attn_q_weight = qkv_weight_sharder(fused_qkv_weight, dim=1, weight_tiling=qkv_tiling)
+            self.fused_pre_attn_ln_qkv_weight = maybe_shard_along(self.fused_pre_attn_ln_qkv_weight, dim=1) # do not tile weights here
             self.attn_q_bias = maybe_shard_along(fused_qkv_bias, dim=0)
             self.attn_q_scales = maybe_shard_along(fused_qkv_scales, dim=0)
         else:
@@ -1639,6 +1643,7 @@ class DecoderLayer(torch.nn.Module):
         return [
             self.pre_attn_ln_weight,
             self.pre_attn_ln_bias,
+            self.fused_pre_attn_ln_qkv_weight,
             self.attn_q_weight,
             self.attn_q_scales,
             self.attn_q_bias,
@@ -1706,6 +1711,7 @@ class DecoderLayer(torch.nn.Module):
         (
             pre_attn_ln_weight,
             pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
             attn_q_weight,
             attn_q_scales,
             attn_q_bias,
@@ -1737,6 +1743,7 @@ class DecoderLayer(torch.nn.Module):
         return [
             pre_attn_ln_weight,
             pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
             attn_q_weight,
             attn_q_scales,
             attn_q_bias,
@@ -1773,6 +1780,7 @@ class DecoderLayer(torch.nn.Module):
     def assign_parameters(self, layer):
         self.pre_attn_ln_weight = layer.pre_attn_ln_weight
         self.pre_attn_ln_bias = layer.pre_attn_ln_bias
+        self.fused_pre_attn_ln_qkv_weight = layer.fused_pre_attn_ln_qkv_weight
         self.attn_q_weight = layer.attn_q_weight
         self.attn_q_scales = layer.attn_q_scales
         self.attn_q_bias = layer.attn_q_bias

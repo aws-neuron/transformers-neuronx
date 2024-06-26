@@ -21,6 +21,7 @@ from transformers_neuronx.layers import transformer, rotary, attention, attentio
 from transformers_neuronx.llama.config import LlamaConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.nki.compile import nki_call
 
 
 class LlamaForSamplingNoEmbeddingHlo:
@@ -113,6 +114,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -128,15 +130,27 @@ class LlamaForSamplingNoEmbeddingHlo:
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
-        attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
-            attn_k_cache, attn_v_cache,
-            attn_q_weight, attn_q_scales, attn_q_bias,
-            attn_k_weight, attn_k_scales, attn_k_bias,
-            attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias
-        )
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv and active_mask is None:
+            assert fused_pre_attn_ln_qkv_weight is not None
+            attn_output, out_attn_k_cache, out_attn_v_cache = self.fused_rmsnorm_qkv(
+                hidden, None, eps,
+                ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+                attn_k_cache, attn_v_cache,
+                fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
+                attn_k_weight, attn_k_scales, attn_k_bias, # should be none
+                attn_v_weight, attn_v_scales, attn_v_bias, # should be none
+                attn_out_weight, attn_out_scales, attn_out_bias
+            )
+        else:
+            ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+            attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
+                ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+                attn_k_cache, attn_v_cache,
+                attn_q_weight, attn_q_scales, attn_q_bias,
+                attn_k_weight, attn_k_scales, attn_k_bias,
+                attn_v_weight, attn_v_scales, attn_v_bias,
+                attn_out_weight, attn_out_scales, attn_out_bias
+            )
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
@@ -206,6 +220,74 @@ class LlamaForSamplingNoEmbeddingHlo:
         logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
         return logits
 
+    def fused_rmsnorm_qkv(
+        self, hidden, pre_attn_ln_weight, eps,
+        cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+        attn_k_cache, attn_v_cache,
+        attn_q_weight, attn_q_scales, attn_q_bias,
+        attn_k_weight, attn_k_scales, attn_k_bias, # should be none
+        attn_v_weight, attn_v_scales, attn_v_bias, # should be none
+        attn_out_weight, attn_out_scales, attn_out_bias
+    ):
+        # TODO: refactor below
+        from neuronxcc.nki._private_kernels.fused_linear import fused_rms_norm_qkv
+        def _kernel(h, w, output):
+            return fused_rms_norm_qkv(h, w, output, eps=eps)
+
+        n_seqs, n_active_tokens, _ = hidden.sizes
+        d_head = self.config.attention_head_size
+        tp_degree = self.config.tp_degree
+
+        # Compute the expected number of KV heads (Used in case fused QKV is used)
+        n_kv_heads_tp = None
+        if self.config.num_key_value_heads is not None:
+            n_head = self.config.num_attention_heads
+            n_kv_head = self.config.num_key_value_heads
+            n_head, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_kv_heads_tp = n_kv_head_padded // tp_degree
+
+        _, hidden_size_tp = attn_q_weight.sizes
+
+        n_total_heads_tp = hidden_size_tp // d_head
+        n_heads_tp = n_total_heads_tp - 2 * n_kv_heads_tp
+        # Q hidden size
+        hidden_size_tp = d_head * n_heads_tp
+
+        nki_output = nki_call(_kernel,
+                              hidden, attn_q_weight,
+                              output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], attn_q_weight.sizes[-1]]])
+        slice_lim = nki_output.sizes[-1] // (n_heads_tp + 2 * n_kv_heads_tp)
+        query = hlo.slice_along(nki_output, -1, n_heads_tp*slice_lim, start=0)
+        key = hlo.slice_along(nki_output, -1, (n_heads_tp+n_kv_heads_tp)*slice_lim, start=n_heads_tp*slice_lim)
+        value = hlo.slice_along(nki_output, -1, (n_heads_tp+2*n_kv_heads_tp)*slice_lim, start=(n_heads_tp+n_kv_heads_tp)*slice_lim)
+
+        # shard over head (llama/hlo.py)
+        active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
+        active_kv_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, d_head
+        query = hlo.reshape(query, active_q_sizes)
+        key = hlo.reshape(key, active_kv_sizes)
+        value = hlo.reshape(value, active_kv_sizes)
+        assert all([attn_q_scales is None,
+                    attn_q_bias is None,
+                    attn_k_weight is None,
+                    attn_k_scales is None,
+                    attn_k_bias is None,
+                    attn_v_weight is None,
+                    attn_v_scales is None,
+                    attn_v_bias is None])
+
+        # Pass QKV tuple since it will not be computed in the attention block
+        attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
+            nki_output, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+            attn_k_cache, attn_v_cache,
+            attn_q_weight, None, None,
+            None, None, None,
+            None, None, None,
+            attn_out_weight, attn_out_scales, attn_out_bias,
+            qkv_tuple=(query, key, value),
+        )
+        return attn_output, out_attn_k_cache, out_attn_v_cache
+
 
     def attention(
         self,
@@ -215,6 +297,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         k_weight, k_scales, k_bias,
         v_weight, v_scales, v_bias,
         out_weight, out_scales, out_bias,
+        qkv_tuple: tuple = None,
     ):
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
@@ -230,17 +313,22 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV
-        query, key, value = attention.query_key_value(
-            hidden,
-            q_weight, q_scales, q_bias,
-            k_weight, k_scales, k_bias,
-            v_weight, v_scales, v_bias,
-            d_head,
-            neuron_config=self.neuron_config,
-            tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
-            shard_over_batch=self.shard_over_batch,
-            n_kv_heads_tp=n_kv_heads_tp,
-        )
+        if qkv_tuple: 
+            # If computed already, skip computation here
+            assert active_mask is None
+            query, key, value = qkv_tuple
+        else:
+            query, key, value = attention.query_key_value(
+                hidden,
+                q_weight, q_scales, q_bias,
+                k_weight, k_scales, k_bias,
+                v_weight, v_scales, v_bias,
+                d_head,
+                neuron_config=self.neuron_config,
+                tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
+                shard_over_batch=self.shard_over_batch,
+                n_kv_heads_tp=n_kv_heads_tp,
+            )
 
         # Q = Rotate(Q)
         # K = Rotate(K)
