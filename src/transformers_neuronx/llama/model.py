@@ -193,8 +193,8 @@ class LlamaForSampling(base.NeuronModelBase):
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
 
-    def preprocess_and_embed(self, input_ids, cache_ids=None, start_ids=None):
-        padded_inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+    def preprocess_and_embed(self, input_ids, cache_ids=None, start_ids=None, **kwargs):
+        padded_inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids, **kwargs)
         if not self.neuron_config.on_device_embedding:
             input_embeddings = self.chkpt_model.model.embed_tokens(padded_inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
@@ -204,15 +204,15 @@ class LlamaForSampling(base.NeuronModelBase):
             input_embeddings = None
         return padded_inputs, input_embeddings, *rst
 
-    def forward(self, input_ids, cache_ids=None, start_ids=None, last_token_id=None, input_embeddings=None):
+    def forward(self, input_ids, cache_ids=None, start_ids=None, last_token_id=None, input_embeddings=None, **kwargs):
         if last_token_id is not None: # preprocess_and_embed() has already been invoked
             rst = cache_ids, start_ids, last_token_id
         else: # invoke preprocess_and_embed()
-            input_ids, input_embeddings, *rst = self.preprocess_and_embed(input_ids, cache_ids, start_ids)
+            input_ids, input_embeddings, *rst = self.preprocess_and_embed(input_ids, cache_ids, start_ids, **kwargs)
         # either input_embeddings are generated (off device embedding), or input_ids will be padded from preprocess_and_embed (on device embedding)
         inputs = input_embeddings if input_embeddings is not None else input_ids
         logits = self._forward(inputs, *rst)
-        logits = self._postprocess(logits, start_ids=start_ids)
+        logits = self._postprocess(logits, start_ids=start_ids, **kwargs)
         return logits
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):

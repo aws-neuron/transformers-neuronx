@@ -813,7 +813,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         layers_caches = []
         dim_size = {1: n_positions} if self.bsh_cache_layout else {0: n_positions}
         if self.neuron_config.continuous_batching:
-            batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
+            batch_size = self.neuron_config.continuous_batching.max_num_seqs
+            if self.neuron_config.paged_attention:
+                block_size = self.neuron_config.continuous_batching.block_size
+                dim_size = {1: block_size} if self.bsh_cache_layout else {0: block_size}
         for layer in layers:
             layer_caches = []
             if self.neuron_config.shard_over_sequence:
@@ -1589,19 +1592,21 @@ class DecoderLayer(torch.nn.Module):
         # NeuronCores.
         if self.allow_pad and not self.shard_over_batch:
             n_heads_kv_cache = utils.round_up_to_divisor(self.n_kv_head, self.tp_degree)
+        block_size = self.neuron_config.continuous_batching.block_size if self.neuron_config.paged_attention else self.n_positions
         # Separate KV cache for each batch size
         manipulator = parallel.ParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         for batch_size in self.batch_sizes:
+            num_blocks = self.neuron_config.continuous_batching.num_blocks if self.neuron_config.paged_attention else batch_size
             if self.bsh_cache_layout:
-                cache_shape = [batch_size, self.n_positions, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [batch_size, self.n_positions, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+                cache_shape = [num_blocks, block_size, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [batch_size, block_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             else:
-                cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [self.n_positions, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+                cache_shape = [block_size, num_blocks, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [block_size, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
             if self.shard_over_batch:
                 assert not self.bsh_cache_layout, "shard-over-batch for GQA with BSH cache layout is not supported."
-                self.cache_shape[batch_size] = [self.n_positions, batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [block_size, num_blocks // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
             elif self.neuron_config.shard_over_sequence:

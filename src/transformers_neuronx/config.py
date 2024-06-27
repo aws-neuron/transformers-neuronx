@@ -53,8 +53,28 @@ class ContinuousBatchingConfig:
     The config class that contains all continuous batching related settings
     """
 
-    def __init__(self, batch_size_for_shared_caches):
-        self.batch_size_for_shared_caches = batch_size_for_shared_caches
+    def __init__(self, **kwargs):
+        self.max_num_seqs = kwargs.pop("max_num_seqs") if kwargs.get("max_num_seqs", None) is not None else kwargs.pop("batch_size_for_shared_caches")
+        self.max_model_len = kwargs.pop("max_model_len") if kwargs.get("max_model_len", None) is not None else None
+        self.optimized_paged_attention = kwargs.pop("optimized_paged_attention") if kwargs.get("optimized_paged_attention", None) is not None else False
+        self.block_size = None
+        self.num_blocks = None
+        assert len(kwargs) == 0, f"unexpected key word arguments: {kwargs.keys()}"
+
+    @property
+    def batch_size_for_shared_caches(self) -> int:
+        return self.max_num_seqs
+
+    @property
+    def _paged_attention(self) -> bool:
+        if self.block_size and self.max_model_len:
+            if self.block_size < self.max_model_len:
+                return True
+        return False
+
+    def init_cache_engine(self, block_size, num_blocks):
+        self.block_size = block_size
+        self.num_blocks = num_blocks
 
 
 
@@ -275,6 +295,21 @@ class NeuronConfig():
     @property
     def use_1d_query(self):
         return self.cache_layout == Layout.BSH and self.padding_side == 'right'
+
+    @property
+    def paged_attention(self):
+        if self.continuous_batching:
+            return self.continuous_batching._paged_attention and self.bsh_cache_layout
+        return False
+
+    @property
+    def optimized_paged_attention(self):
+        return self.paged_attention and self.continuous_batching.optimized_paged_attention
+
+    @property
+    def bsh_cache_layout(self):
+        from transformers_neuronx import constants
+        return self.cache_layout == constants.Layout.BSH
 
     @property
     def vectorize_last_token_id(self):
