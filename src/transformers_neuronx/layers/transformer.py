@@ -85,15 +85,29 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
 
     if cache_2d and neuron_config.use_1d_query and n_active_tokens>1:
         start_ids = s32[n_active_tokens].Parameter(parameter_number=2)
+    elif neuron_config.paged_attention:
+        # start_ids will be used as slot_mappings
+        if n_active_tokens > 1:
+            start_ids = s32[batch_size, n_active_tokens].Parameter(parameter_number=2)
+        else:
+            start_ids = s32[batch_size].Parameter(parameter_number=2)
     else:
         start_ids = s32[batch_size].Parameter(parameter_number=2)
 
     # Build parameters for last_token_id and others
     if cache_2d:
-        if neuron_config and neuron_config.use_1d_query:
+        if neuron_config and neuron_config.use_1d_query and n_active_tokens > 1:
+            # context encoding: last_token_id is used as prompt_lens
             max_num_seqs = neuron_config.continuous_batching.batch_size_for_shared_caches
             last_token_id = s32[max_num_seqs].Parameter(parameter_number=3)
+        elif neuron_config and neuron_config.paged_attention and n_active_tokens == 1:
+            # decode with multiple KV cache blocks: last_token_id is used as block_tables
+            max_model_len = neuron_config.continuous_batching.max_model_len
+            block_size = neuron_config.continuous_batching.block_size
+            max_num_blocks_per_seq = (max_model_len + block_size - 1) // block_size
+            last_token_id = s32[batch_size, max_num_blocks_per_seq].Parameter(parameter_number=3)
         else:
+            # regular token gen
             last_token_id = s32[batch_size].Parameter(parameter_number=3)
     else:
         last_token_id = s32[1].Parameter(parameter_number=3)

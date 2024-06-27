@@ -130,7 +130,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
+            ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
@@ -209,7 +209,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def attention(
         self,
-        hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
+        hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -276,6 +276,10 @@ class LlamaForSamplingNoEmbeddingHlo:
                 else:
                     cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
                     cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
+            elif self.neuron_config.paged_attention:
+                # For decoding with multiple KV cache blocks, start_ids are used as block_tables
+                cached_keys_s = attention_utils.gather_blocks(cached_keys, block_tables=last_token_id)
+                cached_values_s = attention_utils.gather_blocks(cached_values, block_tables=last_token_id)
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
