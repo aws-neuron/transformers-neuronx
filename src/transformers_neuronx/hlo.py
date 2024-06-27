@@ -284,6 +284,11 @@ def dot_general(lhs, rhs, dimension_numbers):
     return output_dot
 
 
+def blockwise_qk_matmul(query, keys, neuron_config):
+    output_dot = hlo.full(0, )
+    return output_dot
+
+
 def dot00(lhs, rhs):
     dtype = lhs.dtype
     _, lhs_size = lhs.sizes
@@ -2631,6 +2636,8 @@ def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
         "Each updates array must be of rank (update_window_dims.size + scatter_indices.rank - 1)"
     dtype = updates.dtype
     updated_sizes = operands.sizes
+    assert scatter_indices.sizes[0] == updates.sizes[0], \
+        "update window size must match betwen scatter_indices and updates."
     updated = dtype[updated_sizes].Scatter(
         operands, scatter_indices, updates, scatter_dimension_numbers=scatter_dims, to_apply=to_apply)
     return updated
@@ -2987,12 +2994,13 @@ def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=Non
     if n_active_tokens == n_positions:
         # Context Encoding
         if neuron_config and neuron_config.use_1d_query:
+            # For concatenated prompt encoding (1D query), last_token_id is used as prompt_lens
             return decoder_attention_block_diagonal_causal_mask(last_token_id, n_positions)
         else:
             return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
     else:
         # Token generation
-        return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions)
+        return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, neuron_config=neuron_config)
 
 
 def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
@@ -3098,8 +3106,8 @@ def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
 
 def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, neuron_config=None):
     if neuron_config and neuron_config.optimized_paged_attention:
-        block_size = neuron_config.block_size
-        num_blocks = neuron_config.num_blocks
+        block_size = neuron_config.continuous_batching.block_size
+        num_blocks = neuron_config.continuous_batching.num_blocks
         return decoder_attention_mask_lhs_aligned_token_blockwise(cache_ids, block_size=block_size, num_blocks=num_blocks)
     else:
         return decoder_attention_mask_lhs_aligned_token_padded(cache_ids, n_positions)
@@ -3151,6 +3159,8 @@ def decoder_attention_mask_lhs_aligned_token_blockwise(context_lens, block_size,
     >>>     mask = jnp.int32(jnp.logical_and(mask_iota >= start_idx, mask_iota < end_idx))
     >>>     prior_mask = prior_mask + mask
     """
+    assert len(context_lens.sizes) == 1, "context_lens is expected to be a 1D vector."
+
     s32 = context_lens.scribe.s32
     f32 = context_lens.scribe.f32
     max_num_seqs = context_lens.sizes[0]

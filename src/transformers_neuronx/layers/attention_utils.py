@@ -121,7 +121,45 @@ def update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config=
     return indices
 
 
-def gather_blocks(key_cache, block_tables):
+def gather_blocks(key_cache, block_tables, neuron_config=None):
+    if neuron_config and neuron_config.optimized_paged_attention:
+        return gather_blocks_active(key_cache, block_tables)
+    else:
+        return gather_blocks_all(key_cache, block_tables)
+
+
+def gather_blocks_active(key_cache, block_tables):
+    """
+    Select KV cache blocks and gather assigned blocks into output buffer.
+
+    Reference design in PyTorch:
+        result = torch.index_select(key_cache, dim=0, index=block_table.flatten())
+        result = torch.reshape(result, (n_seqs, max_model_len, n_kv_heads, d_head))
+
+    Args:
+        key_cache: The KV cache blocks.
+            The input shape is [num_blocks, block_size, n_kv_heads, d_head]
+        block_tables: The block table that contains block indices for each of the sequences.
+            The input shape is [n_active_blocks]
+
+    Returns:
+        cached_keys: The selected KV cache blocks.
+            The output layout is [n_seqs, max_model_len, n_kv_heads, d_head],
+            where max_model_len=max_num_blocks_per_seq*block_size
+    """
+    num_blocks, block_size, n_kv_heads, d_head = key_cache.sizes
+    assert len(block_tables.sizes) == 1, f"invalid block_table input shape."
+    n_active_blocks, = block_tables.sizes
+    dtype = key_cache.dtype
+    hidden_size = n_kv_heads * d_head
+    chunk_size = block_size * hidden_size
+    key_cache = hlo.reshape(key_cache, (num_blocks, chunk_size))
+    cached_keys = hlo.index_select(key_cache, dim=0, index=block_tables)
+    cached_keys = hlo.reshape(cached_keys, (n_active_blocks, block_size, n_kv_heads, d_head))
+    return cached_keys
+
+
+def gather_blocks_all(key_cache, block_tables):
     """
     Select KV cache blocks and gather assigned blocks into output buffer.
 
@@ -223,4 +261,4 @@ def wrapper_flash_attention_nki(q, k, v, o, lse=None):
     flash_fwd(q, k, v, seed, o, lse, softmax_scale=softmax_scale, use_causal_mask=True, mixed_precision=True, dropout_p=0.0, config=config)
 
 def wrapper_flash_attention_bir(q, k, v, out, scale=1.0, kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap"):
-  attention_isa_kernel(q, k, v, scale, out, kernel_name)
+    attention_isa_kernel(q, k, v, scale, out, kernel_name)
