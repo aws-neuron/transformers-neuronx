@@ -81,6 +81,9 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         assert target.decoder_lm_head.tp_degree == draft.decoder_lm_head.tp_degree, (
             "The target model and draft model must have the same tp degree."
         )
+        assert isinstance(k, int), (
+            "The k value must be an integer."
+        )
  
         # FIXME: Add more validation to ensure draft/target compatibility
  
