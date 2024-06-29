@@ -14,11 +14,14 @@
 # ==============================================================================
 import math
 import itertools
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
+from transformers_neuronx import GQA
+from transformers_neuronx import NeuronConfig
 
 
 def parse_dtype_replica_groups(neuron_config, tp_degree):
@@ -260,3 +263,79 @@ def build_replica_groups(num_groups, group_size):
     ]
     return replica_groups
 
+
+def get_qkv_padding(
+        n_head: int,
+        n_kv_head: int,
+        tp_degree: int,
+        neuron_config: Optional[NeuronConfig] = None
+    ):
+    """
+    Compute the number of Q & KV heads after required padding.
+
+    This function does not validate that the GQA configuration is valid for the
+    given tensor parallel degree.
+
+    Args:
+        n_head: The original number of Q heads.
+        n_kv_head: The original number of KV heads.
+        tp_degree: The tensor parallelism degree.
+        neuron_config: The neuron configurations including the sharding options.
+
+    Returns:
+        n_head_padded: The total number of Q heads after padding.
+        n_kv_head_padded: The total number of KV heads after padding.
+    """
+    n_head_padded = round_up_to_divisor(n_head, tp_degree)
+    # Assume no KV padding by default. This applies to:
+    # - SHARD_OVER_BATCH -> Linearly split across NCs
+    # - ALL_GATHER_HEADS -> Linearly split across NCs
+    # - SHARD_OVER_HEADS -> Split by head across NCs (Assumes validated size)
+    n_kv_head_padded = n_kv_head
+
+    gqa = GQA.SHARD_OVER_HEADS
+    if neuron_config is not None:
+        gqa = neuron_config.group_query_attention
+
+    # When replicated, we need to check when we must fully/partially replicated
+    if (
+        n_head != n_kv_head
+        and gqa == GQA.REPLICATED_HEADS
+    ):
+        # Full Replication - Base case: replicate up to the number of Q heads
+        ratio = int(n_head / n_kv_head)
+
+        # Partial replication - Check if we can reduce the replication of the
+        # KV head only up to the tensor parallel degree so that the data copying
+        # is minimal per NeuronCore.
+        if (
+            (n_kv_head < tp_degree)
+            and (tp_degree % n_kv_head == 0)
+            and (
+                (n_head % tp_degree == 0)
+                or (
+                    (n_head_padded - n_head) % n_kv_head == 0
+                    and n_head_padded - n_head > 0
+                )
+            )
+        ):
+            ratio = int(tp_degree / n_kv_head)
+        # In case the number of Q heads that share same KV head (i.e. n_head / n_kv_head) is equal to
+        # the number of Q heads (after padding) assigned to each core (i.e. n_head_padded / tp_degree),
+        # we only need to allocate one KV head to each core
+        # (e.g. TP = 32, Q heads = 72 (96 after padding), KV heads = 24)
+        elif n_head_padded / tp_degree == n_head / n_kv_head:
+            ratio = 1
+
+        n_kv_head_padded = n_kv_head * ratio
+
+        # Ensure KV heads are at least padded to TP degree
+        if n_kv_head_padded < tp_degree:
+            n_kv_head_padded = tp_degree
+
+        # Full Replication - If fully replicated but needed to pad Q heads, then
+        # also pad KV heads.
+        if n_kv_head_padded == n_head:
+            n_kv_head_padded = n_head_padded
+
+    return n_head_padded, n_kv_head_padded

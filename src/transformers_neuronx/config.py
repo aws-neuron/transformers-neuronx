@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from transformers_neuronx import constants
-
-
 import os
 import math
 import logging
+import warnings
+from typing import Optional
+
+from transformers_neuronx import GQA, Layout, SparseAttnConfig
+
 
 class QuantizationConfig:
     """ The config class that contains all quantization related settings """
@@ -47,71 +49,180 @@ class QuantizationConfig:
 
 
 class ContinuousBatchingConfig:
-    """ The config class that contains all continuous batching related settings """
+    """
+    The config class that contains all continuous batching related settings
+    """
 
     def __init__(self, batch_size_for_shared_caches):
         self.batch_size_for_shared_caches = batch_size_for_shared_caches
 
 
+class GenerationConfig:
+
+    def __init__(self, *,
+        max_length = None,      # Default: Infer max sequence length from model
+        do_sample = False,      # Default: Greedy
+        top_k = 50,             # Default: Top 50 (when sampling)
+        top_p = 1.0,            # Default: Use all tokens
+        top_p_min_tokens = 1,   # Default: A minimum of 1 for Top-P sampling
+        global_top_k = None,    # Default: Do not use a global top-k value
+        eos_token_id = None,    # Default: Ignore EOS token, otherwise enable early stop.
+        temperature = 1.0,      # Default: No temperature application
+        dynamic = False,        # Default: Do not support changing generation config at runtime
+        deterministic = False,  # Default: Do not use a constant 0.5 as token acceptance threshold during sampling
+    ):
+        self.max_length = max_length
+        self.do_sample = do_sample
+        self.top_k = top_k
+        self.top_p = float(top_p)
+        self.top_p_min_tokens = top_p_min_tokens
+        self.global_top_k = global_top_k
+        self.eos_token_id = eos_token_id
+        self.temperature = float(temperature)
+        self.dynamic = dynamic
+        self.deterministic = deterministic
+
+    def __eq__(self, value: object) -> bool:
+        if not isinstance(value, GenerationConfig):
+            return False
+        return self.__dict__ == value.__dict__
+
+
+valid_dtypes = [
+    "float32",
+    "float16",
+    "bfloat16",
+]
+
+
 class NeuronConfig():
     """
-    Configuration class to store all Neuron related configs.
+    Neuron configurations for extra features and performance optimizations.
 
     Arguments:
-        all_reduce_dtype (str, optional): Data type that's used for AllReduce
-            CC ops, to be selected from `["float32", "float16", "bfloat16"]`.
-            Default: `None`.
-        sparse_attn (`sparse_attn_utils.SparseAttnConfig`, optional): Sparse
-            attention related configurations. Default: `None`.
-        quant (`QuantizationConfig`, optional): Quantization related
-            configurations. Default: `None`.
-        cast_logits_dtype (`str`, optional): Cast logits to this dtype at the end
-            of every forward pass. Must be selected from `["float32", "float16", "bfloat16"]`.
-            Default: Upcasts all logits to `float32`.
-        continuous_batching (`ContinuousBatchingConfig`, optional): Continuous
-            batching related configurations. Default: `None`.
-        use_2d_cache_ids (bool, optional): Whether to use 2D layout for cache_ids (aka position_ids).
-            Default: `False`.
-        attention_layout (`str`, optional): Layout to be used for attention computation.
+        sparse_attn: Enables attention sparsity with the given
+            configurations.
+        quant: Enables quantization with the given configurations.
+        continuous_batching: Enables the model to be used with continuous
+            batching using the given configurations.
+        attention_layout: Layout to be used for attention computation.
             To be selected from `["HSB", "BSH"]`.
-            Default: `"HSB"`.
-        collectives_layout (`str`, optional): Layout to be used for collectives within attension HSB.
+        collectives_layout: Layout to be used for collectives within attention.
             To be selected from `["HSB", "BSH"]`.
-            Default: `"HSB"`.
-        on_device_embedding (bool, optional): Whether to use on-device embedding for sampling.
-            Default: `False`.
-        log_softmax_scores: (`bool`, optional): Return log-softmax scores along with logits.
-            Default: False
-        on_device_generation (GenerationConfig, optional): Generation related configurations.
-            Used to set configurations to sample on device.
-            Default: `None`.
+        cache_layout: Layout to be used for storing the KV cache.
+            To be selected from `["SBH", "BSH"]`.
+        padding_side: The expected tokenizer batch padding side. See:
+            https://huggingface.co/docs/transformers/v4.39.0/en/main_classes/tokenizer#transformers.PreTrainedTokenizer.padding_side
+            The default padding side is "left", however using "right"
+            padding enables variable length sequences to be used. This is
+            enabled when using features such as continuous batching or batched
+            speculation.
+        group_query_attention: The sharding configuration to use when the number
+            of query attention heads is not equal to the number of key/value
+            heads. Neuron attempts to select the best configuration by default.
+        on_device_embedding: Enables the input embedding to be performed on
+            Neuron. By default, the embedding is computed on CPU.
+        on_device_generation: Enables token generation to be performed on Neuron
+            hardware with the given configuration. By default token generation
+            is computed on CPU. By configuring this at compilation time,
+            generation configurations cannot be dynamically configured during
+            inference.
+        all_reduce_dtype: The data type that is used for AllReduce collectives.
+            To be selected from `["float32", "float16", "bfloat16"]`.
+        cast_logits_dtype: The data type to cast logits to in the forward
+            pass. To be selected from `["float32", "float16", "bfloat16"]`.
+        fuse_qkv: Fuses the QKV projection into a single matrix multiplication.
+        qkv_tiling: Splits attention QKV to introduce "free" 128 dimensions.
+        weight_tiling: Splits model MLP to introduce "free" 128 dimensions.
+        log_softmax_scores: Return log-softmax scores along with logits.
+        shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
+        output_all_logits: Return all logits from each model invocation.
+        attn_output_transposed: Transposes the attention output projection weight tensor.
     """
-    def __init__(self, **kargs):
-        self.all_reduce_dtype = kargs.pop('all_reduce_dtype', None)
-        self.sparse_attn = kargs.pop('sparse_attn', None)
-        self.quant = kargs.pop('quant', None)
-        self.cast_logits_dtype = kargs.pop('cast_logits_dtype', 'float32')
-        self.fuse_qkv = kargs.pop('fuse_qkv', False)
-        self.continuous_batching = kargs.pop('continuous_batching', None)
-        self.lhs_aligned = kargs.pop('use_2d_cache_ids', False) or kargs.pop('lhs_aligned', False)
+    def __init__(self, *,
+        sparse_attn: Optional[SparseAttnConfig] = None,
+        quant: Optional[QuantizationConfig] = None,
+        continuous_batching: Optional[ContinuousBatchingConfig] = None,
+        attention_layout: Layout = Layout.HSB,
+        collectives_layout: Layout = Layout.HSB,
+        cache_layout: Layout = Layout.SBH,
+        padding_side: str = 'left',
+        group_query_attention: Optional[GQA] = None,
+        on_device_embedding: bool = False,
+        on_device_generation: Optional[GenerationConfig] = None,
+        all_reduce_dtype: Optional[str] = None,
+        cast_logits_dtype: str = 'float32',
+        fuse_qkv: bool = False,
+        qkv_tiling: bool = False,
+        weight_tiling: bool = False,
+        log_softmax_scores: bool = False,
+        shard_over_sequence: bool = False,
+        output_all_logits: bool = False,
+        attn_output_transposed: bool = False,
+        **kwargs,
+    ):
+        self.all_reduce_dtype = all_reduce_dtype
+        self.sparse_attn = sparse_attn
+        self.quant = quant
+        self.cast_logits_dtype = cast_logits_dtype
+        assert cast_logits_dtype in valid_dtypes, (
+            f"The `cast_logits_dtype={cast_logits_dtype}` argument must be one of {valid_dtypes}"
+        )
+        self.fuse_qkv = fuse_qkv
+        self.continuous_batching = continuous_batching
+        self.padding_side = padding_side
+        assert padding_side in ['left', 'right'], (
+            f"The `padding_side={padding_side}` argument must be either 'left' or 'right'"
+        )
+
+        self.lhs_aligned = padding_side == 'right'
+        if 'use_2d_cache_ids' in kwargs:
+            warnings.warn(
+                "NeuronConfig `use_2d_cache_ids` argument is deprecated. "
+                "Please specify `padding_side = 'right'`."
+            )
+            self.lhs_aligned = kwargs.pop('use_2d_cache_ids', False)
+        if 'lhs_aligned' in kwargs:
+            warnings.warn(
+                "NeuronConfig `lhs_aligned` argument is deprecated. "
+                "Please specify `padding_side = 'right'`."
+            )
+            self.lhs_aligned = kwargs.pop('lhs_aligned', False)
         if self.continuous_batching:
-            # Force using 2D cache_ids layout for continuous batching.
+            # Force left alignment for continuous batching.
             self.lhs_aligned = True
-        self.attention_layout = kargs.pop('attention_layout', constants.LAYOUT_HSB)
-        self.cache_layout = kargs.pop('cache_layout', constants.LAYOUT_SBH)
-        self.collectives_layout = kargs.pop('collectives_layout', constants.LAYOUT_HSB)
-        self.log_softmax_scores = kargs.pop('log_softmax_scores', False)
-        self.group_query_attention = kargs.pop('group_query_attention', None)
+
+        self.attention_layout = attention_layout
+        self.collectives_layout = collectives_layout
+        self.cache_layout = cache_layout
+        self.log_softmax_scores = log_softmax_scores
+        self.group_query_attention = group_query_attention
         if self.group_query_attention is not None:
-            self.group_query_attention = constants.GQA(self.group_query_attention)
-        self.on_device_embedding = kargs.pop('on_device_embedding', False)
-        self.on_device_generation = kargs.pop('on_device_generation', None)
-        assert len(kargs)==0, f"unexpected arguments: {kargs}"
+            self.group_query_attention = GQA(self.group_query_attention)
+        self.on_device_embedding = on_device_embedding
+        self.on_device_generation = on_device_generation
+        self.qkv_tiling = qkv_tiling
+        if self.qkv_tiling is True:
+            assert self.fuse_qkv is True, (
+                "QKV weight tiling is currently only supported when QKV fusion is enabled."
+            )
+
+        self.weight_tiling = weight_tiling
+        if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", False):
+            warnings.warn(
+                "NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT is deprecated. "
+                "To enable weight tiling, please use `NeuronConfig(weight_tiling=True)` instead.",
+            )
+            self.weight_tiling = True
+        self.output_all_logits = output_all_logits
+
+        assert len(kwargs) == 0, (
+            f"Unexpected NeuronConfig keyword arguments: {kwargs}"
+        )
 
         self.rank_id = int(os.getenv("NEURON_RANK_ID", "0"))
 
         self.local_tp = os.getenv("NEURON_LOCAL_TP", None)
-
 
         self.pp_stages = int(os.getenv("NEURON_PP_STAGES", 1))
 
@@ -121,7 +232,10 @@ class NeuronConfig():
         self.dist = None
 
         self.layer_partition = {}
+        
+        self.shard_over_sequence = shard_over_sequence
 
+        self.attn_output_transposed = attn_output_transposed
     @property
     def use_2d_cache_ids(self):
         return self.lhs_aligned
@@ -185,19 +299,3 @@ class NeuronConfig():
 
     def get_g_start_device_id(self, tp):
         return self.rank_id*self.get_local_tp(tp)
-
-
-class GenerationConfig:
-
-    def __init__(self, *,
-        max_length = None,      # Default: Infer max sequence length from model
-        do_sample = False,      # Default: Greedy
-        top_k = 50,             # Default: Top 50 (when sampling)
-        eos_token_id = None,    # Default: Ignore EOS token, otherwise enable early stop.
-        temperature = None,     # Default: No temperature application
-    ):
-        self.max_length = max_length
-        self.do_sample = do_sample
-        self.top_k = top_k
-        self.eos_token_id = eos_token_id
-        self.temperature = temperature

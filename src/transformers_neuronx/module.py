@@ -139,6 +139,25 @@ class LowMemoryModule(torch.nn.Module):
                 complete = False
         return complete
 
+    def _load_ties(self):
+        for ties in self.get_tied_parameters():
+
+            # Find if any tie has a weight
+            src = None
+            for tie in ties:
+                if hasattr(tie, '_file_path'):
+                    src = tie
+                    break
+
+            if src is None:
+                continue
+
+            # Copy weight for remaining empty tied weights
+            for dst in ties:
+                if not hasattr(dst, '_file_path'):
+                    dst._file_path = src._file_path
+                    dst._global_key = src._global_key
+
     def _load_from_state_dict_dir(self, state_dict_dir, key_to_filename, prefix=''):
         state_dict_dir = os.path.realpath(state_dict_dir)
 
@@ -147,20 +166,14 @@ class LowMemoryModule(torch.nn.Module):
 
         # Check for ties and base model prefixes if initial weight load was incomplete
         if not complete:
+
             # Load base model weights
             base = self.get_base_model()
             if base:
                 base._load_state(state_dict_dir, key_to_filename, prefix)
 
             # Load tied weights
-            def load_tie(src, dst):
-                if hasattr(src, '_file_path') and not hasattr(dst, '_file_path'):
-                    dst._file_path = src._file_path
-                    dst._global_key = src._global_key
-
-            for first, second in self.get_tied_parameters():
-                load_tie(first, second)
-                load_tie(second, first)
+            self._load_ties()
 
     def load_pytorch_model_bin(self, state_dict_dir):
         """
@@ -211,7 +224,7 @@ class LowMemoryModule(torch.nn.Module):
             key_to_filename = json.load(f)
         self._load_from_state_dict_dir(weight_directory, key_to_filename)
 
-    def get_tied_parameters(self) -> List[Tuple[torch.nn.Parameter, torch.nn.Parameter]]:
+    def get_tied_parameters(self) -> List[Tuple[torch.nn.Parameter, ...]]:
         """
         Get parameter path pairs whose weights are identical.
 
@@ -394,9 +407,9 @@ class PretrainedModel(LowMemoryModule):
                 batch_size_for_shared_caches = neuron_config.continuous_batching.batch_size_for_shared_caches
                 expected_batch_size = kwargs.get("batch_size")
                 assert batch_size_for_shared_caches == expected_batch_size, \
-                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"
-                assert isinstance(n_positions, list) and len(n_positions) == 1
+                    f"invalid batch_size_for_shared_caches ({batch_size_for_shared_caches}), {expected_batch_size} is expected"   
                 if bsh_cache_layout:
+                    assert isinstance(n_positions, list) and len(n_positions) == 1
                     assert isinstance(context_length_estimate, list) and len(context_length_estimate) == 1, \
                     	"BSH cache layout does not support multi-bucketing"
             else:

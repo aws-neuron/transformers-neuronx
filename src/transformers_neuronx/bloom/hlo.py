@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.layers import transformer, alibi, generation
+from transformers_neuronx.layers import transformer, alibi, attention
 from transformers_neuronx.bloom.config import BloomConfig
 
 class BloomForSamplingNoEmbeddingHlo:
@@ -22,15 +22,15 @@ class BloomForSamplingNoEmbeddingHlo:
     def __init__(self, config: BloomConfig, neuron_config=None):
         self.config = config
         self.neuron_config = neuron_config
+        self.n_positions = None
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, cache_ids, mask, active_mask), dims
+        return tensors, dims
 
-    def embedding(self, input_ids, last_token_id, cache_ids, mask, active_mask, slopes, word_embeddings, ln_weight, ln_bias):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, slopes, word_embeddings, ln_weight, ln_bias):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(word_embeddings, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -41,8 +41,9 @@ class BloomForSamplingNoEmbeddingHlo:
         return hlo.layer_norm_bsh(hidden, ln_weight, ln_bias) if is_bsh \
                else hlo.layer_norm(hidden, ln_weight, ln_bias)
 
-    def pre_layer(self, hidden, last_token_id, cache_ids, mask, active_mask, *pre_layer_weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *pre_layer_weights):
         slopes, *rest = pre_layer_weights
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
         prior_alibi, active_alibi = alibi.alibi(slopes, mask, active_mask)
         return hidden, last_token_id, cache_ids, mask, active_mask, prior_alibi, active_alibi
 
@@ -87,14 +88,9 @@ class BloomForSamplingNoEmbeddingHlo:
         hidden = dtype[hidden.sizes].Add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.ln_lm_head(self.config.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight,
                                         lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
-        if self.neuron_config.on_device_generation is not None:
-            return generation.generate(logits, logits_indices,
-                                       config=self.neuron_config.on_device_generation, 
-                                       tp_degree=self.config.tp_degree, 
-                                       eos_token_id=self.config.eos_token_id)
         return logits
 
     def attention(self,
@@ -110,12 +106,6 @@ class BloomForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
         dtype = hidden.dtype
         d_head = self.config.hidden_size // self.config.n_head
-
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK

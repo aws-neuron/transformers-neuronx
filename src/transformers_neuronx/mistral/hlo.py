@@ -16,7 +16,8 @@ from typing import Optional
 
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
-from transformers_neuronx.layers import attention_hsb as attention, transformer, rotary, generation
+from transformers_neuronx import utils
+from transformers_neuronx.layers import attention, transformer, rotary, attention_utils
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -30,25 +31,16 @@ class MistralForSamplingNoEmbeddingHlo:
     ):
         self.config = config
         self.neuron_config = neuron_config
+        self.n_positions = None
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.config.hidden_size, self.neuron_config
         )
-        if self.neuron_config and self.neuron_config.lhs_aligned:
-            curr_window_start = scribe.s32[batch_size].Parameter(parameter_number=4)
-        else:
-            curr_window_start = scribe.s32.Parameter(parameter_number=4)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
+        return (*tensors, curr_window_start), (*dims, None)
 
-        head_dim = self.config.attention_head_size
-        pos_embed = rotary.hlo_rotary_embedding(dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
-                                                base=self.config.rope_theta,
-                                                interpolation_factor=self.config.position_interpolation_factor)
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask), (*dims, None)
-
-    def embedding(self, input_ids, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask, embed_weight):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -56,6 +48,16 @@ class MistralForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
+
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
+        head_dim = self.config.attention_head_size
+        pos_embed = rotary.hlo_rotary_embedding(
+            hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+            base=self.config.rope_theta,
+            interpolation_factor=self.config.position_interpolation_factor
+        )
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        return hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask
 
     def layer(
             self, hidden, last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
@@ -102,13 +104,8 @@ class MistralForSamplingNoEmbeddingHlo:
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+    def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)
-        if self.neuron_config.on_device_generation is not None:
-            return generation.generate(logits, logits_indices,
-                                       config=self.neuron_config.on_device_generation,
-                                       tp_degree=self.config.tp_degree,
-                                       eos_token_id=self.config.eos_token_id)
         return logits
 
     def attention(
@@ -154,11 +151,14 @@ class MistralForSamplingNoEmbeddingHlo:
         d_head = self.config.attention_head_size
         tp_degree = self.config.tp_degree
 
-        if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
-        from transformers_neuronx.layers import attention_utils
+        # Compute the expected number of KV heads (Used in case fused QKV is used)
+        n_kv_heads_tp = None
+        if self.config.num_key_value_heads is not None:
+            n_head = self.config.num_attention_heads
+            n_kv_head = self.config.num_key_value_heads
+            _, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_kv_heads_tp = n_kv_head_padded // tp_degree
+
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
@@ -171,7 +171,8 @@ class MistralForSamplingNoEmbeddingHlo:
             d_head,
             neuron_config=self.neuron_config,
             tp_degree=tp_degree,  # TODO: include tp_degree into neuron_config
-            shard_over_batch=shard_over_batch
+            shard_over_batch=shard_over_batch,
+            n_kv_heads_tp=n_kv_heads_tp,
         )
 
         # Q = Rotate(Q)
@@ -201,9 +202,10 @@ class MistralForSamplingNoEmbeddingHlo:
 
             if self.config.window_size:
                 if list(cached_keys.sizes)[0] > self.config.window_size and list(cached_values.sizes)[0] > self.config.window_size and list(mask.sizes)[2] >self.config.window_size:
-                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start, size=self.config.window_size)
-                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start, size=self.config.window_size)
+                    curr_window_start_scalar = hlo.reshape(curr_window_start, [])
+                    useful_cached_keys = hlo.dynamic_slice_along(cached_keys, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
+                    useful_cached_values = hlo.dynamic_slice_along(cached_values, dim=0, start=curr_window_start_scalar, size=self.config.window_size)
+                    useful_mask = hlo.dynamic_slice_along(mask, dim=2, start=curr_window_start_scalar, size=self.config.window_size)
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, useful_cached_keys, n_kv_heads=self.config.num_key_value_heads,

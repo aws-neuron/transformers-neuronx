@@ -93,8 +93,8 @@ class LlamaForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
-            if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-                new_layer.add_attention_output(attn.o_proj.weight.detach().T, None, sharding=0, transposed=True)
+            if self.neuron_config and self.neuron_config.attn_output_transposed:
+                new_layer.add_attention_output(attn.o_proj.weight.T.detach(), None, sharding=0, transposed=True)
             else:
                 new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
@@ -104,7 +104,7 @@ class LlamaForSampling(base.NeuronModelBase):
                                     allow_quantize=True, allow_transform=True)
             new_layer.add_parameter(mlp.up_proj.weight.T, sharding=1, allow_pad=True,
                                     allow_quantize=True, allow_transform=True)
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+            if self.neuron_config.weight_tiling:
                 new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
                                         allow_quantize=True, allow_transform=True)
             else:
@@ -113,7 +113,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
             new_layer.to_neuron()
             layer.nullify()
-
+            if self.neuron_config.shard_over_sequence:
+                self.decoder_lm_head.add_pre_layer_parameter(torch.arange(self.config.tp_degree), sharding=0)
         # For pipeline parallel, we need to load ln and lm_head for now even if the pipeline stage doesn't compute the, because
         # 1) we need the ln_lm_head hlo for pp0 to get the logits shape and dtype
         # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
@@ -166,14 +167,6 @@ class LlamaForSampling(base.NeuronModelBase):
         self.forward(self.prefixed_input_ids)
         self.prefixed_length = prefixed_length
 
-
-    def _compute_logits(self, input_ids, *rst):
-        hidden = self.chkpt_model.model.embed_tokens(input_ids)
-        if self.neuron_config.attention_layout == LAYOUT_HSB:
-            hidden = hidden.transpose(0, -1).contiguous()
-        return self._forward(hidden, *rst)
-
-
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if not self.neuron_config.on_device_embedding:
@@ -184,9 +177,20 @@ class LlamaForSampling(base.NeuronModelBase):
         logits = self._postprocess(logits, start_ids=start_ids)
         return logits
 
-
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
-        inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        if self.neuron_config and self.neuron_config.continuous_batching:
+            inputs, *args = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        else:
+            batch_size, *_ = input_ids.shape
+            if start_ids is None:
+                start_ids = torch.zeros(batch_size, dtype=torch.int32)
+            if cache_ids is None:
+                batch_size, context_length = input_ids.shape
+                cache_ids = torch.arange(context_length, dtype=torch.int32)
+                if self.neuron_config.use_2d_cache_ids:
+                    cache_ids = cache_ids.unsqueeze(0).expand(batch_size, context_length)
+
+            inputs, *args = input_ids, cache_ids, start_ids
 
         batch_size, seq_len = input_ids.shape
         if speculation_length is None:
@@ -205,7 +209,8 @@ class LlamaForSampling(base.NeuronModelBase):
             inputs = self.chkpt_model.model.embed_tokens(inputs)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
-        logits = model(inputs, *args)
+        with torch.inference_mode():
+            logits = model(inputs, *args)
         logits = self._cast_logits(logits)
         logits = logits[:self.config.vocab_size, -speculation_length:, :]
         logits = logits.transpose(0, 1)
@@ -214,10 +219,10 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, cache_ids=None, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, **kwargs):
-        
+
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
-                                            config=self.neuron_config.on_device_generation)
+                                            config=self.neuron_config.on_device_generation, streamer=streamer)
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()

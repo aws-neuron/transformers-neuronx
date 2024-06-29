@@ -40,6 +40,8 @@ class MixtralForSampling(base.NeuronModelBase):
         self.context_hook = None
         self.config = config
         self.neuron_config = neuron_config if neuron_config else NeuronConfig()
+        if self.neuron_config.on_device_generation:
+            self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
         if context_unroll is None:
             context_unroll = config.num_hidden_layers
         self.context_unroll = context_unroll
@@ -53,12 +55,12 @@ class MixtralForSampling(base.NeuronModelBase):
         self.batch_sizes = bucket.batch_sizes(batch_size)
 
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
-        hlo_builder = MixtralForSamplingNoEmbeddingHlo(config, neuron_config=neuron_config)
+        hlo_builder = MixtralForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
             num_layers=config.num_hidden_layers, n_head=config.num_attention_heads, n_kv_head=config.num_key_value_heads,
-            unroll=unroll, neuron_config=neuron_config, allow_pad=True,
+            unroll=unroll, neuron_config=self.neuron_config, allow_pad=True,
             builder=hlo_builder
         )
         self.decoder_lm_head_for_context= self.decoder_param_set.init_context_decoder(unroll=self.context_unroll, buckets=self.context_buckets, model_obj=self)
@@ -84,10 +86,7 @@ class MixtralForSampling(base.NeuronModelBase):
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
-            if self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH:
-                new_layer.add_attention_output(attn.o_proj.weight.detach().T, None, sharding=0, transposed=True)
-            else:
-                new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
+            new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
             new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note:
@@ -146,7 +145,7 @@ class MixtralForSampling(base.NeuronModelBase):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
         curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
         inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
         if not self.neuron_config.on_device_embedding:
@@ -163,6 +162,10 @@ class MixtralForSampling(base.NeuronModelBase):
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
+
+        if self.neuron_config.on_device_generation:
+            return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
+                                            config=self.neuron_config.on_device_generation, streamer=streamer)
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()
