@@ -136,7 +136,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             assert fused_pre_attn_ln_qkv_weight is not None
             attn_output, out_attn_k_cache, out_attn_v_cache = self.fused_rmsnorm_qkv(
                 hidden, None, eps,
-                ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+                cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
                 attn_k_cache, attn_v_cache,
                 fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias, # should be none
