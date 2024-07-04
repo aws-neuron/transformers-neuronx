@@ -75,19 +75,19 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         cache_ids = s32[n_active_tokens].Parameter(parameter_number=1)  # 1d cache_ids
 
     start_ids = s32[batch_size].Parameter(parameter_number=2)
-    if neuron_config and neuron_config.vectorize_last_token_id:
+    if cache_2d:
         last_token_id = s32[batch_size].Parameter(parameter_number=3)
     else:
-        last_token_id = s32.Parameter(parameter_number=3)
+        last_token_id = s32[1].Parameter(parameter_number=3)
 
     sequence_slice_dimensions = (
-        1,                     # hidden        | In both HSB/BSH the sequence dim is 1
-        1 if cache_2d else 0,  # cache_ids     | Sequence dim varies based on alignment
-        None,                  # start_ids     | Offset is per batch, no slicing required
-        None                   # last_token_id | Scalar, no slicing required
+        1,                        # hidden        | In both HSB/BSH the sequence dim is 1
+        1 if cache_2d else 0,     # cache_ids     | Sequence dim varies based on alignment
+        None,                     # start_ids     | Offset is per batch, no slicing required
+        0 if cache_2d else None   # last_token_id | Scalar, no slicing required
     )
 
-    return hidden, cache_ids, start_ids, last_token_id, sequence_slice_dimensions
+    return (hidden, cache_ids, start_ids, last_token_id), sequence_slice_dimensions
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):
     """
@@ -192,14 +192,15 @@ def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
         batch_size, n_active_tokens, hidden_size = hidden.sizes
     else:
         hidden_size, n_active_tokens, batch_size = hidden.sizes
-    if len(last_token_id.sizes) > 0:
+    if neuron_config and neuron_config.lhs_aligned:
         if not is_bsh:
             hidden = hlo.transpose210(hidden)
         hidden = hlo.reshape(hidden, (batch_size*n_active_tokens, hidden_size))
 
         # [6,3,9] -> [(0,6),(1,3),(2,9)] -> [6+0*128,3+1*128,9+2*128] -> [6,131,265]
         # last_token_id + iota * n_active_tokens
-        assert last_token_id.sizes[0] == batch_size, "unexpected shape of vectorized last_token_id"
+        assert last_token_id.sizes[0] == batch_size, \
+            f"vectorized last_token_id length ({last_token_id.sizes[0]}) is expected to equal to batch size ({batch_size})"
         offset = hlo.iota(last_token_id.dtype, last_token_id.sizes, [0])
         offset = hlo.multiply(offset, n_active_tokens)
         last_token_id = hlo.add(last_token_id, offset)
@@ -209,5 +210,7 @@ def _dynamic_logits_slice(hidden, last_token_id, neuron_config=None):
         if not is_bsh:
             hidden = hlo.transpose210(hidden)
     else:
-        hidden = hlo.dynamic_slice_along(hidden, dim=1, start=last_token_id, size= 1)
+        hidden = hlo.transpose102(hidden)
+        hidden = hlo.index_select(hidden, dim=0, index=last_token_id)
+        hidden = hlo.transpose102(hidden)
     return hidden

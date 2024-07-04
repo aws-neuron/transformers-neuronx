@@ -139,9 +139,9 @@ class GPTNeoXForSampling(module.PretrainedModel):
             ops.parallel_write(in_buffer, duplicated_tensor)
         return program.run(bucket_id)
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         return simple_sample(self, input_ids, start_ids, sequence_length,
-                             eos_token_id=self.config.eos_token_id, top_k=top_k)
+                             eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
     def _fixed_pos_embedding(self, dim, head_dim, offset):
         """
@@ -305,7 +305,7 @@ class GPTNeoXLayer(module.LowMemoryModule):
         self.attn_k_bias = shard_along(k_bias, dim=0)
         self.attn_v_weight = shard_along(v, dim=1)
         self.attn_v_bias = shard_along(v_bias, dim=0)
-        self.attn_out_weight = shard_along(attention.dense.weight.detach().T, dim=0)
+        self.attn_out_weight = shard_along(attention.dense.weight.detach(), dim=1)
         self.attn_out_bias = primary_only(attention.dense.bias.detach())
 
         self.ln_2_weight = duplicate(self.post_attention_layernorm.weight.detach())

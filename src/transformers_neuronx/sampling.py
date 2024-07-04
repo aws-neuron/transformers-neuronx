@@ -22,11 +22,11 @@ from transformers_neuronx.stopping_criteria import StoppingCriteriaList
 
 
 @torch.no_grad()
-def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False):
+def simple_sample(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, streamer=None, output_scores=False, cache_ids=None):
     # populate key/value caches according to the prompt text
     next_token_scores = model(input_ids, None, start_ids)
     return sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
-                       eos_token_id, top_k, streamer, output_scores=output_scores)
+                       eos_token_id, top_k, streamer, output_scores=output_scores, cache_ids=cache_ids)
 
 
 @torch.no_grad()
