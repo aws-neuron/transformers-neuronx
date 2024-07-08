@@ -479,9 +479,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH].
             if self.neuron_config.cache_layout == constants.LAYOUT_SBH:
                 bucket_id = self.program.find_bucket_id(cache_ids.max().item())
+                batch_size, _ = cache_ids.shape
+            # Enabling Output bucketing for Paged attention with BSH cache layout.
+            elif self.bsh_cache_layout and self.neuron_config.optimized_paged_attention:
+                bucket_id = 0
+                batch_size = self.program.find_block_bucket_size(context_length=inputs[1],block_size=self.neuron_config.continuous_batching.block_size)   
             else:
                 bucket_id = 0
-            batch_size, _ = cache_ids.shape
+                batch_size, _ = cache_ids.shape
         elif self.neuron_config and self.neuron_config.shard_over_sequence:
              bucket_id = self.program.find_bucket_id(cache_ids.item() + self.kv_replication - 1)
         else:
@@ -567,13 +572,28 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         # for pipeline parallel: only do FullyUnrolled when there is valid ln_lm_head
         if self.unroll == self.num_layers and self.neuron_config.is_valid_lm_head() and not self.neuron_config.is_pp():
-            for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
-                hlo_modules[npos,batch_size], debug_tensors[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
-            num_inputs = len(self.inputs_sdim)
-            batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
-                if self.neuron_config.continuous_batching else None
-            program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length,
-                                                  batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
+            # For page attention we are replacing the batch size with the active blocks, 
+            # And the n_positions used for the various block sizes corresponded to the max n_position.
+            if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+                # Taking block sizes based on n_positions,block_size for bucketing.
+                block_sizes = [n_pos * self.neuron_config.continuous_batching.max_num_seqs // self.neuron_config.continuous_batching.block_size for n_pos in self.n_positions_list]
+                # Taking max of n_positions_list for building bucketing for paged attention token gen.
+                pa_npos = [max(self.n_positions_list)]  
+                for npos,block_size in itertools.product(pa_npos, block_sizes):
+                    hlo_modules[npos,block_size], debug_tensors[npos,block_size] = self._hlo_fully_unrolled(npos, block_size)
+                num_inputs = len(self.inputs_sdim)
+                batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                    if self.neuron_config.continuous_batching else None
+                program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, pa_npos, block_sizes, self.prefixed_length,
+                                                    batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
+            else:
+                for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
+                    hlo_modules[npos,batch_size], debug_tensors[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
+                num_inputs = len(self.inputs_sdim)
+                batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                    if self.neuron_config.continuous_batching else None
+                program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length,
+                                                    batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
         else:
 
             if utils.amp_is_u8(self.amp):
@@ -628,14 +648,20 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def _hlo_fully_unrolled(self, n_positions, batch_size):
 
         self.builder.n_positions = n_positions
-
+        if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+            self.builder.num_active_blocks = batch_size
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
 
+            # Page attention parameters
+            if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+                (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                    scribe, dtype, self.n_active_tokens, self.neuron_config.continuous_batching.max_num_seqs)
             # Create user parameters
-            (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, self.n_active_tokens, batch_size)
+            else:
+                (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                    scribe, dtype, self.n_active_tokens, batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
 
             # Create inputs for all weights & caches
@@ -1931,7 +1957,10 @@ class DecoderProgram:
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
             kernel_tag = f"seqlen{npos}-batch{batch_size}"
             if tag is not None:
-                kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
+                if self.neuron_config.optimized_paged_attention and tag == 'token':
+                    kernel_tag = f"{tag}-seqlen{npos}-block{batch_size}"
+                else:
+                    kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
             self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag)
         self.debug_tensors = debug_tensors
         self.debug_output_buffers = dict()
@@ -1973,6 +2002,11 @@ class DecoderProgram:
 
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
+    
+    def find_block_bucket_size(self, context_length, block_size):
+        n_active_blocks = ((context_length+block_size-1) // block_size).sum().item()
+        active_block = bucket.find(self.batch_sizes, n_active_blocks)
+        return active_block
 
     def inputs_host_to_device(self, input_tensors, batch_size):
 
