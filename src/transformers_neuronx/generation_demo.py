@@ -231,6 +231,7 @@ def main():
     run_parser.add_argument('--fuse_qkv', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm_threshold', type=int, default=2048)
+    run_parser.add_argument('--shard_over_sequence', action='store_true')
     # logging
     run_parser.add_argument('--debug', action='store_true')
 
@@ -527,6 +528,7 @@ def run(args, hf_model_name, model_cls):
                 sequence_parallel_norm_threshold=args.sequence_parallel_norm_threshold,
                 attention_layout=args.attention_layout,
                 mlp_out_weight_transpose=args.mlp_out_weight_transpose,
+                shard_over_sequence=args.shard_over_sequence,
             )
 
             if args.no_bucketing_n_positions:
