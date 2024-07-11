@@ -225,9 +225,12 @@ def interleave_qkv(q, k, v, tp_degree, dim=1):
             else:
                 tensor[:, (idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
     else:
-        q_hidden_dim, q_interleave_dim = q.shape
-        _, kv_interleave_dim = k.shape
-        tensor = torch.zeros((q_hidden_dim, q_interleave_dim + kv_interleave_dim * 2), dtype=q.dtype)
+        q_hidden_dim, q_interleave_dim = q.shape[0], q.shape[1] if len(q.shape) > 1 else 1
+        kv_hidden_dim, kv_interleave_dim = k.shape[0], k.shape[1] if len(k.shape) > 1 else 1
+        if len(q.shape) > 1:
+            tensor = torch.zeros((q_hidden_dim, q_interleave_dim + kv_interleave_dim * 2), dtype=q.dtype)
+        else:
+            tensor = torch.zeros((q_hidden_dim + kv_hidden_dim * 2), dtype=q.dtype)
         q_size, q_shard_size, q_slices = get_slice_params(q, dim, tp_degree)
         kv_size, kv_shard_size, kv_slices = get_slice_params(k, dim, tp_degree)
         for idx, ((_, q_shard_tensors), (_, kv_shard_tensors)) in enumerate(zip(
@@ -237,7 +240,10 @@ def interleave_qkv(q, k, v, tp_degree, dim=1):
             q_shard = q_shard_tensors[0]
             kv_shard = torch.concat(kv_shard_tensors, dim=dim).contiguous()
             shard = torch.cat((q_shard, kv_shard), dim=dim).contiguous()
-            tensor[:, (idx)*shard.shape[1]:(idx+1)*shard.shape[1]] = shard
+            if dim == 1:
+                tensor[:, (idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
+            else:
+                tensor[(idx) * shard.shape[dim]:(idx + 1) * shard.shape[dim]] = shard
     return tensor
 
 
