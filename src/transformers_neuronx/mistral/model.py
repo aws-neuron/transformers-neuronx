@@ -132,6 +132,32 @@ class MistralForSampling(base.NeuronModelBase):
         # num_processed_tokens tracks number of processed tokens for sliding window attention
         self.num_processed_tokens = torch.tensor([0], dtype=torch.int32)
 
+    def forward_old(self, input_ids, cache_ids=None, start_ids=None):
+        # Compute the window starting index for specific mask patterns
+        # For other patterns we pass in a default value of 0, it won't be used
+        curr_window_start = max(0, self.num_processed_tokens - self.config.window_size) if self.config.window_size else 0
+        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        if len(input_ids.shape) == 3:
+            mock_input_ids = torch.ones(input_ids.shape[:2], dtype=torch.int32)
+            _, cache_ids, start_ids, last_token_id = self._preprocess(mock_input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            inputs = input_ids
+            if self.neuron_config.attention_layout == LAYOUT_HSB:
+                inputs = inputs.transpose(0, -1).contiguous()
+        else:
+            inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            if not self.neuron_config.on_device_embedding:
+                inputs = self.chkpt_model.model.embed_tokens(inputs)
+                if self.neuron_config.attention_layout == LAYOUT_HSB:
+                    inputs = inputs.transpose(0, -1).contiguous()
+        logits = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+        logits = self._postprocess(logits, start_ids=start_ids)
+
+        # Increment the token counter, last_token_id = 0 when in decoder mode
+        self.num_processed_tokens += (last_token_id+1)
+        return logits
+
+
+    
     def forward(self, input_ids, cache_ids=None, start_ids=None):
         # Compute the window starting index for specific mask patterns
         # For other patterns we pass in a default value of 0, it won't be used
@@ -139,13 +165,39 @@ class MistralForSampling(base.NeuronModelBase):
             curr_window_start = torch.max(torch.tensor(0, dtype=torch.long), self.num_processed_tokens - self.config.window_size)
         else:
             curr_window_start = self.num_processed_tokens
-        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        last_token_id = rst[-1]
-        rst = (*rst, curr_window_start)
-        if not self.neuron_config.on_device_embedding:
-            inputs = self.chkpt_model.model.embed_tokens(inputs)
+
+        
+        #inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        #last_token_id = rst[-1]
+        #rst = (*rst, curr_window_start)
+
+        #if not self.neuron_config.on_device_embedding:
+        #if self.neuron_config.on_device_embedding:
+        #    inputs = self.chkpt_model.model.embed_tokens(inputs)
+        #    if self.neuron_config.attention_layout == LAYOUT_HSB:
+        #        inputs = inputs.transpose(0, -1).contiguous()
+
+        #zheng add
+        if len(input_ids.shape) == 3:
+            mock_input_ids = torch.ones(input_ids.shape[:2], dtype=torch.int32)
+            inputs_nouse, *rst = self._preprocess(mock_input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            #_, cache_ids, start_ids, last_token_id = self._preprocess(mock_input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            last_token_id = rst[-1]
+            rst = (*rst, curr_window_start)
+            inputs = input_ids
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
+        else:
+            inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            last_token_id = rst[-1]
+            rst = (*rst, curr_window_start)
+            if not self.neuron_config.on_device_embedding:
+                inputs = self.chkpt_model.model.embed_tokens(inputs)
+                if self.neuron_config.attention_layout == LAYOUT_HSB:
+                    inputs = inputs.transpose(0, -1).contiguous()
+
+
+
         logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
 
@@ -154,6 +206,8 @@ class MistralForSampling(base.NeuronModelBase):
         # TODO: Get curr_window_start out of cache_ids, instead of sending it from inputs.
         self.num_processed_tokens += (last_token_id[:1]+1)
         return logits
+
+    
 
     def sample(self, input_ids, sequence_length, start_ids=None,
                top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
@@ -164,7 +218,14 @@ class MistralForSampling(base.NeuronModelBase):
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()
-        batch_size, context_length = input_ids.shape
+
+        #zheng add
+        if len(input_ids.shape) == 3:
+            batch_size, context_length, _ = input_ids.shape
+        else:
+            batch_size, context_length = input_ids.shape
+
+        #batch_size, context_length = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
