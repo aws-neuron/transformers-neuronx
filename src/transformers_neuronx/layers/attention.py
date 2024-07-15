@@ -299,6 +299,13 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
         updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
+        if bsh_cache_layout:
+            updated_keys = hlo.reshape(updated_keys, [n_seqs, n_positions, n_kv_heads, d_head])
+            updated_vals = hlo.reshape(updated_vals, [n_seqs, n_positions, n_kv_heads, d_head])
+        else:
+            updated_keys = hlo.reshape(updated_keys, [n_positions, n_seqs, n_kv_heads, d_head])
+            updated_vals = hlo.reshape(updated_vals, [n_positions, n_seqs, n_kv_heads, d_head])
+
     elif ((n_active_tokens == n_positions) or (paged_attention and (n_active_tokens >= n_positions))) and n_seqs > n_active_seqs:
         # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
         #        +-0-1-2-3-4-5-----------------------------------
@@ -325,6 +332,13 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
                                 index_vector_dim=1)
             updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
             updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+
+            if bsh_cache_layout:
+                updated_keys = hlo.reshape(updated_keys, [n_seqs, n_positions, n_kv_heads, d_head])
+                updated_vals = hlo.reshape(updated_vals, [n_seqs, n_positions, n_kv_heads, d_head])
+            else:
+                updated_keys = hlo.reshape(updated_keys, [n_positions, n_seqs, n_kv_heads, d_head])
+                updated_vals = hlo.reshape(updated_vals, [n_positions, n_seqs, n_kv_heads, d_head])
 
     elif n_active_tokens > 1 and n_active_tokens < n_positions:
         # Speculative forward: n_active_tokens > 1 and < n_positions

@@ -166,7 +166,11 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             # Concatenate all draft outputs
             tokens = hlo.concatenate(draft_tokens, 1)
             draft_scores = hlo.concatenate(draft_logits, 1)
-            cache_ids = hlo.concatenate(prior_ids, 0)
+            if target.neuron_config.padding_side == 'right':
+                # Use 2D cache ID; currently we only support BSH
+                cache_ids = hlo.concatenate(prior_ids, 1)
+            else:
+                cache_ids = hlo.concatenate(prior_ids, 0)
  
             # Execute target model
             in_caches, layers_weights, pre_layer_params, lm_head_params, generation_params = target._hlo_parameters(n_positions, batch_size, param_builder)
@@ -310,10 +314,13 @@ class FusedSpeculativeDecoder(torch.nn.Module):
  
         # Context encoding
         # FIXME: populate scores with the context encoding logits
-        token_id = self.target(input_ids)
+        cache_ids = torch.arange(start, dtype=torch.int32)
+        if self.target.neuron_config.use_2d_cache_ids:
+            cache_ids = cache_ids.unsqueeze(0).expand(batch_size, start)
+        token_id = self.target(input_ids, cache_ids=cache_ids)
         if streamer:
             streamer.put(token_id)
-        self.draft(input_ids)
+        self.draft(input_ids, cache_ids=cache_ids)
  
         # Preallocate state tensors
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
@@ -344,8 +351,10 @@ class FusedSpeculativeDecoder(torch.nn.Module):
  
         while True:
  
-            # FIXME: For bs=1 1D cache_id is sufficient, but we will need 2D cache_id for bs > 1 for left-aligned
-            tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids.squeeze(1), return_ranks=1)
+            if self.target.neuron_config.use_2d_cache_ids:
+                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids, return_ranks=1)
+            else:
+                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids.squeeze(1), return_ranks=1)
  
             if eos_token is not None:
  
