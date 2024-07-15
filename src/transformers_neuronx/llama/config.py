@@ -42,6 +42,13 @@ class LlamaConfig:
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
+        # Speculated configurations for rope scaling. Params names might be different.
+        self.rope_scaling = getattr(config, "rope_scaling", None)
+        if self.rope_scaling is not None:
+            rope_scaling['scale_factor'] = rope_scaling.get('scale_factor', 8)
+            rope_scaling['low_freq_factor'] = rope_scaling.get('low_freq_factor', 1)
+            rope_scaling['high_freq_factor'] = rope_scaling.get('high_freq_factor', 4)
+            rope_scaling['old_context_len'] = rope_scaling.get('old_context_len', 8192)
 
         utils.maybe_override_attributes(self, kwargs)
 

@@ -90,7 +90,8 @@ class LlamaForSamplingNoEmbeddingHlo:
         pos_embed = rotary.hlo_rotary_embedding(
             hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
             base=self.config.rope_theta,
-            interpolation_factor=self.config.position_interpolation_factor
+            interpolation_factor=self.config.position_interpolation_factor,
+            rope_scaling=self.config.rope_scaling
         )
         core_id = None
 
