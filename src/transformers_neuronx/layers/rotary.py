@@ -13,7 +13,33 @@
 # limitations under the License.
 # ==============================================================================
 import torch
+import math
 from transformers_neuronx import hlo
+
+
+def apply_inv_frequency_scaling(freqs, rope_scaling):
+    # Values obtained from grid search
+    scale_factor = rope_scaling.get('scale_factor')
+    low_freq_factor = rope_scaling.get('low_freq_factor')
+    high_freq_factor = rope_scaling.get('high_freq_factor')
+    old_context_len = rope_scaling.get('old_context_len')
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype)
 
 
 def rotary_embedding(head_dim, cache_ids, base=10000, interpolation_factor=None):
@@ -29,7 +55,7 @@ def rotary_embedding(head_dim, cache_ids, base=10000, interpolation_factor=None)
     return pos_embd
 
 
-def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_factor=None):
+def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_factor=None, rope_scaling=None):
 
     scribe = cache_ids.scribe
     # Using f16 during compute causes relatively high error
@@ -49,6 +75,8 @@ def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_f
     size = head_dim // 2
 
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2) / head_dim))
+    if rope_scaling is not None:
+        inv_freq = apply_inv_frequency_scaling(inv_freq, rope_scaling)
     inv_freq = hlo.literal(mtype, inv_freq)
 
     if interpolation_factor:
