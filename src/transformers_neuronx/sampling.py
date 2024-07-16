@@ -138,7 +138,7 @@ def sample_loop(model, input_ids, start_ids, next_token_scores, sequence_length,
 
         # sample
         probs = torch.nn.functional.softmax(topk_values, dim=-1, dtype=torch.float32)
-        print('sample_loop nan values:', torch.sum(torch.isnan(probs)).item())
+        #print('sample_loop nan values:', torch.sum(torch.isnan(probs)).item())
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(topk_indices, 1, inputs_in_topk)
         tokens.append(inputs)
@@ -333,7 +333,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
         # sample
         probs = torch.nn.functional.softmax(top_values, dim=-1, dtype=torch.float32)
-        print('sample_loop_llama:nan values:', torch.sum(torch.isnan(probs)).item())
+        #print('sample_loop_llama:nan values:', torch.sum(torch.isnan(probs)).item())
         inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
@@ -396,7 +396,7 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
  
     # sample
     probs = torch.nn.functional.softmax(top_values, dim=-1)
-    print('select_tokens:nan values:', torch.sum(torch.isnan(probs)).item())
+    #print('select_tokens:nan values:', torch.sum(torch.isnan(probs)).item())
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
