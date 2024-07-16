@@ -148,13 +148,27 @@ def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head
     else:
         hidden_size, n_active_tokens, batch_size = hidden.sizes
 
-    if neuron_config is not None and neuron_config.is_sequence_parallel:
-        hidden = hlo.all_gather(hidden, 1, tp_degree)
+    if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query:
+        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large 
+        # tensor). Since we only need last_token_id, we can first pick out last_token_id % seq_shard_len from each tp rank,
+        # then all-gather only this part, and then pick out the last_token_id // seq_shard_len to pick out the hidden coming
+        # from the correct rank.
 
-    # Check and perform slicing if needed
-    if not return_all_outputs:
-        hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
+        # We do not enable for use_1d_query case since the logic is more involved.
+        last_token_id_pos_in_shard = hlo.remainder(last_token_id, n_active_tokens)
+        hidden = _dynamic_logits_slice(hidden, last_token_id_pos_in_shard, neuron_config)
+        hidden = hlo.all_gather(hidden, 1, tp_degree)
+        last_token_id_shard_idx = hlo.divide(last_token_id, n_active_tokens)
+        hidden = _dynamic_logits_slice(hidden, last_token_id_shard_idx, neuron_config)
         n_active_tokens = 1
+    else:
+        if neuron_config and neuron_config.is_sequence_parallel:
+            hidden = hlo.all_gather(hidden, 1, tp_degree)
+
+        # Check and perform slicing if needed
+        if not return_all_outputs:
+            hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
+            n_active_tokens = 1
 
     if is_bsh:
         ln_hidden = hlo.layer_norm_bsh(hidden, ln_f_weight, ln_f_bias, neuron_config=None, tp_degree=tp_degree)
@@ -205,13 +219,27 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
         batch_size = last_token_id.sizes[0]
     dtype = hidden.dtype
 
-    if neuron_config.is_sequence_parallel:
-        hidden = hlo.all_gather(hidden, 1, tp_degree)
+    if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query:
+        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large 
+        # tensor). Since we only need last_token_id, we can first pick out last_token_id % seq_shard_len from each tp rank,
+        # then all-gather only this part, and then pick out the last_token_id // seq_shard_len to pick out the hidden coming
+        # from the correct rank.
 
-    # Check and perform slicing if needed
-    if not return_all_outputs:
-        hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
+        # We do not enable for use_1d_query case since the logic is more involved.
+        last_token_id_pos_in_shard = hlo.remainder(last_token_id, n_active_tokens)
+        hidden = _dynamic_logits_slice(hidden, last_token_id_pos_in_shard, neuron_config)
+        hidden = hlo.all_gather(hidden, 1, tp_degree)
+        last_token_id_shard_idx = hlo.divide(last_token_id, n_active_tokens)
+        hidden = _dynamic_logits_slice(hidden, last_token_id_shard_idx, neuron_config)
         n_active_tokens = 1
+    else:
+        if neuron_config and neuron_config.is_sequence_parallel:
+            hidden = hlo.all_gather(hidden, 1, tp_degree)
+
+        # Check and perform slicing if needed
+        if not return_all_outputs:
+            hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
+            n_active_tokens = 1
 
     rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, neuron_config=None, tp_degree=tp_degree) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0, neuron_config=None, tp_degree=tp_degree)
 
