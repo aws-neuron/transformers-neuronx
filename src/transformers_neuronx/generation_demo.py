@@ -40,7 +40,7 @@ from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling
 from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
-from transformers_neuronx.config import QuantizationConfig
+from transformers_neuronx.config import QuantizationConfig, ContinuousBatchingConfig
 
 
 def dump(dump_dir, dump_file_name, data):
@@ -216,6 +216,7 @@ def main():
     run_parser.add_argument('--batch_size', type=int, default=1, help="Input batch size")
     run_parser.add_argument('--n_positions', type=int, default=128, help="Input sequence length")
     run_parser.add_argument('--no_bucketing_n_positions', action='store_true', help="Pass n_positions as a list meaning exactly one value gets compiled (no bucketing)")
+    run_parser.add_argument('--no_bucketing_context_length_estimate', action='store_true', help="Pass context_estimate as a list meaning exactly one value gets compiled (no bucketing)")
     run_parser.add_argument('--tp_degree', type=int, default=2, help="Number of neuron cores used for tensor parallel")
     run_parser.add_argument('--unroll', type=int, default=None)
     run_parser.add_argument('--context_unroll', type=int, default=None)
@@ -239,6 +240,7 @@ def main():
     run_parser.add_argument('--simple_sample', action='store_true')
     run_parser.add_argument('--simple_sample_eos_token_override', type=int, default=None, help="override eos token, set to -1 to always generate exactly as many tokens as desired.")
     run_parser.add_argument('--old', action='store_true') # FIXME: debug
+    run_parser.add_argument('--continuous_batching', action='store_true')
     # generation configuration
     # TODO: could we simply make unparsed arguments as generation configuration?
     run_parser.add_argument('--beam', type=int, default=1)
@@ -465,8 +467,19 @@ def save(args, hf_model_name, model_type):
         model = AutoModelForCausalLM.from_pretrained(hf_model_name, low_cpu_mem_usage=True)
     save_pretrained_split(model, args.save)
 
+def verify_and_fallback_args(args):
+     if args.continuous_batching:
+         assert args.model_type == "llama", "--continuous_batching is only supported for model_types that use sample_llama."
+  
+         if not args.simple_sample:
+             logging.warning("--continuous_batching is only supported when using --simple_sample. Enabling --simple_sample.")
+             args.simple_sample = True
+  
+     return args
+
 
 def run(args, hf_model_name, model_cls):
+    args = verify_and_fallback_args(args)
     torch.manual_seed(15213)
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name, padding_side="left")
@@ -476,6 +489,11 @@ def run(args, hf_model_name, model_cls):
     if args.prompt_len is not None:
         input_ids = torch.randint(0, 100, (args.batch_size, args.prompt_len))
         attention_mask = None
+        cache_ids = None
+        start_ids = None
+        if args.continuous_batching:
+            start_ids = torch.arange(args.batch_size)
+            cache_ids = torch.arange(args.prompt_len).unsqueeze(0).expand((args.batch_size, args.prompt_len))
     else:
         full_prompt_text = args.prompt
         if args.various:
@@ -490,6 +508,14 @@ def run(args, hf_model_name, model_cls):
         encoded_text = tokenizer(batched_prompt_text, padding=True, return_tensors="pt")
         input_ids = encoded_text.input_ids
         attention_mask = encoded_text.attention_mask
+        start_ids = None
+        cache_ids = None
+        if args.continuous_batching:
+            start_ids = torch.arange(args.batch_size)
+            cache_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+            # FIXME: batched_seq_lens is character length not token length
+            for idx, prompt_len in enumerate(batched_seq_lens.tolist()):
+                cache_ids[idx, 0:prompt_len] = torch.arange(prompt_len)
 
     print("input_ids", input_ids, " len:", input_ids.shape[-1])
     print("attention_mask:", attention_mask,)
@@ -529,19 +555,25 @@ def run(args, hf_model_name, model_cls):
                 attention_layout=args.attention_layout,
                 mlp_out_weight_transpose=args.mlp_out_weight_transpose,
                 shard_over_sequence=args.shard_over_sequence,
+                continuous_batching=ContinuousBatchingConfig(batch_size_for_shared_caches=args.batch_size) if args.continuous_batching else None,
             )
 
             if args.no_bucketing_n_positions:
                 n_positions_passed_to_model = [args.n_positions]
             else:
                 n_positions_passed_to_model = args.n_positions
+            
+            if args.no_bucketing_context_length_estimate:
+                context_length_estimate_passed_to_model = [args.context_length_estimate]
+            else:
+                context_length_estimate_passed_to_model = args.context_length_estimate
 
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
-                                                unroll=args.unroll, context_unroll=args.context_unroll, context_length_estimate=args.context_length_estimate, neuron_config=neuron_config)
+                                                unroll=args.unroll, context_unroll=args.context_unroll, context_length_estimate=context_length_estimate_passed_to_model, neuron_config=neuron_config)
                 if args.window_context_length_estimate is not None:
                     neuron_model.enable_window_context_decoder(args.window_context_length_estimate, args.window_context_unroll)
             else:
@@ -578,8 +610,13 @@ def run(args, hf_model_name, model_cls):
                     self.scores = scores
             with torch.inference_mode():
                 max_length = args.max_length if args.max_length is not None else args.n_positions
-                forward_func = lambda : neuron_model.sample(input_ids, max_length,
-                    top_k=args.top_k, eos_token_override=args.simple_sample_eos_token_override)
+                forward_func = lambda : neuron_model.sample(
+                    input_ids, max_length,
+                    top_k=args.top_k, 
+                    eos_token_override=args.simple_sample_eos_token_override,
+                    cache_ids=cache_ids,
+                    start_ids=start_ids
+                )
                 sequences = forward_func()
 
                 scores = None
