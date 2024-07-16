@@ -139,13 +139,23 @@ class MistralForSampling(base.NeuronModelBase):
             curr_window_start = torch.max(torch.tensor(0, dtype=torch.long), self.num_processed_tokens - self.config.window_size)
         else:
             curr_window_start = self.num_processed_tokens
-        inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
-        last_token_id = rst[-1]
-        rst = (*rst, curr_window_start)
-        if not self.neuron_config.on_device_embedding:
-            inputs = self.chkpt_model.model.embed_tokens(inputs)
+        
+        if len(input_ids.shape) == 3:
+            mock_input_ids = torch.ones(input_ids.shape[:2], dtype=torch.int32)
+            _, *rst = self._preprocess(mock_input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            inputs = input_ids
+            last_token_id = rst[-1]
+            rst = (*rst, curr_window_start)
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
+        else:
+            inputs, *rst = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+            last_token_id = rst[-1]
+            rst = (*rst, curr_window_start)
+            if not self.neuron_config.on_device_embedding:
+                inputs = self.chkpt_model.model.embed_tokens(inputs)
+                if self.neuron_config.attention_layout == LAYOUT_HSB:
+                    inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, *rst)
         logits = self._postprocess(logits, start_ids=start_ids)
 
@@ -156,7 +166,7 @@ class MistralForSampling(base.NeuronModelBase):
         return logits
 
     def sample(self, input_ids, sequence_length, start_ids=None,
-               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None):
+               top_k=50, top_p=1.0, eos_token_override=None, temperature=1.0, streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=3):
 
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
@@ -164,7 +174,10 @@ class MistralForSampling(base.NeuronModelBase):
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()
-        batch_size, context_length = input_ids.shape
+        if len(input_ids.shape) == 3:
+            batch_size, context_length, _ = input_ids.shape
+        else:
+            batch_size, context_length = input_ids.shape
         if batch_size not in self.batch_sizes:
             raise ValueError(f"Model not compiled for batch_size : {batch_size}. Acceptable batch_size is one of the following {self.batch_sizes}")
 
@@ -172,7 +185,7 @@ class MistralForSampling(base.NeuronModelBase):
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
-            stopping_criteria_list=stopping_criteria_list
+            stopping_criteria_list=stopping_criteria_list, no_repeat_ngram_size=no_repeat_ngram_size
         )
 
         return result

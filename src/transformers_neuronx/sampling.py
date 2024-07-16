@@ -305,14 +305,18 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
 # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
-    tokens = [input_ids]
-    _, start = input_ids.shape
+    if len(input_ids.shape) == 3:
+        tokens = []
+        _, start, _ = input_ids.shape
+    else:
+        tokens = [input_ids]
+        _, start = input_ids.shape
     if cache_ids:
         start = cache_ids.item()+1
 
     for cur_len in range(start, sequence_length):
 
-        if ngram_size:
+        if ngram_size and tokens != []:
             next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, cur_len)
 
         next_len = cur_len + 1
@@ -364,7 +368,10 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
     
     # populate key/value caches according to the prompt text
-    _, start = input_ids.shape
+    if len(input_ids.shape) == 3:
+        _, start, _ = input_ids.shape
+    else:
+        _, start = input_ids.shape
     next_token_scores = model(input_ids, cache_ids, start_ids)
     if model.context_hook is not None:
         model.context_hook()
@@ -382,4 +389,3 @@ def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)
     inputs = torch.gather(top_indices, 1, inputs_in_topk)
     return inputs
-
