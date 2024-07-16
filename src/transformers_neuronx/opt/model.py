@@ -28,7 +28,7 @@ from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR, LAYOUT_BSH, LAYO
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.opt.config import OPTConfig
-from transformers_neuronx.layers import transformer, generation
+from transformers_neuronx.layers import transformer, generation, attention, attention_utils
 
 
 class OPTForSampling(base.NeuronModelBase):
@@ -48,10 +48,13 @@ class OPTForSampling(base.NeuronModelBase):
             self.neuron_config.on_device_generation.vocab_size = self.config.vocab_size
 
         # Check if input sequence length is allowed given position embedding dimensions
-        sequence_length = n_positions
+        if isinstance(n_positions, list) or isinstance(n_positions, tuple):
+            max_bucket = max(n_positions)
+        else:
+            max_bucket = n_positions
         max_allowed_sequence_length = config.max_position_embeddings
-        if sequence_length > max_allowed_sequence_length:
-            raise ValueError(f"Sequence length ({sequence_length}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
+        if (max_bucket) > max_allowed_sequence_length:
+            raise ValueError(f"Sequence length ({max_bucket}) cannot be larger than position embedding's context size ({max_allowed_sequence_length})!")
 
         if unroll is None:
             unroll = config.num_hidden_layers
@@ -103,7 +106,7 @@ class OPTForSampling(base.NeuronModelBase):
             new_layer.add_pre_mlp_layer_norm(layer.final_layer_norm.weight.detach(),
                                              layer.final_layer_norm.bias.detach())
             new_layer.add_mlp_input(layer.fc1.weight.detach().T, layer.fc1.bias.detach())
-            if os.environ.get("NEURON_INTERNAL_TRANSFORM_WEIGHT_LAYOUT", None):
+            if self.neuron_config.weight_tiling:
                 new_layer.add_mlp_output(layer.fc2.weight.detach().T, layer.fc2.bias.detach())
             else:
                 new_layer.add_mlp_output(
@@ -160,19 +163,19 @@ class OPTForSampling(base.NeuronModelBase):
         curr_window_start = \
             self.num_processed_tokens - self.neuron_config.sparse_attn.sparse_attn_config.window_size \
             if sliding_window_attn_enabled else 0
-        curr_window_start = torch.as_tensor(curr_window_start, dtype=torch.int32)
+        curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
         result = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
         self.num_processed_tokens += (last_token_id+1)
         return result
 
-    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50):
+    def sample(self, input_ids, sequence_length, start_ids=None, top_k=50, streamer=None):
         if self.neuron_config.on_device_generation:
-            return sampling.sample_tokens(self, input_ids, start_ids=start_ids, 
-                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation)
+            return sampling.sample_tokens(self, input_ids, start_ids=start_ids,
+                                          sequence_length=sequence_length, config=self.neuron_config.on_device_generation, streamer=streamer)
         else:
             return sampling.simple_sample(self, input_ids, start_ids, sequence_length,
-                                          eos_token_id=self.config.eos_token_id, top_k=top_k)
+                                          eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
 
 class OPTCheckpointCompatible(module.PretrainedModel):
@@ -264,6 +267,7 @@ class OPTForSamplingNoEmbeddingHlo:
         self.start_mask = start_mask
         self.allow_kv_dot_prefetch = os.environ.get('NEURON_INTERNAL_THOMAS_PREFETCH', None) == '1'
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
+        self.n_positions = None
 
         # Offset for for architecture specific on-device embedding
         # OPT Reference: https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/opt/modeling_opt.py#L94-L96
@@ -274,13 +278,12 @@ class OPTForSamplingNoEmbeddingHlo:
         # Property access allows fallback configuration to be enabled after construction
         return self.neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
 
-    def inputs(self, scribe, dtype, n_positions, n_active_tokens, batch_size):
-        hidden, cache_ids, start_ids, last_token_id, dims = transformer.inputs(
+    def inputs(self, scribe, dtype, n_active_tokens, batch_size):
+        tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32.Parameter(parameter_number=4)
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
-        return (hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask), (*dims, None)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
+        return (*tensors, curr_window_start), (*dims, None)
 
     def embed_positions_ids(self, position_ids, start_ids):
         batch_size, = start_ids.sizes
@@ -293,7 +296,7 @@ class OPTForSamplingNoEmbeddingHlo:
         mask = hlo.less(position_ids, zero)
         return hlo.masked_select(mask, zero, position_ids)
 
-    def embedding(self, input_ids, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, wte, wpe):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, wte, wpe):
         dtype = getattr(input_ids.scribe, self.amp)
         inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
         position_ids = self.embed_positions_ids(cache_ids, start_ids)
@@ -310,6 +313,10 @@ class OPTForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
+
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+        return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
@@ -333,8 +340,6 @@ class OPTForSamplingNoEmbeddingHlo:
         else:
             k_weight_shape = attn_k_weight.sizes
             k_weight_dim = k_weight_shape[-1]
-        assert attn_k_cache.sizes[-2] * attn_k_cache.sizes[-1] == k_weight_dim, \
-            f"kv cache shapxe ({attn_k_cache.sizes}) doesn't match kv weight shape ({k_weight_shape})"
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, curr_window_start, cache_ids, mask, active_mask, attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
@@ -355,11 +360,8 @@ class OPTForSamplingNoEmbeddingHlo:
         hidden = hlo.add(mlp_hidden, hidden)
         return hidden, out_attn_k_cache, out_attn_v_cache
 
-    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, logits_indices, return_all_outputs=True):
+    def ln_lm_head(self, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.ln_lm_head(self.tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs, neuron_config=self.neuron_config)
-        if self.neuron_config.on_device_generation:
-            logits = generation.generate(logits, logits_indices, self.neuron_config.on_device_generation, 
-                                         tp_degree=self.tp_degree, eos_token_id=self.eos_token_id)               
         return logits
 
     def post_layer(self, logits):
@@ -402,7 +404,12 @@ class OPTForSamplingNoEmbeddingHlo:
         f32 = scribe.f32
 
         hidden_size, n_active_tokens, n_seqs = hidden.sizes
-        _, hidden_size_tp = q_weight.sizes
+        if len(q_weight.sizes) == 4:
+            weight_tiling = True
+            tile_size, hidden_size_tile, _, _ = q_weight.sizes
+            hidden_size_tp = tile_size * hidden_size_tile
+        else:
+            _, hidden_size_tp = q_weight.sizes
         fuse_qkv = neuron_config and neuron_config.fuse_qkv
         if fuse_qkv:
             hidden_size_tp //= FUSED_QKV_TP_FACTOR
@@ -418,13 +425,6 @@ class OPTForSamplingNoEmbeddingHlo:
         else:
             max_ctx_plus_n_active_tokens, _, n_kv_heads_tp, d_head = cached_keys.sizes
             n_kv_heads = n_kv_heads_tp * tp_degree
-
-        is_bsh = neuron_config and neuron_config.attention_layout == LAYOUT_BSH
-        if is_bsh:
-            import transformers_neuronx.layers.attention as attention
-        else:
-            import transformers_neuronx.layers.attention_hsb as attention
-        from transformers_neuronx.layers import attention_utils
 
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK

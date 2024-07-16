@@ -40,11 +40,11 @@ def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_f
     use_2d_cache_ids = len(cache_ids.sizes) > 1
     if use_2d_cache_ids:
         batch_size, n_active_tokens = cache_ids.sizes  # 2d cache_ids
-        cache_ids = mtype[batch_size, n_active_tokens, 1].Reshape(cache_ids)
+        cache_ids = hlo.reshape(cache_ids, [batch_size, n_active_tokens, 1])
         dot_dims = dict(lhs_contracting_dimensions=[2], rhs_contracting_dimensions=[0])
     else:
         n_active_tokens, = cache_ids.sizes  # 1d cache_ids
-        cache_ids = mtype[n_active_tokens, 1].Reshape(cache_ids)
+        cache_ids = hlo.reshape(cache_ids, [n_active_tokens, 1])
         dot_dims = dict(lhs_contracting_dimensions=[1], rhs_contracting_dimensions=[0])
     size = head_dim // 2
 
@@ -52,11 +52,9 @@ def hlo_rotary_embedding(dtype, head_dim, cache_ids, base=10000, interpolation_f
     inv_freq = hlo.literal(mtype, inv_freq)
 
     if interpolation_factor:
-        scale = mtype.Constant(constant_value=interpolation_factor)
-        scale_br = mtype[cache_ids.sizes].Broadcast(scale, dimensions=[])
-        cache_ids = mtype[cache_ids.sizes].Divide(cache_ids, scale_br)
+        cache_ids = hlo.divide(cache_ids, interpolation_factor)
 
-    inv_freq = mtype[1, size].Reshape(inv_freq)
+    inv_freq = hlo.reshape(inv_freq, (1, size))
     sinusoid_inp = hlo.dot_general(cache_ids, inv_freq, dimension_numbers=dot_dims)
 
     sin = hlo.sin(sinusoid_inp)
@@ -92,15 +90,15 @@ def rotate_vec(q, sin_r, cos_r, rotary_percentage=1):
         q_up, q_down = get_up_down(q)
         q_rot_up = hlo.ax_minus_by(cos_r, q_up, sin_r, q_down)
         q_rot_down = hlo.ax_plus_by(cos_r, q_down, sin_r, q_up)
-        q_rot = q.dtype[q.sizes].Concatenate(q_rot_up, q_rot_down, dimensions=[3])
+        q_rot = hlo.concatenate([q_rot_up, q_rot_down], dimension=3)
         return q_rot
     else:
         q_rotary, q_pass = get_up_down_with_percentage(q, rotary_percentage)
         q_rotary_up, q_rotary_down = get_up_down(q_rotary)
         q_rotary_rot_up = hlo.ax_minus_by(cos_r, q_rotary_up, sin_r, q_rotary_down)
         q_rotary_rot_down = hlo.ax_plus_by(cos_r, q_rotary_down, sin_r, q_rotary_up)
-        q_rotary_rot = q.dtype[q_rotary.sizes].Concatenate(q_rotary_rot_up, q_rotary_rot_down, dimensions=[3])
-        return q.dtype[q.sizes].Concatenate(q_rotary_rot, q_pass, dimensions=[3])
+        q_rotary_rot = hlo.concatenate([q_rotary_rot_up, q_rotary_rot_down], dimension=3)
+        return hlo.concatenate([q_rotary_rot, q_pass], dimension=3)
 
 
 def rotate_half(query, key, sin_cos, rotary_percentage=1, tp_degree=None, shard_over_batch=False):
@@ -136,12 +134,12 @@ def rotate_half(query, key, sin_cos, rotary_percentage=1, tp_degree=None, shard_
             sin_t = hlo.transpose(sin, 0, 1)
             cos_t = hlo.transpose(cos, 0, 1)
             # broadcast from (n_active_tokens, n_seqs, d_head) to (n_active_tokens, n_seqs, n_heads_tp, d_head)
-            sin_r = dtype[broadcast_sizes].Broadcast(sin_t, dimensions=[0,1,3])
-            cos_r = dtype[broadcast_sizes].Broadcast(cos_t, dimensions=[0,1,3])
+            sin_r = hlo.broadcast(sin_t, broadcast_sizes, [0, 1, 3])
+            cos_r = hlo.broadcast(cos_t, broadcast_sizes, [0, 1, 3])
         else:
             # 1D cache_ids
-            sin_r = dtype[broadcast_sizes].Broadcast(sin, dimensions=[0,3])
-            cos_r = dtype[broadcast_sizes].Broadcast(cos, dimensions=[0,3])
+            sin_r = hlo.broadcast(sin, broadcast_sizes, [0, 3])
+            cos_r = hlo.broadcast(cos, broadcast_sizes, [0, 3])
         return sin_r, cos_r
 
     # Get sin and cos as upper and lower half of input embedding

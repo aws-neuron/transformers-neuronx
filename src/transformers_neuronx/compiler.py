@@ -356,6 +356,10 @@ class Executor:
         """
         casted = []
         for cpu, buf in zip(inputs, self.inputs):
+            if cpu.shape != buf.shape:
+                raise AssertionError(
+                    f"Input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
+                )
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)
             casted.append(cpu)
@@ -368,11 +372,16 @@ class Executor:
                 self.kernel.snapshot_exit(self.memory.output_tensors)
             else:
                 outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
-            ParallelKernel.hlo_snapshot_iter += 1
+                ParallelKernel.hlo_snapshot_iter += 1
         else:
             outputs = torch.ops.neuron._parallel_executor_run(self.executor, casted, return_ranks)
 
-        if return_ranks == 1:
+        # Executor v1 returns multiple shards
+        # Executor v2 returns concatenated shards (across dim=0) in one contiguous allocation
+        # This logic is compatible with both new/old versions of `libtorchneuron.so`
+        if len(outputs) > 0 and isinstance(outputs[0], torch.Tensor):
+            result = tuple(outputs)
+        elif return_ranks == 1:
             result = tuple(shards[0] for shards in outputs)
         else:
             result = tuple(torch.cat(shards, dim=0) for shards in outputs)
@@ -494,7 +503,10 @@ class ParallelKernel:
         self.snapshot = snapshot
 
     def snapshot_path(self):
-        path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}')
+        suffix = ''
+        if self.tag is not None:
+            suffix = f'-{self.tag}'
+        path = os.path.join(self.snapshot, f'iter{ParallelKernel.hlo_snapshot_iter}{suffix}')
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -624,6 +636,11 @@ def gen_zero_output_from_shape(input):
     shape = tuple(shape_proto.dimensions)
     dtype = DataTypeConverter().hlo2torch(shape_proto.element_type)
     return torch.zeros(shape, dtype=dtype)
+
+def gen_zero_output_from_shape_proto(input):
+     shape = tuple(input.dimensions)
+     dtype = DataTypeConverter().hlo2torch(input.element_type)
+     return torch.zeros(shape, dtype=dtype)
 
 def get_debug_outputs(program, bucket_id=0):
     debug_tensors = program.memories[bucket_id].get_debug_tensors()

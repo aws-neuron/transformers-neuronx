@@ -14,6 +14,8 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
+from neuronxcc.nki.kernels.attention import flash_fwd, attention_isa_kernel
+from dataclasses import dataclass
 
 
 def transpose_qkv(query, key, value):
@@ -102,7 +104,7 @@ def update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config=
         n_positions_br = hlo.full(n_positions, cache_ids_dtype, cache_ids.sizes)
         start_ids_br = hlo.broadcast(start_ids, cache_ids.sizes, [1])
         offset = hlo.multiply(start_ids_br, n_positions_br)
-        indices = hlo.add(offset, cache_ids)
+        indices = hlo.add(indices, cache_ids)
         indices = hlo.reshape(indices, [n_active_tokens * batch_size])
     else:
         # start_ids + cache_ids * n_seqs
@@ -199,3 +201,22 @@ def prior_context(past_scores, past_values,
 
     output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
     return output_dot
+
+
+@dataclass(frozen=True)
+class FlashConfig:
+  """
+    Config class for flash attention with default values
+  """
+  seq_tile_size:int = 2048
+  training:bool=False
+  should_transpose_v:bool=False
+
+def wrapper_flash_attention_nki(q, k, v, o, lse=None):
+    softmax_scale = 1.0
+    config = FlashConfig()
+    seed = None
+    flash_fwd(q, k, v, seed, o, lse, softmax_scale=softmax_scale, use_causal_mask=True, mixed_precision=True, dropout_p=0.0, config=config)
+
+def wrapper_flash_attention_bir(q, k, v, out, scale=1.0, kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap"):
+  attention_isa_kernel(q, k, v, scale, out, kernel_name)
