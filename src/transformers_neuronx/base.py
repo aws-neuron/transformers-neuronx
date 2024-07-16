@@ -271,7 +271,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             - there is no change on start_ids with right padding.
             - cache_ids will be set to [0, 1, 2, 3] in self.forward()
         """
-        batch_size, context_length = input_ids.shape
+        #batch_size, context_length = input_ids.shape
+        #zheng add
+        if len(input_ids.shape) == 3:
+            batch_size, context_length, _ = input_ids.shape
+        else:
+            batch_size, context_length = input_ids.shape
+
 
         # if last_token_id not used, simply set to 0
         if self.neuron_config.vectorize_last_token_id:
@@ -331,7 +337,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         return cache_ids
 
     def _prepare_for_continuous_batching(self, input_ids, cache_ids=None, seq_ids=None):
-        n_seqs, n_active_tokens = input_ids.shape
+        #n_seqs, n_active_tokens = input_ids.shape
+        #zheng add
+        if len(input_ids.shape) == 3:
+            n_seqs, n_active_tokens, _ = input_ids.shape
+        else:
+            n_seqs, n_active_tokens = input_ids.shape
+
         continuous_batching = self.neuron_config and self.neuron_config.continuous_batching
 
         if seq_ids is None or not continuous_batching:
