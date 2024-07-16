@@ -176,6 +176,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -194,7 +195,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
         reordered_attn_k_cache, reordered_attn_v_cache = attention.reorder_kv_cache(attn_k_cache, attn_v_cache, previous_cache_ids, reorder_mapping, neuron_config=self.neuron_config)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask, core_id,
+            ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
             reordered_attn_k_cache, reordered_attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
