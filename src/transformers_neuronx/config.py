@@ -318,6 +318,10 @@ class NeuronConfig():
             assert not self.is_sequence_parallel and not self.sequence_parallel_norm, "Cannot use sequence parallel with fused RMSnorm QKV kernel"
         self.mlp_out_weight_transpose = mlp_out_weight_transpose
 
+        if self.shard_over_sequence:
+            assert self.sparse_attn is None, f"sparse attn is not supported with flash decoding"
+            assert self.cache_layout == Layout.SBH, f"flash decoding only support SBH layout , got {self.cache_layout}"
+
     @property
     def use_2d_cache_ids(self):
         return self.lhs_aligned
