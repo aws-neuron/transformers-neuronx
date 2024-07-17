@@ -67,7 +67,10 @@ class LlamaForSamplingNoEmbeddingHlo:
         return (*tensors, previous_cache_ids, reorder_mapping), (*dims, seq_slice_dim, seq_slice_dim)
 
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, *weights):
-        embed_weight, *rst = weights
+        if self.neuron_config.shard_over_sequence and self.neuron_config.on_device_embedding:
+            *rst, embed_weight = weights
+        else:
+            embed_weight, *rst = weights
         dtype = getattr(input_ids.scribe, self.config.amp)
         if self.neuron_config.on_device_embedding and self.neuron_config.sequence_parallel_norm:
             hidden = hlo.embedding(embed_weight, input_ids, tp_degree=1, dtype=dtype)
@@ -89,17 +92,21 @@ class LlamaForSamplingNoEmbeddingHlo:
             base=self.config.rope_theta,
             interpolation_factor=self.config.position_interpolation_factor
         )
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
-                                               last_token_id=last_token_id, neuron_config=self.neuron_config)
         core_id = None
+
+        # flash decoding 
         if self.neuron_config.shard_over_sequence:
-            core_id,*rst  = weights
+            core_id, *rst  = weights
             n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
             cores_per_kv_head = self.config.tp_degree // n_kv_heads
             self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree 
-            cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, 
+            cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, start_ids,
                                                                         core_id, self.n_positions,
                                                                         cores_per_kv_head=self.cores_per_kv_head)
+        else:
+            mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions, 
+                                                   last_token_id=last_token_id, neuron_config=self.neuron_config)
+
 
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id
 
