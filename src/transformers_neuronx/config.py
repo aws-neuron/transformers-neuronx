@@ -13,12 +13,16 @@
 # limitations under the License.
 # ==============================================================================
 import os
+import json
+import enum
 import math
 import logging
 import warnings
 from typing import Optional, List
 
 from transformers_neuronx import GQA, Layout, SparseAttnConfig
+
+import torch
 
 
 class QuantizationConfig:
@@ -405,3 +409,49 @@ class NeuronConfig():
     def get_g_start_device_id(self, tp):
         return self.rank_id*self.get_local_tp(tp)
 
+    def to_json(self):
+        json_serializable_types = (str, int, float, bool)
+        def _to_json(obj):
+            if obj is None or isinstance(obj, json_serializable_types):
+                return obj
+            elif isinstance(obj, enum.Enum):
+                return obj.value
+            elif isinstance(obj, torch.Tensor):
+                return obj.tolist()
+            elif isinstance(obj, list):
+                return [ _to_json(e) for e in obj ]
+            elif isinstance(obj, dict):
+                return { _to_json(k): _to_json(v) for k, v in obj.items() }
+            elif isinstance(obj, tuple):
+                return str(tuple(_to_json(e) for e in obj))
+            else:
+                as_dict = obj.__dict__
+                return _to_json(as_dict)
+        return _to_json(self)
+
+
+def maybe_dump_config(config, neuron_config):
+    if "NEURONX_DUMP_TO" in os.environ and (neuron_config or config):
+        dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+        os.makedirs(dump_to, exist_ok=True)
+        config_to_dump = {}
+        if neuron_config:
+            config_to_dump['neuron_config'] = neuron_config.to_json()
+        if config:
+            key_aliases = {
+                'attention_dropout': ['attn_pdrop'],
+                'hidden_act': ['activation_function'],
+                'max_position_embeddings': ['n_positions'],
+                'num_hidden_layers': ['n_layer'],
+                'num_attention_heads': ['n_head'],
+                'intermediate_size': ['ffn_dim', 'n_inner'],
+                'hidden_size': ['n_embd'],
+                'initializer_range': ['init_std']
+            }
+            key_mapping = {}  # inverted and flattened key_aliases
+            for key, aliases in key_aliases.items():
+                for alias in aliases: key_mapping[alias] = key
+            model_config = { key_mapping.get(k, k): v for k, v in config.__dict__.items() }
+            config_to_dump['model_config'] = model_config
+        with open(os.path.join(dump_to, 'neuron_model_config.json'), 'w') as fp:
+            json.dump(config_to_dump, fp)
