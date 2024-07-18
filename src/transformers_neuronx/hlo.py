@@ -668,20 +668,37 @@ def gated_mlp_bsh(
             f"in order to use weight tiling."
         hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden_active  = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
-        hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden_active = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_tiled_sizes = hidden_active.sizes[0], 2, hidden_active.sizes[1] // (2 * constants.TILE_SIZE), \
+                                 constants.TILE_SIZE
+        else:
+            hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
         hidden_active = reshape(hidden_active, hidden_tiled_sizes)
-        hidden_active = get_activation(activation_function)(hidden_active)
-        hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
-        hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_gate = slice_along(hidden_active, 1, limit=1, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2, start=1)
+            hidden_gate = squeeze(hidden_gate, dim=1)
+            hidden_linear = squeeze(hidden_linear, dim=1)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
+            hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
         hidden_states = multiply(hidden_active, hidden_linear)
         result = dot_1220_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
     else:
         hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
                                scales=in0_scales, neuron_config=neuron_config)
-        hidden_active = get_activation(activation_function)(hidden_active)
-        hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+        if neuron_config and neuron_config.fuse_mlp:
+            size = hidden_active.sizes[1]//2
+            hidden_gate = slice_along(hidden_active, 1, limit=size, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2*size, start=size)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
                                scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
         if neuron_config is not None and neuron_config.mlp_out_weight_transpose:
@@ -750,23 +767,40 @@ def gated_mlp(
 
         hidden_active = dot_0120_add1(hidden, in0_weight, in0_bias,
                                       scales=in0_scales, neuron_config=neuron_config)
-        hidden_active = get_activation(activation_function)(hidden_active)
-        hidden_linear = dot_0120_add1(hidden, in1_weight, in1_bias,
-                                      scales=in1_scales, neuron_config=neuron_config)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_tiled_sizes = n_active_tokens * batch_size, 2, hidden_active.sizes[1] // (2 * constants.TILE_SIZE), \
+                                 constants.TILE_SIZE
+            hidden_active = reshape(hidden_active, hidden_tiled_sizes)
+            hidden_gate = slice_along(hidden_active, 1, limit=1, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2, start=1)
+            hidden_gate = squeeze(hidden_gate, dim=1)
+            hidden_linear = squeeze(hidden_linear, dim=1)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+            hidden_states = multiply(hidden_active, hidden_linear)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot_0120_add1(hidden, in1_weight, in1_bias,
+                                          scales=in1_scales, neuron_config=neuron_config)
 
-        hidden_states = multiply(hidden_active, hidden_linear)
-        hidden_states_tiled_sizes = hidden_states.sizes[0], hidden_states.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
-        hidden_states = reshape(hidden_states, hidden_states_tiled_sizes)
+            hidden_states = multiply(hidden_active, hidden_linear)
+            hidden_states_tiled_sizes = hidden_states.sizes[0], hidden_states.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+            hidden_states = reshape(hidden_states, hidden_states_tiled_sizes)
 
         result = dot_1220_add1(hidden_states, out_weight, out_bias,
                                scales=out_scales, neuron_config=neuron_config)
     else:
         # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
         hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
-        hidden_active = get_activation(activation_function)(hidden_active)
+        if neuron_config and neuron_config.fuse_mlp:
+            size = hidden_active.sizes[1]//2
+            hidden_gate = slice_along(hidden_active, 1, limit=size, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2*size, start=size)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
 
-        # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
-        hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
+            # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+            hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
 
         if neuron_config is not None and neuron_config.mlp_out_weight_transpose:

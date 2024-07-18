@@ -133,9 +133,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
-            in0_weight, in0_scales,
-            in1_weight, in1_scales,
-            out_weight, out_scales,
+            in0_weight=None, in0_scales=None,
+            in1_weight=None, in1_scales=None,
+            out_weight=None, out_scales=None,
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
@@ -164,6 +164,12 @@ class LlamaForSamplingNoEmbeddingHlo:
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
         norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+        if self.neuron_config.fuse_mlp:
+            assert all(map(lambda x: not(x), [in0_weight, in1_weight, out_weight, in0_scales, in1_scales, out_scales])) ,\
+                f"in0, in1 and out weights have to be None"
+            in0_weight, in0_scales = mlp_in_weight, mlp_in_scales
+            out_weight, out_scales = mlp_out_weight, mlp_out_scales
+
         mlp_hidden = gated_mlp(
             norm_hidden,
             in0_weight, in1_weight, out_weight,

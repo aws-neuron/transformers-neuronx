@@ -1422,6 +1422,10 @@ class DecoderLayer(torch.nn.Module):
 
                 self.mlp_in_weight = maybe_pad(self.mlp_in_weight, dim=1)
                 self.mlp_in_bias = maybe_pad(self.mlp_in_bias, dim=0)
+                if self.neuron_config.fuse_mlp:
+                    intermediate_size = intermediate_size // 2
+                    intermediate_size_padded = utils.round_up_to_divisor(intermediate_size, self.tp_degree)
+                    maybe_pad = MaybePadder(intermediate_size_padded)
                 self.mlp_out_weight = maybe_pad(self.mlp_out_weight, dim=self.mlp_out_sharding)
 
         if utils.amp_is_u8(self.amp):
