@@ -219,6 +219,7 @@ class NeuronConfig():
         attn_output_transposed: bool = False,
         fused_rmsnorm_qkv: bool = False,
         mlp_out_weight_transpose: bool = False,
+        fuse_mlp: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -230,6 +231,7 @@ class NeuronConfig():
             f"The `cast_logits_dtype={cast_logits_dtype}` argument must be one of {valid_dtypes}"
         )
         self.fuse_qkv = fuse_qkv
+        self.fuse_mlp = fuse_mlp
         self.continuous_batching = continuous_batching
         self.padding_side = padding_side
         assert padding_side in ['left', 'right'], (
