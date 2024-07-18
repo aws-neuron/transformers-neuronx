@@ -352,9 +352,6 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # forward pass to get next token
         cache_ids = cache_ids + 1
         
-        if model.neuron_config and model.neuron_config.use_2d_cache_ids:
-            cache_ids = torch.unsqueeze(cache_ids, dim=0)
-        
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
