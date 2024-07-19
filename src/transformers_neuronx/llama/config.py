@@ -45,10 +45,10 @@ class LlamaConfig:
         # Speculated configurations for rope scaling. Params names might be different.
         self.rope_scaling = getattr(config, "rope_scaling", None)
         if self.rope_scaling is not None:
-            rope_scaling['scale_factor'] = rope_scaling.get('scale_factor', 8)
-            rope_scaling['low_freq_factor'] = rope_scaling.get('low_freq_factor', 1)
-            rope_scaling['high_freq_factor'] = rope_scaling.get('high_freq_factor', 4)
-            rope_scaling['old_context_len'] = rope_scaling.get('old_context_len', 8192)
+            self.rope_scaling['scale_factor'] = self.rope_scaling.get('scale_factor', 8)
+            self.rope_scaling['low_freq_factor'] = self.rope_scaling.get('low_freq_factor', 1)
+            self.rope_scaling['high_freq_factor'] = self.rope_scaling.get('high_freq_factor', 4)
+            self.rope_scaling['old_context_len'] = self.rope_scaling.get('old_context_len', 8192)
 
         utils.maybe_override_attributes(self, kwargs)
 
