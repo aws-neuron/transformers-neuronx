@@ -25,7 +25,7 @@ from transformers_neuronx import module
 from transformers_neuronx import ops
 from transformers_neuronx.compiler import ParallelKernel
 from transformers_neuronx.constants import LAYOUT_BSH
-from transformers_neuronx.config import GenerationConfig, maybe_dump_config
+from transformers_neuronx.config import GenerationConfig
 from transformers_neuronx.util.token_tree import validate_token_tree
 from concurrent.futures import ProcessPoolExecutor
 import json
@@ -53,7 +53,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     # top level api
     def compile(self, parallel_degree=None):
-        maybe_dump_config(self.config, self.neuron_config)
         kernels = self._get_all_kernels()
         neff_bytes_futures = dict()
         if parallel_degree is None:

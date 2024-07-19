@@ -20,7 +20,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx.config import NeuronConfig, maybe_dump_config
+from transformers_neuronx import NeuronConfig
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
@@ -65,7 +65,6 @@ class GPTJForSampling(module.PretrainedModel):
 
     def to_neuron(self):
         ops.init()
-        maybe_dump_config(self.config, self.neuron_config)
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
