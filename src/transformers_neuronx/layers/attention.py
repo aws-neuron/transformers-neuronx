@@ -435,7 +435,7 @@ def scale(query, d_head):
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
+def score(query, keys, tp_degree=None, n_kv_heads=0, block_to_seq=None, neuron_config=None):
     """
     Compute the attention score by combining scaled-query & keys.
 
@@ -464,7 +464,12 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
                     rhs_contracting_dimensions=[3],
                     rhs_batch_dimensions=batch_dimensions)
 
-    result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
+    n_active_q_tokens = query.sizes[1 if bsh_cache_layout else 0]
+    n_active_k_tokens = keys.sizes[1 if bsh_cache_layout else 0]
+    if (neuron_config and neuron_config.optimized_paged_attention) and (n_active_q_tokens < n_active_k_tokens) and (n_active_q_tokens == 1):
+        result_dot = attention_utils.blockwise_qk_matmul(query, keys, block_to_seq)
+    else:
+        result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
 
     return result_dot
 
@@ -528,13 +533,13 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
         # broadcast from [n_seqs, n_active_tokens, n_positions] to [n_seqs, n_heads, n_active_tokens, n_positions]
         mask_br = hlo.broadcast(mask, score_sizes, [0, 2, 3])
-    score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
+    score = hlo.masked_select(mask_br, score, large_neg_br)
     return score
 
 
 def context(past_scores, active_score, past_values, active_values,
             sparse_mask=None, past_mask=None, active_mask=None,
-            n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None):
+            n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None, context_lens=None, num_active_blocks=None, block_to_seq=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -566,7 +571,7 @@ def context(past_scores, active_score, past_values, active_values,
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
     n_seqs, n_heads, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
-    n_seqs, n_heads, n_active_tokens, n_positions = past_scores.sizes
+    _, _, _, n_positions = past_scores.sizes
     if shard_over_batch:
         n_positions, n_seqs_per_nc, n_kv_heads, d_head = past_values.sizes
         n_seqs = n_seqs_per_nc * tp_degree
@@ -574,9 +579,11 @@ def context(past_scores, active_score, past_values, active_values,
         reduce_sizes = n_seqs_per_nc, n_heads, n_active_tokens
     else:
         if bsh_cache_layout:
-            n_seqs, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+            _, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+            n_seqs = active_values.sizes[0]
         else:
-            n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
+            n_positions, _, n_kv_heads_tp, d_head = past_values.sizes
+            n_seqs = active_values.sizes[1]
         _, n_heads_tp, _, _ = active_score.sizes
         reduce_sizes = n_seqs, n_heads_tp, n_active_tokens
 
@@ -585,17 +592,24 @@ def context(past_scores, active_score, past_values, active_values,
     active_score = hlo.cast(active_score, f32)
 
     # Compute maximum of both past_scores and active_scores
-    minus_inf = f32.Constant(constant_value=float('-inf'))
-    max_func = hlo.gen_max_func(f32)
-    reduce_max = f32[reduce_sizes].Reduce(past_scores, minus_inf, dimensions=[3], to_apply=max_func)
-    active_reduce_max = f32[reduce_sizes].Reduce(active_score, minus_inf, dimensions=[3], to_apply=max_func)
-    reduce_max = f32[reduce_sizes].Maximum(reduce_max, active_reduce_max)
-    reduce_max_br = f32[past_scores.sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
+    reduce_max = hlo.reduce_max(past_scores, dim=3)
+    active_reduce_max = hlo.reduce_max(active_score, dim=3)
+
+    if neuron_config and neuron_config.optimized_paged_attention:
+        num_seqs = neuron_config.continuous_batching.max_num_seqs
+        block_size = neuron_config.continuous_batching.block_size
+        reduce_max = attention_utils.blockwise_reduce_max(reduce_max, block_to_seq, num_seqs)
+        active_reduce_max = hlo.unsqueeze(active_reduce_max, -1)
+        active_reduce_max = attention_utils.gather_blocks_active(active_reduce_max, block_to_seq)
+        active_reduce_max = hlo.squeeze(active_reduce_max, -1)
+
+    reduce_max = hlo.maximum(reduce_max, active_reduce_max)
+    reduce_max_br = hlo.broadcast(reduce_max, past_scores.sizes, broadcast_dimensions=[0, 1, 2])
 
     # Pa = softmax(Sa)
     # Pp = softmax(Sp)
-    score_shifted = f32[past_scores.sizes].Subtract(past_scores, reduce_max_br)
-    exp = f32[past_scores.sizes].Exp(score_shifted)
+    score_shifted = hlo.subtract(past_scores, reduce_max_br)
+    exp = hlo.exp(score_shifted)
     if past_mask is not None:
         exp = attention.mask(
             exp,
@@ -604,14 +618,15 @@ def context(past_scores, active_score, past_values, active_values,
             shard_over_batch=shard_over_batch,
             constant_value=0,
         )
-    zero = f32.Constant(constant_value=0)
-    add_func = hlo.gen_add_func(f32)
-    denom = f32[reduce_sizes].Reduce(exp, zero, dimensions=[3], to_apply=add_func)
-    past_prob = dtype[exp.sizes].Convert(exp)
-
-    reduce_max_bra = f32[active_score_sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
-    active_score_shifted = f32[active_score_sizes].Subtract(active_score, reduce_max_bra)
-    active_prob = f32[active_score_sizes].Exp(active_score_shifted)
+    denom = hlo.reduce_sum(exp, dim=3)
+    past_prob = hlo.cast(exp, dtype)
+    reduce_max_bra = hlo.broadcast(reduce_max, list(reduce_max.sizes) + [n_active_tokens], broadcast_dimensions=[0, 1, 2])
+    if neuron_config and neuron_config.optimized_paged_attention:
+        active_score_bw = attention_utils.gather_blocks_active(active_score, block_to_seq)
+        active_score_shifted = hlo.subtract(active_score_bw, reduce_max_bra)
+    else:
+        active_score_shifted = hlo.subtract(active_score, reduce_max_bra)
+    active_prob = hlo.exp(active_score_shifted)
     if active_mask is not None:
         active_prob = attention.mask(
             active_prob,
@@ -620,9 +635,12 @@ def context(past_scores, active_score, past_values, active_values,
             shard_over_batch=shard_over_batch,
             constant_value=0,
         )
-    active_denom = f32[reduce_sizes].Reduce(active_prob, zero, dimensions=[3], to_apply=add_func)
-    denom = f32[reduce_sizes].Add(denom, active_denom)
-    active_prob = dtype[active_prob.sizes].Convert(active_prob)
+    active_denom = hlo.reduce_sum(active_prob, dim=3)
+    if neuron_config and neuron_config.optimized_paged_attention:
+        denom = attention_utils.blockwise_reduce_sum(denom, block_to_seq, num_seqs)
+
+    denom = hlo.add(denom, active_denom)
+    active_prob = hlo.cast(active_prob, dtype)
 
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
@@ -662,6 +680,12 @@ def context(past_scores, active_score, past_values, active_values,
                 rhs_batch_dimensions=rhs_batch_dimensions)
 
     output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
+    if neuron_config and neuron_config.optimized_paged_attention:
+        block_size = neuron_config.continuous_batching.block_size
+        selected_block_indices = attention_utils.sample_block_indices(context_lens, num_active_blocks, block_size)
+        output_dot = attention_utils.blockwise_tensor_contraction(output_dot, selected_block_indices)
+        active_prob = attention_utils.gather_blocks_active(active_prob, selected_block_indices)
+        denom = hlo.index_select(denom, dim=0, index=selected_block_indices)
     active_output_dot = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
     output = hlo.add(output_dot, active_output_dot)
 
@@ -671,10 +695,10 @@ def context(past_scores, active_score, past_values, active_values,
         denom = hlo.all_to_all(denom, split_dim=1, concat_dim=0, tp_degree=tp_degree)
 
     sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-    denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
-    output = dtype[sizes].Divide(output, denom_br)
-    sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-    output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+    denom_br = hlo.broadcast(denom, sizes, broadcast_dimensions=[0, 1, 2])
+    output = hlo.divide(output, denom_br)
+    # (n_seqs, n_heads_tp, n_active_tokens, d_head) -> (n_active_tokens, n_seqs, n_heads_tp, d_head)
+    output = hlo.permute(output, dimensions=[2, 0, 1, 3])
     return output
 
 
