@@ -914,7 +914,7 @@ def token_tree_attention_mask(full_token_tree_attention_mask, active_mask):
     return pred_token_tree_active_mask
 
 
-def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, neuron_config=None):
+def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None):
     """
     Create decomposed prior/active attention masks.
 
@@ -958,6 +958,7 @@ def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, neuron
             cache_ids,
             n_positions,
             last_token_id=last_token_id,
+            num_active_blocks=num_active_blocks,
             neuron_config=neuron_config,
         )
     else:
@@ -2607,6 +2608,11 @@ def multiply(lhs, rhs):
     _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Multiply(lhs, rhs)
 
+def minimum(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
+    return lhs.dtype[lhs.sizes].Minimum(lhs, rhs)
+
 def maximum(lhs, rhs):
     lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
     _check_binary_arguments(lhs, rhs)
@@ -3030,7 +3036,7 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, neuron_config=None):
+def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None):
     """
     Create attention masks for LHS-aligned sequences.
 
@@ -3053,7 +3059,8 @@ def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=Non
             return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
     else:
         # Token generation
-        return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, neuron_config=neuron_config)
+        return decoder_attention_mask_lhs_aligned_token(
+            cache_ids, n_positions, num_active_blocks=num_active_blocks, neuron_config=neuron_config)
 
 
 def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
@@ -3157,11 +3164,12 @@ def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, neuron_config=None):
+def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, num_active_blocks=None, neuron_config=None):
     if neuron_config and neuron_config.optimized_paged_attention:
         block_size = neuron_config.continuous_batching.block_size
-        num_blocks = neuron_config.continuous_batching.num_blocks
-        return decoder_attention_mask_lhs_aligned_token_blockwise(cache_ids, block_size=block_size, num_blocks=num_blocks)
+        assert isinstance(num_active_blocks, int) and (num_active_blocks is not None), \
+            f"num_active_blocks is expected to be an int, but got {num_active_blocks}"
+        return decoder_attention_mask_lhs_aligned_token_blockwise(cache_ids, block_size=block_size, num_blocks=num_active_blocks)
     else:
         return decoder_attention_mask_lhs_aligned_token_padded(cache_ids, n_positions)
 
@@ -3212,12 +3220,16 @@ def decoder_attention_mask_lhs_aligned_token_blockwise(context_lens, block_size,
     >>>     mask = jnp.int32(jnp.logical_and(mask_iota >= start_idx, mask_iota < end_idx))
     >>>     prior_mask = prior_mask + mask
     """
-    assert len(context_lens.sizes) == 1, "context_lens is expected to be a 1D vector."
+    assert len(context_lens.sizes) == 2, "context_lens is expected to be a 2D vector."
 
     s32 = context_lens.scribe.s32
     f32 = context_lens.scribe.f32
+    pred = context_lens.scribe.pred
     max_num_seqs = context_lens.sizes[0]
     num_tokens = block_size * num_blocks
+
+    # reshape from 2D to 1D vector
+    context_lens = reshape(context_lens, (max_num_seqs,))
 
     # blocks_cumsum = cumsum((context_lens+block_size-1)//block_size, axis=0)
     blocks_add = add(context_lens, block_size-1)
@@ -3225,7 +3237,7 @@ def decoder_attention_mask_lhs_aligned_token_blockwise(context_lens, block_size,
     blocks_cumsum = cumsum(blocks_div, dim=0)
 
     blocks_mul = multiply(blocks_cumsum, block_size)
-    prior_mask = full(0, dtype=context_lens.dtype, sizes=(num_tokens,))
+    prior_mask = full(0, dtype=pred, sizes=(num_tokens,))
     mask_iota = iota(s32, (num_tokens,), [0])
     for seq_id in range(max_num_seqs):
         zero, prev_seq_id, curr_seq_id = s32.Constant(constant_value=0), s32.Constant(constant_value=seq_id-1), s32.Constant(constant_value=seq_id)
@@ -3235,8 +3247,10 @@ def decoder_attention_mask_lhs_aligned_token_blockwise(context_lens, block_size,
         end_idx = add(dynamic_slice_along(context_lens, dim=0, start=curr_seq_id, size=1), start_idx)
         end_idx_br = broadcast(end_idx, out_dim_size=(num_tokens,), broadcast_dimensions=[0])
         mask = logical_and(greater_equal(mask_iota, start_idx_br), less(mask_iota, end_idx_br))
-        prior_mask = add(prior_mask, cast(mask, s32))
-    active_mask = full(1, dtype=context_lens.dtype, sizes=(max_num_seqs,))
+        # start_idx is loaded from cumsum of block placement location, therefore the mask update location should never overlap.
+        prior_mask = add(prior_mask, cast(mask, pred))
+    prior_mask = reshape(prior_mask, (num_blocks, 1, block_size))
+    active_mask = full(1, dtype=pred, sizes=(max_num_seqs,1,1))
     return prior_mask, active_mask
 
 
@@ -3600,3 +3614,22 @@ def flip(tensor, dims):
     if isinstance(dims, int):
         dims = [dims]
     return tensor.dtype[tensor.sizes].Reverse(tensor, dimensions=dims)
+
+
+def diff(tensor, dim):
+    """
+    Computes the n-th forward difference along the given dimension, where n=1.
+
+    Example:
+    >>> c = tensor([[1, 2, 3], [3, 4, 5]])
+    >>> diff(c, dim=0)
+    tensor([[2, 2, 2]])
+    >>> diff(c, dim=1)
+    tensor([[1, 1],
+            [1, 1]])
+    """
+    o_sizes = tensor.sizes
+    a = slice_along(tensor, dim, limit=o_sizes[dim]-1, start=0)
+    b = slice_along(tensor, dim, limit=o_sizes[dim], start=1)
+    output = subtract(b, a)
+    return output
