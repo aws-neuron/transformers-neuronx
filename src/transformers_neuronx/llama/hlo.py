@@ -35,6 +35,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         self.config = config
         self.neuron_config = neuron_config
         self.n_positions = None
+        self.num_active_blocks = None
 
     @property
     def shard_over_batch(self):
@@ -86,6 +87,29 @@ class LlamaForSamplingNoEmbeddingHlo:
         return self.embedding(input_ids, cache_ids, start_ids, last_token_id, *weights)
 
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
+        # TODO: move this fallback calculation to decoder.py
+        if self.num_active_blocks is None and self.neuron_config.optimized_paged_attention:
+            max_model_len = self.neuron_config.continuous_batching.max_model_len
+            max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
+            block_size = self.neuron_config.continuous_batching.block_size
+            self.num_active_blocks = (max_model_len * max_num_seqs // block_size) - 2
+
+        if self.neuron_config.optimized_paged_attention and len(last_token_id.sizes) == 2:
+            # For decoding with multiple KV cache blocks:
+            # - cache_ids are used as context_lens
+            # - start_ids are used as slot_mapping
+            # - last_token_id is used as block_tables
+            # The function below transforms 2D block_tables into 1D active block table
+            last_token_id = attention_utils.active_block_tables(
+                block_tables=last_token_id, context_lens=cache_ids,
+                num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+            max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
+            block_size = self.neuron_config.continuous_batching.block_size
+            block_to_seq = attention_utils.block_to_seq_indexing(
+                context_lens=cache_ids, num_seqs=max_num_seqs, num_blocks=self.num_active_blocks, block_size=block_size)
+        else:
+            block_to_seq = None
+
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(
             hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
@@ -106,10 +130,10 @@ class LlamaForSamplingNoEmbeddingHlo:
                                                                         cores_per_kv_head=self.cores_per_kv_head)
         else:
             mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions, 
-                                                   last_token_id=last_token_id, neuron_config=self.neuron_config)
+                                                   last_token_id=last_token_id, num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
 
 
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
 
     def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
         hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
@@ -121,7 +145,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
 
     def layer(
-            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id,
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             fused_pre_attn_ln_qkv_weight,
@@ -144,7 +168,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             assert fused_pre_attn_ln_qkv_weight is not None
             attn_output, out_attn_k_cache, out_attn_v_cache = self.fused_rmsnorm_qkv(
                 hidden, None, eps,
-                cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+                cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
                 attn_k_cache, attn_v_cache,
                 fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias, # should be none
@@ -154,7 +178,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         else:
             ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
             attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-                ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+                ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
                 attn_k_cache, attn_v_cache,
                 attn_q_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias,
@@ -239,7 +263,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def fused_rmsnorm_qkv(
         self, hidden, pre_attn_ln_weight, eps,
-        cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+        cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
         attn_k_cache, attn_v_cache,
         attn_q_weight, attn_q_scales, attn_q_bias,
         attn_k_weight, attn_k_scales, attn_k_bias, # should be none
@@ -295,7 +319,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # Pass QKV tuple since it will not be computed in the attention block
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            nki_output, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+            nki_output, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             attn_q_weight, None, None,
             None, None, None,
@@ -308,7 +332,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def attention(
         self,
-        hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+        hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -384,10 +408,13 @@ class LlamaForSamplingNoEmbeddingHlo:
                 if self.neuron_config and self.neuron_config.kv_cache_quant:
                     cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys_s, self.neuron_config)
                     cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)
-            elif self.neuron_config.paged_attention:
+            elif self.neuron_config and self.neuron_config.paged_attention:
                 # For decoding with multiple KV cache blocks, start_ids are used as block_tables
-                cached_keys_s = attention_utils.gather_blocks(cached_keys, block_tables=last_token_id)
-                cached_values_s = attention_utils.gather_blocks(cached_values, block_tables=last_token_id)
+                cached_keys_s = attention_utils.gather_blocks(cached_keys, block_tables=last_token_id, neuron_config=self.neuron_config)
+                cached_values_s = attention_utils.gather_blocks(cached_values, block_tables=last_token_id, neuron_config=self.neuron_config)
+                if self.neuron_config and self.neuron_config.kv_cache_quant:
+                    cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys_s, self.neuron_config)
+                    cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)
             elif self.neuron_config and self.neuron_config.kv_cache_quant:
                 cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys, self.neuron_config)
                 cached_values_s = dequantize_kv_cache_direct_cast(cached_values, self.neuron_config)   
@@ -402,7 +429,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             # Sp = Q @ Kp
             prior_scores = attention.score(query, cached_keys_s, n_kv_heads=self.config.num_key_value_heads,
-                                           tp_degree=tp_degree, neuron_config=self.neuron_config)
+                                           tp_degree=tp_degree, block_to_seq=block_to_seq, neuron_config=self.neuron_config)
             prior_scores = attention.mask(prior_scores, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
 
             # Sa = Q @ Ka
@@ -422,6 +449,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             else:
                 context = attention.context(prior_scores, active_score, cached_values_s, value,
                                             n_kv_heads=self.config.num_key_value_heads, tp_degree=tp_degree,
+                                            context_lens=cache_ids, num_active_blocks=self.num_active_blocks,
+                                            block_to_seq=block_to_seq,
                                             neuron_config=self.neuron_config)
 
             # KCache[I], VCache[I] = K, V
