@@ -42,13 +42,10 @@ class LlamaConfig:
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
-        # Speculated configurations for rope scaling. Params names might be different.
         self.rope_scaling = getattr(config, "rope_scaling", None)
-        if self.rope_scaling is not None:
-            self.rope_scaling['scale_factor'] = self.rope_scaling.get('scale_factor', 8)
-            self.rope_scaling['low_freq_factor'] = self.rope_scaling.get('low_freq_factor', 1)
-            self.rope_scaling['high_freq_factor'] = self.rope_scaling.get('high_freq_factor', 4)
-            self.rope_scaling['old_context_len'] = self.rope_scaling.get('old_context_len', 8192)
+        rope_scaling_type = self.rope_scaling.get("rope_type", self.rope_scaling.get("type", None)) if self.rope_scaling is not None else None
+        if self.rope_scaling is not None and rope_scaling_type not in {'default', 'llama3'}:
+            raise ValueError(f"Only default and llama3 ropes scaling types are currently supported. Received {rope_scaling_type}")
 
         utils.maybe_override_attributes(self, kwargs)
 
