@@ -336,7 +336,7 @@ class LlamaForSampling(base.NeuronModelBase):
 
         if self.neuron_config.on_device_generation:
             return sampling.sample_tokens(self, input_ids, start_ids, sequence_length=sequence_length,
-                                            config=self.neuron_config.on_device_generation, streamer=streamer)
+                                            config=self.neuron_config.on_device_generation, streamer=streamer, cache_ids=cache_ids)
 
         if self.context_pre_hook is not None:
             self.context_pre_hook()
