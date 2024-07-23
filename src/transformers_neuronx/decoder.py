@@ -1353,7 +1353,7 @@ class DecoderLayer(torch.nn.Module):
 
             if n_kv_heads_padded != self.n_kv_head:
 
-                if n_kv_heads_padded % self.n_kv_head == 0:
+                if n_kv_heads_padded % self.n_kv_head == 0 and extra_heads == 0:
                     ratio = int(n_kv_heads_padded / self.n_kv_head)
                 else:
                     ratio = int((n_kv_heads_padded - extra_heads) / self.n_kv_head)
