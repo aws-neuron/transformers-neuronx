@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import transformers
+import warnings
 
 from transformers_neuronx.config import GenerationConfig
 from transformers_neuronx.stopping_criteria import StoppingCriteriaList
@@ -38,6 +39,7 @@ def sample_tokens(
         sequence_length: int = 128,
         config: Optional[GenerationConfig] = None,
         streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+        cache_ids: Optional[torch.Tensor] = None,
     ):
     """
     A sampling loop for a model that emits selected tokens.
@@ -48,9 +50,8 @@ def sample_tokens(
     batch_size, start = input_ids.shape
 
     # Populate the KV cache with prompt
-    next_tokens = model(input_ids, None, start_ids)
+    next_tokens = model(input_ids, cache_ids, start_ids)
 
-    cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
 
     # Use a default config if none is provided
@@ -64,7 +65,7 @@ def sample_tokens(
         early_stop = True
 
     # Generate loop
-    for current, cache_id in zip(range(start + 1, sequence_length + 1), cache_ids):
+    for current in range(start + 1, sequence_length + 1):
 
         if early_stop:
             done_flags |= (next_tokens == eos_token)
@@ -83,7 +84,15 @@ def sample_tokens(
         if current >= sequence_length:
             break
 
-        next_tokens = model(next_tokens, cache_id, start_ids)
+        cache_ids = torch.as_tensor([current-1], dtype=torch.int32)
+        if model.neuron_config and model.neuron_config.use_2d_cache_ids:
+            warnings.warn(
+                "We are making the assumption that all the sequences progress at the same rate in naive continuous batching. "
+                "Please make sure you are running naive continuous batching which is enabled by adding the --continuous_batching flag in generation_demo."
+            )
+            cache_ids=cache_ids.unsqueeze(0).expand(batch_size,1) 
+        
+        next_tokens = model(next_tokens, cache_ids, start_ids)
 
     if streamer:
         streamer.end()
