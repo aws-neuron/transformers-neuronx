@@ -40,7 +40,7 @@ from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling
 from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
-from transformers_neuronx.config import QuantizationConfig, ContinuousBatchingConfig
+from transformers_neuronx.config import ContinuousBatchingConfig, QuantizationConfig, KVCacheQuantizationConfig, GenerationConfig
 
 
 def dump(dump_dir, dump_file_name, data):
@@ -224,15 +224,18 @@ def main():
     run_parser.add_argument('--device', type=str, default="cpu")
     run_parser.add_argument('--context_length_estimate', type=int, default=None)
     run_parser.add_argument('--window_context_length_estimate', type=int, default=None)
-    run_parser.add_argument('--mlp_out_weight_transpose', action='store_true', default=False)
+    run_parser.add_argument('--on_device_embedding', action='store_true')
+    run_parser.add_argument('--on_device_sampling', action='store_true')
 
     run_parser.add_argument('--gqa', type=str, default=None)
     run_parser.add_argument('--quant', action='store_true')
+    run_parser.add_argument('--kv_cache_quant', action='store_true')
     run_parser.add_argument('--attention_layout', type=str, default='HSB')
     run_parser.add_argument('--fuse_qkv', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm_threshold', type=int, default=2048)
     run_parser.add_argument('--shard_over_sequence', action='store_true')
+    run_parser.add_argument('--weight_tiling', action='store_true')
     # logging
     run_parser.add_argument('--debug', action='store_true')
 
@@ -468,15 +471,14 @@ def save(args, hf_model_name, model_type):
     save_pretrained_split(model, args.save)
 
 def verify_and_fallback_args(args):
-     if args.continuous_batching:
-         assert args.model_type == "llama", "--continuous_batching is only supported for model_types that use sample_llama."
-  
-         if not args.simple_sample:
-             logging.warning("--continuous_batching is only supported when using --simple_sample. Enabling --simple_sample.")
-             args.simple_sample = True
-  
-     return args
+    if args.continuous_batching:
+        assert args.model_type == "llama", "--continuous_batching is only supported for model_types that use sample_llama."
 
+        if not args.simple_sample:
+            logging.warning("--continuous_batching is only supported when using --simple_sample. Enabling --simple_sample.")
+            args.simple_sample = True
+
+    return args
 
 def run(args, hf_model_name, model_cls):
     args = verify_and_fallback_args(args)
@@ -487,7 +489,8 @@ def run(args, hf_model_name, model_cls):
 
     # prepare input
     if args.prompt_len is not None:
-        input_ids = torch.randint(0, 100, (args.batch_size, args.prompt_len))
+        input_ids = torch.randint(0, 100, (1, args.prompt_len))
+        input_ids = torch.broadcast_to(input_ids, (args.batch_size, args.prompt_len))
         attention_mask = None
         cache_ids = None
         start_ids = None
@@ -532,6 +535,10 @@ def run(args, hf_model_name, model_cls):
     else:
         compile_batch_size = args.batch_size*args.beam
 
+    if args.on_device_sampling:
+        args.simple_sample = True
+        args.max_length = args.prompt_len+args.max_new_tokens
+
     # wrap whole thing with try and finally as we want to collect artifacts in the end
     try:
         if args.device == "neuron":
@@ -544,17 +551,25 @@ def run(args, hf_model_name, model_cls):
             if args.pack_artifacts:
                 os.environ["NEURONX_DUMP_TO"] = dump_path
                 print(f"Set dump_path: {dump_path}")
-
+            if args.kv_cache_quant:
+                os.environ['NEURON_CC_FLAGS'] = '--internal-hlo2tensorizer-options=--experimental-unsafe-fp8e4m3fn-as-fp8e4m3'
+            if args.no_bucketing_n_positions:
+                n_positions_passed_to_model = [args.n_positions]
+            else:
+                n_positions_passed_to_model = args.n_positions
 
             neuron_config = NeuronConfig(
+                shard_over_sequence=args.shard_over_sequence,
                 group_query_attention=args.gqa,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
+                kv_cache_quant=KVCacheQuantizationConfig(quant_dtype='f8e4m3fn', dequant_dtype='bf16') if args.kv_cache_quant else None,
                 fuse_qkv=args.fuse_qkv,
                 sequence_parallel_norm=args.sequence_parallel_norm,
                 sequence_parallel_norm_threshold=args.sequence_parallel_norm_threshold,
                 attention_layout=args.attention_layout,
-                mlp_out_weight_transpose=args.mlp_out_weight_transpose,
-                shard_over_sequence=args.shard_over_sequence,
+                weight_tiling=args.weight_tiling,
+                on_device_embedding = args.on_device_embedding,
+                on_device_generation = GenerationConfig(max_length=args.prompt_len+args.max_new_tokens, top_k=1, do_sample=True, eos_token_id=9999) if args.on_device_sampling else None,
                 continuous_batching=ContinuousBatchingConfig(batch_size_for_shared_caches=args.batch_size) if args.continuous_batching else None,
             )
 
@@ -568,13 +583,16 @@ def run(args, hf_model_name, model_cls):
             else:
                 context_length_estimate_passed_to_model = args.context_length_estimate
 
+            if args.context_unroll < 0:
+                args.context_unroll = None
+
             print(f'running {model_cls.__name__}.from_pretrained')
             if model_cls == GPT2ForSamplingWithContextBroadcasting or model_cls == LlamaForSampling or model_cls == BloomForSampling or model_cls == OPTForSampling:
                 suffix += f"_ctx{args.context_length_estimate}"
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
                                                 tp_degree=args.tp_degree, n_positions=n_positions_passed_to_model,
                                                 unroll=args.unroll, context_unroll=args.context_unroll, context_length_estimate=context_length_estimate_passed_to_model, neuron_config=neuron_config)
-                if args.window_context_length_estimate is not None:
+                if args.window_context_length_estimate is not None and args.window_context_length_estimate > 0:
                     neuron_model.enable_window_context_decoder(args.window_context_length_estimate, args.window_context_unroll)
             else:
                 neuron_model = model_cls.from_pretrained(args.load, batch_size=compile_batch_size, amp=args.amp,
