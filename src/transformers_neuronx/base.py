@@ -54,7 +54,6 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     # top level api
     def compile(self, parallel_degree=None):
-        maybe_dump_config(self.config, self.neuron_config)
         kernels = self._get_all_kernels()
         neff_bytes_futures = dict()
         if parallel_degree is None:
@@ -78,15 +77,16 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     # TODO: decouple hlo_generation from load weights so compile can be called before it
     def to_neuron(self):
-        if hasattr(self, "_using_presharded_weights"):
-            self.load_presharded_weights()
-        else:
-            self.load_weights()
-        if hasattr(self, "_compiled_artifacts_directory"):
-            self._load_compiled_artifacts(self._compiled_artifacts_directory)
-        else:
-            self.compile()
-        self.setup()
+        with maybe_dump_config(self.config, self.neuron_config):
+            if hasattr(self, "_using_presharded_weights"):
+                self.load_presharded_weights()
+            else:
+                self.load_weights()
+            if hasattr(self, "_compiled_artifacts_directory"):
+                self._load_compiled_artifacts(self._compiled_artifacts_directory)
+            else:
+                self.compile()
+            self.setup()
     
     def load_presharded_weights(self):
         assert self.neuron_config.on_device_embedding, "on_device_embedding must be True to save and load presharded weights"

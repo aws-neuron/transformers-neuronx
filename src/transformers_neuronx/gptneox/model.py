@@ -69,17 +69,17 @@ class GPTNeoXForSampling(module.PretrainedModel):
 
     def to_neuron(self):
         ops.init()
-        maybe_dump_config(self.config, self.neuron_config)
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
-        self.program = build_gptneox_program(config, 1, n_positions_list, unroll, self.debug)
-        self.gpt_neox.embed_in.materialize()
-        for idx, block in enumerate(self.gpt_neox.layers):
-            block.to_neuron(n_positions_list)
-        self.ln_lm_head.to_neuron()
-        self.program.setup(self.gpt_neox.layers, self.ln_lm_head)
-        self.init_program.setup(self.gpt_neox.layers, self.ln_lm_head)
+        with maybe_dump_config(self.config, self.neuron_config):
+            self.program = build_gptneox_program(config, 1, n_positions_list, unroll, self.debug)
+            self.gpt_neox.embed_in.materialize()
+            for idx, block in enumerate(self.gpt_neox.layers):
+                block.to_neuron(n_positions_list)
+            self.ln_lm_head.to_neuron()
+            self.program.setup(self.gpt_neox.layers, self.ln_lm_head)
+            self.init_program.setup(self.gpt_neox.layers, self.ln_lm_head)
 
     def reset(self):
         for block in self.gpt_neox.layers:
