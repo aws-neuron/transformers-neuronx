@@ -14,6 +14,7 @@
 # ==============================================================================
 import os
 import shlex
+import shutil
 import subprocess
 import hashlib
 import tarfile
@@ -122,8 +123,8 @@ def compile_hlo_module(hlo_module, tag=None, num_exec_repetition=1):
         hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
 
     if dump:
-        dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
-        dump_to = os.path.join(dump_to, hlo_module_name)
+        dump_to_parent = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+        dump_to = os.path.join(dump_to_parent, hlo_module_name)
         os.makedirs(dump_to, exist_ok=True)
         hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
         hlo_module_path = os.path.realpath(hlo_module_path)
@@ -138,6 +139,10 @@ def compile_hlo_module(hlo_module, tag=None, num_exec_repetition=1):
             subprocess.check_call(command_line, cwd=dump_to)
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
+        try:
+            shutil.copyfile(os.path.join(dump_to_parent, 'neuron_model_config.json'), os.path.join(dump_to, 'neuron_model_config.json'))
+        except FileNotFoundError:
+            pass
     else:
         module_bytes = hlo_module.SerializeToString()
         try:
