@@ -403,8 +403,8 @@ class LlamaForSamplingNoEmbeddingHlo:
                     cached_keys_s = hlo.select(cached_keys, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
                     cached_values_s = hlo.select(cached_values, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
                 else:
-                    cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
-                    cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
+                    cached_keys_s = cached_keys
+                    cached_values_s = cached_values
                 if self.neuron_config and self.neuron_config.kv_cache_quant:
                     cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys_s, self.neuron_config)
                     cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)

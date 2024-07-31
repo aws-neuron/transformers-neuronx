@@ -403,3 +403,68 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         if self.output_scores:
             return sequences[:, :ends.max().item()], scores[:, start:ends.max().item(), :]
         return sequences[:, :ends.max().item()]
+    # add this to the base CR
+
+    def speculative_iteration(
+            self,
+            input_ids: torch.Tensor,
+            cache_ids: torch.Tensor,
+            start_ids: torch.Tensor,
+    ) -> (torch.Tensor, torch.Tensor):
+
+        """
+        fused speculative iteration for continous batching.
+        Note that this method only do one speculative iteration.
+        user need to define the sampling loop for the whole sequence generation.
+
+        Args:
+            input_ids:
+                The input token ids passed to the model to generate
+                next predicted tokens (sequence_length - len(input_ids)).
+            cache_ids:
+                The positions in the KV cache that should be updated.
+                shape=(batch, seqlen) for continous batching
+            start_ids:
+                The offset from the beginning of each input in a batch.
+
+        Returns:
+            tokens (list of [tensor of shape (accepted_token_length)]):
+        """
+
+        batch_size, context_len = input_ids.shape
+        cache_ids = self.prepare_cache_ids(cache_ids, batch_size, context_len)
+        min_values_per_row, _ = torch.min(cache_ids, dim=-1)
+
+        # in continuous batching, we need to identify new request and do context decoding
+        do_context_decoding = (min_values_per_row == 0).any()
+        if do_context_decoding :
+            # TODO implement logic so how does the draft and target model only override
+            #   caches for new request with context decoding
+            target_next_id = self.target(input_ids, cache_ids, start_ids).reshape(batch_size, -1)
+            self.draft(input_ids, cache_ids, start_ids)
+            return  target_next_id, torch.tensor([[1]]*batch_size)
+
+        # TODO, implement logics to guarantee k + current output_len < max output len
+        tokens, counts, token_id, *score = self.speculator.execute(input_ids, cache_ids, start_ids, return_ranks=1)
+
+        return tokens, counts
+
+    def prepare_cache_ids(self, cache_ids: torch.Tensor, batch: int, seq_len: int) -> List[torch.Tensor]:
+            """
+            Args:
+                cache_ids:
+                    The positions in the KV cache that should be updated.
+                batch:
+                    The batch size
+                seq_len:
+                    sequence length
+
+            Returns:
+                cache_ids of shape=(batch, seqlen) for continous batching or (seq_len,) for non-continous batching
+            """
+            if cache_ids is not None:
+                return cache_ids
+            if self.target.neuron_config and self.target.neuron_config.use_2d_cache_ids:
+                return torch.tensor([[j for j in range(seq_len)] for i in range(batch)])
+            else:
+                return torch.tensor([i for i in range(seq_len)])
