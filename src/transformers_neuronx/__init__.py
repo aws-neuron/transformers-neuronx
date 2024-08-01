@@ -28,6 +28,7 @@ from transformers_neuronx.gptj.model import GPTJForSampling
 from transformers_neuronx.mistral.model import MistralForSampling
 from transformers_neuronx.mixtral.model import MixtralForSampling
 from transformers_neuronx.opt.model import OPTForSampling
+from transformers_neuronx.starcoder2.model import Starcoder2ForSampling
 
 from transformers_neuronx.modeling_auto import NeuronAutoModelForCausalLM
 
