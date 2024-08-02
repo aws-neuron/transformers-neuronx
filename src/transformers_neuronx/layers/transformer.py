@@ -55,6 +55,8 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
 
     if neuron_config and neuron_config.sequence_parallel_norm and n_active_tokens > neuron_config.sequence_parallel_norm_threshold:
         neuron_config.is_sequence_parallel = True
+    else:
+        neuron_config.is_sequence_parallel = False
 
     # Multilayer on device embedding will use the already-embedded inputs for the layers NEFF
     # because there is a separate neff for embedding.
