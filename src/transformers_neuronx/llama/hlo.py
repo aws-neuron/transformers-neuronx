@@ -402,9 +402,16 @@ class LlamaForSamplingNoEmbeddingHlo:
                     # TODO: revert to hlo.index_select once its faster P126527643
                     cached_keys_s = hlo.select(cached_keys, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
                     cached_values_s = hlo.select(cached_values, batch_dim, hlo.reshape(start_ids, slice_sizes), keepdim=True)
-                else:
+                elif cached_keys.sizes[batch_dim] == start_ids.sizes[0]:
+                    # For batched speculative decoding, we will select kv caches for all sequences. No need to do
+                    # index select, which is slow
                     cached_keys_s = cached_keys
                     cached_values_s = cached_values
+                else:
+                    # for multi prompt use case, cached_keys.sizes[batch_dim] can still be larger than 1, so we
+                    # need to use start_ids size to determine if we want to select kv cache.
+                    cached_keys_s = hlo.index_select(cached_keys, batch_dim, start_ids)
+                    cached_values_s = hlo.index_select(cached_values, batch_dim, start_ids)
                 if self.neuron_config and self.neuron_config.kv_cache_quant:
                     cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys_s, self.neuron_config)
                     cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)
