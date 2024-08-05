@@ -3558,7 +3558,7 @@ def speculative_mask(
     draft_scores,        # shape: (vocab_size_tp, k, batch_size)
     target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
     tp_degree=1,
-    deterministic=False,
+    deterministic_threshold=None,
 ):
     s32 = draft_ids.scribe.s32
 
@@ -3584,8 +3584,8 @@ def speculative_mask(
     # Compare ratio of probabilities at locations to a random sample
     ratio = divide(target_probs, draft_probs) # shape: (k, batch_size)
     ratio = clamp(ratio, maximum=1.0)
-    if deterministic:
-        random = full_like(ratio, 0.5)
+    if deterministic_threshold:
+        random = full_like(ratio, deterministic_threshold)
     else:
         random = random_uniform(ratio.dtype, ratio.sizes)
     accepted_mask = less(random, ratio) # shape: (k, batch_size)
@@ -3610,7 +3610,7 @@ def speculative_token_selection(
         target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
         tp_degree=1,
         pad_token_id=0,
-        deterministic=False,
+        deterministic_threshold=None,
         output_mask=False,
     ):
     """
@@ -3628,7 +3628,7 @@ def speculative_token_selection(
         draft_scores: The raw draft model logit output.
         target_scores: The raw target model logits output.
         tp_degree: The number of ranks to collect across.
-        deterministic: Flag which enables using a constant 0.5 as token
+        deterministic_threshold: Flag that allows this value to be used as the token
             acceptance threshold instead of a random uniform. This is used for
             debug/testing.
         output_mask: Flag that enables returning the token selection mask. This
@@ -3647,7 +3647,7 @@ def speculative_token_selection(
         draft_scores,        # shape: (vocab_size_tp, k, batch_size)
         target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
         tp_degree=tp_degree,
-        deterministic=deterministic,
+        deterministic_threshold=deterministic_threshold,
     )
 
     # Select the final tokens
