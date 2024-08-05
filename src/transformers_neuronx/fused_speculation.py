@@ -48,6 +48,9 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             from the `target` model.
         output_scores: Flag that indicates whether to construct the fused model
             so that it will return the target model scores during sampling.
+        deterministic_threshold: Flag that allows this value to be used as the token
+            acceptance threshold instead of a random uniform. This is used for
+            debug/testing.
     """
  
     def __init__(
@@ -59,6 +62,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             eos_token_id: Optional[int] = None,
             buckets: Optional[List[int]] = None,
             output_scores: Optional[bool] = False,
+            deterministic_threshold: Optional[float] = None,
         ) -> None:
         super().__init__()
  
@@ -94,6 +98,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.output_scores = output_scores
+        self.deterministic_threshold = deterministic_threshold
  
         # Derived attributes
         self.neuron_config = self.target.neuron_config
@@ -192,7 +197,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
                 draft_ids, target_ids, draft_scores, target_scores,
                 tp_degree=self.tp_degree,
                 pad_token_id=self.pad_token_id,
-                deterministic=True, output_mask=self.output_scores
+                deterministic_threshold=self.deterministic_threshold, output_mask=self.output_scores
             )
             index = hlo.reshape(index, (batch_size, 1))
             next_token_id = hlo.gather(next_tokens, 1, index)
