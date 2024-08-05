@@ -516,7 +516,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         full_cache_ids = torch.zeros(batch_size, 1, dtype=input_ids.dtype)
         full_seq_ids = torch.arange(batch_size, dtype=torch.int32)
 
-        seq_ids_int64 = seq_ids.unsqueeze(-1).to(torch.int64)
+        # vLLM v0.3.3 used to pass 1d seq_ids but starting with
+        # v0.4.0 that is no longer the case. To ensure consistent behaviour
+        # across versions, we flatten them before unsqueezing them.
+        seq_ids_int64 = seq_ids.flatten().unsqueeze(-1).to(torch.int64)
         full_input_ids.scatter_(dim=0, index=seq_ids_int64, src=input_ids)
         full_cache_ids.scatter_(dim=0, index=seq_ids_int64, src=cache_ids)
 
