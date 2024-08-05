@@ -88,6 +88,14 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         assert isinstance(k, int), (
             "The k value must be an integer."
         )
+        if draft.batch_sizes != [1]:
+            assert draft.neuron_config.padding_side == "right", (
+                "The draft model must set padding_side as right for batch size > 1."
+            )
+        if target.batch_sizes != [1]:
+            assert target.neuron_config.padding_side == "right", (
+                "The target model must set padding_side as right for batch size > 1."
+            )
  
         # FIXME: Add more validation to ensure draft/target compatibility
  
@@ -266,6 +274,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
     def sample(
         self,
         input_ids: torch.Tensor,
+        start_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         sequence_length: Optional[int] = None,
         streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
@@ -275,6 +284,8 @@ class FusedSpeculativeDecoder(torch.nn.Module):
  
         Args:
             input_ids: The tokenized input identifiers.
+            start_ids: The offset from the beginning of each input in a batch.
+                For batched speculation, this is sequence ids.
             attention_mask: A mask which indicates which input tokens
                 should be attended to.
             sequence_length: The total length of inputs + outputs.
@@ -300,7 +311,6 @@ class FusedSpeculativeDecoder(torch.nn.Module):
 
             fsd.sample(input_ids, sequence_length=256)
         """
-        # FIXME: Handle attention_mask. Currently, attention_mask is not used.
  
         if sequence_length is None:
             sequence_length = self.max_position - self.k # type: int
@@ -308,8 +318,18 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         assert sequence_length <= self.max_position - self.k
  
         batch_size, start = input_ids.shape
-        if batch_size > 1:
-            raise NotImplementedError("Current speculative sampling supported only with batch size = 1.")
+        if start_ids is None:
+            start_ids = torch.arange(batch_size)
+
+        if batch_size>1:
+            assert attention_mask is not None, (
+                "The attention mask needs to be provided for speculation where batch_size>1"
+            )
+            cache_ids = torch.arange(start).reshape(1, start).expand(batch_size, start).mul(attention_mask)
+        else:
+            cache_ids = torch.arange(start, dtype=torch.int32)
+            if self.target.neuron_config.use_2d_cache_ids:
+                cache_ids = cache_ids.unsqueeze(0).expand(batch_size, start)
  
         # The streamer should send back the input tokens to conform to
         # huggingface behavior.
@@ -319,20 +339,23 @@ class FusedSpeculativeDecoder(torch.nn.Module):
  
         # Context encoding
         # FIXME: populate scores with the context encoding logits
-        cache_ids = torch.arange(start, dtype=torch.int32)
-        if self.target.neuron_config.use_2d_cache_ids:
-            cache_ids = cache_ids.unsqueeze(0).expand(batch_size, start)
-        token_id = self.target(input_ids, cache_ids=cache_ids)
+        token_id = self.target(input_ids, cache_ids=cache_ids, start_ids=start_ids)
         if streamer:
             streamer.put(token_id)
-        self.draft(input_ids, cache_ids=cache_ids)
+        self.draft(input_ids, cache_ids=cache_ids, start_ids=start_ids)
  
         # Preallocate state tensors
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
-        cache_ids = torch.full((batch_size, 1), start, dtype=torch.int32)
-        positions = torch.arange(start + 1, start + self.k + 2, dtype=torch.int64).repeat((batch_size, 1))
         sequences[:, :start] = input_ids
-        sequences[:, start:start + 1] = token_id
+        if batch_size>1:
+            cache_ids = torch.count_nonzero(attention_mask,dim=1).view(-1, 1)
+            positions = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) + torch.arange(self.k + 1, dtype=torch.int64).repeat((batch_size, 1))
+            sequences.scatter_(1, torch.count_nonzero(attention_mask,dim=1).view(-1, 1), token_id)
+            positions = positions + 1
+        else:
+            cache_ids = torch.full((batch_size, 1), start, dtype=torch.int32)
+            positions = torch.arange(start + 1, start + self.k + 2, dtype=torch.int64).repeat((batch_size, 1))
+            sequences.scatter_(1, torch.full((batch_size, 1), start, dtype=torch.int64), token_id)
  
         if self.output_scores:
             # We cut off the first `start` tokens when returning scores
@@ -357,9 +380,9 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         while True:
  
             if self.target.neuron_config.use_2d_cache_ids:
-                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids, return_ranks=1)
+                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids, start_ids, return_ranks=1)
             else:
-                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids.squeeze(1), return_ranks=1)
+                tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids.squeeze(1), start_ids, return_ranks=1)
  
             if eos_token is not None:
  
@@ -395,8 +418,10 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             # Clamp the cache_ids to the sequence length so that any batch lines
             # that have not reached the end can continue. For batch lines that
             # are complete this populates garbage data into KV cache tail beyond
-            # the sequence_length.
+            # the sequence_length. Clamp position ids as well to populate garbage
+            # tokens beyond sequence_length.
             cache_ids = torch.clamp(cache_ids, max=sequence_length)
+            positions = torch.clamp(positions, max=sequence_length)
             done.logical_or_(torch.eq(cache_ids, sequence_length))
  
             if done.all().item():
