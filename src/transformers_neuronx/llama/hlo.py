@@ -136,13 +136,13 @@ class LlamaForSamplingNoEmbeddingHlo:
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
 
     def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
-        hidden, last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
+        hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
         if self.neuron_config.on_device_embedding:
             embed_weight, token_tree_mask = weights
         else:
             token_tree_mask, *rst = weights
         active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
 
     def layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
@@ -209,7 +209,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def token_tree_layer(
-            self, hidden, last_token_id, pos_embed, cache_ids, start_ids,
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq,
             previous_cache_ids, reorder_mapping,
             mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
@@ -233,7 +233,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
         reordered_attn_k_cache, reordered_attn_v_cache = attention.reorder_kv_cache(attn_k_cache, attn_v_cache, previous_cache_ids, reorder_mapping, neuron_config=self.neuron_config)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, last_token_id, pos_embed, mask, active_mask, core_id,
+            ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
             reordered_attn_k_cache, reordered_attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
