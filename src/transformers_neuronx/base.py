@@ -27,6 +27,7 @@ from transformers_neuronx.compiler import ParallelKernel
 from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx.config import GenerationConfig
 from transformers_neuronx.util.token_tree import validate_token_tree
+from transformers_neuronx.utils import set_num_exec_repetition
 from concurrent.futures import ProcessPoolExecutor
 import json
 
@@ -59,7 +60,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             parallel_degree = len(kernels)
         with ProcessPoolExecutor(parallel_degree) as executor:
             for kernel in kernels:
-                neff_bytes_futures[hash_hlo(kernel.hlo_module)] = executor.submit(kernel.compile)
+                num_exec_repetition = set_num_exec_repetition(self, kernel)
+                neff_bytes_futures[hash_hlo(kernel.hlo_module)] = executor.submit(kernel.compile, num_exec_repetition)
             for kernel in kernels:
                 kernel.neff_bytes = neff_bytes_futures[hash_hlo(kernel.hlo_module)].result()
 
@@ -715,3 +717,4 @@ def hash_hlo(hlo_module):
     hash_gen.update(message)
     hash = str(hash_gen.hexdigest())[:20]
     return hash + '.neff'
+
