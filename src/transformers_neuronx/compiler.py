@@ -104,9 +104,11 @@ def get_compiler_flags() -> str:
     return ' '.join(flags)
 
 
-def compile_hlo_module(hlo_module, tag=None):
+def compile_hlo_module(hlo_module, tag=None, num_exec_repetition=1):
 
     flags = get_compiler_flags()
+    flags = f'{flags} --execute-repetition={num_exec_repetition}'
+
     module_flag_hash = get_hash_module(hlo_module, flags)
     module_hash = get_hash_module(hlo_module, None)
 
@@ -493,15 +495,15 @@ class ParallelKernel:
         self.memories.append(memory)
         return memory
 
-    def compile(self):
-        self.build()
+    def compile(self, num_exec_repetition=1):
+        self.build(num_exec_repetition)
         return self.neff_bytes
 
-    def build(self):
+    def build(self, num_exec_repetition=1):
         # Avoid rebuilding NEFF. This path occurs during deserialization
         if self.neff_bytes is not None:
             return
-        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag)
+        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag, num_exec_repetition)
 
     def load(self, io_ring_cache_size=1):
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
@@ -726,3 +728,4 @@ class HLOKernel:
 
     def run(self):
         self.kernel(self.memories)
+
