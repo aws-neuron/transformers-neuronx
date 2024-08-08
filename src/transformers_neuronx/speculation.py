@@ -683,6 +683,7 @@ class SpeculativeGenerator:
         pad_token_id: Optional[int] = 0,
         attention_mask: Optional[torch.Tensor] = None,
         streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+        output_logits: bool = False,
     ):
         """
         Speculative sampling loop:
@@ -709,6 +710,7 @@ class SpeculativeGenerator:
         """
         batch_size, context_len = input_ids.shape
         cache_ids=None
+        draft_logits, target_logits = [], []
         
         if batch_size>1:
             # We need the user to provide attention mask along with padded input_ids for batched cases
@@ -723,6 +725,8 @@ class SpeculativeGenerator:
         # Context encoding
         _draft_ids, _draft_scores = self.draft(input_ids, self.k, cache_ids, start_ids)
         target_scores = self.target(input_ids, cache_ids, start_ids)
+        if output_logits:
+            target_logits.append(target_scores.unsqueeze(1))
                 
         # The streamer should send back the input tokens to conform to
         # huggingface behavior.
@@ -804,6 +808,9 @@ class SpeculativeGenerator:
             # Run token acceptor and returns padded (bs, k) tensor with accepted tokens
             # Tensor is padded with zeros for seqs with accepted tokens < k
             accepted_tokens = self.acceptor(draft_ids, draft_next_scores, target_next_scores)
+            if output_logits:
+                draft_logits.append(draft_next_scores)
+                target_logits.append(target_next_scores)
         
             # Calculate actual acceptance lengths and end_positions
             actual_accepted_tokens_lengths=torch.count_nonzero(accepted_tokens,dim=1)
@@ -850,6 +857,6 @@ class SpeculativeGenerator:
         if streamer:
             streamer.end()
 
-        return tokens[:,:sequence_length]
+        return tokens[:,:sequence_length] if not output_logits else (tokens[:,:sequence_length], draft_logits, target_logits)
 
 
