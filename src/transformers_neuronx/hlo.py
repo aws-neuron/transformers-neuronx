@@ -2413,7 +2413,14 @@ def multinomial(probabilities, dim, deterministic=False):
     cumprob = cumsum(probabilities, dim)
 
     sizes = list(probabilities.sizes)
-    sizes.pop(dim)
+    vocab_size = sizes.pop(dim)
+    # Fix to ensure cumprob add up to 1.0 to prevent chance of
+    # generating sample with value of vocab_size when cumprob is < 1.0.
+    # As an example, cumprob can be 0.996 or 1.007 due to floating point accumulation error.
+    max_prob = slice_along(cumprob, dim, vocab_size, start=vocab_size-1, stride=1)
+    max_prob = broadcast(max_prob, cumprob.sizes, list(range(len(cumprob.sizes))))
+    cumprob = divide(cumprob, max_prob)
+
     if deterministic:
         uniform = full(0.5, dtype, sizes)
     else:
