@@ -484,7 +484,7 @@ def run(args, hf_model_name, model_cls):
     args = verify_and_fallback_args(args)
     torch.manual_seed(15213)
 
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(args.load, padding_side="left")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # prepare input
