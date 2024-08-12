@@ -61,16 +61,21 @@ def sample_tokens(
     early_stop = False
     if config.eos_token_id is not None:
         done_flags = torch.full((batch_size, 1), False)
-        eos_token = torch.tensor(config.eos_token_id, dtype=torch.int32)
+        eos_token = config.eos_token_id
+        if isinstance(eos_token, int):
+            eos_token = [eos_token]
+        eos_token = torch.tensor(eos_token, dtype=torch.int32)
         early_stop = True
 
     # Generate loop
     for current in range(start + 1, sequence_length + 1):
 
         if early_stop:
-            done_flags |= (next_tokens == eos_token)
+            eos_flags = torch.isin(next_tokens, eos_token)
+            done_flags |= (eos_flags)
             if batch_size > 1:  # Avoid writing tokens to completed sequnces
-                next_tokens[done_flags] = eos_token
+                # no need to set positions that are already eos
+                next_tokens[torch.logical_and(done_flags, ~eos_flags)] = eos_token[0]
 
         tokens.append(next_tokens)
 
@@ -313,6 +318,9 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     stopping_criteria_list = stopping_criteria_list if stopping_criteria_list is not None else StoppingCriteriaList()
 
 # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
+    if isinstance(eos_token_id, int):
+        eos_token_id = [eos_token_id]
+    eos_token_id = torch.tensor(eos_token_id, dtype=torch.int32)
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
     tokens = [input_ids]
     _, start_length = input_ids.shape
@@ -337,13 +345,14 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
         # Update done flags.
-        done_flags = torch.logical_or(done_flags, inputs == eos_token_id)
+        eos_flags = torch.isin(inputs, eos_token_id)
+        done_flags = torch.logical_or(done_flags, eos_flags)
         # Update token id to be eos_token_id if the corresponding done flag is True. For a batch,
         # this means that, while every sequence in the batch has the same length, a sequence that
         # encounters eos_token_id earlier will be filled with eos_token_ids post the first appearance
         # of eos_token_id.
-
-        token = torch.where(done_flags.eq(True), eos_token_id, inputs)
+        # no need to set positions that are already eos                        
+        token = torch.where(torch.logical_and(done_flags, ~eos_flags), eos_token_id[0], inputs)
         tokens.append(token)
 
         if streamer is not None and hasattr(streamer, 'response_with_prefix') and streamer.response_with_prefix:
