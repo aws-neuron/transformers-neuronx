@@ -701,8 +701,15 @@ class SpeculativeGenerator:
                 The offset from the beginning of each input in a batch.
             eos_token_id:
                 The id for the end of sentence token. Results in early stop as soon as eos_token is reached.
+            pad_token_id:
+                The id for the padding token.
+            attention_mask:
+                A binary mask with the same shape as input_ids that
+                indicates which tokens should be attended to.
             streamer:
                 The streamer to be used for streaming generated tokens.
+            output_logits:
+                Whether to include logits in the output. Used for internal testing.
 
         Returns:
             tokens (tensor of shape (batch, sequence_length)):
@@ -710,7 +717,7 @@ class SpeculativeGenerator:
         """
         batch_size, context_len = input_ids.shape
         cache_ids=None
-        draft_logits, target_logits = [], []
+        draft_logits, target_logits = [], []  # only used if output_logits == True
         
         if batch_size>1:
             # We need the user to provide attention mask along with padded input_ids for batched cases
