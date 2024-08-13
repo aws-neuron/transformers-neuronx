@@ -96,7 +96,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             assert target.neuron_config.padding_side == "right", (
                 "The target model must set padding_side as right for batch size > 1."
             )
- 
+
         # FIXME: Add more validation to ensure draft/target compatibility
  
         # User-provided attributes
@@ -107,7 +107,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         self.eos_token_id = eos_token_id
         self.output_scores = output_scores
         self.deterministic_threshold = deterministic_threshold
- 
+
         # Derived attributes
         self.neuron_config = self.target.neuron_config
         self.tp_degree = self.target.decoder_lm_head.tp_degree
@@ -311,7 +311,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
 
             fsd.sample(input_ids, sequence_length=256)
         """
- 
+
         if sequence_length is None:
             sequence_length = self.max_position - self.k # type: int
         # FIXME: Loosen this restriction to sequence_length <= max_position
@@ -467,17 +467,73 @@ class FusedSpeculativeDecoder(torch.nn.Module):
 
         # in continuous batching, we need to identify new request and do context decoding
         do_context_decoding = (min_values_per_row == 0).any()
-        if do_context_decoding :
-            # TODO implement logic so how does the draft and target model only override
-            #   caches for new request with context decoding
+        if do_context_decoding:
             target_next_id = self.target(input_ids, cache_ids, start_ids).reshape(batch_size, -1)
             self.draft(input_ids, cache_ids, start_ids)
-            return  target_next_id, torch.tensor([[1]]*batch_size)
+            return target_next_id, torch.tensor([[1]] * batch_size)
 
-        # TODO, implement logics to guarantee k + current output_len < max output len
-        tokens, counts, token_id, *score = self.speculator.execute(input_ids, cache_ids, start_ids, return_ranks=1)
+        seq_ids = start_ids
+        # TODO: enable multiple bucket in batch dimension
+        graph_batch_size = self.batch_sizes[0]
+        full_input_ids, cache_ids_pad, seq_ids_pad = self.handle_padding_list(
+            [input_ids, cache_ids, seq_ids],
+            seq_ids,
+            graph_batch_size
+        )
+        seq_ids_pad = seq_ids_pad.view(-1)
+        tokens, counts, token_id, *score = self.speculator.execute(full_input_ids, cache_ids_pad, seq_ids_pad,
+                                                                   return_ranks=1)
+        output_tokens, output_counts = self.handle_padding_list([tokens, counts], seq_ids, batch_size)
+        return output_tokens, output_counts
 
-        return tokens, counts
+    def handle_padding_list(
+            self,
+            tensor_list: List[torch.Tensor],
+            seq_ids: torch.Tensor,
+            target_batch_size: int
+    ) -> List[torch.Tensor]:
+        return [self.handle_padding(tensor, seq_ids, target_batch_size) for tensor in tensor_list]
+
+    def handle_padding(
+            self,
+            tensor: torch.Tensor,
+            seq_ids: torch.Tensor,
+            target_batch_size: int
+    ) -> torch.Tensor:
+        """
+         add or remove padding for when running batch size is different from target_batch_size(neff batch size)
+         i.e. input_tensor [[2],[3]], seq_ids: [2, 1] target_batch_size:3 -> [[0], [2], [3]]
+              input_tensor [2, 1]   , seq_ids: [2, 1] target_batch_size:3-> [0, 2, 1]
+              input_tensor [[1,2,3,4],[11,12,13,14],[21,22,23,24]], seq_ids: [0, 2, 1] taget_batch_size:2
+              ->[[11,12,13,14],[21,22,23,24]]
+            input_tensor [6,6,6], seq_ids: [0, 2, 1] target_batch_size:2 ->[6,6]
+
+         Args:
+             tensor:
+                 The input tensor to be processed. first dimension is batch. dim_size >=1
+             seq_ids:
+                 The positions in the KV cache that should be updated.
+             target_batch_size:
+                 batch size the output tensor should have
+
+         Returns:
+             tensors, first dimension is the target batch size.
+         """
+
+        original_shape = tensor.shape
+        current_batch_size = original_shape[0]
+
+        if current_batch_size == target_batch_size:
+            return tensor
+
+        new_shape = (target_batch_size,) + original_shape[1:]
+        output_tensor = torch.zeros(new_shape, dtype=tensor.dtype)
+        for idx, seq_id in enumerate(seq_ids):
+            if current_batch_size < target_batch_size:
+                output_tensor[seq_id] = tensor[idx]
+            else:
+                output_tensor[idx] = tensor[seq_id]
+        return output_tensor
 
     def prepare_cache_ids(self, cache_ids: torch.Tensor, batch: int, seq_len: int) -> List[torch.Tensor]:
             """
