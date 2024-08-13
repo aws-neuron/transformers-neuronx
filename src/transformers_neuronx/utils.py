@@ -396,3 +396,21 @@ def get_qkv_padding(
             n_kv_head_padded = n_head_padded
 
     return n_head_padded, n_kv_head_padded
+
+
+def set_num_exec_repetition(self, kernel):
+
+    num_exec_repetition = 1
+
+    if hasattr(self.config, 'n_layer'):
+        n_layers = self.config.n_layer
+    elif hasattr(self.config, 'num_hidden_layers'):
+        n_layers = self.config.num_hidden_layers
+    else:
+        raise("Unable to access the number of layers, please check the model's config for num_hidden_layers")
+
+    if "MultiLayer" in kernel.hlo_module.name:
+        num_exec_repetition = n_layers // self.unroll
+    
+    return num_exec_repetition
+
