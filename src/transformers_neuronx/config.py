@@ -25,10 +25,9 @@ class QuantizationConfig:
     """ The config class that contains all quantization related settings """
 
     def __init__(self, quant_dtype='s8', dequant_dtype='f16', quantize_method='vector_dynamic',
-                 quantize_attn=True):
-        QUANT_DTYPE_LIST = ['s8',]
-        QUANTIZE_METHOD_LIST = ['vector_dynamic',]
-
+                 quantize_attn=True, no_quantize_list=[]):
+        QUANT_DTYPE_LIST = ['s8', 'f8e4m3fn']
+        QUANTIZE_METHOD_LIST = ['vector_dynamic', 'direct_cast']
         # The data type that the parameter is quantized into
         self.quant_dtype = quant_dtype
         if self.quant_dtype not in QUANT_DTYPE_LIST:
@@ -37,7 +36,6 @@ class QuantizationConfig:
 
         # The data type that is dequantized to
         self.dequant_dtype = dequant_dtype
-
         # Which quantization algorithm to use
         self.quantize_method = quantize_method
         if self.quantize_method not in QUANTIZE_METHOD_LIST:
@@ -46,6 +44,10 @@ class QuantizationConfig:
 
         # Decide whether the attention layer needs be quantized
         self.quantize_attn = quantize_attn
+        self.no_quantize_list = no_quantize_list
+
+    def is_unit_scale(self, layer_num):
+        return f"model.layers.{layer_num}" in self.no_quantize_list
 
 class KVCacheQuantizationConfig:
     """ The config class that contains all KV cache quantization related settings """
