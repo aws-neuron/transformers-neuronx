@@ -315,11 +315,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def add_post_layer_builder(self, builder):
         self.post_layer_builder = builder
 
-    def new_layer(self):
+    def new_layer(self, is_unit_scale=False):
+        # handle cases where some layers are not quantized with unit scale
         *_, n_positions = self.n_positions_list
         layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
                              amp=self.amp, neuron_config=self.neuron_config, allow_pad=self.allow_pad, n_active_tokens=self.n_active_tokens,
-                             n_head=self.n_head, n_kv_head=self.n_kv_head, layer_num=len(self.layers))
+                             n_head=self.n_head, n_kv_head=self.n_kv_head, layer_num=len(self.layers),
+                             is_unit_scale=is_unit_scale)
         self.layers.append(layer)
         return layer
 
@@ -1176,7 +1178,8 @@ class MaybePadder:
 class DecoderLayer(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, n_head, amp,
-                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, layer_num=None):
+                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, layer_num=None,
+                 is_unit_scale=False):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -1244,6 +1247,7 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_transposed = True
         self.kv_replication  = 1 # default value to denote weight replication factor
         self.layer_num = layer_num
+        self.is_unit_scale = is_unit_scale
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1, allow_transform=False):
@@ -1468,12 +1472,16 @@ class DecoderLayer(torch.nn.Module):
         if self.neuron_config and self.neuron_config.quant:
             if self.mlp_in_weight is not None:
                 self.mlp_in_weight, self.mlp_in_scales = \
-                    quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant,
+                                                    is_unit_scale=self.is_unit_scale)
                 self.mlp_out_weight, self.mlp_out_scales = \
                     quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant,
-                                                    out_feature_dim = 1 if self.mlp_out_transposed else 0)
+                                                    out_feature_dim = 1 if self.mlp_out_transposed else 0,
+                                                    is_unit_scale=self.is_unit_scale)
 
             if self.neuron_config.quant.quantize_attn:
+                assert "self_attn" not in self.neuron_config.quant.no_quantize_list, "self attn quantization not " \
+                                                                                     "allowed for this model"
                 if self.neuron_config.fuse_qkv:
                     fused_qkv_weight, fused_qkv_scales = \
                         quantize.maybe_quantize_weights(fused_qkv_weight, self.neuron_config.quant)
@@ -1558,7 +1566,8 @@ class DecoderLayer(torch.nn.Module):
                 # the layer arguments
                 if self.neuron_config and self.neuron_config.quant:
                     param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant,
-                                                                    out_feature_dim=out_feature_dim)
+                                                                    out_feature_dim=out_feature_dim,
+                                                                    is_unit_scale=self.is_unit_scale)
                     scales_dim = 0 if dim == out_feature_dim else None
                     scales = maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)
                 else:
