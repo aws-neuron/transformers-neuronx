@@ -104,7 +104,11 @@ class LlamaForSampling(base.NeuronModelBase):
             layer.materialize()
             attn = layer.self_attn
             mlp = layer.mlp
-            new_layer = self.decoder_lm_head.new_layer()
+            if self.neuron_config and self.neuron_config.quant:
+                is_unit_scale = self.neuron_config.quant.is_unit_scale(layer_id)
+            else:
+                is_unit_scale = False
+            new_layer = self.decoder_lm_head.new_layer(is_unit_scale=is_unit_scale)
             new_layer.add_pre_attention_layer_norm(layer.input_layernorm.weight.detach(), None)
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)

@@ -31,6 +31,13 @@ LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
 LAYOUT_SBH = 'SBH'
 
+
+# fp8 bounds
+class FpBounds:
+    min = -240.0
+    max = 240.0
+
+
 class Layout(enum.Enum):
     HSB = 'HSB'
     BSH = 'BSH'
@@ -42,7 +49,6 @@ class Layout(enum.Enum):
 
 # Group query attention sharding configurations
 class GQA(enum.Enum):
-
     # [Default] Sharding over the heads splits entire (complete) K/V heads
     # onto the NeuronCores where the corresponding Q heads reside. This is
     # similar to traditional MHA except that the Q and K/V heads do not need

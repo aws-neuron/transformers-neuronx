@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import warnings
 from typing import Optional, List
 import torch
 from transformers_neuronx.config import QuantizationConfig
 
+from transformers_neuronx.constants import FpBounds
+
 
 def maybe_quantize_weights(
-    tensor: torch.Tensor,
-    quantize_config: QuantizationConfig,
-    out_feature_dim: Optional[int] = 1,
-    contract_dims: Optional[List] = None,
+        tensor: torch.Tensor,
+        quantize_config: QuantizationConfig,
+        out_feature_dim: Optional[int] = 1,
+        contract_dims: Optional[List] = None,
+        is_unit_scale=False,
 ):
     """
     Quantize tensors using the dtype and method specified in quantize_config.
@@ -45,7 +49,7 @@ def maybe_quantize_weights(
 
     if contract_dims is None:
         assert (
-            tensor_rank == 2
+                tensor_rank == 2
         ), f"Contract dimensions must be specified for {tensor_rank}-dimensional tensors."
         # Preserve original quantization API behavior
         contract_dims = [0] if out_feature_dim == 1 else [1]
@@ -66,7 +70,7 @@ def maybe_quantize_weights(
 
     if quantize_config.quantize_method == "vector_dynamic":
         if quantize_config.quant_dtype == "s8":
-            # Use W_f = W_q * scales
+            # Use W_f = W_q *
             int8_min = torch.iinfo(torch.int8).min
             int8_max = torch.iinfo(torch.int8).max
             max_values = torch.amax(torch.abs(tensor), dim=contract_dims, keepdim=True)
@@ -80,10 +84,30 @@ def maybe_quantize_weights(
                 quantized_weights = torch.clamp(quantized_weights, int8_min, int8_max)
                 quantized_weights = quantized_weights.to(torch.int8)
                 scales = scales.flatten()
+        elif quantize_config.quant_dtype == "f8e4m3fn":
+            if is_unit_scale:
+                scales = torch.ones(tensor.shape[out_feature_dim], dtype=tensor.dtype)
+                quantized_weights = tensor.to(torch.float8_e4m3fn)
+            else:
+                fp8_max = float(FpBounds.max)
+                max_values = torch.amax(torch.abs(tensor), dim=contract_dims, keepdim=True)
+                scales = max_values / fp8_max
+                if scales.count_nonzero() == 0:
+                    # If the scales is all zeros, the weight tensor are zeros
+                    quantized_weights = tensor.to(torch.float8_e4m3fn)
+                else:
+                    quantized_weights = tensor / scales
+                    quantized_weights = quantized_weights.to(torch.float8_e4m3fn)
+                    scales = scales.flatten()
         else:
             raise NotImplementedError(
                 f"{quantize_config.quant_dtype} for {quantize_config.quantize_method} is not yet implemented."
             )
+    elif quantize_config.quantize_method == 'direct_cast':
+        warnings.warn(
+            f"direct casting is enabled with dtype {quantize_config.quant_dtype}, make sure the values are within "
+            f"representable range of the datatype")
+        return tensor.to(quantize_config.quant_dtype), None
     else:
         raise NotImplementedError(
             f"{quantize_config.quantize_method} is not yet implemented."

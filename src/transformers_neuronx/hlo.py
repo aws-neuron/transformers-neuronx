@@ -357,7 +357,7 @@ def dot_add(
     """
 
     lhs, rhs, _ = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None and neuron_config.quant is not None
+    enable_quantize = neuron_config is not None and neuron_config.quant is not None and scales is not None
 
     if not isinstance(lhs_contracting_dimension, list):
         lhs_contracting_dimension = [lhs_contracting_dimension]
