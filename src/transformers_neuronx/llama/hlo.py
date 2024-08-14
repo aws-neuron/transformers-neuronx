@@ -25,6 +25,8 @@ from transformers_neuronx.hlo import quantize_kv_cache_direct_cast, dequantize_k
 
 from transformers_neuronx.nki.compile import nki_call
 
+import logging
+
 
 class LlamaForSamplingNoEmbeddingHlo:
 
@@ -143,8 +145,54 @@ class LlamaForSamplingNoEmbeddingHlo:
             token_tree_mask, *rst = weights
         active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
+    
+    def layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
+            attn_k_cache, attn_v_cache,
+            pre_attn_ln_weight, pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
+            attn_q_weight, attn_q_scales, attn_q_bias,
+            attn_k_weight, attn_k_scales, attn_k_bias,
+            attn_v_weight, attn_v_scales, attn_v_bias,
+            attn_out_weight, attn_out_scales, attn_out_bias,
+            post_attn_ln_weight, post_attn_ln_bias,
+            pre_mlp_ln_weight, pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
+            mlp_in_weight, mlp_in_scales, mlp_in_bias,
+            mlp_out_weight, mlp_out_scales, mlp_out_bias,
+            post_mlp_ln_weight, post_mlp_ln_bias,
+            in0_weight=None, in0_scales=None,
+            in1_weight=None, in1_scales=None,
+            out_weight=None, out_scales=None,
+            is_first_last_layer=False,
+        ):
+        local_args = {**locals()}
+        local_args.pop('self')
 
-    def layer(
+        # Initialize with kernels
+        enable_qkv_kernel, enable_mlp_kernel = False, False
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
+            try:
+                from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_fused_add_kernel
+                enable_qkv_kernel = True
+            except:
+                logging.warning("No QKV kernel found")
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_mlp:
+            try:
+                from neuronxcc.nki._private_kernels.mlp import mlp_isa_kernel
+                enable_mlp_kernel = True
+            except:
+                logging.warning("No MLP kernel found")
+            enable_mlp_kernel = True
+
+        if (not enable_qkv_kernel and not enable_mlp_kernel) or active_mask != None:
+            return self.flat_compiler_layer(**local_args)
+
+        local_args['enable_qkv_kernel'] = enable_qkv_kernel
+        local_args['enable_mlp_kernel'] = enable_mlp_kernel
+        return self.native_kernel_layer(**local_args)
+
+
+    def flat_compiler_layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
@@ -155,36 +203,26 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
             in0_weight=None, in0_scales=None,
             in1_weight=None, in1_scales=None,
             out_weight=None, out_scales=None,
+            is_first_last_layer=False,
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv and active_mask is None:
-            assert fused_pre_attn_ln_qkv_weight is not None
-            attn_output, out_attn_k_cache, out_attn_v_cache = self.fused_rmsnorm_qkv(
-                hidden, None, eps,
-                cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
-                attn_k_cache, attn_v_cache,
-                fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
-                attn_k_weight, attn_k_scales, attn_k_bias, # should be none
-                attn_v_weight, attn_v_scales, attn_v_bias, # should be none
-                attn_out_weight, attn_out_scales, attn_out_bias
-            )
-        else:
-            ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
-            attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-                ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
-                attn_k_cache, attn_v_cache,
-                attn_q_weight, attn_q_scales, attn_q_bias,
-                attn_k_weight, attn_k_scales, attn_k_bias,
-                attn_v_weight, attn_v_scales, attn_v_bias,
-                attn_out_weight, attn_out_scales, attn_out_bias
-            )
+        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+        attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
+            ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+            attn_k_cache, attn_v_cache,
+            attn_q_weight, attn_q_scales, attn_q_bias,
+            attn_k_weight, attn_k_scales, attn_k_bias,
+            attn_v_weight, attn_v_scales, attn_v_bias,
+            attn_out_weight, attn_out_scales, attn_out_bias
+        )
         hidden = hlo.add(attn_output, hidden)
         gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
         rms_norm_dim = 2 if is_bsh else 0
@@ -207,6 +245,92 @@ class LlamaForSamplingNoEmbeddingHlo:
         )
         res_hidden = hlo.add(mlp_hidden, hidden)
         return res_hidden, out_attn_k_cache, out_attn_v_cache
+
+    def native_kernel_layer(
+            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
+            attn_k_cache, attn_v_cache,
+            pre_attn_ln_weight, pre_attn_ln_bias,
+            fused_pre_attn_ln_qkv_weight,
+            attn_q_weight, attn_q_scales, attn_q_bias,
+            attn_k_weight, attn_k_scales, attn_k_bias,
+            attn_v_weight, attn_v_scales, attn_v_bias,
+            attn_out_weight, attn_out_scales, attn_out_bias,
+            post_attn_ln_weight, post_attn_ln_bias,
+            pre_mlp_ln_weight, pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
+            mlp_in_weight, mlp_in_scales, mlp_in_bias,
+            mlp_out_weight, mlp_out_scales, mlp_out_bias,
+            post_mlp_ln_weight, post_mlp_ln_bias,
+            in0_weight=None, in0_scales=None,
+            in1_weight=None, in1_scales=None,
+            out_weight=None, out_scales=None,
+            is_first_last_layer=False,
+            enable_qkv_kernel=False, 
+            enable_mlp_kernel=False
+        ):
+        eps = self.config.rms_norm_eps
+        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        rms_norm_dim = 2 if is_bsh else 0
+
+        if enable_qkv_kernel:
+            assert fused_pre_attn_ln_qkv_weight is not None
+            fused_out = self.fused_rmsnorm_qkv(
+                hidden, None, eps,
+                cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+                attn_k_cache, attn_v_cache,
+                fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
+                attn_k_weight, attn_k_scales, attn_k_bias, # should be none
+                attn_v_weight, attn_v_scales, attn_v_bias, # should be none
+                attn_out_weight, attn_out_scales, attn_out_bias
+            )
+            if len(fused_out) == 3:
+                attn_output, out_attn_k_cache, out_attn_v_cache = fused_out
+            else:
+                attn_output, out_attn_k_cache, out_attn_v_cache, fused_added_hidden = fused_out
+        else:
+            ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+            attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
+                ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+                attn_k_cache, attn_v_cache,
+                attn_q_weight, attn_q_scales, attn_q_bias,
+                attn_k_weight, attn_k_scales, attn_k_bias,
+                attn_v_weight, attn_v_scales, attn_v_bias,
+                attn_out_weight, attn_out_scales, attn_out_bias
+            )
+
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+
+        if enable_mlp_kernel:
+            from neuronxcc.nki._private_kernels.mlp import mlp_isa_kernel
+            def _mlp_kernel(in0, in1, ln_w, gate_w, up_w, down_w, out, kernel_name="MLP"):
+                mlp_isa_kernel(in0, in1, ln_w, gate_w, up_w, down_w, out, kernel_name)
+            if is_first_last_layer or not enable_qkv_kernel:
+                hidden_add = hlo.add(attn_output, hidden)
+            mlp_result = nki_call(_mlp_kernel, attn_output, hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight, 
+                                output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], hidden.sizes[2]]])
+            dtype, replica_groups = utils.parse_dtype_replica_groups(self.neuron_config, self.config.tp_degree)
+            mlp_hidden = hlo.all_reduce_sum(mlp_result, self.config.tp_degree, dtype=dtype, replica_groups=replica_groups)
+            if is_first_last_layer or not enable_qkv_kernel:
+                return hlo.add(mlp_hidden, hidden_add), out_attn_k_cache, out_attn_v_cache
+            return (hidden, mlp_hidden, attn_output), out_attn_k_cache, out_attn_v_cache
+        else:
+            hidden = hlo.add(attn_output, hidden)
+            gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
+            norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+            mlp_hidden = gated_mlp(
+                norm_hidden,
+                in0_weight, in1_weight, out_weight,
+                in0_scales=in0_scales,
+                in1_scales=in1_scales,
+                out_scales=out_scales,
+                activation_function='silu',
+                tp_degree=self.config.tp_degree,
+                neuron_config=self.neuron_config
+            )
+            if is_first_last_layer or not enable_qkv_kernel:
+                return hlo.add(mlp_hidden, hidden), out_attn_k_cache, out_attn_v_cache
+            return (hidden, mlp_hidden, attn_output), out_attn_k_cache, out_attn_v_cache
 
     def token_tree_layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq,
@@ -270,10 +394,19 @@ class LlamaForSamplingNoEmbeddingHlo:
         attn_v_weight, attn_v_scales, attn_v_bias, # should be none
         attn_out_weight, attn_out_scales, attn_out_bias
     ):
-        # TODO: refactor below
-        from neuronxcc.nki._private_kernels.fused_linear import fused_rms_norm_qkv
+        from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
         def _kernel(h, w, output):
-            return fused_rms_norm_qkv(h, w, output, eps=eps)
+            return rmsnorm_qkv_isa_kernel(h, w, output, "QKV")
+
+        def _fused_out_kernel(h0, h1, h2, w, output):
+            # This kernel will perform h0 = h0 + h1 + h2 (writing results in-place to an input buffer
+            # FIXME: allow for multiple outputs
+            return rmsnorm_qkv_isa_fused_add_kernel(h0, h1, h2, w, output, "QKV")
+
+        fused_add = False
+        if isinstance(hidden, tuple):
+            fused_add = True
+            hidden, mlp_out, attn_out = hidden
 
         n_seqs, n_active_tokens, _ = hidden.sizes
         d_head = self.config.attention_head_size
@@ -291,12 +424,15 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         n_total_heads_tp = hidden_size_tp // d_head
         n_heads_tp = n_total_heads_tp - 2 * n_kv_heads_tp
-        # Q hidden size
-        hidden_size_tp = d_head * n_heads_tp
 
-        nki_output = nki_call(_kernel,
-                              hidden, attn_q_weight,
-                              output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], attn_q_weight.sizes[-1]]])
+        if fused_add:
+            nki_output = nki_call(_fused_out_kernel,
+                                hidden, mlp_out, attn_out, attn_q_weight,
+                                output_HloShapes=[hidden.dtype[n_seqs, n_active_tokens, hidden_size_tp]])
+        else:
+            nki_output = nki_call(_kernel,
+                                hidden, attn_q_weight,
+                                output_HloShapes=[hidden.dtype[n_seqs, n_active_tokens, hidden_size_tp]])
         slice_lim = nki_output.sizes[-1] // (n_heads_tp + 2 * n_kv_heads_tp)
         query = hlo.slice_along(nki_output, -1, n_heads_tp*slice_lim, start=0)
         key = hlo.slice_along(nki_output, -1, (n_heads_tp+n_kv_heads_tp)*slice_lim, start=n_heads_tp*slice_lim)
@@ -327,6 +463,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             qkv_tuple=(query, key, value),
         )
+        if fused_add:
+            return attn_output, out_attn_k_cache, out_attn_v_cache, hidden
         return attn_output, out_attn_k_cache, out_attn_v_cache
 
 

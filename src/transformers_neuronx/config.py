@@ -193,6 +193,7 @@ class NeuronConfig():
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
         output_all_logits: Return all logits from each model invocation.
         fused_rmsnorm_qkv: Use the fused RMS norm and QKV input projection kernel.
+        fused_rmsnorm_mlp: Use the fused RMSNorm and MLP BIR kernel for llama3.
         attn_output_transposed: Transposes the attention output projection weight tensor.
     """
     def __init__(self, *,
@@ -221,6 +222,7 @@ class NeuronConfig():
         output_all_logits: bool = False,
         attn_output_transposed: bool = False,
         fused_rmsnorm_qkv: bool = False,
+        fused_rmsnorm_mlp: bool = False,
         mlp_out_weight_transpose: bool = False,
         fuse_mlp: bool = False,
         **kwargs,
@@ -320,11 +322,19 @@ class NeuronConfig():
         self.attn_output_transposed = attn_output_transposed
 
         self.fused_rmsnorm_qkv = fused_rmsnorm_qkv
-        if self.fused_rmsnorm_qkv:
-            assert self.fuse_qkv, "Fused RMSnorm QKV kernel requires fused QKV weights"
-            assert self.attention_layout == Layout.BSH, "Fused RMSnorm QKV kernel requires BSH attention layout"
-            assert self.group_query_attention == GQA.REPLICATED_HEADS, "Fused RMSnorm QKV kernel requires replicated GQA heads"
-            assert not self.is_sequence_parallel and not self.sequence_parallel_norm, "Cannot use sequence parallel with fused RMSnorm QKV kernel"
+        self.fused_rmsnorm_mlp = fused_rmsnorm_mlp
+        
+        if any([not self.fuse_qkv, 
+                self.attention_layout != Layout.BSH, 
+                self.group_query_attention != GQA.REPLICATED_HEADS, 
+                self.sequence_parallel_norm]):
+            self.fused_rmsnorm_qkv = False
+            
+        if any([self.attention_layout != Layout.BSH, 
+                self.group_query_attention != GQA.REPLICATED_HEADS, 
+                self.sequence_parallel_norm]):
+            self.fused_rmsnorm_mlp = False
+
         self.mlp_out_weight_transpose = mlp_out_weight_transpose
 
         if self.shard_over_sequence:

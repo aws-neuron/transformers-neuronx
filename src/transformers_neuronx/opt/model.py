@@ -333,6 +333,7 @@ class OPTForSamplingNoEmbeddingHlo:
               attn_out_weight, attn_out_scales, attn_out_bias,
               post_attn_ln_weight, post_attn_ln_bias,
               pre_mlp_ln_weight, pre_mlp_ln_bias,
+              fused_pre_mlp_ln_in_weight,
               mlp_in_weight, mlp_in_scales, mlp_in_bias,
               mlp_out_weight, mlp_out_scales, mlp_out_bias,
               post_mlp_ln_weight, post_mlp_ln_bias,
