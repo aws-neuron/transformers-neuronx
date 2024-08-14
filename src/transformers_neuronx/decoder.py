@@ -34,6 +34,7 @@ from transformers_neuronx.layers import generation
 from transformers_neuronx.config import NeuronConfig, GenerationConfig
 from transformers_neuronx.utils import interleave_qkv
 from transformers_neuronx.util.token_tree import generate_attention_mask
+from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
 
 from safetensors.torch import save_file
 from safetensors import safe_open
@@ -863,11 +864,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights, alias_caches=True):
         output_caches = []
-        for layer, caches, weights in zip(layers, layers_caches, layers_weights):
+        for idx, (layer, caches, weights) in enumerate(zip(layers, layers_caches, layers_weights)):
             in_caches = [maybe_transfer_with_static_ring(cache) for cache in caches]
             weights = [maybe_transfer_with_static_ring(weight) for weight in weights]
             weights = layer.hlo_maybe_dequantize_weights(weights)
-            hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
+            is_first_last_layer = True if idx == 0 or idx == len(layers) - 1 else False
+            if isinstance(self.layer_builder.__self__, LlamaForSamplingNoEmbeddingHlo):
+                # Positional information is needed for fused residual adds in kernels in Llama 3
+                hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights, is_first_last_layer=is_first_last_layer)
+            else:
+                hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
             output_caches.append(out_caches)
 
         if alias_caches:
@@ -1200,6 +1206,7 @@ class DecoderLayer(torch.nn.Module):
         self.post_attn_ln_bias = None
         self.pre_mlp_ln_weight = None
         self.pre_mlp_ln_bias = None
+        self.fused_pre_mlp_ln_in_weight = None
         self.mlp_in_weight = None
         self.mlp_in_scales = None
         self.mlp_in_bias = None
@@ -1506,6 +1513,10 @@ class DecoderLayer(torch.nn.Module):
 
         if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
             self.fused_pre_attn_ln_qkv_weight = (fused_qkv_weight.T * self.pre_attn_ln_weight.to(dtype=fused_qkv_weight.dtype)).T
+
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_mlp and self.mlp_in_weight is not None:
+            self.fused_pre_mlp_ln_in_weight = (self.mlp_in_weight.T * self.pre_mlp_ln_weight.to(dtype=self.mlp_in_weight.dtype)).T
+        
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
@@ -1540,6 +1551,7 @@ class DecoderLayer(torch.nn.Module):
         self.post_attn_ln_bias = maybe_duplicate(self.post_attn_ln_bias)
         self.pre_mlp_ln_weight = maybe_duplicate(self.pre_mlp_ln_weight)
         self.pre_mlp_ln_bias = maybe_duplicate(self.pre_mlp_ln_bias)
+        self.fused_pre_mlp_ln_in_weight = maybe_duplicate(self.fused_pre_mlp_ln_in_weight)
         if self.mlp_in_weight is not None:
             self.mlp_in_weight = maybe_shard_along_and_transform(self.mlp_in_weight, 1, weight_tiling=self.neuron_config.weight_tiling)
             self.mlp_in_scales = maybe_shard_along(self.mlp_in_scales, dim=0)
@@ -1712,6 +1724,7 @@ class DecoderLayer(torch.nn.Module):
             self.post_attn_ln_bias,
             self.pre_mlp_ln_weight,
             self.pre_mlp_ln_bias,
+            self.fused_pre_mlp_ln_in_weight,
             self.mlp_in_weight,
             self.mlp_in_scales,
             self.mlp_in_bias,
@@ -1780,6 +1793,7 @@ class DecoderLayer(torch.nn.Module):
             post_attn_ln_bias,
             pre_mlp_ln_weight,
             pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
             mlp_in_weight,
             mlp_in_scales,
             mlp_in_bias,
@@ -1812,6 +1826,7 @@ class DecoderLayer(torch.nn.Module):
             post_attn_ln_bias,
             pre_mlp_ln_weight,
             pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
             mlp_in_weight,
             mlp_in_scales,
             mlp_in_bias,
@@ -1849,6 +1864,7 @@ class DecoderLayer(torch.nn.Module):
         self.post_attn_ln_bias = layer.post_attn_ln_bias
         self.pre_mlp_ln_weight = layer.pre_mlp_ln_weight
         self.pre_mlp_ln_bias = layer.pre_mlp_ln_bias
+        self.fused_pre_mlp_ln_in_weight = layer.fused_pre_mlp_ln_in_weight
         self.mlp_in_weight = layer.mlp_in_weight
         self.mlp_in_scales = layer.mlp_in_scales
         self.mlp_in_bias = layer.mlp_in_bias
