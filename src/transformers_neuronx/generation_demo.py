@@ -583,7 +583,7 @@ def run(args, hf_model_name, model_cls):
             else:
                 context_length_estimate_passed_to_model = args.context_length_estimate
 
-            if args.context_unroll < 0:
+            if args.context_unroll and args.context_unroll < 0:
                 args.context_unroll = None
 
             print(f'running {model_cls.__name__}.from_pretrained')
