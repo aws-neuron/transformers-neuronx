@@ -117,10 +117,24 @@ class LlamaForSampling(base.NeuronModelBase):
                 new_layer.add_attention_output(attn.o_proj.weight.T.detach(), None, sharding=0, transposed=True)
             else:
                 new_layer.add_attention_output(attn.o_proj.weight.detach(), None, sharding=1, transposed=False)
-            new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
+            
+            if self.neuron_config.fused_rmsnorm_mlp:
+                dummy_post_attention_ln_weight = torch.ones_like(layer.post_attention_layernorm.weight.detach())
+                new_layer.add_pre_mlp_layer_norm(dummy_post_attention_ln_weight, None)
+            else:
+                new_layer.add_pre_mlp_layer_norm(layer.post_attention_layernorm.weight.detach(), None)
 
             # Note: Automatic MLP padding is safe since zeros are *only* introduced to intermediary state
-            if self.neuron_config.fuse_mlp:
+            if self.neuron_config.fused_rmsnorm_mlp:
+                fused_pre_mlp_ln_gate_weight = mlp.gate_proj.weight * layer.post_attention_layernorm.weight.detach().to(dtype=mlp.gate_proj.weight.dtype)
+                new_layer.add_parameter(fused_pre_mlp_ln_gate_weight.T, sharding=1, allow_pad=True,
+                                        allow_quantize=True)
+                fused_pre_mlp_ln_up_weight = mlp.up_proj.weight * layer.post_attention_layernorm.weight.detach().to(dtype=mlp.up_proj.weight.dtype)
+                new_layer.add_parameter(fused_pre_mlp_ln_up_weight.T, sharding=1, allow_pad=True,
+                                        allow_quantize=True)
+                new_layer.add_parameter(mlp.down_proj.weight.T, sharding=0, allow_pad=True,
+                                        allow_quantize=True, out_feature_dim=0)
+            elif self.neuron_config.fuse_mlp:
                 assert all(getattr(mlp, attr, None) for attr in ['gate_proj', 'up_proj']),\
                     "fuse_mlp need to have gate and up proj weights"
                 assert all(getattr(mlp, attr, None).weight.shape[0] % self.config.tp_degree == 0

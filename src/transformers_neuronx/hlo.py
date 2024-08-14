@@ -662,7 +662,16 @@ def gated_mlp_bsh(
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = reshape(hidden, hidden_r_sizes)
-    if neuron_config is not None and neuron_config.weight_tiling:
+    if neuron_config is not None and neuron_config.fused_rmsnorm_mlp:
+        hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+                               scales=in0_scales, neuron_config=neuron_config)
+        hidden_active = get_activation(activation_function)(hidden_active)
+        hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+                               scales=in1_scales, neuron_config=neuron_config)
+        hidden_states = multiply(hidden_active, hidden_linear)
+        result = dot10_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
+    elif neuron_config is not None and neuron_config.weight_tiling:
         assert hidden_size % constants.TILE_SIZE == 0, \
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
             f"in order to use weight tiling."
