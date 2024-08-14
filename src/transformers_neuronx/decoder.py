@@ -1952,7 +1952,7 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, neuron_config, layers, hlo_modules : dict, debug_tensors: dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False, tag=None):
+    def __init__(self, neuron_config, layers, hlo_modules : dict, debug_tensors: dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False, tag=None, num_exec_repetition=1):
         # Each hlo module corresponds to one npos and one batch_size
         # hlo_modules is a 2D map (i,j) i is npos , j is batch_size
         self.neuron_config = neuron_config
@@ -1974,7 +1974,7 @@ class DecoderProgram:
                     kernel_tag = f"{tag}-seqlen{npos}-block{batch_size}"
                 else:
                     kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
-            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag)
+            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag, num_exec_repetition=num_exec_repetition)
         self.debug_tensors = debug_tensors
         self.debug_output_buffers = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
@@ -2242,9 +2242,10 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 class DecoderProgramMultiLayer(DecoderProgram):
 
     def __init__(self, neuron_config, layers, ode_hlo_modules, ode_num_inputs, hlo_modules, debug_tensors, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None,tag=None):
-        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag)
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
+        self.num_exec_repetition = num_layers // unroll
+        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag, num_exec_repetition=self.num_exec_repetition)
         self.num_layers = num_layers
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
         if self.neuron_config.log_softmax_scores:
@@ -2269,7 +2270,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
             self.ode_executors = []
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params):
-        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_layers // self.unroll)
+        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_exec_repetition)
 
         if self.neuron_config.on_device_embedding:
             for i in range(len(self.input_ids_buffer)):

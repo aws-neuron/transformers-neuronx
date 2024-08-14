@@ -477,7 +477,7 @@ def io_ring_cache_context(size):
 
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None, num_exec_repetition=1):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
@@ -492,6 +492,7 @@ class ParallelKernel:
         self.tag = tag
         self.g_device_count = g_device_count
         self.memories = []
+        self.num_exec_repetition = num_exec_repetition
         self.total_input_tensors_size = get_total_input_tensors_size(self.hlo_module)
         logging.debug(f"Total input tensor size of the module (per rank): {self.total_input_tensors_size / (10**9)} G, whole (all ranks): {self.total_input_tensors_size * tp_degree / (10**9)} G")
 
