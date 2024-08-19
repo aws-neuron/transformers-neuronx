@@ -345,12 +345,14 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
+            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
             in0_weight, in0_scales,
             in1_weight, in1_scales,
             out_weight, out_scales,
+            is_first_last_layer=False,
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
