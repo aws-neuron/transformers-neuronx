@@ -195,7 +195,7 @@ def convert_attn_mask_and_cache_id(cache_ids, start_ids,  core_id, n_positions, 
     """
 
     is_2d_cache = len(cache_ids.sizes) > 1
-    batch_size = start_ids.sizes[0] if not(is_2d_cache) else cache_ids.sizes[0]
+    batch_size = start_ids.sizes[0] if not is_2d_cache else cache_ids.sizes[0]
     n_batches, n_active_tokens = cache_ids.sizes if is_2d_cache else (batch_size, cache_ids.sizes[0])
     seq_dim = 1 if is_2d_cache else 0
     
@@ -208,21 +208,21 @@ def convert_attn_mask_and_cache_id(cache_ids, start_ids,  core_id, n_positions, 
     num_cache_splits = cores_per_kv_head
     real_cache_ids = hlo.divide(cache_ids, num_cache_splits)
     # Default cache ID = cache_size -1
-    default_cache_ids = hlo.full(cache_size-1, dtype, real_cache_ids.sizes)
+    default_cache_ids = hlo.full(cache_size - 1, dtype, real_cache_ids.sizes)
     # Now mask out the entries that should not go to this core's cache
     target_core_ids = hlo.remainder(cache_ids, num_cache_splits)
     core_id_cast = hlo.cast(core_id, dtype)
     curr_core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
-    curr_core_id_in_head = hlo.broadcast(curr_core_id_in_head, target_core_ids.sizes, [0])
-    mask = hlo.equal(target_core_ids, curr_core_id_in_head)
-    converted_cache_ids = hlo.masked_select(mask,real_cache_ids, default_cache_ids)
+    curr_core_id_in_head_br = hlo.broadcast(curr_core_id_in_head, target_core_ids.sizes, [0])
+    mask = hlo.equal(target_core_ids, curr_core_id_in_head_br)
+    converted_cache_ids = hlo.masked_select(mask, real_cache_ids, default_cache_ids)
 
     # Generate masks for context encoding / windowed /speculation
     if is_context_encoding:
         # We don't need active mask for context encoding
         converted_mask, converted_active_mask = hlo.attention_mask(cache_ids, start_ids, n_positions)
 
-        return (converted_cache_ids, converted_mask, converted_active_mask)
+        return converted_cache_ids, converted_mask, converted_active_mask
     else:
         # token generation / windowed / speculative 
         converted_mask_size = batch_size, n_active_tokens, cache_size
@@ -231,27 +231,28 @@ def convert_attn_mask_and_cache_id(cache_ids, start_ids,  core_id, n_positions, 
         if n_active_tokens > 1:
             # Multi-token speculative sampling & windowed attention
             num_processed_tokens = hlo.reduce_min(cache_ids, dim=seq_dim, keepdim=True)
-            raise Exception(f"n_active_tokens {n_active_tokens} > 1, windowed / speculative decoding not "
-                            f"supported yet in flash_decoding")
         else:
             num_processed_tokens = cache_ids
         # core_id_in_head = hlo.remainder(core_id_cast, num_cache_splits)
-        num_tokens_on_core = hlo.divide(hlo.subtract(hlo.add(num_processed_tokens, num_cache_splits-1), curr_core_id_in_head), num_cache_splits)
+        num_tokens_on_core = hlo.divide(hlo.subtract(hlo.add(num_processed_tokens, num_cache_splits-1),
+                                                     hlo.reshape(curr_core_id_in_head, [])), num_cache_splits)
+
         # Use Iota to generate the mask
         iota = dtype[converted_mask_size].Iota(dimensions=[2])
-        num_tokens_on_core_br = hlo.broadcast(num_tokens_on_core, converted_mask_size, [0,1] if is_2d_cache else [0])
+        num_tokens_on_core_br = hlo.broadcast(num_tokens_on_core, converted_mask_size, [0, 1] if is_2d_cache else [0])
         converted_mask = hlo.less(iota, num_tokens_on_core_br)
 
         # Construct the active mask based on the rule above, each core is in charge of tokens
         # that are written to its own cache
         converted_active_mask = hlo.tril_mask(pred, (n_active_tokens, n_active_tokens))
-        converted_active_mask = hlo.broadcast(converted_active_mask, (batch_size, n_active_tokens, n_active_tokens), broadcast_dimensions=[1, 2])
-        mask_br = hlo.broadcast(mask, converted_active_mask.sizes, [0,2] if is_2d_cache else [2])
+        converted_active_mask = hlo.broadcast(converted_active_mask, (batch_size, n_active_tokens, n_active_tokens),
+                                              broadcast_dimensions=[1, 2])
+        mask_br = hlo.broadcast(mask, converted_active_mask.sizes, [0, 2] if is_2d_cache else [2])
         converted_active_mask = hlo.logical_and(converted_active_mask, mask_br)
 
         # rhs aligned so we need to account for start_ids as well
-        if not(is_2d_cache):
-            real_start_ids = hlo.divide(start_ids,num_cache_splits) 
+        if not is_2d_cache:
+            real_start_ids = hlo.divide(start_ids, num_cache_splits)
             start_ids_remainder = hlo.remainder(start_ids, num_cache_splits)
             core_id_in_head_br = hlo.broadcast(curr_core_id_in_head, start_ids.sizes, [0])
             start_core_mask = hlo.less(core_id_in_head_br, start_ids_remainder)
@@ -262,7 +263,8 @@ def convert_attn_mask_and_cache_id(cache_ids, start_ids,  core_id, n_positions, 
             converted_mask = hlo.logical_and(converted_mask, start_mask)
 
         return converted_cache_ids, converted_mask, converted_active_mask
-    
+
+
 def select_values_within_bound(cache_ids, values, keys, cores_per_kv_head, core_id, dim):
     dtype = cache_ids.dtype
 
