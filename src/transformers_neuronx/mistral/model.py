@@ -135,7 +135,7 @@ class MistralForSampling(base.NeuronModelBase):
             if self.neuron_config.attention_layout == LAYOUT_HSB:
                 inputs = inputs.transpose(0, -1).contiguous()
         logits = self._forward(inputs, *rst)
-        logits = self._postprocess(logits, start_ids=start_ids)
+        logits = self._postprocess(input_ids, logits, start_ids=start_ids)
 
         return logits
 
