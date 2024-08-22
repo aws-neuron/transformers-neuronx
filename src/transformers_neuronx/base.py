@@ -547,8 +547,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         return input_ids, cache_ids, start_ids, last_token_id
 
-    def _postprocess(self, logits, start_ids=None, **kwargs):
-
+    def _postprocess(self, input_ids, logits, start_ids=None, **kwargs):
         if start_ids is None or (self.neuron_config.output_all_logits and logits.shape[1] > 1):
             return logits
 
@@ -562,14 +561,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 context_lens = input_metadata.context_lens
                 return logits[:len(context_lens), :]
 
-        running_batch_size, n_embed = logits.shape
-        input_batch_size = start_ids.shape[0]
-        if running_batch_size == input_batch_size:
-            # context encoding (aka prefill)
-            # NOTE: logits are returned directly, since dynamic batching is handled in _context_dynamic_batching
+        if not self.neuron_config.lhs_aligned or input_ids.shape[-1] > 1:
             return logits
 
-        # token generation (aka decoding)
+        input_batch_size = start_ids.shape[0]
         seq_ids = start_ids.flatten()
         if torch.equal(seq_ids, torch.arange(input_batch_size)):
             logits = logits[:input_batch_size]
