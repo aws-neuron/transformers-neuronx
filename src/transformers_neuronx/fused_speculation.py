@@ -9,6 +9,7 @@ from transformers_neuronx import hlo
 from transformers_neuronx import decoder
 from transformers_neuronx import program
 from transformers_neuronx import base
+from transformers_neuronx.config import GenerationConfig
  
  
 class FusedSpeculativeDecoder(torch.nn.Module):
@@ -270,7 +271,13 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         target_params = self.target.decoder_lm_head.valid_parameters(sequence_length, batch_size)
         self.speculator.build(workers)
         self.speculator.setup([*draft_params, *target_params])
- 
+
+
+    def update_generation_config(self, generation_config: GenerationConfig):
+        self.draft.update_generation_config(generation_config)
+        self.target.update_generation_config(generation_config)
+
+
     def sample(
         self,
         input_ids: torch.Tensor,
