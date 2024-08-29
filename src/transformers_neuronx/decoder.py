@@ -533,7 +533,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # 1st n_active_tokens.
             bucket_id = self.program.find_bucket_id(max_id)
             if self.use_executor:
-                if self.neuron_config and self.neuron_config.is_sequence_parallel:
+                if self.neuron_config and self.neuron_config.sequence_parallel_norm:
                     self.program.inputs_host_to_device(input_tensors, batch_size)
                     input_tensors = []
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
