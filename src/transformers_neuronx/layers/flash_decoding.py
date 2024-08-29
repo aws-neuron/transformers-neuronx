@@ -265,7 +265,7 @@ def convert_attn_mask_and_cache_id(cache_ids, start_ids,  core_id, n_positions, 
         return converted_cache_ids, converted_mask, converted_active_mask
 
 
-def select_values_within_bound(cache_ids, values, keys, cores_per_kv_head, core_id, dim):
+def select_values_within_bound(cache_ids, values, keys, cores_per_kv_head, core_id, dim, n_positions):
     dtype = cache_ids.dtype
 
     core_id = hlo.reshape(core_id,[])
@@ -273,9 +273,11 @@ def select_values_within_bound(cache_ids, values, keys, cores_per_kv_head, core_
     sizes = list(values.sizes)
     cache_sizes = list(cache_ids.sizes)
     is_2d_cache_id = len(cache_ids.sizes) > 1
+    n_active_tokens = cache_ids.sizes[-1]
+    is_context_encoding = n_active_tokens == n_positions
 
     # don't slice for token gen
-    if cache_ids.sizes[-1] > 1:
+    if cache_ids.sizes[-1] > 1 and is_context_encoding:
         cache_dim = 1 if is_2d_cache_id else 0
         slice_size = sizes[dim] - (num_cache_splits - 1)
         cache_slice_size = cache_sizes[cache_dim] - (num_cache_splits - 1)

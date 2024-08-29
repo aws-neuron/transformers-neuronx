@@ -258,7 +258,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             token_tree=token_tree,
             tag=f"speculation-k{n_active_tokens}",
         )
-        assert self.neuron_config.shard_over_sequence is False, "flash decoding not supported with speculative decoder"
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
 
