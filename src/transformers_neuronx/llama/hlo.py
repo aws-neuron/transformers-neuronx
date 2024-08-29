@@ -85,7 +85,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def token_tree_embedding(self, input_ids, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
+    def token_tree_embedding(self, input_ids, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping,
+                             *weights):
         return self.embedding(input_ids, cache_ids, start_ids, last_token_id, *weights)
 
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
@@ -265,9 +266,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             in1_weight=None, in1_scales=None,
             out_weight=None, out_scales=None,
             is_first_last_layer=False,
-            enable_qkv_kernel=False, 
+            enable_qkv_kernel=False,
             enable_mlp_kernel=False
-        ):
+    ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         rms_norm_dim = 2 if is_bsh else 0
@@ -353,7 +354,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             in1_weight, in1_scales,
             out_weight, out_scales,
             is_first_last_layer=False,
-        ):
+    ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
@@ -587,11 +588,16 @@ class LlamaForSamplingNoEmbeddingHlo:
             # C = softmax(Sa, Sp) @ (Va, Vp)
             if self.neuron_config.shard_over_sequence:
                 dtype = query.dtype
-                context = flash_decoding.context(prior_scores, active_score, cached_values_s, value, core_id, mask, active_mask,
-                                        n_kv_heads=self.config.num_key_value_heads, n_heads=n_head, dtype=dtype, 
-                                        tp_degree=tp_degree, neuron_config=self.neuron_config,
-                                        shard_over_batch=self.shard_over_batch)
-                cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,value, key,self.cores_per_kv_head,core_id,dim=0)
+                context = flash_decoding.context(prior_scores, active_score, cached_values_s, value, core_id, mask,
+                                                 active_mask,
+                                                 n_kv_heads=self.config.num_key_value_heads, n_heads=n_head,
+                                                 dtype=dtype,
+                                                 tp_degree=tp_degree, neuron_config=self.neuron_config,
+                                                 shard_over_batch=self.shard_over_batch)
+                cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids, value, key,
+                                                                                  self.cores_per_kv_head,
+                                                                                  core_id,
+                                                                                  dim=0, n_positions=self.n_positions)
 
             else:
                 context = attention.context(prior_scores, active_score, cached_values_s, value,
@@ -625,10 +631,11 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             if self.neuron_config.shard_over_sequence:
                 cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,
-                                                            value, 
-                                                            key,
-                                                            self.cores_per_kv_head,
-                                                            core_id,dim=0)
+                                                                                  value,
+                                                                                  key,
+                                                                                  self.cores_per_kv_head,
+                                                                                  core_id, dim=0,
+                                                                                  n_positions=self.n_positions)
             # KCache, VCache = K, V
             if cached_keys.sizes == key.sizes:
                 if self.neuron_config and self.neuron_config.kv_cache_quant:
