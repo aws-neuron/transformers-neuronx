@@ -1518,7 +1518,7 @@ def _embedding(weight, index, dtype=None):
     return reshape(result, (*index.sizes, embedding_dim))
 
 
-def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
+def embedding(weight, index, tp_degree=1, dim=1, dtype=None, core_id=None, sequence_parallel=False):
     """
     An embedding operation analogous to torch.nn.Embedding
 
@@ -1558,15 +1558,17 @@ def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
 
     # Case 2: Partitioned vocabulary - Sum masked embeddings
     if dim == 0:
+        if core_id is None:
 
-        raise NotImplementedError(
-            f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
-        )
-
+            raise NotImplementedError(
+                f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
+            )
+            replica_id = index.dtype.ReplicaId() # XXX: Unsupported
+        else:
+            replica_id = reshape(core_id,[])
         pred = index.scribe.pred
 
         # Compute embedding mask
-        replica_id = index.dtype.ReplicaId() # XXX: Unsupported
         vocab_size = index.dtype.Constant(constant_value=partition_size)
         one = index.dtype.Constant(constant_value=1)
 
@@ -1588,13 +1590,17 @@ def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
         zero = result.dtype.Constant(constant_value=0)
         zero_br = result.dtype[result.sizes].Broadcast(zero, dimensions=[])
         masked_result = result.dtype[result.sizes].Select(mask_br, result, zero_br)
-
+        if sequence_parallel:
+            add_fn = gen_add_func(masked_result.dtype)
+            replica_groups = utils.build_replica_groups(1, group_size=tp_degree)
+            return reduce_scatter(masked_result, dim=1, replica_groups=replica_groups, to_apply=add_fn)
         # Combine embeddings from all partitions
         return all_reduce_sum(masked_result, tp_degree=tp_degree)
 
     # Case 3: Partitioned embedding: Concatenate embedding pieces
     if dim == 1:
         # Using BSH, concatenate along the last dim
+        assert sequence_parallel is False, "sequence_parallel with dim=1 is not compatible for BSH layout"
         return all_gather(result, 2, tp_degree=tp_degree)
 
     raise NotImplementedError(
