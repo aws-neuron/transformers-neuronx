@@ -331,8 +331,7 @@ class NeuronConfig():
             self.fused_rmsnorm_qkv = False
             
         if any([self.attention_layout != Layout.BSH, 
-                self.group_query_attention != GQA.REPLICATED_HEADS, 
-                self.sequence_parallel_norm]):
+                self.group_query_attention != GQA.REPLICATED_HEADS]):
             self.fused_rmsnorm_mlp = False
 
         self.mlp_out_weight_transpose = mlp_out_weight_transpose
