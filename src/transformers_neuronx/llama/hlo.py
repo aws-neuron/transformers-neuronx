@@ -271,7 +271,16 @@ class LlamaForSamplingNoEmbeddingHlo:
     ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
+        assert is_bsh
         rms_norm_dim = 2 if is_bsh else 0
+
+        from neuronxcc.nki._private_kernels.mlp import mlp_isa_kernel, mlp_fused_add_isa_kernel
+        # lambda functions for calling kernels
+        def _mlp_fused_add_kernel(attn_output, hidden, ln_w, gate_w, up_w, down_w, out, fused_rmsnorm=True):
+            mlp_fused_add_isa_kernel(attn_output, hidden, ln_w, gate_w, up_w, down_w, out, "MLP", fused_rmsnorm=fused_rmsnorm)
+            
+        def _mlp_kernel(hidden, ln_w, gate_w, up_w, down_w, out, fused_rmsnorm=False):
+            mlp_isa_kernel(hidden, ln_w, gate_w, up_w, down_w, out, "MLP", fused_rmsnorm=fused_rmsnorm)
 
         if enable_qkv_kernel:
             assert fused_pre_attn_ln_qkv_weight is not None
@@ -303,17 +312,26 @@ class LlamaForSamplingNoEmbeddingHlo:
             hidden = hidden[0]
 
         if enable_mlp_kernel:
-            from neuronxcc.nki._private_kernels.mlp import mlp_isa_kernel
-            def _mlp_kernel(in0, in1, ln_w, gate_w, up_w, down_w, out, kernel_name="MLP"):
-                mlp_isa_kernel(in0, in1, ln_w, gate_w, up_w, down_w, out, kernel_name)
+            if self.neuron_config.is_sequence_parallel:
+                # In sequence parallel, we cannot fuse residual add and rms norm into the kernel
+                hidden = hlo.add(attn_output, hidden)
+                norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+                mlp_result = nki_call(_mlp_kernel, norm_hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight,
+                                    output_HloShapes=[norm_hidden.dtype[norm_hidden.sizes[0], norm_hidden.sizes[1], norm_hidden.sizes[2]]])
+                dtype, replica_groups = utils.parse_dtype_replica_groups(self.neuron_config, self.config.tp_degree)
+                mlp_hidden = hlo.reduce_scatter_sum(mlp_result, tp_degree=self.config.tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+                return hlo.add(mlp_hidden, hidden), out_attn_k_cache, out_attn_v_cache
+
+            # In TP, we can fuse residual add and rms norm into the kernel
             if is_first_last_layer or not enable_qkv_kernel:
                 hidden_add = hlo.add(attn_output, hidden)
-            mlp_result = nki_call(_mlp_kernel, attn_output, hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight, 
-                                output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], hidden.sizes[2]]])
+            mlp_result = nki_call(_mlp_fused_add_kernel, attn_output, hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight, 
+                                 output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], hidden.sizes[2]]])
             dtype, replica_groups = utils.parse_dtype_replica_groups(self.neuron_config, self.config.tp_degree)
             mlp_hidden = hlo.all_reduce_sum(mlp_result, self.config.tp_degree, dtype=dtype, replica_groups=replica_groups)
             if is_first_last_layer or not enable_qkv_kernel:
                 return hlo.add(mlp_hidden, hidden_add), out_attn_k_cache, out_attn_v_cache
+
             return (hidden, mlp_hidden, attn_output), out_attn_k_cache, out_attn_v_cache
         else:
             hidden = hlo.add(attn_output, hidden)
