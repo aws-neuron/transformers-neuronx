@@ -1566,6 +1566,7 @@ def embedding(weight, index, tp_degree=1, dim=1, dtype=None, core_id=None, seque
             replica_id = index.dtype.ReplicaId() # XXX: Unsupported
         else:
             replica_id = reshape(core_id,[])
+        replica_id = cast(replica_id, index.dtype)
         pred = index.scribe.pred
 
         # Compute embedding mask
@@ -1677,7 +1678,7 @@ def quantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
     quant_dtype = getattr(scribe, neuron_config.kv_cache_quant.quant_dtype)
     quantized_tensor = quant_dtype[tensor.sizes].Convert(tensor)
     return quantized_tensor
-  
+
 def dequantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
     scribe = tensor.scribe
     dequant_dtype = getattr(scribe, neuron_config.kv_cache_quant.dequant_dtype)
