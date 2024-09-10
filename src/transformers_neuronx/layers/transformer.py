@@ -68,7 +68,7 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         else: # HASB LAyout
             hidden_sizes = hidden_size, n_active_tokens, batch_size
 
-    if neuron_config.is_sequence_parallel:
+    if neuron_config.is_sequence_parallel and not neuron_config.on_device_embedding:
         hidden_sizes = list(hidden_sizes)
         hidden_sizes[1] = hidden_sizes[1] // tp_degree
         hidden_sizes = tuple(hidden_sizes)

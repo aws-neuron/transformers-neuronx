@@ -70,13 +70,18 @@ class LlamaForSamplingNoEmbeddingHlo:
         return (*tensors, previous_cache_ids, reorder_mapping), (*dims, seq_slice_dim, seq_slice_dim)
 
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, *weights):
-        if self.neuron_config.shard_over_sequence and self.neuron_config.on_device_embedding:
-            *rst, embed_weight = weights
+        core_id = None
+        if ((self.neuron_config.shard_over_sequence or self.neuron_config.sequence_parallel_norm)
+                and self.neuron_config.on_device_embedding):
+            core_id, embed_weight = weights
         else:
             embed_weight, *rst = weights
         dtype = getattr(input_ids.scribe, self.config.amp)
         if self.neuron_config.on_device_embedding and self.neuron_config.sequence_parallel_norm:
-            hidden = hlo.embedding(embed_weight, input_ids, tp_degree=1, dtype=dtype)
+            hidden = hlo.embedding(embed_weight, input_ids,
+                                   tp_degree=self.config.tp_degree, dim=0,
+                                   dtype=dtype, core_id=core_id,
+                                   sequence_parallel=self.neuron_config.is_sequence_parallel)
         else:
             hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -121,10 +126,11 @@ class LlamaForSamplingNoEmbeddingHlo:
             rope_scaling=self.config.rope_scaling
         )
         core_id = None
-
+        if (self.neuron_config.shard_over_sequence or
+                (self.neuron_config.sequence_parallel_norm and self.neuron_config.on_device_embedding)):
+            core_id, *rst = weights
         # flash decoding 
         if self.neuron_config.shard_over_sequence:
-            core_id, *rst  = weights
             n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
             cores_per_kv_head = self.config.tp_degree // n_kv_heads
             self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree 

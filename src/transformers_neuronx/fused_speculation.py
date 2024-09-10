@@ -111,6 +111,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
 
         # Derived attributes
         self.neuron_config = self.target.neuron_config
+        self.neuron_config.is_sequence_parallel = False
         self.tp_degree = self.target.decoder_lm_head.tp_degree
         if buckets is None:
             buckets = self.target.decoder_lm_head.n_positions_list
@@ -131,6 +132,8 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         target.builder.n_positions = n_positions
         draft.builder.n_active_tokens = 1
         target.builder.n_active_tokens = self.k + 1
+        draft.builder.neuron_config.is_sequence_parallel = False
+        target.builder.neuron_config.is_sequence_parallel = False
  
         num_inputs = 0
         num_outputs = 0

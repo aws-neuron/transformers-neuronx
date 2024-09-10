@@ -2040,7 +2040,7 @@ class DecoderProgram:
 
         def process_input_tensors(tensor, idx):
             # process input_ids
-            if idx == 0 and self.neuron_config.sequence_parallel_norm:
+            if idx == 0 and self.neuron_config.sequence_parallel_norm and not self.neuron_config.on_device_embedding:
                 n_active_tokens = tensor.shape[1]
                 if n_active_tokens > self.neuron_config.sequence_parallel_norm_threshold:
                     return self.manipulator.shard_along_on_cpu(tensor, 1)
