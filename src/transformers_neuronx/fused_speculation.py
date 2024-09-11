@@ -194,7 +194,14 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             tensors = cache_ids, *rest
             target_scores, caches = target._hlo_unroll(tokens, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
             target._hlo_cache_aliases(in_caches, caches)
-            target_ids = target._hlo_generation(target_scores, generation_params)
+
+            # Rebase the target probabilities in case of rejection
+            rebased_draft_scores = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
+            rebased_target_scores = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
+            rebased_draft_scores = hlo.pad(rebased_draft_scores, dim=1, size=1, value=0.0)
+            rebased_target_scores = hlo.subtract(rebased_target_scores, rebased_draft_scores)
+            rebased_target_scores = hlo.clamp(rebased_target_scores, minimum=0.0)
+            target_ids = target._hlo_generation(rebased_target_scores, generation_params)
             target_ids = hlo.cast(target_ids, s32)
  
             target_out_caches = itertools.chain(*caches)
@@ -388,7 +395,6 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         sequence_length = torch.tensor(sequence_length, dtype=torch.int32)
  
         while True:
- 
             if self.target.neuron_config.use_2d_cache_ids:
                 tokens, counts, token_id, *score = self.speculator.execute(token_id, cache_ids, start_ids, return_ranks=1)
             else:

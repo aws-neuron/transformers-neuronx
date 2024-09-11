@@ -484,8 +484,8 @@ def run(args, hf_model_name, model_cls):
     args = verify_and_fallback_args(args)
     torch.manual_seed(15213)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.load, padding_side="left")
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = None
+
 
     # prepare input
     if args.prompt_len is not None:
@@ -498,6 +498,9 @@ def run(args, hf_model_name, model_cls):
             start_ids = torch.arange(args.batch_size)
             cache_ids = torch.arange(args.prompt_len).unsqueeze(0).expand((args.batch_size, args.prompt_len))
     else:
+        tokenizer = AutoTokenizer.from_pretrained(args.load, padding_side="left")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
         full_prompt_text = args.prompt
         if args.various:
             batched_seq_lens = torch.randint(len(full_prompt_text) // 3,
@@ -577,7 +580,7 @@ def run(args, hf_model_name, model_cls):
                 n_positions_passed_to_model = [args.n_positions]
             else:
                 n_positions_passed_to_model = args.n_positions
-            
+
             if args.no_bucketing_context_length_estimate:
                 context_length_estimate_passed_to_model = [args.context_length_estimate]
             else:
@@ -630,7 +633,7 @@ def run(args, hf_model_name, model_cls):
                 max_length = args.max_length if args.max_length is not None else args.n_positions
                 forward_func = lambda : neuron_model.sample(
                     input_ids, max_length,
-                    top_k=args.top_k, 
+                    top_k=args.top_k,
                     eos_token_override=args.simple_sample_eos_token_override,
                     cache_ids=cache_ids,
                     start_ids=start_ids
@@ -696,9 +699,10 @@ def run(args, hf_model_name, model_cls):
             for i in range(dump_logits_limit):
                 dump(dump_logits_dir, f"{i}.pt", outputs.scores[i])
 
-        print('generated_sequence=', outputs.sequences)
-        outputs_sentences = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
-        print(outputs_sentences)
+        if tokenizer:
+            print('generated_sequence=', outputs.sequences)
+            outputs_sentences = [tokenizer.decode(gen_seq) for gen_seq in outputs.sequences]
+            print(outputs_sentences)
 
     finally:
 

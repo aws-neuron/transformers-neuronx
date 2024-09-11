@@ -220,6 +220,7 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     if neuron_config and neuron_config.use_1d_query:
         batch_size = last_token_id.sizes[0]
     dtype = hidden.dtype
+    is_eagle_model = neuron_config.is_eagle_target or neuron_config.is_eagle_draft
 
     if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query:
         # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large 
@@ -239,11 +240,21 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
             hidden = hlo.all_gather(hidden, 1, tp_degree)
 
         # Check and perform slicing if needed
-        if not return_all_outputs:
+        if not return_all_outputs and not is_eagle_model:
             hidden = _dynamic_logits_slice(hidden, last_token_id, neuron_config)
             n_active_tokens = 1
 
-    rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, neuron_config=None, tp_degree=tp_degree) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0, neuron_config=None, tp_degree=tp_degree)
+    if not neuron_config.is_eagle_draft:
+        rms_hidden = hlo.rms_norm(hidden, rms_weight, eps, neuron_config=None, tp_degree=tp_degree) if is_bsh else hlo.rms_norm(hidden, rms_weight, eps, dim=0, neuron_config=None, tp_degree=tp_degree)
+    else:
+        rms_hidden = hidden
+
+    output_hidden = rms_hidden
+
+    # Delay the slicing for EAGLE models
+    if not return_all_outputs and is_eagle_model:
+        rms_hidden = _dynamic_logits_slice(rms_hidden, last_token_id, neuron_config)
+        n_active_tokens = 1
 
     if is_bsh:
         rms_hidden = hlo.transpose210(rms_hidden)
@@ -258,6 +269,8 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     if neuron_config and tp_degree != neuron_config.get_local_tp(tp_degree) and not neuron_config.on_device_generation:
         result = hlo.all_gather(result, 0, tp_degree)
 
+    if neuron_config.is_eagle_target or neuron_config.is_eagle_draft:
+        return result, output_hidden
     return result
 
 

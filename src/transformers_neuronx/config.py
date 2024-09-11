@@ -225,6 +225,8 @@ class NeuronConfig():
         fused_rmsnorm_mlp: bool = False,
         mlp_out_weight_transpose: bool = False,
         fuse_mlp: bool = False,
+        is_eagle_target: bool = False,
+        is_eagle_draft: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -339,6 +341,9 @@ class NeuronConfig():
         if self.shard_over_sequence:
             assert self.sparse_attn is None, f"sparse attn is not supported with flash decoding"
             assert self.cache_layout == Layout.SBH, f"flash decoding only support SBH layout , got {self.cache_layout}"
+
+        self.is_eagle_target = is_eagle_target
+        self.is_eagle_draft = is_eagle_draft
 
     @property
     def use_2d_cache_ids(self):

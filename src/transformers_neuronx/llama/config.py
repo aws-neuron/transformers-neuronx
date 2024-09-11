@@ -46,6 +46,8 @@ class LlamaConfig:
         rope_scaling_type = self.rope_scaling.get("rope_type", self.rope_scaling.get("type", None)) if self.rope_scaling is not None else None
         if self.rope_scaling is not None and rope_scaling_type not in {'default', 'llama3'}:
             raise ValueError(f"Only default and llama3 ropes scaling types are currently supported. Received {rope_scaling_type}")
+        self.is_eagle = getattr(config, "is_eagle", False)
+        self.bias = getattr(config, "bias", True)
 
         utils.maybe_override_attributes(self, kwargs)
 
