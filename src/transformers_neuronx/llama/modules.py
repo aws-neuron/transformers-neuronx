@@ -23,7 +23,7 @@ class LlamaForCausalLM(module.PretrainedModel):
         super().__init__()
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
-        self.model = LlamaModel(config)
+        self.model = LlamaModel(config) if not config.is_eagle else EagleLlamaModel(config, config.bias)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
     def get_tied_parameters(self):
@@ -83,3 +83,15 @@ class LlamaMLP(module.LowMemoryModule):
         self.gate_proj = module.LowMemoryLazyLinear(config.intermediate_size, bias=False, dtype=dtype)
         self.up_proj = module.LowMemoryLazyLinear(config.intermediate_size, bias=False, dtype=dtype)
         self.down_proj = module.LowMemoryLazyLinear(config.hidden_size, bias=False, dtype=dtype)
+
+class EagleLlamaModel(module.LowMemoryModule):
+
+    def __init__(self, config, bias=True):
+        super().__init__()
+        self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = module.LowMemoryModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = LlamaRMSNorm(config)
+        # An extra fc layer before attention layers
+        dtype, _, _ = utils.parse_amp(config.amp)
+        dtype = dtypes.to_torch_dtype(dtype)
+        self.fc = module.LowMemoryLazyLinear(config.hidden_size*2, bias=bias, dtype=dtype)

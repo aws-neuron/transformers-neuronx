@@ -69,6 +69,40 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         return (*tensors, previous_cache_ids, reorder_mapping), (*dims, seq_slice_dim, seq_slice_dim)
 
+    def eagle_draft_inputs(self, scribe, dtype, n_active_tokens, batch_size, token_tree=False, k=0, n_leaves=0, depth=0, n_entrees=0, width=0):
+        # Should use token_tree_inputs
+        tensors, dims = self.inputs(scribe, dtype, n_active_tokens, batch_size)
+        hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
+        prev_hidden = dtype[hidden_sizes].Parameter(parameter_number=4)
+        if not token_tree:
+            return (*tensors, prev_hidden), (*dims, 1)
+        s32 = scribe.s32
+        tree_mask_sizes = k, k
+        tree_mask = s32[tree_mask_sizes].Parameter(parameter_number=5)
+        indices_sizes = batch_size, k-1
+        update_indices = s32[indices_sizes].Parameter(parameter_number=6)
+        hidden_update_sizes = batch_size, k-1
+        hidden_update_indices = s32[hidden_update_sizes].Parameter(parameter_number=7)
+        cache_update_sizes = batch_size, depth
+        cache_gather_indices = s32[cache_update_sizes].Parameter(parameter_number=8)
+        cache_scatter_indices = s32[cache_update_sizes].Parameter(parameter_number=9)
+        pos_sizes = batch_size, k
+        position_ids = s32[pos_sizes].Parameter(parameter_number=10)
+        path_sizes = n_leaves, depth
+        all_paths = s32[path_sizes].Parameter(parameter_number=11)
+        mask_sizes = n_entrees, width
+        path_mask = s32[mask_sizes].Parameter(parameter_number=12)
+        return (*tensors, 
+                prev_hidden, 
+                tree_mask, 
+                update_indices, 
+                hidden_update_indices, 
+                cache_gather_indices, 
+                cache_scatter_indices, 
+                position_ids, 
+                all_paths, 
+                path_mask), (*dims, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, *weights):
         core_id = None
         if ((self.neuron_config.shard_over_sequence or self.neuron_config.sequence_parallel_norm)
@@ -94,7 +128,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                              *weights):
         return self.embedding(input_ids, cache_ids, start_ids, last_token_id, *weights)
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=None):
         # TODO: move this fallback calculation to decoder.py
         if self.num_active_blocks is None and self.neuron_config.optimized_paged_attention:
             max_model_len = self.neuron_config.continuous_batching.max_model_len
@@ -119,8 +153,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_to_seq = None
 
         head_dim = self.config.attention_head_size
+        position_ids = cache_ids if position_ids is None else position_ids
         pos_embed = rotary.hlo_rotary_embedding(
-            hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,
+            hidden.dtype, int(head_dim * self.config.rotary_percentage), position_ids,
             base=self.config.rope_theta,
             interpolation_factor=self.config.position_interpolation_factor,
             rope_scaling=self.config.rope_scaling
@@ -141,7 +176,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions, 
                                                    last_token_id=last_token_id, num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
 
-
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
 
     def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
@@ -152,6 +186,18 @@ class LlamaForSamplingNoEmbeddingHlo:
             token_tree_mask, *rst = weights
         active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
+
+    def eagle_draft_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=None):
+        if self.config.bias:
+            embed_weight, fc_weight, fc_bias, *rst = weights
+        else:
+            embed_weight, fc_weight, *rst = weights
+            fc_bias = None
+        hidden = hlo.dot_add(fc_weight, hidden, fc_bias, 0, 2, 0)
+        hidden = hlo.permute(hidden, [1, 2, 0])
+        hidden = hlo.all_gather(hidden, 2, self.config.tp_degree) 
+        #hidden = hlo.dot_add(hidden, fc_weight, fc_bias, 2, 0, 2)
+        return self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=position_ids)
     
     def layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,
@@ -221,7 +267,10 @@ class LlamaForSamplingNoEmbeddingHlo:
         ):
         eps = self.config.rms_norm_eps
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+        if not self.neuron_config.is_eagle_draft:
+            ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
+        else:
+            ln_hidden = hidden
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
             attn_k_cache, attn_v_cache,

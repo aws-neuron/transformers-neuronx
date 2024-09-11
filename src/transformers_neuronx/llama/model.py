@@ -103,6 +103,8 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def load_weights(self):
         self.materialize_embeddings()
+        if self.neuron_config.is_eagle_draft:
+            self.chkpt_model.model.fc.materialize()
         ops.init()
 
         for layer_id, layer in enumerate(self.chkpt_model.model.layers):
@@ -116,7 +118,8 @@ class LlamaForSampling(base.NeuronModelBase):
             else:
                 is_unit_scale = False
             new_layer = self.decoder_lm_head.new_layer(is_unit_scale=is_unit_scale)
-            new_layer.add_pre_attention_layer_norm(layer.input_layernorm.weight.detach(), None)
+            if not self.neuron_config.is_eagle_draft:
+                new_layer.add_pre_attention_layer_norm(layer.input_layernorm.weight.detach(), None)
             new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
             new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
             new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
@@ -160,7 +163,6 @@ class LlamaForSampling(base.NeuronModelBase):
                     )
                 else:
                     new_layer.add_mlp_output(
-                        mlp.down_proj.weight.detach(), None,
                         sharding=1,
                         transposed=False,
                     )
@@ -191,9 +193,10 @@ class LlamaForSampling(base.NeuronModelBase):
         # 2) we don't needs these for intermediate pp stages, but to keep things simple, just include ln_lm_head for all pp stages for now
         # 3) to get ln_lm_head hlo, we need to do weight loading and sharding
         # 4) this will introduce extra memory allocation, but ln_lm_head i/o tensor is much smaller and we can get rid of it when we can construct hlo in init
-        ln_f = self.chkpt_model.model.norm
-        ln_f.materialize()
-        self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), None)
+        if not self.neuron_config.is_eagle_draft:
+            ln_f = self.chkpt_model.model.norm
+            ln_f.materialize()
+            self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), None)
 
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
@@ -205,6 +208,10 @@ class LlamaForSampling(base.NeuronModelBase):
             else:
                 self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1,
                                                              allow_pad=True)
+        if self.neuron_config.is_eagle_draft:
+            self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.fc.weight.detach().T, sharding=1, allow_pad=True)
+            if self.chkpt_model.model.fc.bias is not None:
+                self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.fc.bias.detach(), sharding=0, allow_pad=True)
         lm_head.nullify()
 
         self.decoder_lm_head.to_neuron()
@@ -270,9 +277,15 @@ class LlamaForSampling(base.NeuronModelBase):
             input_ids, input_embeddings, *rst = self.preprocess_and_embed(input_ids, cache_ids, start_ids, **kwargs)
         # either input_embeddings are generated (off device embedding), or input_ids will be padded from preprocess_and_embed (on device embedding)
         inputs = input_embeddings if input_embeddings is not None else input_ids
+        if 'prev_hidden' in kwargs:
+            rst = *rst, kwargs['prev_hidden']
         logits = self._forward(inputs, *rst)
-        logits = self._postprocess(original_input_ids, logits, start_ids=start_ids, **kwargs)
-        return logits
+        if self.neuron_config.is_eagle_target:
+            logits, hidden = logits
+            logits = self._postprocess(original_input_ids, logits, start_ids=start_ids, **kwargs)
+            return logits, hidden
+        else:
+            return self._postprocess(original_input_ids, logits, start_ids=start_ids, **kwargs)
 
     def speculative_forward(self, input_ids, cache_ids=None, start_ids=None, speculation_length=None):
         if self.neuron_config and self.neuron_config.continuous_batching:

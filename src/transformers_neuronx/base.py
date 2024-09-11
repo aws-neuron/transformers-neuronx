@@ -251,6 +251,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 model = self.decoder_lm_head_for_context[estimate, batch_size]
                 if self.neuron_config.log_softmax_scores:
                     logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
+                elif self.neuron_config.is_eagle_target:
+                    logits, hidden = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
                 else:
                     logits = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
                 if self.neuron_config.output_all_logits:
@@ -295,6 +297,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         if self.neuron_config.log_softmax_scores:
             return logits, scores
+        elif self.neuron_config.is_eagle_target:
+            return logits, hidden
         return logits
 
     def _prepare_for_par_ctx_rhs_padding(self, input_ids, cache_ids, start_ids=None, **kwargs):
@@ -593,6 +597,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             n_iters = input_batch_size // running_batch_size
             all_logits = []
             cache_ids, start_ids, last_token_id = args[0], args[1], args[2]
+            if self.neuron_config.is_eagle_draft:
+                priv_hiddens = args[3]
             for iter_id in range(n_iters):
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
@@ -603,11 +609,22 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 cache_ids_per_batch = cache_ids[start_idx:end_idx, :]
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id_per_batch = last_token_id[start_idx:end_idx]
-                logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
+                if self.neuron_config.is_eagle_draft:
+                    priv_hidden_per_batch = priv_hiddens[start_idx:end_idx, ...]
+                    logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
+                                            start_ids_per_batch, last_token_id_per_batch, priv_hidden_per_batch)
+                else:
+                    logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
                                                 start_ids_per_batch, last_token_id_per_batch)
                 all_logits.append(logits_per_batch)
             if self.neuron_config.on_device_generation:
-                logits = torch.cat(all_logits, dim=0)
+                if self.neuron_config.is_eagle_target:
+                    logits_list, hidden_list = zip(*all_logits)
+                    logits_cat = torch.cat(logits_list, dim=0)
+                    hidden_cat = torch.cat(hidden_list, dim=0)
+                    logits = (logits_cat, hidden_cat)
+                else:
+                    logits = torch.cat(all_logits, dim=0)
             else:
                 logits = torch.cat(all_logits, dim=-1)
         else:
