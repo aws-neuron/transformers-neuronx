@@ -64,6 +64,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             buckets: Optional[List[int]] = None,
             output_scores: Optional[bool] = False,
             token_tree: Optional[Dict[int, List[int]]] = None,
+            greedy: Optional[bool] = False,
         ) -> None:
         super().__init__()
  
@@ -115,6 +116,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.output_scores = output_scores
+        self.greedy = greedy
  
         # Derived attributes
         self.neuron_config = self.target.neuron_config
@@ -782,45 +784,13 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             if not self.linear_tree:
                 draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
 
-                # Recontruct the target ids: the rejected draft ids will be replaced with target ids sampled from adjusted distribution
-                target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
-
-                # Prepare the draft and target distributions. Here we construct probs for all possible paths of a given tree
-                draft_probs = torch.transpose(draft_probs, 0, 2).reshape(batch_size, -1)
-                target_probs = torch.transpose(target_probs, 0, 2).reshape(batch_size, -1)
-
-                mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(batch_size, -1)
-                draft_probs = torch.gather(draft_probs, 1, mask_indices)
-                target_probs = torch.gather(target_probs, 1, mask_indices)
-
-                draft_probs = draft_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-                target_probs = target_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+                if not self.greedy:
+                    # Recontruct the target ids: the rejected draft ids will be replaced with target ids sampled from adjusted distribution
+                    target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
+                else:
+                    target_ids = orig_target_ids
 
                 partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(batch_size, -1, -1) - 1
-                draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
-                target_probs = torch.gather(target_probs, 2, partial_all_paths)
-
-                # Accept or reject the tokens according to a certain distribution
-                ratio = torch.div(target_probs, draft_probs)
-                ratio = torch.clamp(ratio, max=1.0)
-                #dist = torch.rand(ratio.shape)
-                dist = torch.full(ratio.shape, 0.5)
-                accepted_mask = torch.lt(dist, ratio)
-
-                # Post-processing the accepted mask
-                # 1. We mask out the invalid tokens (i.e., the padding tokens for each path)
-                # 2. We find the consecutive accepted tokens
-                _mask = token_mask.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-                accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
-                pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(batch_size, self.n_leaves, self.depth-1) + 1
-                accepted_mask = torch.eq(accepted_mask, pos)
-                counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
-
-                # Construct the final accepted tokens using accepted mask, draft_ids, and reconstructed target_ids
-                # True in accepted mask means draft is taken, otherwise, target is taken
-                # Note that we need to pad a False to the accepted mask: we always accept one extra token with target prediction
-                accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
-
                 draft_ids = draft_ids[:, 1:].reshape(batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
                 draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
                 draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
@@ -829,11 +799,49 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
                 target_ids = torch.gather(target_ids, 2, _all_paths)
 
+                if not self.greedy:
+                    # Prepare the draft and target distributions. Here we construct probs for all possible paths of a given tree
+                    draft_probs = torch.transpose(draft_probs, 0, 2).reshape(batch_size, -1)
+                    target_probs = torch.transpose(target_probs, 0, 2).reshape(batch_size, -1)
+
+                    mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(batch_size, -1)
+                    draft_probs = torch.gather(draft_probs, 1, mask_indices)
+                    target_probs = torch.gather(target_probs, 1, mask_indices)
+
+                    draft_probs = draft_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+                    target_probs = target_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+
+                    draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
+                    target_probs = torch.gather(target_probs, 2, partial_all_paths)
+
+                    # Accept or reject the tokens according to a certain distribution
+                    ratio = torch.div(target_probs, draft_probs)
+                    ratio = torch.clamp(ratio, max=1.0)
+                    #dist = torch.rand(ratio.shape)
+                    dist = torch.full(ratio.shape, 0.5)
+                    accepted_mask = torch.lt(dist, ratio)
+                else:
+                    # For greedy we directly compare target with draft
+                    accepted_mask = torch.eq(target_ids, draft_ids)[:, :, :-1]
+
+                # Post-processing the accepted mask
+                # 1. We mask out the invalid tokens (i.e., the padding tokens for each path)
+                # 2. We find the consecutive accepted tokens
+                _mask = token_mask.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
+                accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
+                pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(batch_size, self.n_leaves, self.depth-1) + 1
+                accepted_mask = torch.eq(accepted_mask, pos)
+
+                # Construct the final accepted tokens using accepted mask, draft_ids, and reconstructed target_ids
+                # True in accepted mask means draft is taken, otherwise, target is taken
+                # Note that we need to pad a False to the accepted mask: we always accept one extra token with target prediction
+                accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
                 tokens = torch.where(accepted_mask, draft_ids, target_ids)
 
                 # We all the paths and the right tokens, we find the longest accepted path
                 # If two paths have the same token counts, we accept from the highest probabilites
                 # (Note that probabilites are already sorted because of topk)
+                counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
                 counts = torch.clamp(counts, max=max_accepted)
                 max_path = torch.argmax(counts, dim=1, keepdim=True)
                 counts = torch.gather(counts, 1, max_path)

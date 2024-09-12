@@ -227,6 +227,7 @@ class NeuronConfig():
         fuse_mlp: bool = False,
         is_eagle_target: bool = False,
         is_eagle_draft: bool = False,
+        has_pre_attention_norm: bool = True,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -344,6 +345,7 @@ class NeuronConfig():
 
         self.is_eagle_target = is_eagle_target
         self.is_eagle_draft = is_eagle_draft
+        self.has_pre_attention_norm = has_pre_attention_norm
 
     @property
     def use_2d_cache_ids(self):
