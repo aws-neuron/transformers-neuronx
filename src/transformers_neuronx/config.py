@@ -195,6 +195,7 @@ class NeuronConfig():
         fused_rmsnorm_qkv: Use the fused RMS norm and QKV input projection kernel.
         fused_rmsnorm_mlp: Use the fused RMSNorm and MLP BIR kernel for llama3.
         attn_output_transposed: Transposes the attention output projection weight tensor.
+        compilation_worker_count: Count of concurrent compilation workers.
     """
     def __init__(self, *,
         sparse_attn: Optional[SparseAttnConfig] = None,
@@ -228,6 +229,7 @@ class NeuronConfig():
         is_eagle_target: bool = False,
         is_eagle_draft: bool = False,
         has_pre_attention_norm: bool = True,
+        compilation_worker_count: Optional[int] = None,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -346,6 +348,7 @@ class NeuronConfig():
         self.is_eagle_target = is_eagle_target
         self.is_eagle_draft = is_eagle_draft
         self.has_pre_attention_norm = has_pre_attention_norm
+        self.compilation_worker_count = compilation_worker_count
 
     @property
     def use_2d_cache_ids(self):

@@ -273,6 +273,126 @@ def gather_blocks_all(key_cache, block_tables):
     return cached_keys
 
 
+def contexted_kv_indexing(query_lens, key_lens, max_num_keys, block_size):
+    """
+    Select KV cache blocks and gather assigned blocks into output buffer.
+
+    Example:
+
+    INPUTS:
+    query_lens = [3, 2, 1, 0]
+    key_lens   = [5, 7, 5, 0]
+    max_num_keys = 20
+    block_size = 4
+
+    INTERMEDIATE RESULTS:
+    context_lens = [2, 5, 4, 0]
+    num_keys_cumsum = [5, 12, 17, 17]
+
+    OUTPUTS:
+    cached_mask =   [1, 1, 0, 0, 0,       # seq 0 - 2 cached and 3 queries (5 total keys)
+                     1, 1, 1, 1, 1, 0, 0, # seq 1 - 5 cached and 2 queries (7 total keys, 12 cumulative)
+                     1, 1, 1, 1, 0,       # seq 2 - 4 cached and 1 query (5 total keys, 17 cumulative)
+                     0, 0, 0]             # padding 3 tokens (20 cumulative)
+    cached_to_ctx = [0, 1, x, x,          # seq 0 - 1st KV cache block
+                     x,                   # seq 0 - output space
+                     4, 5, 6, 7,          # seq 1 - 1st KV cache block
+                     8, x, x,             # seq 1 - 2nd KV cache block
+                     12, 13, 14, 15,      # seq 2 - 1st KV cache block
+                     x,                   # seq 2 - output space
+                     x, x, x]             # padding 3 tokens (20 cumulative)
+    active_to_ctx = [x, x, 0, 1, 2,       # seq 0 - 2 prior tokens, 3 new tokens (5 total)
+                     x, x, x, x, x, 3, 4, # seq 1 - 5 prior tokens, 2 new tokens (7 total, 12 cumulative)
+                     x, x, x, x, 5,       # seq 2 - 4 prior tokens, 1 new tokens (5 total, 17 cumulative)
+                     x, x, x]             # padding 3 tokens (20 cumulative)
+
+    Args:
+        query_lens: A list with number of queries per sequence.
+        key_lens: A list with number of keys per sequence.
+        max_num_keys: The total number of keys for all sequences.
+        block_size: The block size for loading KV cache.
+
+    Returns:
+        cached_mask: The binary mask where cached tokens are marked as positive values.
+        cached_to_ctx: The mapping between locations of block-wise cached tokens and contexted keys/values.
+        active_to_ctx: The mapping between locations of active queries and contexted keys/values.
+    """
+    s32 = query_lens.scribe.s32
+    pred = query_lens.scribe.pred
+    query_lens = hlo.cast(query_lens, s32)
+    key_lens = hlo.cast(key_lens, s32)
+    max_num_seqs, = query_lens.sizes
+    context_lens = hlo.subtract(key_lens, query_lens)
+    key_lens_cumsum = hlo.concatenate([hlo.full(0, s32, [1]), hlo.cumsum(key_lens, dim=0)], dimension=0)
+    query_lens_cumsum = hlo.concatenate([hlo.full(0, s32, [1]), hlo.cumsum(query_lens, dim=0)], dimension=0)
+    cached_steps = hlo.slice_along(key_lens_cumsum, dim=0, limit=max_num_seqs)
+    contexted_steps = hlo.add(cached_steps, context_lens)
+
+    # compute block-wise cache loading index, according to the equation
+    # > cached_start = cumsum((context_lens+block_size-1) // block_size) * block_size
+    block_lens = hlo.divide(hlo.add(context_lens, block_size-1), block_size)
+    block_lens = hlo.concatenate([hlo.full(0, s32, [1]), block_lens], dimension=0)
+    # [3, 5, 4, 0] -(divide)-> [1, 2, 1, 0] -> [0, 1, 2, 1, 0] -(cumsum)-> [0, 1, 3, 4, 4] -> [0, 4, 12, 16, 16]
+    cached_start = hlo.multiply(hlo.cumsum(block_lens, dim=0), block_size)
+
+    def _br(x):
+        return hlo.broadcast(x, [max_num_keys], [0])
+
+    def _selective_masking(steps, cumsum, lens, idx, seq_id, x_to_ctx):
+        loc = hlo.slice_along(steps, dim=0, limit=seq_id+1, start=seq_id)
+        start = hlo.slice_along(cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        length = hlo.slice_along(lens, dim=0, limit=seq_id+1, start=seq_id)
+        # the output x can be either cached index or active index
+        x = hlo.subtract(idx, _br(hlo.subtract(loc, start)))
+        upper_bound = hlo.add(hlo.add(start, length), -1)
+        x = hlo.minimum(_br(upper_bound), hlo.maximum(_br(start), x))
+        left_bound = hlo.add(hlo.add(loc, length), -1)
+        left_mask = hlo.greater_equal(_br(left_bound), idx)
+        right_mask = hlo.less_equal(_br(loc), idx)
+        mask = hlo.logical_and(left_mask, right_mask)
+        x_to_ctx = hlo.masked_select(mask, hlo.cast(x, s32), x_to_ctx)
+        return x_to_ctx, mask
+
+    cached_mask = hlo.full(0, pred, [max_num_keys])
+    cached_to_ctx = hlo.full(0, s32, [max_num_keys])
+    active_to_ctx = hlo.full(0, s32, [max_num_keys])
+    idx = hlo.iota(s32, (max_num_keys,), [0])
+    for seq_id in range(max_num_seqs):
+        cached_to_ctx, mask = _selective_masking(cached_steps, cached_start, context_lens, idx, seq_id, cached_to_ctx)
+        active_to_ctx, _ = _selective_masking(contexted_steps, query_lens_cumsum, query_lens, idx, seq_id, active_to_ctx)
+        cached_mask = hlo.logical_or(cached_mask, mask)
+
+    return cached_mask, cached_to_ctx, active_to_ctx
+
+
+def contexted_kv(cached_keys, active_keys, cached_mask, cached_to_ctx, active_to_ctx):
+    """
+    Combine both cached and active keys, and eliminate padding between sequences.
+
+    It is required to call contexted_kv_indexing, in order to generate loading indices
+    for cached and active tokens. Then the cached mask is used to selectively load these tokens.
+    """
+    n_blocks, block_size, _, _ = cached_keys.sizes
+    _, _, n_kv_head, d_head = active_keys.sizes
+    max_num_keys = cached_to_ctx.sizes[0]
+    sizes = max_num_keys, 1, n_kv_head, d_head
+    dtype = cached_keys.dtype
+
+    # cached keys/values are loaded as blocks from HBM to SRAM
+    cached_keys = hlo.reshape(cached_keys, (n_blocks*block_size, n_kv_head*d_head))
+    cached_keys = hlo.index_select(cached_keys, dim=0, index=cached_to_ctx)
+    cached_keys = hlo.reshape(cached_keys, sizes)
+
+    # active keys/values are loaded as individual tokens
+    active_keys = hlo.index_select(active_keys, dim=0, index=active_to_ctx)
+    cached_mask = hlo.broadcast(cached_mask, sizes, [0])
+
+    # cached mask is used to selectively load cached or active keys/values
+    merged_keys = hlo.masked_select(cached_mask, cached_keys, active_keys)
+
+    return merged_keys
+
+
 def blockwise_qk_matmul(query, keys, block_to_seq):
     num_seqs, _, num_heads, d_head = query.sizes
     num_blocks, block_size, num_kv_heads, _ = keys.sizes
