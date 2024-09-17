@@ -209,7 +209,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
-            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
@@ -256,7 +255,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
-            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
@@ -313,7 +311,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
-            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
@@ -419,7 +416,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             attn_out_weight, attn_out_scales, attn_out_bias,
             post_attn_ln_weight, post_attn_ln_bias,
             pre_mlp_ln_weight, pre_mlp_ln_bias,
-            fused_pre_mlp_ln_in_weight,
             mlp_in_weight, mlp_in_scales, mlp_in_bias,
             mlp_out_weight, mlp_out_scales, mlp_out_bias,
             post_mlp_ln_weight, post_mlp_ln_bias,
@@ -722,6 +718,9 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
+        cores_per_attn_head = tp_degree // self.config.num_attention_heads
+        if cores_per_attn_head and not self.neuron_config.shard_over_sequence:
+            output = hlo.divide(output, cores_per_attn_head)
         return output, updated_keys, updated_values
 
 
