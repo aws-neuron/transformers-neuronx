@@ -83,7 +83,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             if hasattr(self, "_compiled_artifacts_directory"):
                 self._load_compiled_artifacts(self._compiled_artifacts_directory)
             else:
-                self.compile()
+                self.compile(parallel_degree=self.neuron_config.compilation_worker_count)
             self.setup()
     
     def load_presharded_weights(self):

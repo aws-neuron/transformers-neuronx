@@ -3246,6 +3246,8 @@ def decoder_attention_block_diagonal_causal_from_bottomright_mask(num_queries, n
     s32 = num_queries.scribe.s32
     pred = num_queries.scribe.pred
     sizes = max_num_queries, max_num_keys
+    num_queries = cast(num_queries, s32)
+    num_keys = cast(num_keys, s32)
 
     # Constants to be used in the loop
     a = iota(s32, sizes, [0])
