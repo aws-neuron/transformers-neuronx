@@ -440,11 +440,13 @@ class FusedSpeculativeSelector(TokenSelector):
         sizes: The pairs of batch sizes and maximum sequence lengths
             corresponding to each program.
         k: The speculation length.
+        kv_shard: sharding degree in shard over sequence
     """
 
-    def __init__(self, sizes: List[Tuple[int, int]], k):
+    def __init__(self, sizes: List[Tuple[int, int]], k, kv_shard=0):
         self.k = k
+        self.kv_shard = kv_shard
         super().__init__(sizes)
 
     def get_position(self, cache_ids):
-        return cache_ids.max().item() + self.k
+        return cache_ids.max().item() + self.k + self.kv_shard

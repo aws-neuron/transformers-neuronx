@@ -263,8 +263,14 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         for (batch_size, sequence_length) in sizes:
             hlo_module, num_inputs, num_outputs = self.hlo(batch_size, sequence_length)
             hlo_modules.append(hlo_module)
- 
-        selector = program.FusedSpeculativeSelector(sizes, self.k)
+        kv_replication = 0
+        if self.neuron_config.shard_over_sequence:
+            assert hasattr(self.target.decoder_lm_head, 'kv_replication'), "attribute kv_replication need to be set in decoder"
+            target_replication = self.target.decoder_lm_head.kv_replication
+            draft_replication = self.draft.decoder_lm_head.kv_replication \
+                if hasattr(self.draft.decoder_lm_head, 'kv_replication') else 0
+            kv_replication = max(draft_replication, target_replication)
+        selector = program.FusedSpeculativeSelector(sizes, self.k, kv_shard=kv_replication)
         self.speculator = program.BucketedParallelProgram(
             hlo_modules,
             selector=selector,
