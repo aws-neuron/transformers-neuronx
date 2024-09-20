@@ -16,10 +16,10 @@ from transformers_neuronx import hlo, config
 
 def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1):
 
+    logits = mask_logits(logits, logits_indices, config.vocab_size)
     if not config.dynamic and not config.do_sample:
         return greedy_search(logits, tp_degree=tp_degree)
 
-    logits = mask_logits(logits, logits_indices, config.vocab_size)
     if not config.per_batch_line:
         return sample(
             logits,
