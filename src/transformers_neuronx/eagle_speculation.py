@@ -105,7 +105,6 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         self.token_tree = token_tree
         if token_tree is not None:
             self.k, self.depth = validate_token_tree(token_tree)
-            self.linear_tree = self._check_linear_tree()
             self.width = self._get_token_tree_width()
             self.tree_matrix = self._get_tree_matrix()
             self.token_paths, *rst = self._get_all_paths()
@@ -133,19 +132,6 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         self.hidden = {}
         self.cache_gather_indices = {}
         self.cache_scatter_indices = {}
-
-    def _check_linear_tree(self):
-        """
-        Helper function for checking whether the given tree is linear tree or not
-        """
-        assert self.token_tree is not None
-
-        for k, v in self.token_tree.items():
-            if len(v) > 1:
-                return False
-            if v[0] != k + 1:
-                return False
-        return True
 
     def _get_token_tree_width(self):
         """
@@ -349,10 +335,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         draft.builder.n_positions = n_positions
         target.builder.n_positions = n_positions
         draft.builder.n_active_tokens = self.k
-        if self._check_linear_tree():
-            target.builder.n_active_tokens = self.k + 1
-        else:
-            target.builder.n_active_tokens = self.k
+        target.builder.n_active_tokens = self.k
         
         num_inputs = 0
         num_outputs = 0
@@ -386,25 +369,22 @@ class EagleSpeculativeDecoder(torch.nn.Module):
  
             # Allocate Parameters for weight/cache tensors
             param_builder = decoder.DecoderParameterBuilder(scribe, num_inputs)
-            in_caches, layers_weights, pre_layer_params, lm_head_params, generation_params = draft._hlo_parameters(n_positions, batch_size, param_builder)
+            draft_in_caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, draft_generation_params = draft._hlo_parameters(n_positions, batch_size, param_builder)
 
             # Reorder KV cache based on previous acceptance results 
-            if self.linear_tree:
-                caches = in_caches
-            else:
-                caches = []
-                cache = in_caches[0][0]
-                # TODO: Add check for BSH layout
-                _, _, n_kv_heads, d_head = cache.sizes
-                draft_cache_gather_indices = hlo.transpose(cache_gather_indices, 0, 1)
-                draft_cache_gather_indices = hlo.reshape(draft_cache_gather_indices, [self.depth, batch_size, 1, 1])
-                draft_cache_gather_indices = hlo.broadcast(draft_cache_gather_indices, [self.depth, batch_size, n_kv_heads, d_head], [0, 1, 2, 3])
-                for layer_cache in in_caches:
-                    k_cache, v_cache = layer_cache
-                    draft_cache_keys = hlo.gather(k_cache,0, draft_cache_gather_indices)
-                    draft_cache_values = hlo.gather(v_cache, 0, draft_cache_gather_indices)
-                    k_cache, v_cache = fused_kv_update_cache(k_cache, v_cache, cache_scatter_indices, draft_cache_keys, draft_cache_values, start_ids, self.neuron_config)
-                    caches.append([k_cache, v_cache])
+            caches = []
+            cache = draft_in_caches[0][0]
+            # TODO: Add check for BSH layout
+            _, _, n_kv_heads, d_head = cache.sizes
+            draft_cache_gather_indices = hlo.transpose(cache_gather_indices, 0, 1)
+            draft_cache_gather_indices = hlo.reshape(draft_cache_gather_indices, [self.depth, batch_size, 1, 1])
+            draft_cache_gather_indices = hlo.broadcast(draft_cache_gather_indices, [self.depth, batch_size, n_kv_heads, d_head], [0, 1, 2, 3])
+            for layer_cache in draft_in_caches:
+                k_cache, v_cache = layer_cache
+                draft_cache_keys = hlo.gather(k_cache,0, draft_cache_gather_indices)
+                draft_cache_values = hlo.gather(v_cache, 0, draft_cache_gather_indices)
+                k_cache, v_cache = fused_kv_update_cache(k_cache, v_cache, cache_scatter_indices, draft_cache_keys, draft_cache_values, start_ids, self.neuron_config)
+                caches.append([k_cache, v_cache])
 
             # Create lists to aggregate outputs (used for token acceptance)
             draft_logits = list()
@@ -423,9 +403,6 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 prior_ids.append(cache_ids)
             draft_cache_ids = hlo.concatenate(prior_ids, 1)
 
-            if self._check_linear_tree():
-                cache_ids = hlo.add(cache_ids, 1)
-                prior_ids.append(cache_ids)
             target_cache_ids = hlo.concatenate(prior_ids, 1)
             target_cache_ids = hlo.add(target_cache_ids, 1)
 
@@ -436,148 +413,106 @@ class EagleSpeculativeDecoder(torch.nn.Module):
  
             for _ in range(self.depth-1):
                 tensors = draft_cache_ids, start_ids, last_token_id, prev_hidden
-                if self.linear_tree:
-                    logits, new_hidden, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params)
-                    new_tokens = draft._hlo_generation(logits, generation_params)
-                    new_tokens = hlo.cast(new_tokens, s32)
-                    new_tokens = hlo.slice_along(new_tokens, 1, self.k-1)
-                    new_hidden = hlo.slice_along(new_hidden, 1, self.k-1)
-                else:
-                    logits, new_hidden, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params, tree_mask, position_ids)
-                    logits = hlo.permute(logits, (2, 1, 0))
-                    _, new_tokens = hlo.topk(logits, k=self.width, dim=2, tp_degree=self.tp_degree)
-                    new_tokens = hlo.reshape(new_tokens, [batch_size, self.k * self.width])
-                    new_tokens = hlo.cast(new_tokens, s32)
-                    new_tokens = hlo.gather(new_tokens, 1, update_indices)
-                    new_hidden = hlo.gather(new_hidden, 1, hidden_update_indices)
+                logits, new_hidden, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, tree_mask, position_ids)
+                logits = hlo.permute(logits, (2, 1, 0))
+                _, new_tokens = hlo.topk(logits, k=self.width, dim=2, tp_degree=self.tp_degree)
+                new_tokens = hlo.reshape(new_tokens, [batch_size, self.k * self.width])
+                new_tokens = hlo.cast(new_tokens, s32)
+                new_tokens = hlo.gather(new_tokens, 1, update_indices)
+                new_hidden = hlo.gather(new_hidden, 1, hidden_update_indices)
                 tokens = hlo.concatenate([orig_tokens, new_tokens], 1)
                 prev_hidden = hlo.concatenate([orig_hidden, new_hidden], 1)
 
-            # Execute final iteration in case all tokens are accepted.
-            tensors = draft_cache_ids, start_ids, last_token_id, prev_hidden
-            if self.linear_tree:
-                logits, _, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params)
-                new_tokens = draft._hlo_generation(logits, generation_params)
-                new_tokens = hlo.cast(new_tokens, s32)
-                tokens = hlo.concatenate([orig_tokens, new_tokens], 1)
-            else:
-                logits, _, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params, tree_mask, position_ids)
-            draft_scores = logits
-            draft._hlo_cache_aliases(in_caches, caches)
- 
-            draft_out_caches = itertools.chain(*caches)
+            draft_caches = caches
+            draft_position_ids = position_ids
 
             # Concatenate all draft outputs
             cache_ids = target_cache_ids
 
             # Execute target model
             in_caches, layers_weights, pre_layer_params, lm_head_params, generation_params = target._hlo_parameters(n_positions, batch_size, param_builder)
-            if self.linear_tree:
-                caches = in_caches
-            else:
-                caches = []
-                cache = in_caches[0][0]
-                _, _, n_kv_heads, d_head = cache.sizes
-                # TODO: we probably don't need to do these again
-                cache_scatter_indices = hlo.add(cache_scatter_indices, 1)
-                cache_gather_indices = hlo.add(cache_gather_indices, 1)
-                target_cache_gather_indices = hlo.transpose(cache_gather_indices, 0, 1)
-                target_cache_gather_indices = hlo.reshape(target_cache_gather_indices, [self.depth, batch_size, 1, 1])
-                target_cache_gather_indices = hlo.broadcast(target_cache_gather_indices, [self.depth, batch_size, n_kv_heads, d_head], [0, 1, 2, 3])
-                #target_cache_gather_indices = hlo.add(target_cache_gather_indices, 1)
-                for layer_cache in in_caches:
-                    k_cache, v_cache = layer_cache
-                    # We only support BSH
-                    target_cache_keys = hlo.gather(k_cache,0, target_cache_gather_indices)
-                    target_cache_values = hlo.gather(v_cache, 0, target_cache_gather_indices)
-                    k_cache, v_cache = fused_kv_update_cache(k_cache, v_cache, cache_scatter_indices, target_cache_keys, target_cache_values, start_ids, self.neuron_config)
-                    caches.append([k_cache, v_cache])
-
+            caches = []
+            cache = in_caches[0][0]
+            _, _, n_kv_heads, d_head = cache.sizes
+            # TODO: we probably don't need to do these again
+            cache_scatter_indices = hlo.add(cache_scatter_indices, 1)
+            cache_gather_indices = hlo.add(cache_gather_indices, 1)
+            target_cache_gather_indices = hlo.transpose(cache_gather_indices, 0, 1)
+            target_cache_gather_indices = hlo.reshape(target_cache_gather_indices, [self.depth, batch_size, 1, 1])
+            target_cache_gather_indices = hlo.broadcast(target_cache_gather_indices, [self.depth, batch_size, n_kv_heads, d_head], [0, 1, 2, 3])
+            #target_cache_gather_indices = hlo.add(target_cache_gather_indices, 1)
+            for layer_cache in in_caches:
+                k_cache, v_cache = layer_cache
+                # We only support BSH
+                target_cache_keys = hlo.gather(k_cache,0, target_cache_gather_indices)
+                target_cache_values = hlo.gather(v_cache, 0, target_cache_gather_indices)
+                k_cache, v_cache = fused_kv_update_cache(k_cache, v_cache, cache_scatter_indices, target_cache_keys, target_cache_values, start_ids, self.neuron_config)
+                caches.append([k_cache, v_cache])
 
             tensors = target_cache_ids, start_ids, last_token_id
-            if self.linear_tree:
-                target_scores, hidden, caches = target._hlo_eagle_target_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params)
-            else:
-                position_ids = hlo.add(position_ids, 1)
-                target_scores, hidden, caches = target._hlo_eagle_target_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params, tree_mask, position_ids)
+            position_ids = hlo.add(position_ids, 1)
+            target_scores, hidden, caches = target._hlo_eagle_target_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params, tree_mask, position_ids)
             target._hlo_cache_aliases(in_caches, caches)
-            if not self.linear_tree:
-                target_ids = target._hlo_generation(target_scores, generation_params)
-                orig_target_ids = hlo.cast(target_ids, s32)
+
+            # Execute final iteration in case all tokens are accepted.
+            # Need to use target's hidden to update the draft cache
+            new_hidden = hlo.gather(hidden, 1, hidden_update_indices)
+            prev_hidden = hlo.concatenate([orig_hidden, new_hidden], 1)
+            tensors = draft_cache_ids, start_ids, last_token_id, prev_hidden
+            logits, _, draft_caches = draft._hlo_eagle_draft_unroll(tokens, tensors, draft_caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, tree_mask, draft_position_ids)
+            draft_scores = logits
+            draft._hlo_cache_aliases(draft_in_caches, draft_caches)
+
+            # Prepare output caches
+            draft_out_caches = itertools.chain(*draft_caches)
+            target_out_caches = itertools.chain(*caches)
+
+            # Sample output tokens
+            target_ids = target._hlo_generation(target_scores, generation_params)
+            orig_target_ids = hlo.cast(target_ids, s32)
+
             # Rebase the target probabilities in case of rejection
+            # TODO: This needs to be fixed!!
             rebased_draft_scores = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
             rebased_target_scores = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
-            if self.linear_tree:
-                rebased_draft_scores = hlo.pad(rebased_draft_scores, dim=1, size=1, value=0.0) 
             rebased_target_scores = hlo.subtract(rebased_target_scores, rebased_draft_scores)
             rebased_target_scores = hlo.clamp(rebased_target_scores, minimum=0.0)
             target_ids = target._hlo_generation(rebased_target_scores, generation_params)
             target_ids = hlo.cast(target_ids, s32)
 
-            target_out_caches = itertools.chain(*caches)
 
-            if self.linear_tree:
-                # NOTE: Exclude the input token during the speculative token selection
-                draft_ids = hlo.slice_along(tokens, 1, self.k+1, start=1)
+            n_entrees = self.tree_matrix.shape[0]
+   
+            draft_ids = hlo.transpose(tokens, 0, 1) # (k, batch_size)
+            draft_ids = hlo.reshape(draft_ids, [self.k, 1, batch_size])
+            draft_ids = hlo.broadcast(draft_ids, [self.k, n_entrees, batch_size], [0, 1, 2])
 
-                draft_ids = hlo.transpose(draft_ids, 0, 1)
-                target_ids = hlo.transpose(target_ids, 0, 1)
+            tree_matrix = hlo.transpose(tree_matrix, 0, 1)
+            tree_matrix = hlo.reshape(tree_matrix, [self.width, n_entrees, 1])
+            tree_matrix = hlo.broadcast(tree_matrix, [self.width, n_entrees, batch_size], [0, 1, 2])
 
-                next_tokens, index, *mask = hlo.speculative_token_selection(
-                    draft_ids, target_ids, draft_scores, target_scores,
-                    tp_degree=self.tp_degree,
-                    pad_token_id=self.pad_token_id,
-                    deterministic_threshold=0.5, 
-                    #deterministic_threshold=None,
-                    output_mask=self.output_scores,
-                )
+            draft_ids = hlo.gather(draft_ids, 0, tree_matrix) # (self.width, self.k-1, batch_size)
+            debugs.append(tokens)
+            debugs.append(draft_ids)
 
-                index = hlo.reshape(index, (batch_size, 1))
-                next_token_id = hlo.gather(next_tokens, 1, index)
+            draft_probabilities = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
+            target_probabilities = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
 
-                # Determine counts of tokens per batch line
-                counts = hlo.add(index, 1)
+            if self.tp_degree > 1:
+                draft_probabilities = hlo.all_gather(draft_probabilities, dim=0, tp_degree=self.tp_degree)
+                target_probabilities = hlo.all_gather(target_probabilities, dim=0, tp_degree=self.tp_degree)
 
-                # Format output
-                outputs = [
-                    next_tokens,
-                    counts,
-                    next_token_id,
-                    hidden,
-                ]
-            else:
-                n_entrees = self.tree_matrix.shape[0]
-       
-                draft_ids = hlo.transpose(tokens, 0, 1) # (k, batch_size)
-                draft_ids = hlo.reshape(draft_ids, [self.k, 1, batch_size])
-                draft_ids = hlo.broadcast(draft_ids, [self.k, n_entrees, batch_size], [0, 1, 2])
+            draft_probs = hlo.gather(draft_probabilities, 0, draft_ids) # (self.width, self.k-1, batch_size)
+            target_probs = hlo.gather(target_probabilities, 0, draft_ids)
 
-                tree_matrix = hlo.transpose(tree_matrix, 0, 1)
-                tree_matrix = hlo.reshape(tree_matrix, [self.width, n_entrees, 1])
-                tree_matrix = hlo.broadcast(tree_matrix, [self.width, n_entrees, batch_size], [0, 1, 2])
-
-                draft_ids = hlo.gather(draft_ids, 0, tree_matrix) # (self.width, self.k-1, batch_size)
-                debugs.append(tokens)
-                debugs.append(draft_ids)
-
-                draft_probabilities = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
-                target_probabilities = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
-
-                if self.tp_degree > 1:
-                    draft_probabilities = hlo.all_gather(draft_probabilities, dim=0, tp_degree=self.tp_degree)
-                    target_probabilities = hlo.all_gather(target_probabilities, dim=0, tp_degree=self.tp_degree)
-
-                draft_probs = hlo.gather(draft_probabilities, 0, draft_ids) # (self.width, self.k-1, batch_size)
-                target_probs = hlo.gather(target_probabilities, 0, draft_ids)
-
-                outputs = [
-                    tokens,
-                    target_ids,
-                    orig_target_ids,
-                    draft_probs,
-                    target_probs,
-                    hidden,
-                ]
+            outputs = [
+                tokens,
+                target_ids,
+                orig_target_ids,
+                draft_probs,
+                target_probs,
+                hidden,
+            ]
  
             # Retrieve the target model output scores for the selected tokens
             target_output_scores = None
@@ -714,10 +649,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
         sequences[:, :start] = input_ids
         cache_ids = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) - 1
-        if self.linear_tree:
-            positions = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) + torch.arange(self.k + 1, dtype=torch.int64).repeat((batch_size, 1))
-        else:
-            positions = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) + torch.arange(self.depth, dtype=torch.int64).repeat((batch_size, 1))
+        positions = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) + torch.arange(self.depth, dtype=torch.int64).repeat((batch_size, 1))
         sequences.scatter_(1, torch.count_nonzero(attention_mask,dim=1).view(-1, 1), token_id)
         positions = positions + 1
         gather_index = cache_ids.reshape(batch_size, -1, 1).expand(-1, -1, hidden.shape[-1])
@@ -734,12 +666,8 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         ends = torch.full((batch_size,), sequence_length, dtype=torch.int32)
  
         # Tensors to track local batch positions/masking for early stop
-        if self.linear_tree:
-            batch_positions = torch.arange(self.k+1).unsqueeze(0)
-            batch_mask = torch.full((batch_size, self.k+1), False)
-        else:
-            batch_positions = torch.arange(self.depth).unsqueeze(0)
-            batch_mask = torch.full((batch_size, self.depth), False)
+        batch_positions = torch.arange(self.depth).unsqueeze(0)
+        batch_mask = torch.full((batch_size, self.depth), False)
  
         # Minor optimization: Convert token types to tensors to avoid casting
         eos_token = None
@@ -781,95 +709,87 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                     self.tree_matrix, 
                     return_ranks=1)
 
-            if not self.linear_tree:
-                draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
+            draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
 
-                if not self.greedy:
-                    # Recontruct the target ids: the rejected draft ids will be replaced with target ids sampled from adjusted distribution
-                    target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
-                else:
-                    target_ids = orig_target_ids
-
-                partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(batch_size, -1, -1) - 1
-                draft_ids = draft_ids[:, 1:].reshape(batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
-                draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
-                draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
-
-                target_ids = target_ids.reshape(batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
-                _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-                target_ids = torch.gather(target_ids, 2, _all_paths)
-
-                if not self.greedy:
-                    # Prepare the draft and target distributions. Here we construct probs for all possible paths of a given tree
-                    draft_probs = torch.transpose(draft_probs, 0, 2).reshape(batch_size, -1)
-                    target_probs = torch.transpose(target_probs, 0, 2).reshape(batch_size, -1)
-
-                    mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(batch_size, -1)
-                    draft_probs = torch.gather(draft_probs, 1, mask_indices)
-                    target_probs = torch.gather(target_probs, 1, mask_indices)
-
-                    draft_probs = draft_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-                    target_probs = target_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-
-                    draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
-                    target_probs = torch.gather(target_probs, 2, partial_all_paths)
-
-                    # Accept or reject the tokens according to a certain distribution
-                    ratio = torch.div(target_probs, draft_probs)
-                    ratio = torch.clamp(ratio, max=1.0)
-                    #dist = torch.rand(ratio.shape)
-                    dist = torch.full(ratio.shape, 0.5)
-                    accepted_mask = torch.lt(dist, ratio)
-                else:
-                    # For greedy we directly compare target with draft
-                    accepted_mask = torch.eq(target_ids, draft_ids)[:, :, :-1]
-
-                # Post-processing the accepted mask
-                # 1. We mask out the invalid tokens (i.e., the padding tokens for each path)
-                # 2. We find the consecutive accepted tokens
-                _mask = token_mask.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-                accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
-                pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(batch_size, self.n_leaves, self.depth-1) + 1
-                accepted_mask = torch.eq(accepted_mask, pos)
-
-                # Construct the final accepted tokens using accepted mask, draft_ids, and reconstructed target_ids
-                # True in accepted mask means draft is taken, otherwise, target is taken
-                # Note that we need to pad a False to the accepted mask: we always accept one extra token with target prediction
-                accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
-                tokens = torch.where(accepted_mask, draft_ids, target_ids)
-
-                # We all the paths and the right tokens, we find the longest accepted path
-                # If two paths have the same token counts, we accept from the highest probabilites
-                # (Note that probabilites are already sorted because of topk)
-                counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
-                counts = torch.clamp(counts, max=max_accepted)
-                max_path = torch.argmax(counts, dim=1, keepdim=True)
-                counts = torch.gather(counts, 1, max_path)
-                max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
-                tokens = torch.gather(tokens, 1, max_path)
-                tokens = torch.reshape(tokens, (batch_size, -1))
-
-                # Post-processing for preparing the next iteration
-                # Get the last token, which becomes the input to the next iteration
-                token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
-
-                # Get the new ordering of the cache ids
-                cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids, all_paths, max_path)
-
-                # Ger the correct hidden value according to the accepted token
-                _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-                path = torch.gather(_all_paths, 1, max_path)
-                _counts = counts.to(torch.int64).reshape(batch_size, 1, -1) - 1
-                path = torch.gather(path, -1, _counts)
-                path = path.expand(-1, -1, hidden.shape[-1])
-                hidden = torch.gather(hidden, 1, path)
+            if not self.greedy:
+                # Recontruct the target ids: the rejected draft ids will be replaced with target ids sampled from adjusted distribution
+                target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
             else:
-                tokens, counts, token_id, hidden, *debugs = outputs 
+                target_ids = orig_target_ids
 
-                gather_index = counts.reshape(batch_size, 1, 1).expand(-1, -1, hidden.shape[-1])
-                gather_index = gather_index - 1
-                gather_index = gather_index.to(torch.int64)
-                hidden = torch.gather(hidden, 1, gather_index)
+            partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(batch_size, -1, -1) - 1
+            draft_ids = draft_ids[:, 1:].reshape(batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
+            draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
+            draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
+
+            target_ids = target_ids.reshape(batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
+            _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
+            target_ids = torch.gather(target_ids, 2, _all_paths)
+
+            if not self.greedy:
+                # Prepare the draft and target distributions. Here we construct probs for all possible paths of a given tree
+                draft_probs = torch.transpose(draft_probs, 0, 2).reshape(batch_size, -1)
+                target_probs = torch.transpose(target_probs, 0, 2).reshape(batch_size, -1)
+
+                mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(batch_size, -1)
+                draft_probs = torch.gather(draft_probs, 1, mask_indices)
+                target_probs = torch.gather(target_probs, 1, mask_indices)
+
+                draft_probs = draft_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+                target_probs = target_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+
+                draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
+                target_probs = torch.gather(target_probs, 2, partial_all_paths)
+
+                # Accept or reject the tokens according to a certain distribution
+                ratio = torch.div(target_probs, draft_probs)
+                ratio = torch.clamp(ratio, max=1.0)
+                #dist = torch.rand(ratio.shape)
+                dist = torch.full(ratio.shape, 0.5)
+                accepted_mask = torch.lt(dist, ratio)
+            else:
+                # For greedy we directly compare target with draft
+                accepted_mask = torch.eq(target_ids, draft_ids)[:, :, :-1]
+
+            # Post-processing the accepted mask
+            # 1. We mask out the invalid tokens (i.e., the padding tokens for each path)
+            # 2. We find the consecutive accepted tokens
+            _mask = token_mask.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
+            accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
+            pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(batch_size, self.n_leaves, self.depth-1) + 1
+            accepted_mask = torch.eq(accepted_mask, pos)
+
+            # Construct the final accepted tokens using accepted mask, draft_ids, and reconstructed target_ids
+            # True in accepted mask means draft is taken, otherwise, target is taken
+            # Note that we need to pad a False to the accepted mask: we always accept one extra token with target prediction
+            accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
+            tokens = torch.where(accepted_mask, draft_ids, target_ids)
+
+            # We all the paths and the right tokens, we find the longest accepted path
+            # If two paths have the same token counts, we accept from the highest probabilites
+            # (Note that probabilites are already sorted because of topk)
+            counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
+            counts = torch.clamp(counts, max=max_accepted)
+            max_path = torch.argmax(counts, dim=1, keepdim=True)
+            counts = torch.gather(counts, 1, max_path)
+            max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
+            tokens = torch.gather(tokens, 1, max_path)
+            tokens = torch.reshape(tokens, (batch_size, -1))
+
+            # Post-processing for preparing the next iteration
+            # Get the last token, which becomes the input to the next iteration
+            token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
+
+            # Get the new ordering of the cache ids
+            cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids, all_paths, max_path)
+
+            # Ger the correct hidden value according to the accepted token
+            _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
+            path = torch.gather(_all_paths, 1, max_path)
+            _counts = counts.to(torch.int64).reshape(batch_size, 1, -1) - 1
+            path = torch.gather(path, -1, _counts)
+            path = path.expand(-1, -1, hidden.shape[-1])
+            hidden = torch.gather(hidden, 1, path)
 
             for batch in range(batch_size):
                 if not done[batch]:
@@ -1021,71 +941,64 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             return_ranks=1
         )
 
-        if not self.linear_tree:
-            draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
-            target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
+        draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
+        target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
 
-            mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(graph_batch_size, -1)
+        mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(graph_batch_size, -1)
 
-            draft_probs = torch.transpose(draft_probs, 0, 2).reshape(graph_batch_size, -1)
-            target_probs = torch.transpose(target_probs, 0, 2).reshape(graph_batch_size, -1)
+        draft_probs = torch.transpose(draft_probs, 0, 2).reshape(graph_batch_size, -1)
+        target_probs = torch.transpose(target_probs, 0, 2).reshape(graph_batch_size, -1)
 
-            draft_probs = torch.gather(draft_probs, 1, mask_indices)
-            target_probs = torch.gather(target_probs, 1, mask_indices)
+        draft_probs = torch.gather(draft_probs, 1, mask_indices)
+        target_probs = torch.gather(target_probs, 1, mask_indices)
 
-            draft_probs = draft_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-            target_probs = target_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+        draft_probs = draft_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
+        target_probs = target_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
 
-            partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(graph_batch_size, -1, -1) - 1
+        partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(graph_batch_size, -1, -1) - 1
 
-            draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
-            target_probs = torch.gather(target_probs, 2, partial_all_paths)
+        draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
+        target_probs = torch.gather(target_probs, 2, partial_all_paths)
 
-            ratio = torch.div(target_probs, draft_probs)
-            ratio = torch.clamp(ratio, max=1.0)
-            #dist = torch.rand(ratio.shape)
-            dist = torch.full(ratio.shape, 0.5)
+        ratio = torch.div(target_probs, draft_probs)
+        ratio = torch.clamp(ratio, max=1.0)
+        #dist = torch.rand(ratio.shape)
+        dist = torch.full(ratio.shape, 0.5)
 
-            accepted_mask = torch.lt(dist, ratio)
+        accepted_mask = torch.lt(dist, ratio)
 
-            _mask = token_mask.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-            accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
-            pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(graph_batch_size, self.n_leaves, self.depth-1) + 1
-            accepted_mask = torch.eq(accepted_mask, pos)
+        _mask = token_mask.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
+        accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
+        pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(graph_batch_size, self.n_leaves, self.depth-1) + 1
+        accepted_mask = torch.eq(accepted_mask, pos)
 
-            counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
-            accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
+        counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
+        accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
 
-            draft_ids = draft_ids[:, 1:].reshape(graph_batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
-            draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
-            draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
+        draft_ids = draft_ids[:, 1:].reshape(graph_batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
+        draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
+        draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
 
-            target_ids = target_ids.reshape(graph_batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
-            _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-            target_ids = torch.gather(target_ids, 2, _all_paths)
+        target_ids = target_ids.reshape(graph_batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
+        _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
+        target_ids = torch.gather(target_ids, 2, _all_paths)
 
-            tokens = torch.where(accepted_mask, draft_ids, target_ids)
+        tokens = torch.where(accepted_mask, draft_ids, target_ids)
 
-            counts = torch.clamp(counts, max=max_accepted)
-            max_path = torch.argmax(counts, dim=1, keepdim=True)
-            counts = torch.gather(counts, 1, max_path)
-            max_path = torch.reshape(max_path, (graph_batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
-            tokens = torch.gather(tokens, 1, max_path)
-            tokens = torch.reshape(tokens, (graph_batch_size, -1))
-            token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
-            cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids_pad, all_paths, max_path)
-            _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-            path = torch.gather(_all_paths, 1, max_path)
-            _counts = counts.to(torch.int64).reshape(graph_batch_size, 1, -1) - 1
-            path = torch.gather(path, -1, _counts)
-            path = path.expand(-1, -1, hidden.shape[-1])
-            hidden = torch.gather(hidden, 1, path)
-        else:
-            tokens, counts, token_id, hidden, *debugs = outputs
-            gather_index = counts.reshape(graph_batch_size, 1, 1).expand(-1, -1, hidden.shape[-1])
-            gather_index = gather_index - 1
-            gather_index = gather_index.to(torch.int64)
-            hidden = torch.gather(hidden, 1, gather_index)
+        counts = torch.clamp(counts, max=max_accepted)
+        max_path = torch.argmax(counts, dim=1, keepdim=True)
+        counts = torch.gather(counts, 1, max_path)
+        max_path = torch.reshape(max_path, (graph_batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
+        tokens = torch.gather(tokens, 1, max_path)
+        tokens = torch.reshape(tokens, (graph_batch_size, -1))
+        token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
+        cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids_pad, all_paths, max_path)
+        _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
+        path = torch.gather(_all_paths, 1, max_path)
+        _counts = counts.to(torch.int64).reshape(graph_batch_size, 1, -1) - 1
+        path = torch.gather(path, -1, _counts)
+        path = path.expand(-1, -1, hidden.shape[-1])
+        hidden = torch.gather(hidden, 1, path)
 
         output_tokens, output_counts, output_hidden, output_cache_gather_indices, output_cache_scatter_indices = self.handle_padding_list(
             [tokens, counts, hidden, cache_gather_indices, cache_scatter_indices],
