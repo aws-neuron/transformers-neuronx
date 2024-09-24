@@ -174,10 +174,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             )
             self.neuron_config.group_query_attention = constants.GQA.REPLICATED_HEADS
 
-    def init_context_decoder(self, unroll, buckets, model_obj):
+    def init_context_decoder(self, unroll, buckets, model_obj, context_batch_sizes=None):
         cls = type(self)
         decoder_lm_head = {}
-        if self.prompt_batch_size:
+        if context_batch_sizes:
+            # if context_batch_sizes is passed we directly use it. This is useful for cases
+            # like chunked prefill where batch size bucket is used for the number of active KV cache 
+            # blocks.
+            self.context_batch_sizes = context_batch_sizes
+        elif self.prompt_batch_size:
             self.context_batch_sizes = [self.prompt_batch_size]
         elif self.neuron_config and self.neuron_config.continuous_batching:
             self.context_batch_sizes = [1]
@@ -228,7 +233,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             builder=self.builder,
             tag="token",
         )
-        base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
+        if not self.neuron_config.enable_chunked_prefill: # skip token model for chunked prefill due to not needed and also compiler error
+            base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.builder.inputs)
         if hasattr(self.builder, 'pre_layer'):
             decoder_lm_head.add_pre_layer_builder(self.builder.pre_layer)
@@ -506,6 +512,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
         batch_size = 1 if self.neuron_config.use_1d_query else start_ids.shape[0]
+        if self.neuron_config.enable_chunked_prefill:
+            batch_size = self.batch_size[0] # in this case batch size is single element list
+            assert len(self.batch_size) == 1
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
@@ -530,7 +539,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # When context_length == m * n_active_tokens, bucket-size of n_active_tokens should be chosen.
             # This is useful for Fusion-In-Decoder case, where 2nd n_active_tokens don't need to attend to
             # 1st n_active_tokens.
-            bucket_id = self.program.find_bucket_id(max_id)
+            if self.neuron_config.enable_chunked_prefill:
+                bucket_id = self.program.find_bucket_id(self.n_active_tokens - 1) # can't use max_id since it can be high
+            else:
+                bucket_id = self.program.find_bucket_id(max_id)
             if self.use_executor:
                 if self.neuron_config and self.neuron_config.sequence_parallel_norm:
                     self.program.inputs_host_to_device(input_tensors, batch_size)
@@ -579,6 +591,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
                 # Taking block sizes based on n_positions,block_size for bucketing.
                 block_sizes = [n_pos * self.neuron_config.continuous_batching.max_num_seqs // self.neuron_config.continuous_batching.block_size for n_pos in self.n_positions_list]
+                assert max(block_sizes) <= self.neuron_config.continuous_batching.num_blocks, "Too few blocks allocated, consider increasing gpu_memory_utilization or override"
                 # Taking max of n_positions_list for building bucketing for paged attention token gen.
                 pa_npos = [max(self.n_positions_list)]
                 for npos,block_size in itertools.product(pa_npos, block_sizes):
@@ -685,6 +698,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.builder.n_positions = n_positions
         if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
             self.builder.num_active_blocks = batch_size
+        if self.neuron_config.enable_chunked_prefill and self.n_active_tokens == n_positions:
+            self.builder.num_active_blocks = batch_size
+            batch_size = 1
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
@@ -1703,10 +1719,10 @@ class DecoderLayer(torch.nn.Module):
             num_blocks = self.neuron_config.continuous_batching.num_blocks if self.neuron_config.paged_attention else batch_size
             if self.bsh_cache_layout:
                 cache_shape = [num_blocks, block_size, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [batch_size, block_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+                self.cache_shape[batch_size] = [num_blocks, block_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             else:
                 cache_shape = [block_size, num_blocks, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [block_size, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+                self.cache_shape[batch_size] = [block_size, num_blocks, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn:
                 int8_cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8) #Cannot directly use fp8: *** RuntimeError: "fill_cpu" not implemented for 'Float8_e4m3fn'
                 cpu_cache= int8_cpu_cache.to(torch.float8_e4m3fn)
@@ -2028,6 +2044,8 @@ class DecoderProgram:
                     kernel_tag = f"{tag}-seqlen{npos}-block{batch_size}"
                 else:
                     kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
+                if self.neuron_config.enable_chunked_prefill:
+                    kernel_tag = f"{tag}-chunked-prefill-chunksize{npos}-block{batch_size}"
             self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag, num_exec_repetition=num_exec_repetition)
         self.debug_tensors = debug_tensors
         self.debug_output_buffers = dict()
@@ -2142,7 +2160,11 @@ class DecoderProgram:
             batch_size = self.batch_size_for_shared_caches
         for layer in layers:
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
-                cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
+                if self.neuron_config.paged_attention:
+                    # don't slice because we pass full KV cache for each bucket
+                    cache_slice = cache
+                else:
+                    cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
                 input_tensors.append(cache_slice)
                 output_tensors.append(cache_slice)
         for layer in layers:

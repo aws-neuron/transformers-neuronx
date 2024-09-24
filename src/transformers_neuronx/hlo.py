@@ -923,7 +923,7 @@ def token_tree_attention_mask(full_token_tree_attention_mask, active_mask):
     return pred_token_tree_active_mask
 
 
-def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None):
+def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None, context_lens=None):
     """
     Create decomposed prior/active attention masks.
 
@@ -969,6 +969,7 @@ def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, num_ac
             last_token_id=last_token_id,
             num_active_blocks=num_active_blocks,
             neuron_config=neuron_config,
+            context_lens=context_lens,
         )
     else:
         n_active_tokens, = cache_ids.sizes
@@ -3059,7 +3060,7 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None):
+def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None, context_lens=None):
     """
     Create attention masks for LHS-aligned sequences.
 
@@ -3073,7 +3074,13 @@ def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=Non
         active_mask: The attention mask to apply to the active tokens.
     """
     batch_size, n_active_tokens = cache_ids.sizes
-    if n_active_tokens == n_positions:
+    if neuron_config and neuron_config.enable_chunked_prefill and n_active_tokens == n_positions:
+        batch_size = neuron_config.continuous_batching.max_num_seqs
+        seq_lens = add(context_lens, last_token_id) # last_token_id is query_lens
+        block_size = neuron_config.continuous_batching.block_size
+        return decoder_attention_block_diagonal_causal_from_bottomright_mask(
+            num_queries=last_token_id, num_keys=seq_lens, max_num_queries=n_active_tokens, max_num_keys=block_size*num_active_blocks+n_active_tokens, max_num_seqs=batch_size)
+    elif n_active_tokens == n_positions:
         # Context Encoding
         if neuron_config and neuron_config.use_1d_query:
             # For concatenated prompt encoding (1D query), last_token_id is used as prompt_lens
@@ -3531,7 +3538,7 @@ def masked_select(mask, true_tensor, false_tensor):
     assert dtype == false_tensor.dtype
     assert mask.sizes == true_tensor.sizes == false_tensor.sizes, (
         "Tensor size mismatch."
-        f"mask shape={len(mask.sizes)}, true_tensor shape={len(true_tensor.sizes)}, false_tensor shape={len(false_tensor.sizes)}"
+        f"mask shape={mask.sizes}, true_tensor shape={true_tensor.sizes}, false_tensor shape={false_tensor.sizes}"
     )
     return dtype[mask.sizes].Select(mask, true_tensor, false_tensor)
 

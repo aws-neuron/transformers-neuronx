@@ -92,18 +92,18 @@ class LlamaForSamplingNoEmbeddingHlo:
         all_paths = s32[path_sizes].Parameter(parameter_number=11)
         mask_sizes = n_entrees, width
         path_mask = s32[mask_sizes].Parameter(parameter_number=12)
-        return (*tensors, 
-                prev_hidden, 
-                tree_mask, 
-                update_indices, 
-                hidden_update_indices, 
-                cache_gather_indices, 
-                cache_scatter_indices, 
-                position_ids, 
-                all_paths, 
+        return (*tensors,
+                prev_hidden,
+                tree_mask,
+                update_indices,
+                hidden_update_indices,
+                cache_gather_indices,
+                cache_scatter_indices,
+                position_ids,
+                all_paths,
                 path_mask), (*dims, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, *weights):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights):
         core_id = None
         if ((self.neuron_config.shard_over_sequence or self.neuron_config.sequence_parallel_norm)
                 and self.neuron_config.on_device_embedding):
@@ -128,7 +128,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                              *weights):
         return self.embedding(input_ids, cache_ids, start_ids, last_token_id, *weights)
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=None):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
         # TODO: move this fallback calculation to decoder.py
         if self.num_active_blocks is None and self.neuron_config.optimized_paged_attention:
             max_model_len = self.neuron_config.continuous_batching.max_model_len
@@ -136,6 +136,10 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_size = self.neuron_config.continuous_batching.block_size
             self.num_active_blocks = (max_model_len * max_num_seqs // block_size) - 2
 
+        block_to_seq = None
+        cached_mask = None
+        cached_to_contexted = None
+        active_to_contexted = None
         if self.neuron_config.optimized_paged_attention and len(last_token_id.sizes) == 2:
             # For decoding with multiple KV cache blocks:
             # - cache_ids are used as context_lens
@@ -149,8 +153,17 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_size = self.neuron_config.continuous_batching.block_size
             block_to_seq = attention_utils.block_to_seq_indexing(
                 context_lens=cache_ids, num_seqs=max_num_seqs, num_blocks=self.num_active_blocks, block_size=block_size)
-        else:
-            block_to_seq = None
+        elif self.neuron_config.enable_chunked_prefill:
+            context_lens_2d = hlo.unsqueeze(context_lens, 1)
+            block_tables = attention_utils.active_block_tables(
+                block_tables=block_tables, context_lens=context_lens_2d,
+                num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+            seq_lens = hlo.add(context_lens, last_token_id)
+            block_size = self.neuron_config.continuous_batching.block_size
+            max_num_keys = self.num_active_blocks * block_size + self.n_positions
+            cached_mask, cached_to_contexted, active_to_contexted = \
+                attention_utils.contexted_kv_indexing(query_lens=last_token_id, key_lens=seq_lens,
+                                                      max_num_keys=max_num_keys, block_size=block_size)
 
         head_dim = self.config.attention_head_size
         position_ids = cache_ids if position_ids is None else position_ids
@@ -164,19 +177,22 @@ class LlamaForSamplingNoEmbeddingHlo:
         if (self.neuron_config.shard_over_sequence or
                 (self.neuron_config.sequence_parallel_norm and self.neuron_config.on_device_embedding)):
             core_id, *rst = weights
-        # flash decoding 
+        # flash decoding
         if self.neuron_config.shard_over_sequence:
             n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
             cores_per_kv_head = self.config.tp_degree // n_kv_heads
-            self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree 
+            self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree
             cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, start_ids,
                                                                         core_id, self.n_positions,
                                                                         cores_per_kv_head=self.cores_per_kv_head)
         else:
-            mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions, 
-                                                   last_token_id=last_token_id, num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+            mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
+                                                   last_token_id=last_token_id, num_active_blocks=self.num_active_blocks,
+                                                   neuron_config=self.neuron_config, context_lens=context_lens)
 
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
+
+        return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id, \
+               block_tables, cached_mask, cached_to_contexted, active_to_contexted
 
     def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
         hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
@@ -195,11 +211,12 @@ class LlamaForSamplingNoEmbeddingHlo:
             fc_bias = None
         hidden = hlo.dot_add(fc_weight, hidden, fc_bias, 0, 2, 0)
         hidden = hlo.permute(hidden, [1, 2, 0])
-        hidden = hlo.all_gather(hidden, 2, self.config.tp_degree) 
+        hidden = hlo.all_gather(hidden, 2, self.config.tp_degree)
         #hidden = hlo.dot_add(hidden, fc_weight, fc_bias, 2, 0, 2)
         return self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=position_ids)
-    
+
     def layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
+            block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             fused_pre_attn_ln_qkv_weight,
@@ -246,6 +263,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def flat_compiler_layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
+            block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             fused_pre_attn_ln_qkv_weight,
@@ -271,6 +289,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             ln_hidden = hidden
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+            block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
@@ -302,6 +321,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
     def native_kernel_layer(
             self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
+            block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
             fused_pre_attn_ln_qkv_weight,
@@ -330,7 +350,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         # lambda functions for calling kernels
         def _mlp_fused_add_kernel(attn_output, hidden, ln_w, gate_w, up_w, down_w, out, fused_rmsnorm=True):
             mlp_fused_add_isa_kernel(attn_output, hidden, ln_w, gate_w, up_w, down_w, out, "MLP", fused_rmsnorm=fused_rmsnorm)
-            
+
         def _mlp_kernel(hidden, ln_w, gate_w, up_w, down_w, out, fused_rmsnorm=False):
             mlp_isa_kernel(hidden, ln_w, gate_w, up_w, down_w, out, "MLP", fused_rmsnorm=fused_rmsnorm)
 
@@ -339,6 +359,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             fused_out = self.fused_rmsnorm_qkv(
                 hidden, None, eps,
                 cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+                block_tables, cached_mask, cached_to_contexted, active_to_contexted,
                 attn_k_cache, attn_v_cache,
                 fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias, # should be none
@@ -353,6 +374,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
             attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
                 ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+                block_tables, cached_mask, cached_to_contexted, active_to_contexted,
                 attn_k_cache, attn_v_cache,
                 attn_q_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias,
@@ -377,7 +399,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             # In TP, we can fuse residual add and rms norm into the kernel
             if is_first_last_layer or not enable_qkv_kernel:
                 hidden_add = hlo.add(attn_output, hidden)
-            mlp_result = nki_call(_mlp_fused_add_kernel, attn_output, hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight, 
+            mlp_result = nki_call(_mlp_fused_add_kernel, attn_output, hidden, pre_mlp_ln_weight, in0_weight, in1_weight, out_weight,
                                  output_HloShapes=[hidden.dtype[hidden.sizes[0], hidden.sizes[1], hidden.sizes[2]]])
             dtype, replica_groups = utils.parse_dtype_replica_groups(self.neuron_config, self.config.tp_degree)
             mlp_hidden = hlo.all_reduce_sum(mlp_result, self.config.tp_degree, dtype=dtype, replica_groups=replica_groups)
@@ -460,6 +482,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     def fused_rmsnorm_qkv(
         self, hidden, pre_attn_ln_weight, eps,
         cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+        block_tables, cached_mask, cached_to_contexted, active_to_contexted,
         attn_k_cache, attn_v_cache,
         attn_q_weight, attn_q_scales, attn_q_bias,
         attn_k_weight, attn_k_scales, attn_k_bias, # should be none
@@ -528,6 +551,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Pass QKV tuple since it will not be computed in the attention block
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
             nki_output, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+            block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             attn_q_weight, None, None,
             None, None, None,
@@ -543,6 +567,7 @@ class LlamaForSamplingNoEmbeddingHlo:
     def attention(
         self,
         hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
+        block_tables, cached_mask, cached_to_contexted, active_to_contexted,
         cached_keys, cached_values,
         q_weight, q_scales, q_bias,
         k_weight, k_scales, k_bias,
@@ -564,7 +589,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Q = (hidden @ wQ) + bQ
         # K = (hidden @ wK) + bK
         # V = (hidden @ wV) + bV
-        if qkv_tuple: 
+        if qkv_tuple:
             # If computed already, skip computation here
             assert active_mask is None
             query, key, value = qkv_tuple
@@ -634,13 +659,13 @@ class LlamaForSamplingNoEmbeddingHlo:
                     cached_values_s = dequantize_kv_cache_direct_cast(cached_values_s, self.neuron_config)
             elif self.neuron_config and self.neuron_config.kv_cache_quant:
                 cached_keys_s = dequantize_kv_cache_direct_cast(cached_keys, self.neuron_config)
-                cached_values_s = dequantize_kv_cache_direct_cast(cached_values, self.neuron_config)   
+                cached_values_s = dequantize_kv_cache_direct_cast(cached_values, self.neuron_config)
             else:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
             # Communication 1: all-gather query from cores
             if (n_active_tokens != self.n_positions) and self.neuron_config.shard_over_sequence:
-                query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, 
+                query = flash_decoding.gather_query_group(query, self.cores_per_kv_head,
                                                   n_head,
                                                   tp_degree)
 
@@ -681,22 +706,38 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # Multi-Token Context Encoding
         else:
-            _, batch_size, _, _ = query.sizes
-            if self.neuron_config.lhs_aligned or batch_size == 1:
+            batch_size = query.sizes[batch_dim]
+            if (self.neuron_config.lhs_aligned or batch_size == 1) and not self.neuron_config.enable_chunked_prefill and not self.neuron_config.bsh_cache_layout:
                 context = attention.flash_attention(query, key, value)
             else:
                 # do not use flash attention for lhs padded (right aligned) batch > 1 case
-                # because it does not correctly take mask into account 
+                # because it does not correctly take mask into account
                 context = None
 
             if context is None:
-                # S = Q @ K
+                if self.neuron_config.enable_chunked_prefill:
+                    # S = Q @ K
+                    cached_keys_gathered = attention_utils.gather_blocks(cached_keys, block_tables=block_tables, neuron_config=self.neuron_config)
+                    contexted_keys = attention_utils.contexted_kv(cached_keys_gathered, key, cached_mask, cached_to_contexted, active_to_contexted)
+                    score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads,
+                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
 
-                score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
-                                        tp_degree=tp_degree, neuron_config=self.neuron_config)
-                score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
-                context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
-                                                    tp_degree=tp_degree, neuron_config=self.neuron_config)
+                    score = attention.mask(score, mask, tp_degree=tp_degree)
+
+                    # C = softmax(Sa, Sp) @ (Va, Vp)
+                    cached_values_gathered = attention_utils.gather_blocks(cached_values, block_tables=block_tables, neuron_config=self.neuron_config)
+                    contexted_values = attention_utils.contexted_kv(cached_values_gathered, value, cached_mask,
+                                                                    cached_to_contexted, active_to_contexted)
+                    context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads,
+                                                         tp_degree=tp_degree, neuron_config=self.neuron_config)
+                else:
+                    # S = Q @ K
+
+                    score = attention.score(query, key, n_kv_heads=self.config.num_key_value_heads,
+                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
+                    score = attention.mask(score, mask, tp_degree=tp_degree, shard_over_batch=self.shard_over_batch)
+                    context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
+                                                        tp_degree=tp_degree, neuron_config=self.neuron_config)
 
             if self.neuron_config.shard_over_sequence:
                 cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,

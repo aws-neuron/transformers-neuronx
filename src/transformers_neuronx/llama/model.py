@@ -85,6 +85,18 @@ class LlamaForSampling(base.NeuronModelBase):
         self.context_batch_sizes = [
             1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
         hlo_builder = LlamaForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
+        if self.neuron_config.enable_chunked_prefill:
+            max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
+            block_size = self.neuron_config.continuous_batching.block_size
+            num_blocks = self.neuron_config.continuous_batching.num_blocks
+
+            # define block buckets based on the n_positions
+            block_sizes = [n_pos * max_num_seqs // block_size for n_pos in self.token_buckets]
+            assert max(block_sizes) <= num_blocks, \
+                "Too few blocks allocated, consider increasing gpu_memory_utilization or override"
+            # for chunked prefill we set the context batch sizes to the block sizes (we use the batch size bucketing
+            # for KV cache active blocks and the context length estimate bucket for number of queries)
+            self.context_batch_sizes = block_sizes
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
@@ -97,7 +109,7 @@ class LlamaForSampling(base.NeuronModelBase):
                                                                          model_obj=self)
         self.decoder_lm_head_for_context = self.decoder_param_set.init_context_decoder(unroll=self.context_unroll,
                                                                                        buckets=self.context_buckets,
-                                                                                       model_obj=self)
+                                                                                       model_obj=self, context_batch_sizes=self.context_batch_sizes)
         self.decoder_lm_head_for_speculation = {}
         self.decoder_lm_head_for_window_context = {}
 
