@@ -248,7 +248,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 current = estimate
 
             if current == estimate:
-                model = self.decoder_lm_head_for_context[estimate, batch_size]
+                if self.neuron_config.enable_chunked_prefill:
+                    # here the "batch_size" bucket is determined based on the number of blocks needed
+                    block_tables, context_lens = rest[0], rest[1]
+                    block_size = self.neuron_config.continuous_batching.block_size
+                    n_active_blocks = ((context_lens+block_size-1) // block_size).sum().item()
+                    active_block_bucket = bucket.find(self.context_batch_sizes, n_active_blocks)
+                    # we use the model indexed by estimate (i.e., number of queries) and 
+                    # active_block_bucket (i.e., number of active KV cache blocks)
+                    model = self.decoder_lm_head_for_context[estimate, active_block_bucket]
+                else:
+                    model = self.decoder_lm_head_for_context[estimate, batch_size]
                 if self.neuron_config.log_softmax_scores:
                     logits, scores = model(hidden_context, cache_context, start_ids, last_token_id, *rest)
                 elif self.neuron_config.is_eagle_target:
@@ -318,12 +328,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         """
         batch_size, context_length = input_ids.shape
 
+        # define for chunked_prefill (set to size 1 zero tensor when no chunked prefill 
+        # (unused in that case))
+        block_tables = torch.tensor([0])
+        context_lens = torch.tensor([0])
+
         # if last_token_id not used, simply set to 0
         if self.neuron_config.vectorize_last_token_id:
             last_token_id = torch.zeros(batch_size, dtype=torch.int32)
         else:
             last_token_id = torch.as_tensor([0], dtype=torch.int32)
-        if context_length == 1:
+        if context_length == 1 and not self.neuron_config.enable_chunked_prefill:
             # token generation
             if self.neuron_config.paged_attention:
                 max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
@@ -335,11 +350,12 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 last_token_id = input_metadata.block_tables
                 last_token_id = utils.pad(last_token_id, 0, max_num_seqs, left=False)
                 last_token_id = utils.pad(last_token_id, 1, max_num_blocks_per_seq, left=False)
-            return input_ids, cache_ids, last_token_id
+            return input_ids, cache_ids, last_token_id, block_tables, context_lens
 
         # TODO: check context_buckets for compatibility with OPT
-        if cache_ids is not None and cache_ids.flatten()[0].item() > 0:
-            # speculative forward: n_active_tokens > 1 and cache_ids start from position > 0
+        if (cache_ids is not None and cache_ids.flatten()[0].item() > 0) and not self.neuron_config.enable_chunked_prefill:
+            # Speculative forward: n_active_tokens > 1 and cache_ids start from position > 0
+            # For chunked prefill we use context buckets below
             speculation_buckets = list(set([k for k, batch_size in self.decoder_lm_head_for_speculation.keys()]))
             estimate = bucket.find(speculation_buckets, context_length)
         elif hasattr(self, "context_buckets"):
@@ -352,7 +368,32 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             if self.neuron_config.vectorize_last_token_id:
                 if self.neuron_config.use_1d_query:
                     max_num_seqs = self.neuron_config.continuous_batching.batch_size_for_shared_caches
-                    if self.neuron_config.paged_attention:
+                    if self.neuron_config.enable_chunked_prefill:
+                        # define useful variables
+                        input_metadata = kwargs.get("input_metadata")
+                        max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
+                        max_model_len = self.neuron_config.continuous_batching.max_model_len
+                        block_size = self.neuron_config.continuous_batching.block_size
+                        max_num_blocks_per_seq = (max_model_len + block_size - 1) // block_size
+                        # set block_tables based on input_metadata and pad appropriately
+                        input_metadata = kwargs.get("input_metadata")
+                        block_tables = input_metadata.block_tables
+                        block_tables = utils.pad(block_tables, 0, max_num_seqs, left=False)
+                        block_tables = utils.pad(block_tables, 1, max_num_blocks_per_seq, left=False)
+                        # get context_lens and seq_lens from input_metadata
+                        context_lens = input_metadata.context_lens
+                        seq_lens = input_metadata.seq_lens_tensor
+                        query_lens = seq_lens - context_lens
+                        context_lens = utils.pad(context_lens, 0, max_num_seqs, left=False) # padding
+                        # last_token_id is used for dynamic slicing logits
+                        last_token_id = utils.pad(query_lens, 0, max_num_seqs, left=False)
+
+                        # finally we set "context_length" to the total length of queries. We use the context
+                        # encoding model with the queries being the active tokens and hence context_length
+                        # refers to the active tokens (number of queries). This is not to be confused with 
+                        # context_lens from input_metadata which refers to the past tokens for each request. 
+                        context_length = query_lens.sum().item()
+                    elif self.neuron_config.paged_attention:
                         # For context encoding phase of paged attention, we get prompt_lens from input_metadata.
                         input_metadata = kwargs.get("input_metadata")
                         prompt_lens = input_metadata.prompt_lens_tensor
@@ -393,13 +434,17 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 input_ids = utils.pad(input_ids, 1, estimate, left=False)
                 cache_ids = self._pad_cache_ids(cache_ids, batch_size, context_length, estimate)
 
-        return input_ids, cache_ids, last_token_id
+        return input_ids, cache_ids, last_token_id, block_tables, context_lens
 
     def _pad_cache_ids(self, cache_ids, batch_size, context_length, estimate):
         if self.neuron_config.use_2d_cache_ids:
             if self.neuron_config.use_1d_query:
                 assert (cache_ids.ndim == 2) and (cache_ids.shape[0] == 1), \
                     f"cache_ids is expected to be a 1xN matrix, but its shape is {cache_ids.shape}"
+                if self.neuron_config.enable_chunked_prefill:
+                    # in this case, just pad with 0s 
+                    cache_ids = utils.pad(cache_ids, 1, estimate, left=False)
+                    return cache_ids
                 start_idx = cache_ids[0, -1].item() + 1
                 end_idx = estimate + start_idx - context_length
                 pad_elements = torch.arange(start_idx, end_idx, dtype=torch.long).unsqueeze(0)
@@ -441,7 +486,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
 
-        if n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0:
+        if (n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0) or self.neuron_config.enable_chunked_prefill:
             # context encoding
             n_active_seqs, n_active_tokens = input_ids.shape
             continuous_batching_n_positions = bucket.find(self.context_buckets, n_active_tokens)
@@ -532,7 +577,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         input_ids, cache_ids, new_start_ids = self._prepare_for_continuous_batching(input_ids, cache_ids, start_ids)
 
         # right pad the input_ids if neccessary
-        input_ids, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids, start_ids, **kwargs)
+        input_ids, cache_ids, last_token_id, block_tables, context_lens = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids, start_ids, **kwargs)
         start_ids = new_start_ids
 
         # note: this context_length is after right padded
@@ -549,13 +594,13 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         if hasattr(self, "prefixed_length") and self.prefixed_length:
             cache_ids += self.prefixed_length
 
-        return input_ids, cache_ids, start_ids, last_token_id
+        return input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens
 
     def _postprocess(self, input_ids, logits, start_ids=None, **kwargs):
         if start_ids is None or (self.neuron_config.output_all_logits and logits.shape[1] > 1):
             return logits
 
-        if self.neuron_config.paged_attention:
+        if self.neuron_config.paged_attention and not self.neuron_config.enable_chunked_prefill:
             input_metadata = kwargs.get("input_metadata")
             is_prompt = input_metadata.is_prompt
             if is_prompt:
@@ -570,7 +615,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         input_batch_size = start_ids.shape[0]
         seq_ids = start_ids.flatten()
-        if torch.equal(seq_ids, torch.arange(input_batch_size)):
+        if self.neuron_config.enable_chunked_prefill:
+            return logits
+        elif torch.equal(seq_ids, torch.arange(input_batch_size)):
             logits = logits[:input_batch_size]
         else:
             logits = logits[seq_ids.to(torch.long)]
@@ -590,7 +637,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         input_batch_size = hidden.shape[0] if is_bsh or self.neuron_config.on_device_embedding else hidden.shape[2]
         assert hasattr(self, "context_batch_sizes"), f"{type(self)} doesn't support dynamic batching."
 
-        running_batch_size = self.context_batch_sizes[-1]
+        # set running batch size to 1 for enable_chunked_prefill because context_batch_sizes is used for block bucketing
+        running_batch_size = 1 if self.neuron_config.enable_chunked_prefill else self.context_batch_sizes[-1]
         if input_batch_size > running_batch_size:
             assert input_batch_size % running_batch_size == 0, \
                 "input batch size ({input_batch_size}) not divisible by running batch size ({running_batch_size})"

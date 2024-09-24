@@ -96,6 +96,9 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     else:
         start_ids = s32[batch_size].Parameter(parameter_number=2)
 
+    block_table = None
+    context_lens = None
+
     # Build parameters for last_token_id and others
     if cache_2d:
         if neuron_config and neuron_config.use_1d_query and n_active_tokens > 1:
@@ -111,17 +114,35 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
         else:
             # regular token gen
             last_token_id = s32[batch_size].Parameter(parameter_number=3)
+        if neuron_config and neuron_config.enable_chunked_prefill:
+            # need to add two more inputs, block_table and context_lens
+            max_model_len = neuron_config.continuous_batching.max_model_len
+            block_size = neuron_config.continuous_batching.block_size
+            max_num_blocks_per_seq = (max_model_len + block_size - 1) // block_size
+            max_num_seqs = neuron_config.continuous_batching.batch_size_for_shared_caches
+            block_table = s32[max_num_seqs, max_num_blocks_per_seq].Parameter(parameter_number=4)
+            context_lens = s32[max_num_seqs].Parameter(parameter_number=5)
     else:
         last_token_id = s32[1].Parameter(parameter_number=3)
+
+    # add block tables and context lens parameters as single length tensors 
+    # when chunked prefill is not enabled. In this case, these inputs are not used
+    # but are kept for consistency and are defined as length 1 tensors.
+    if not block_table:
+        block_table = s32[1].Parameter(parameter_number=4)
+    if not context_lens:
+        context_lens = s32[1].Parameter(parameter_number=5)
 
     sequence_slice_dimensions = (
         1,                        # hidden        | In both HSB/BSH the sequence dim is 1
         1 if cache_2d else 0,     # cache_ids     | Sequence dim varies based on alignment
         None,                     # start_ids     | Offset is per batch, no slicing required
         0 if cache_2d else None,  # last_token_id | Scalar, no slicing required
+        None,                     # block_table   | No sequence dim
+        None,                     # context_lens  | No sequence dim
     )
 
-    return (hidden, cache_ids, start_ids, last_token_id), sequence_slice_dimensions
+    return (hidden, cache_ids, start_ids, last_token_id, block_table, context_lens), sequence_slice_dimensions
 
 
 def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head_weight, lm_head_bias, return_all_outputs=True, neuron_config=None):

@@ -148,7 +148,7 @@ class OPTForSampling(base.NeuronModelBase):
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
 
-        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        inputs, cache_ids, start_ids, last_token_id, block_tables, context_lens = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.decoder.embed_tokens(inputs)
@@ -170,7 +170,7 @@ class OPTForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
-        result = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+        result = self._forward(inputs, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start)
         self.num_processed_tokens += (last_token_id+1)
         return result
 
@@ -287,7 +287,7 @@ class OPTForSamplingNoEmbeddingHlo:
         tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=6)
         return (*tensors, curr_window_start), (*dims, None)
 
     def embed_positions_ids(self, position_ids, start_ids):
@@ -301,7 +301,7 @@ class OPTForSamplingNoEmbeddingHlo:
         mask = hlo.less(position_ids, zero)
         return hlo.masked_select(mask, zero, position_ids)
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, wte, wpe):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start, wte, wpe):
         dtype = getattr(input_ids.scribe, self.amp)
         inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
         position_ids = self.embed_positions_ids(cache_ids, start_ids)
@@ -319,7 +319,7 @@ class OPTForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start, *weights):
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
                                                last_token_id=last_token_id, neuron_config=self.neuron_config)
         return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask

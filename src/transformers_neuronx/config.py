@@ -79,6 +79,9 @@ class ContinuousBatchingConfig:
         self.max_num_seqs = kwargs.pop("max_num_seqs") if kwargs.get("max_num_seqs", None) is not None else kwargs.pop("batch_size_for_shared_caches")
         self.max_model_len = kwargs.pop("max_model_len") if kwargs.get("max_model_len", None) is not None else None
         self.optimized_paged_attention = kwargs.pop("optimized_paged_attention") if kwargs.get("optimized_paged_attention", None) is not None else False
+        self.enable_chunked_prefill = kwargs.pop("enable_chunked_prefill") if kwargs.get("enable_chunked_prefill", None) is not None else False
+        if self.enable_chunked_prefill:
+            assert self.optimized_paged_attention, "chunked prefill is only supported with optimized paged attention"
         self.block_size = None
         self.num_blocks = None
         assert len(kwargs) == 0, f"unexpected key word arguments: {kwargs.keys()}"
@@ -363,6 +366,10 @@ class NeuronConfig():
         if self.continuous_batching:
             return self.continuous_batching._paged_attention and self.bsh_cache_layout
         return False
+
+    @property
+    def enable_chunked_prefill(self):
+        return self.paged_attention and self.continuous_batching.enable_chunked_prefill
 
     @property
     def optimized_paged_attention(self):

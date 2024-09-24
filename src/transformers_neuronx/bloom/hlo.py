@@ -30,7 +30,7 @@ class BloomForSamplingNoEmbeddingHlo:
         )
         return tensors, dims
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, slopes, word_embeddings, ln_weight, ln_bias):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, slopes, word_embeddings, ln_weight, ln_bias):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(word_embeddings, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -41,7 +41,7 @@ class BloomForSamplingNoEmbeddingHlo:
         return hlo.layer_norm_bsh(hidden, ln_weight, ln_bias) if is_bsh \
                else hlo.layer_norm(hidden, ln_weight, ln_bias)
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *pre_layer_weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *pre_layer_weights):
         slopes, *rest = pre_layer_weights
         mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
                                                last_token_id=last_token_id, neuron_config=self.neuron_config)

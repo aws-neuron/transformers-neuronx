@@ -452,7 +452,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
 
-        inputs, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
+        inputs, cache_ids, last_token_id, *_ = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
         batch_size, context_length = inputs.shape
 
         model = self.decoder_lm_head
