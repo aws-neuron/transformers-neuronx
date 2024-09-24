@@ -39,7 +39,7 @@ class MistralForSamplingNoEmbeddingHlo:
         )
         return tensors, dims
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, embed_weight):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, embed_weight):
         dtype = getattr(input_ids.scribe, self.config.amp)
         hidden = hlo.embedding(embed_weight, input_ids, tp_degree=self.config.tp_degree, dtype=dtype)
         if self.config.hidden_size % self.config.tp_degree != 0:
@@ -48,7 +48,7 @@ class MistralForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights):
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights):
         head_dim = self.config.attention_head_size
         pos_embed = rotary.hlo_rotary_embedding(
             hidden.dtype, int(head_dim * self.config.rotary_percentage), cache_ids,

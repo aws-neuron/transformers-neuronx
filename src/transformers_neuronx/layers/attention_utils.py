@@ -373,10 +373,14 @@ def contexted_kv(cached_keys, active_keys, cached_mask, cached_to_ctx, active_to
     for cached and active tokens. Then the cached mask is used to selectively load these tokens.
     """
     n_blocks, block_size, _, _ = cached_keys.sizes
-    _, _, n_kv_head, d_head = active_keys.sizes
+    bs, active_seq_len, n_kv_head, d_head = active_keys.sizes
+    assert bs == 1, "batch size is 1 for chunked prefill"
     max_num_keys = cached_to_ctx.sizes[0]
     sizes = max_num_keys, 1, n_kv_head, d_head
     dtype = cached_keys.dtype
+
+    # active_keys is in BSH layout, need to reshape
+    active_keys = hlo.reshape(active_keys, (active_seq_len, 1, n_kv_head, d_head))
 
     # cached keys/values are loaded as blocks from HBM to SRAM
     cached_keys = hlo.reshape(cached_keys, (n_blocks*block_size, n_kv_head*d_head))
@@ -389,6 +393,9 @@ def contexted_kv(cached_keys, active_keys, cached_mask, cached_to_ctx, active_to
 
     # cached mask is used to selectively load cached or active keys/values
     merged_keys = hlo.masked_select(cached_mask, cached_keys, active_keys)
+
+    # convert to BSH layout
+    merged_keys = hlo.reshape(merged_keys, (1, max_num_keys, n_kv_head, d_head))
 
     return merged_keys
 
