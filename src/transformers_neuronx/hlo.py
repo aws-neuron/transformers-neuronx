@@ -1938,7 +1938,7 @@ def dynamic_slice_along(tensor, dim, start, size):
     )
     assert not isinstance(start, int), (
         f"Parameter 'start' must be a tensor. Found type={type(size)}"
-    )
+)
     assert len(start.sizes) == 0, (
         f"Parameter 'start' must be a scalar. Found shape={start.sizes}"
     )
@@ -3233,7 +3233,7 @@ def decoder_attention_block_diagonal_causal_from_bottomright_mask(num_queries, n
       nc = num_keys[seq_id]
 
     we can trim the triangle mask from different directions, in order to get the desired shape.
-    
+
                  (0, ci+nc-ri-nr)
     +--------------------+----------------------------------+
     |                      \                                |
