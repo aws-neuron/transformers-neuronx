@@ -235,6 +235,7 @@ def main():
     run_parser.add_argument('--sequence_parallel_norm', action='store_true')
     run_parser.add_argument('--sequence_parallel_norm_threshold', type=int, default=2048)
     run_parser.add_argument('--shard_over_sequence', action='store_true')
+    run_parser.add_argument('--duplicate_q_weight_sos', action='store_true')
     run_parser.add_argument('--weight_tiling', action='store_true')
     # logging
     run_parser.add_argument('--debug', action='store_true')
@@ -563,6 +564,7 @@ def run(args, hf_model_name, model_cls):
 
             neuron_config = NeuronConfig(
                 shard_over_sequence=args.shard_over_sequence,
+                duplicate_q_weight_sos=args.duplicate_q_weight_sos,
                 group_query_attention=args.gqa,
                 quant=QuantizationConfig(quant_dtype="s8", dequant_dtype=args.amp) if args.quant else None,
                 kv_cache_quant=KVCacheQuantizationConfig(quant_dtype='f8e4m3fn', dequant_dtype='bf16') if args.kv_cache_quant else None,

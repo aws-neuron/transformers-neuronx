@@ -194,6 +194,7 @@ class NeuronConfig():
         mlp_out_weight_transpose: transpose the mlp output weight layout from [H, F] into [F, H]. `default=False`
         log_softmax_scores: Return log-softmax scores along with logits.
         shard_over_sequence: Enables flash decoding / sequence parallel attention for token gen models, `default=False`
+        duplicate_q_weight_sos: Duplicate q weights to skip allgather in shard_over_sequence
         output_all_logits: Return all logits from each model invocation.
         fused_rmsnorm_qkv: Use the fused RMS norm and QKV input projection kernel.
         fused_rmsnorm_mlp: Use the fused RMSNorm and MLP BIR kernel for llama3.
@@ -233,6 +234,7 @@ class NeuronConfig():
         is_eagle_draft: bool = False,
         has_pre_attention_norm: bool = True,
         compilation_worker_count: Optional[int] = None,
+        duplicate_q_weight_sos: bool = False,
         **kwargs,
     ):
         self.all_reduce_dtype = all_reduce_dtype
@@ -331,14 +333,14 @@ class NeuronConfig():
 
         self.fused_rmsnorm_qkv = fused_rmsnorm_qkv
         self.fused_rmsnorm_mlp = fused_rmsnorm_mlp
-        
-        if any([not self.fuse_qkv, 
-                self.attention_layout != Layout.BSH, 
-                self.group_query_attention != GQA.REPLICATED_HEADS, 
+
+        if any([not self.fuse_qkv,
+                self.attention_layout != Layout.BSH,
+                self.group_query_attention != GQA.REPLICATED_HEADS,
                 self.sequence_parallel_norm]):
             self.fused_rmsnorm_qkv = False
-            
-        if any([self.attention_layout != Layout.BSH, 
+
+        if any([self.attention_layout != Layout.BSH,
                 self.group_query_attention != GQA.REPLICATED_HEADS]):
             self.fused_rmsnorm_mlp = False
 
@@ -347,6 +349,8 @@ class NeuronConfig():
         if self.shard_over_sequence:
             assert self.sparse_attn is None, f"sparse attn is not supported with flash decoding"
             assert self.cache_layout == Layout.SBH, f"flash decoding only support SBH layout , got {self.cache_layout}"
+
+        self.duplicate_q_weight_sos = duplicate_q_weight_sos
 
         self.is_eagle_target = is_eagle_target
         self.is_eagle_draft = is_eagle_draft
