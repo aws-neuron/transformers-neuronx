@@ -606,6 +606,13 @@ class LlamaForSamplingNoEmbeddingHlo:
                 n_kv_heads_tp=n_kv_heads_tp,
             )
 
+        if active_mask is None and self.neuron_config.shard_over_sequence and self.neuron_config.duplicate_q_weight_sos:
+            # slice on computed qeury when sos and duplicate Q weights is on
+            kv_replication_constant = core_id.dtype.Constant(constant_value=self.neuron_config.kv_replication)
+            slice_start = hlo.remainder(hlo.reshape(core_id,[]), kv_replication_constant)
+            slice_size = self.neuron_config.n_head_padded // tp_degree
+            query = hlo.dynamic_slice_along(query, 2, start=slice_start, size=slice_size)
+
         # Q = Rotate(Q)
         # K = Rotate(K)
         query, key = rotary.rotate_half(query, key, pos_embed, self.config.rotary_percentage,
@@ -664,7 +671,8 @@ class LlamaForSamplingNoEmbeddingHlo:
                 cached_keys_s = cached_keys
                 cached_values_s = cached_values
             # Communication 1: all-gather query from cores
-            if (n_active_tokens != self.n_positions) and self.neuron_config.shard_over_sequence:
+            # skip all-gather if query weight is already duplicated
+            if (n_active_tokens != self.n_positions) and self.neuron_config.shard_over_sequence and not self.neuron_config.duplicate_q_weight_sos:
                 query = flash_decoding.gather_query_group(query, self.cores_per_kv_head,
                                                   n_head,
                                                   tp_degree)

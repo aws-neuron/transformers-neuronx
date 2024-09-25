@@ -1369,6 +1369,7 @@ class DecoderLayer(torch.nn.Module):
 
     def to_neuron(self):
         # If we allow padding then we need to pad non-sharded QKV weight dimensions
+        self.neuron_config.n_head_padded = self.n_head
         if self.allow_pad:
             # Hidden size padding
             _, hidden_size = self.attn_q_weight.shape
@@ -1376,6 +1377,7 @@ class DecoderLayer(torch.nn.Module):
 
             n_head_padded, n_kv_heads_padded = utils.get_qkv_padding(n_heads, self.n_kv_head, self.tp_degree, self.neuron_config)
             self.n_head_padded = n_head_padded
+            self.neuron_config.n_head_padded = self.n_head_padded
 
             hidden_size_padded = hidden_size_padded_qkv = n_head_padded * self.attention_head_size
             if self.neuron_config.group_query_attention == constants.GQA.ALL_GATHER_HEADS:
@@ -1465,6 +1467,8 @@ class DecoderLayer(torch.nn.Module):
                     self.attn_v_bias = repeat(self.attn_v_bias)
                     self.n_kv_head *= ratio
                 self.kv_replication = ratio
+                # FIXME: As a workaround to get kv_replication info (after padding) in HLO construction
+                self.neuron_config.kv_replication = self.kv_replication
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = qkv_maybe_pad(self.attn_k_weight, dim=1)
@@ -1483,6 +1487,19 @@ class DecoderLayer(torch.nn.Module):
                 view_shape = (stride, shape[0]//stride,shape[1]) if dim == 0 else (shape[0],stride, shape[1]//stride)
                 return (tensor.reshape(view_shape).permute(1, 0, 2).reshape(shape) if dim == 0
                                 else tensor.reshape(view_shape).permute(0, 2, 1).reshape(shape))
+
+            if self.neuron_config.shard_over_sequence and self.neuron_config.duplicate_q_weight_sos:
+                q_weight = self.attn_q_weight
+                q_weight = q_weight.reshape(-1, n_kv_heads_padded, self.n_head_padded // n_kv_heads_padded, self.attn_q_weight.shape[-1] // self.n_head_padded)
+                q_weight = q_weight.repeat(1, 1, self.kv_replication, 1)
+                self.attn_q_weight = q_weight.reshape(-1, self.kv_replication*self.attn_q_weight.shape[-1])
+
+                if self.attn_q_bias is not None:
+                    q_bias = self.attn_q_bias
+                    q_bias = q_bias.reshape(n_kv_heads_padded, self.n_head_padded // n_kv_heads_padded, self.attn_q_bias.shape[-1] // self.n_head_padded)
+                    q_bias = q_bias.repeat(1, self.kv_replication, 1)
+                    self.attn_q_bias = q_bias.reshape(-1)
+
 
             if node_interleaving:
                 n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE
@@ -1573,7 +1590,7 @@ class DecoderLayer(torch.nn.Module):
 
         if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
             self.fused_pre_attn_ln_qkv_weight = (fused_qkv_weight.T * self.pre_attn_ln_weight.to(dtype=fused_qkv_weight.dtype)).T
-        
+
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
