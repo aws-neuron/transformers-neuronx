@@ -680,8 +680,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         This is the special unroll function that returns the output hidden for EAGLE draft model.
         """
         last_token_id = tensors[2]
-        prev_hidden = tensors[3]
-        tensors = tensors[0:3]
+        prev_hidden = tensors[5]
+        tensors = tensors[0:5]
         hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
         hidden = hlo.concatenate([hidden, prev_hidden], 2)
         hidden, *tensors = self.builder.eagle_draft_pre_layer(hidden, *tensors, *pre_layer_params, position_ids=position_ids)

@@ -351,7 +351,9 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             (tokens, 
              cache_ids, 
              start_ids, 
-             last_token_id, 
+             last_token_id,
+             block_tables,
+             context_lens,
              prev_hidden, 
              tree_mask, 
              update_indices, 
@@ -412,7 +414,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             hidden_update_indices = hlo.broadcast(hidden_update_indices, [batch_size, self.k-1, hidden_size], [0, 1, 2])
  
             for _ in range(self.depth-1):
-                tensors = draft_cache_ids, start_ids, last_token_id, prev_hidden
+                tensors = draft_cache_ids, start_ids, last_token_id, block_tables, context_lens, prev_hidden
                 logits, new_hidden, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, tree_mask, position_ids)
                 logits = hlo.permute(logits, (2, 1, 0))
                 _, new_tokens = hlo.topk(logits, k=self.width, dim=2, tp_degree=self.tp_degree)
@@ -449,7 +451,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 k_cache, v_cache = fused_kv_update_cache(k_cache, v_cache, cache_scatter_indices, target_cache_keys, target_cache_values, start_ids, self.neuron_config)
                 caches.append([k_cache, v_cache])
 
-            tensors = target_cache_ids, start_ids, last_token_id
+            tensors = target_cache_ids, start_ids, last_token_id, block_tables, context_lens
             position_ids = hlo.add(position_ids, 1)
             target_scores, hidden, caches = target._hlo_eagle_target_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params, tree_mask, position_ids)
             target._hlo_cache_aliases(in_caches, caches)
@@ -458,7 +460,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             # Need to use target's hidden to update the draft cache
             new_hidden = hlo.gather(hidden, 1, hidden_update_indices)
             prev_hidden = hlo.concatenate([orig_hidden, new_hidden], 1)
-            tensors = draft_cache_ids, start_ids, last_token_id, prev_hidden
+            tensors = draft_cache_ids, start_ids, last_token_id, block_tables, context_lens, prev_hidden
             logits, _, draft_caches = draft._hlo_eagle_draft_unroll(tokens, tensors, draft_caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, tree_mask, draft_position_ids)
             draft_scores = logits
             draft._hlo_cache_aliases(draft_in_caches, draft_caches)
@@ -692,12 +694,16 @@ class EagleSpeculativeDecoder(torch.nn.Module):
 
             last_token_id = torch.as_tensor([0], dtype=torch.int32).expand(batch_size)
             position_ids = self._get_position_ids(batch_size, cache_ids)
+            block_tables = torch.as_tensor([0])
+            context_lens = torch.as_tensor([0])
 
             outputs = self.speculator.execute(
                     token_id, 
                     cache_ids, 
                     start_ids, 
                     last_token_id, 
+                    block_tables,
+                    context_lens,
                     hidden, 
                     tree_mask, 
                     update_indices, 
@@ -917,6 +923,8 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         seq_ids_pad = torch.arange(graph_batch_size)
 
         last_token_id = torch.as_tensor([0], dtype=torch.int32).expand(graph_batch_size)
+        block_tables = torch.as_tensor([0])
+        context_lens = torch.as_tensor([0])
         tree_mask = generate_attention_mask(self.token_tree)
         update_indices = self._get_update_indices(graph_batch_size)
         hidden_update_indices = self._get_hidden_update_indices(graph_batch_size)
@@ -929,6 +937,8 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             cache_ids_pad,
             seq_ids_pad,
             last_token_id,
+            block_tables,
+            context_lens,
             hidden_pad,
             tree_mask,
             update_indices,

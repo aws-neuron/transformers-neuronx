@@ -60,11 +60,11 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Allow tree based speculation inputs
         if cache_2d:
             position_sizes = batch_size, n_active_tokens
-            previous_cache_ids = s32[position_sizes].Parameter(parameter_number=4)
-            reorder_mapping = s32[position_sizes].Parameter(parameter_number=5)
+            previous_cache_ids = s32[position_sizes].Parameter(parameter_number=6)
+            reorder_mapping = s32[position_sizes].Parameter(parameter_number=7)
         else:
-            previous_cache_ids = s32[n_active_tokens].Parameter(parameter_number=4)
-            reorder_mapping = s32[n_active_tokens].Parameter(parameter_number=5)
+            previous_cache_ids = s32[n_active_tokens].Parameter(parameter_number=6)
+            reorder_mapping = s32[n_active_tokens].Parameter(parameter_number=7)
         seq_slice_dim = 1 if cache_2d else 0
 
         return (*tensors, previous_cache_ids, reorder_mapping), (*dims, seq_slice_dim, seq_slice_dim)
@@ -73,25 +73,25 @@ class LlamaForSamplingNoEmbeddingHlo:
         # Should use token_tree_inputs
         tensors, dims = self.inputs(scribe, dtype, n_active_tokens, batch_size)
         hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
-        prev_hidden = dtype[hidden_sizes].Parameter(parameter_number=4)
+        prev_hidden = dtype[hidden_sizes].Parameter(parameter_number=6)
         if not token_tree:
             return (*tensors, prev_hidden), (*dims, 1)
         s32 = scribe.s32
         tree_mask_sizes = k, k
-        tree_mask = s32[tree_mask_sizes].Parameter(parameter_number=5)
+        tree_mask = s32[tree_mask_sizes].Parameter(parameter_number=7)
         indices_sizes = batch_size, k-1
-        update_indices = s32[indices_sizes].Parameter(parameter_number=6)
+        update_indices = s32[indices_sizes].Parameter(parameter_number=8)
         hidden_update_sizes = batch_size, k-1
-        hidden_update_indices = s32[hidden_update_sizes].Parameter(parameter_number=7)
+        hidden_update_indices = s32[hidden_update_sizes].Parameter(parameter_number=9)
         cache_update_sizes = batch_size, depth
-        cache_gather_indices = s32[cache_update_sizes].Parameter(parameter_number=8)
-        cache_scatter_indices = s32[cache_update_sizes].Parameter(parameter_number=9)
+        cache_gather_indices = s32[cache_update_sizes].Parameter(parameter_number=10)
+        cache_scatter_indices = s32[cache_update_sizes].Parameter(parameter_number=11)
         pos_sizes = batch_size, k
-        position_ids = s32[pos_sizes].Parameter(parameter_number=10)
+        position_ids = s32[pos_sizes].Parameter(parameter_number=12)
         path_sizes = n_leaves, depth
-        all_paths = s32[path_sizes].Parameter(parameter_number=11)
+        all_paths = s32[path_sizes].Parameter(parameter_number=13)
         mask_sizes = n_entrees, width
-        path_mask = s32[mask_sizes].Parameter(parameter_number=12)
+        path_mask = s32[mask_sizes].Parameter(parameter_number=14)
         return (*tensors,
                 prev_hidden,
                 tree_mask,
@@ -124,9 +124,9 @@ class LlamaForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def token_tree_embedding(self, input_ids, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping,
+    def token_tree_embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, previous_cache_ids, reorder_mapping,
                              *weights):
-        return self.embedding(input_ids, cache_ids, start_ids, last_token_id, *weights)
+        return self.embedding(input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights)
 
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
         # TODO: move this fallback calculation to decoder.py
@@ -194,7 +194,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id, \
                block_tables, cached_mask, cached_to_contexted, active_to_contexted
 
-    def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, previous_cache_ids, reorder_mapping, *weights):
+    def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, previous_cache_ids, reorder_mapping, *weights):
         hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
         if self.neuron_config.on_device_embedding:
             embed_weight, token_tree_mask = weights
@@ -203,7 +203,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
 
-    def eagle_draft_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=None):
+    def eagle_draft_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
         if self.config.bias:
             embed_weight, fc_weight, fc_bias, *rst = weights
         else:
