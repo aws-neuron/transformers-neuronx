@@ -98,7 +98,6 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
 
     block_table = None
     context_lens = None
-
     # Build parameters for last_token_id and others
     if cache_2d:
         if neuron_config and neuron_config.use_1d_query and n_active_tokens > 1:

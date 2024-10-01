@@ -348,7 +348,8 @@ class NeuronConfig():
 
         if self.shard_over_sequence:
             assert self.sparse_attn is None, f"sparse attn is not supported with flash decoding"
-            assert self.cache_layout == Layout.SBH, f"flash decoding only support SBH layout , got {self.cache_layout}"
+            if not (self.continuous_batching and self.continuous_batching.optimized_paged_attention):
+                assert self.cache_layout == Layout.SBH, f"flash decoding only support SBH layout , got {self.cache_layout}"
 
         self.duplicate_q_weight_sos = duplicate_q_weight_sos
 
