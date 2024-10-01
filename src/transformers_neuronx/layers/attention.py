@@ -704,7 +704,7 @@ def context(past_scores, active_score, past_values, active_values,
     return output
 
 
-def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, tp_degree=None, neuron_config=None):
+def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, tp_degree=None, neuron_config=None, skip_softmax=False):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -727,7 +727,10 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
         shard_over_batch = neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
-    probs = hlo.softmax(score)
+    if skip_softmax:
+        probs = score
+    else:
+        probs = hlo.softmax(score)
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
         probs = sparse_attn_mask(probs, sparse_mask, constant_value=0)
@@ -763,7 +766,7 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
         rhs_contracting_dimensions=rhs_contracting_dimensions,
         rhs_batch_dimensions=rhs_batch_dimensions
     )
-    result = hlo.dot_general(probs, values, dimension_numbers=dot_dims)
+    result = hlo.dot_general(probs, values, dimension_numbers=dot_dims, dtype=dtype)
 
     if n_kv_heads != 0:
         if shard_over_batch:

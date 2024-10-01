@@ -589,6 +589,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # For page attention we are replacing the batch size with the active blocks,
             # And the n_positions used for the various block sizes corresponded to the max n_position.
             if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+                # do not compile token decoder for chunked prefill
+                if self.neuron_config.enable_chunked_prefill:
+                    return None
                 # Taking block sizes based on n_positions,block_size for bucketing.
                 block_sizes = [n_pos * self.neuron_config.continuous_batching.max_num_seqs // self.neuron_config.continuous_batching.block_size for n_pos in self.n_positions_list]
                 assert max(block_sizes) <= self.neuron_config.continuous_batching.num_blocks, "Too few blocks allocated, consider increasing gpu_memory_utilization or override"
@@ -912,7 +915,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         for layer in layers:
             layer_caches = []
             if self.neuron_config.shard_over_sequence:
-                dim_size = {k:n_positions//layer.kv_replication for k in dim_size.keys()}
+                if self.neuron_config.enable_chunked_prefill:
+                    dim_size = {k:block_size//layer.kv_replication for k in dim_size.keys()}
+                else:
+                    dim_size = {k:n_positions//layer.kv_replication for k in dim_size.keys()}
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
                 par = param_builder.from_tensor(cache, dim_size=dim_size)
                 layer_caches.append(par)
@@ -1754,13 +1760,20 @@ class DecoderLayer(torch.nn.Module):
                 # note here we use kv_replication since self.n_kv_head is replicated
                 # for SOS we need original n_kv_head before replication
                 kv_replication = self.kv_replication
-                cache_shape = [self.n_positions*self.tp_degree//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
-                cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8).to(torch.float8_e4m3fn) \
-                    if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn \
-                    else torch.zeros(cache_shape, dtype=self.cache_dtype)
-                self.cache_shape[batch_size] = [self.n_positions//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
-                self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
-                self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                if self.neuron_config.paged_attention:
+                    cache_shape = [num_blocks, block_size*self.tp_degree//kv_replication, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+                    self.cache_shape[batch_size] = [num_blocks, block_size//kv_replication, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+                    self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+                else:
+                    cache_shape = [self.n_positions*self.tp_degree//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8).to(torch.float8_e4m3fn) \
+                        if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn \
+                        else torch.zeros(cache_shape, dtype=self.cache_dtype)
+                    self.cache_shape[batch_size] = [self.n_positions//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                    self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
             else:
                 assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
                     f"cannot shard along kv_heads dimension: n_kv_head={n_heads_kv_cache}, tp_degree={self.tp_degree}"

@@ -14,6 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo
 from transformers_neuronx import constants
+from transformers_neuronx import utils
 from neuronxcc.nki.kernels.attention import flash_fwd
 try:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel
@@ -398,6 +399,212 @@ def contexted_kv(cached_keys, active_keys, cached_mask, cached_to_ctx, active_to
     merged_keys = hlo.reshape(merged_keys, (1, max_num_keys, n_kv_head, d_head))
 
     return merged_keys
+
+
+def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_id, sos_degree=1):
+    """
+    Mask the slot mapping in shard over sequence strategy.
+
+    Example:
+
+    INPUTS:
+    query_lens   = [1, 5, 5]
+    key_lens     = [5, 8, 0]
+    block_size   = 6
+    sos_degree   = 3
+    -->
+    KV cache in cache block format: (position_id, slot_mapping) 
+    new token: <position_id, slot_mapping>
+
+    Block ID
+             <---- NC0 ---->  | <---- NC1 ---->  | <---- NC2 ----> 
+        0    (0, 0), (1, 1)   | (2, 0), (3, 1)   | (4, 0), <5, 1>     (seq 0)
+        2    (0, 4), (1, 5)   | (2, 4), (3, 5)   | (4, 4), (5, 5)     (seq 1)
+        3    (6, 6), (7, 7)   | <8, 6>, <9, 7>   | <10, 6>, <11, 7>   (seq 1)
+        4    <12, 8>,         |                  |                    (seq 1)
+        6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
+
+    Args:    
+        slot_mapping = [5, 20, 21, 22, 23, 24, 36, 37, 38, 39, 40]
+        position_ids = [5, 8, 9, 10, 11, 12, 0, 1, 2, 3, 4]
+        block_size   = 6
+        core_id      = 2
+        sos_degree   = 3
+        
+        We first map slot_mapping from global view to local view.
+        slot_mapping = [1, 6, 7, 6, 7, 8, 12, 13, 12, 13, 12]
+
+    OUTPUTS:
+        masked_slotmapping = [1, x, x, 6, 7, x, x, x, x, x, 12]
+
+    In this example, we only leave the slot mapping on NC2 (core_id = 2), and x represents masked out.
+    """
+    sharded_block_size = block_size // sos_degree
+    # build mask
+    flat_position_ids = hlo.reshape(position_ids, (position_ids.sizes[1],))
+    mapped_position_ids = hlo.divide(flat_position_ids, sharded_block_size)
+    token_on_sos_rank = hlo.remainder(mapped_position_ids, sos_degree)
+    core_id = hlo.cast(core_id, slot_mapping.scribe.s32)
+    core_sos_rank = hlo.broadcast(hlo.remainder(core_id, sos_degree), slot_mapping.sizes, [0])
+    mask = hlo.cast(hlo.equal(token_on_sos_rank, core_sos_rank), slot_mapping.dtype)
+
+    # convert global slot_mapping to local slot_mapping
+    slot_mapping = hlo.add(hlo.multiply(hlo.divide(slot_mapping, block_size), sharded_block_size), hlo.remainder(slot_mapping, sharded_block_size))
+    masked_slot_mapping = hlo.multiply(slot_mapping, mask)
+    return masked_slot_mapping
+
+
+def sharded_kv_indexing(seq_lens, max_num_keys, block_size, block_tables, core_id, sos_degree=1):
+    """
+    Select KV cache blocks and gather assigned blocks into output buffer for shard over sequence strategy.
+
+    Example:
+
+    INPUTS:
+    query_lens   = [1, 5, 5]
+    key_lens     = [5, 8, 0]
+    block_size   = 6
+    sos_degree   = 3
+    -->
+    KV cache in cache block format: (position_id, slot_mapping) 
+    new token: <position_id, slot_mapping>
+    We suppose all the tokens have been written into the KV cache.
+
+    Block ID
+             <---- NC0 ---->  | <---- NC1 ---->  | <---- NC2 ----> 
+        0    (0, 0), (1, 1)   | (2, 0), (3, 1)   | (4, 0), <5, 1>     (seq 0)
+        2    (0, 4), (1, 5)   | (2, 4), (3, 5)   | (4, 4), (5, 5)     (seq 1)
+        3    (6, 6), (7, 7)   | <8, 6>, <9, 7>   | <10, 6>, <11, 7>   (seq 1)
+        4    <12, 8>,         |                  |                    (seq 1)
+        6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
+
+    Args:
+        seq_lens = [6, 13, 5]
+        core_id  = 2
+
+    OUTPUTS:
+        active_idx = [0, 1,   # seq 0
+                      4, 5,   # seq 1
+                      6, 7,   # seq 1
+                      x, x,   # seq 1 (x is pad)
+                      12, x]  # seq 2
+    """
+    s32 = seq_lens.scribe.s32
+    sharded_block_size = block_size // sos_degree
+    max_num_seqs, = seq_lens.sizes
+    # compute sharded_seq_lens
+    base_num_blocks = hlo.divide(seq_lens, block_size)
+    remainder = hlo.subtract(seq_lens, hlo.multiply(base_num_blocks, block_size))
+    core_sos_rank = hlo.remainder(hlo.cast(core_id, s32), sos_degree)
+    core_sos_rank_br = hlo.broadcast(hlo.multiply(core_sos_rank, sharded_block_size), remainder.sizes, [0])
+    core_remainder = hlo.subtract(remainder, core_sos_rank_br)
+    core_remainder = hlo.minimum(hlo.maximum(core_remainder, 0), sharded_block_size)
+    sharded_seq_lens = hlo.add(hlo.multiply(base_num_blocks, sharded_block_size), core_remainder)
+    sharded_seq_cumsum = hlo.concatenate([hlo.full(0, s32, [1]), hlo.cumsum(sharded_seq_lens, dim=0)], dimension=0)
+    sharded_seq_steps = hlo.slice_along(sharded_seq_cumsum, dim=0, limit=max_num_seqs)
+
+    # compute block-wise cache loading index, according to the equation
+    # > old_start = cumsum((seq_lens+block_size-1) // block_size) * block_size
+    block_lens = hlo.divide(hlo.add(seq_lens, block_size-1), block_size)
+    block_lens = hlo.concatenate([hlo.full(0, s32, [1]), block_lens], dimension=0)
+    # [3, 5, 4, 0] -(divide)-> [1, 2, 1, 0] -> [0, 1, 2, 1, 0] -(cumsum)-> [0, 1, 3, 4, 4] -> [0, 4, 12, 16, 16]
+    sharded_seq_start = hlo.multiply(hlo.cumsum(block_lens, dim=0), sharded_block_size)
+
+    def _br(x):
+        return hlo.broadcast(x, [max_num_keys], [0])
+
+    def _selective_masking(steps, cumsum, lens, idx, seq_id, x_to_ctx):
+        loc = hlo.slice_along(steps, dim=0, limit=seq_id+1, start=seq_id)
+        start = hlo.slice_along(cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        length = hlo.slice_along(lens, dim=0, limit=seq_id+1, start=seq_id)
+        x = hlo.subtract(idx, _br(hlo.subtract(loc, start)))
+        upper_bound = hlo.add(hlo.add(start, length), -1)
+        x = hlo.minimum(_br(upper_bound), hlo.maximum(_br(start), x))
+        left_bound = hlo.add(hlo.add(loc, length), -1)
+        left_mask = hlo.greater_equal(_br(left_bound), idx)
+        right_mask = hlo.less_equal(_br(loc), idx)
+        mask = hlo.logical_and(left_mask, right_mask)
+        x_to_ctx = hlo.masked_select(mask, hlo.cast(x, s32), x_to_ctx)
+        return x_to_ctx, mask, steps, cumsum, lens, left_mask, right_mask, x, loc, start, length, upper_bound, left_bound
+
+    active_ctx = hlo.full(0, s32, [max_num_keys])
+    idx = hlo.iota(s32, (max_num_keys,), [0])
+    for seq_id in range(max_num_seqs):
+        active_ctx, *_ = _selective_masking(sharded_seq_steps, sharded_seq_start, sharded_seq_lens, idx, seq_id, active_ctx)
+
+    # then convert block_tables to full slot_mapping
+    # - block_tables: [n_active_blocks]
+    # > slot_mapping = np.arange(block_size).reshape(1, block_size) \
+    #                 * np.reshape(block_tables, (n_active_blocks, 1))
+    n_active_blocks, = block_tables.sizes
+    block_idx = hlo.reshape(hlo.iota(s32, (sharded_block_size,), [0]), (1, sharded_block_size))
+    block_idx = hlo.broadcast(block_idx, [n_active_blocks, sharded_block_size], [0, 1])
+    block_tables = hlo.reshape(block_tables, (n_active_blocks, 1))
+    block_tables = hlo.broadcast(block_tables, [n_active_blocks, sharded_block_size], [0, 1])
+    slot_mapping = hlo.add(hlo.multiply(block_tables, sharded_block_size), block_idx)
+    slot_mapping = hlo.reshape(slot_mapping, (n_active_blocks * sharded_block_size,))
+
+    # finally mask and select from the slot_mapping
+    active_idx = hlo.index_select(slot_mapping, dim=0, index=active_ctx)
+    mask = hlo.iota(s32, (max_num_keys,), [0])
+    total_kv_tokens = hlo.reshape(hlo.reduce_sum(sharded_seq_lens, dim=0), (1,))
+    mask = hlo.less(mask, hlo.broadcast(total_kv_tokens, mask.sizes, [0]))
+    active_idx = hlo.multiply(active_idx, hlo.cast(mask, s32))
+    return active_idx, active_ctx, sharded_seq_lens
+
+
+def gather_sharded_kv(kv_cache, active_idx):
+    """
+    Gather the KV cache for the active slots.
+
+    kv_cache: [num_blocks, sharded_block_size, num_kv_heads, d_head]
+    active_idx: [num_active_blocks]
+    """
+    num_blocks, sharded_block_size, num_kv_heads, d_head = kv_cache.sizes
+    max_num_keys = active_idx.sizes[0]
+    kv_cache = hlo.reshape(kv_cache, (num_blocks * sharded_block_size, num_kv_heads * d_head))
+    active_kv_cache = hlo.index_select(kv_cache, dim=0, index=active_idx)
+    # convert to BSH layout
+    active_kv_cache = hlo.reshape(active_kv_cache, (1, max_num_keys, num_kv_heads, d_head))
+    return active_kv_cache
+
+
+def sharded_softmax_correction(logits, dim, tp_degree, sos_degree):
+    """
+    Correct the softmax scores for shard over sequence strategy.
+
+    Args:
+        score: []
+    """
+    # 1. all-reduce (max) along the sequence dimension to get the global max and denominator
+    maximum = hlo.reduce_max(logits, dim=dim)
+    if sos_degree > 1:
+        group_size = sos_degree
+        num_groups = tp_degree // sos_degree
+        replica_groups = utils.build_replica_groups(num_groups=num_groups,
+                                                    group_size=group_size, interleave=False)
+        maximum = hlo.all_reduce_max(maximum, tp_degree=sos_degree, replica_groups=replica_groups)
+    dims = list(range(len(logits.sizes)))
+    dims.pop(dim)
+
+    # cast to FP32 for better numerical stability
+    dtype = logits.dtype
+    f32 = logits.scribe.f32
+    maximum = hlo.cast(maximum, f32)
+    logits = hlo.cast(logits, f32)
+
+    maximum_br = hlo.broadcast(maximum, logits.sizes, dims)
+    difference = hlo.subtract(logits, maximum_br)
+    exponential = hlo.exp(difference)
+
+    denominator = hlo.reduce_sum(exponential, dim)
+    if sos_degree > 1:
+        denominator = hlo.all_reduce_sum(denominator, tp_degree=sos_degree, replica_groups=replica_groups)
+    denominator_br = hlo.broadcast(denominator, logits.sizes, dims)
+ 
+    output = hlo.divide(exponential, denominator_br)
+    output = hlo.cast(output, dtype)
+    return output
 
 
 def blockwise_qk_matmul(query, keys, block_to_seq):

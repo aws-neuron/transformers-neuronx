@@ -252,7 +252,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     # here the "batch_size" bucket is determined based on the number of blocks needed
                     block_tables, context_lens = rest[0], rest[1]
                     block_size = self.neuron_config.continuous_batching.block_size
-                    n_active_blocks = ((context_lens+block_size-1) // block_size).sum().item()
+                    seq_lens = context_lens + last_token_id
+                    n_active_blocks = ((seq_lens+block_size-1) // block_size).sum().item()
                     active_block_bucket = bucket.find(self.context_batch_sizes, n_active_blocks)
                     # we use the model indexed by estimate (i.e., number of queries) and 
                     # active_block_bucket (i.e., number of active KV cache blocks)
