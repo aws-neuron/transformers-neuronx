@@ -251,10 +251,10 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None
     return result
 
 
-def dot_general(lhs, rhs, dimension_numbers):
+def dot_general(lhs, rhs, dimension_numbers, dtype=None):
     # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
 
-    dtype = lhs.dtype
+    dtype = dtype if dtype else lhs.dtype
     lhs_sizes = lhs.sizes
     rhs_sizes = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=dimension_numbers.get("lhs_contracting_dimensions", [0]),
@@ -878,6 +878,12 @@ def softmax(logits, dim=None, tp_degree=1):
         maximum = all_reduce_max(maximum, tp_degree=tp_degree)
     maximum = broadcast(maximum, logits.sizes, dims)
 
+    # cast to FP32 for better numerical stability
+    dtype = logits.dtype
+    f32 = logits.scribe.f32
+    maximum = cast(maximum, f32)
+    logits = cast(logits, f32)
+
     difference = subtract(logits, maximum)
     exponential = exp(difference)
 
@@ -886,7 +892,8 @@ def softmax(logits, dim=None, tp_degree=1):
         denominator = all_reduce_sum(denominator, tp_degree=tp_degree)
     denominator = broadcast(denominator, logits.sizes, dims)
 
-    return divide(exponential, denominator)
+    output = divide(exponential, denominator)
+    return cast(output, dtype)
 
 
 def transfer_with_static_ring(shape):
@@ -3292,6 +3299,104 @@ def decoder_attention_block_diagonal_causal_from_bottomright_mask(num_queries, n
     # [n_positions, n_positions] -> [1, n_positions, n_positions]
     prior_mask = unsqueeze(prior_mask, dim=0)
     active_mask = None
+    return prior_mask, active_mask
+
+
+def sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
+        num_queries, num_keys, max_num_queries, max_num_keys, max_num_seqs, sharded_seq_lens,
+        cached_to_contexted_idx, n_active_blocks, block_size, core_id, sos_degree):
+    """
+    Creates block diagonal causal masks for multiple prompts in shard over sequence strategy.
+
+    Example:
+
+    INPUTS:
+    num_queries   = [1,  5, 5]
+    num_keys      = [6, 13, 5]
+    block_size    = 6
+    sos_degree    = 3
+    -->
+    KV cache in cache block format: (position_id, slot_mapping) 
+    new token: <position_id, slot_mapping>
+    We suppose all the tokens have been written into the KV cache.
+
+    Block ID
+             <---- NC0 ---->  | <---- NC1 ---->  | <---- NC2 ----> 
+        0    (0, 0), (1, 1)   | (2, 0), (3, 1)   | (4, 0), <5, 1>     (seq 0)
+        2    (0, 4), (1, 5)   | (2, 4), (3, 5)   | (4, 4), (5, 5)     (seq 1)
+        3    (6, 6), (7, 7)   | <8, 6>, <9, 7>   | <10, 6>, <11, 7>   (seq 1)
+        4    <12, 8>,         |                  |                    (seq 1)
+        6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
+
+    core_id = 0                          core_id = 2
+    active_mask (NC0) = [                active_mask (NC2) = [
+        [1, 1, 0, 0, 0, 0, 0, 0, 0],         [1, 1, 0, 0, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 1, 1, 0],
+        [0, 0, 1, 1, 1, 1, 1, 0, 0],         [0, 0, 1, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1, 1],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 1],
+    ]                                    ]
+        
+    In this function, we will first compute the full mask for the non-sharded case (with 
+    function decoder_attention_block_diagonal_causal_from_bottomright_mask), and then slice
+    the mask to the corresponding sharded region.
+    """
+    # first compute the full mask
+    max_num_keys_global = max_num_keys * sos_degree
+    prior_mask, active_mask = decoder_attention_block_diagonal_causal_from_bottomright_mask(
+        num_queries, num_keys, max_num_queries, max_num_keys_global, max_num_seqs
+    )
+    # then generate the index of sharded blocks
+    # - block_tables: [n_active_blocks]
+    # > slot_mapping = np.arange(block_size).reshape(1, block_size) \
+    #                 * np.reshape(block_tables, (n_active_blocks, 1))
+    s32 = num_queries.scribe.s32
+    sharded_block_size = block_size // sos_degree
+    core_sos_rank = remainder(cast(core_id, s32), sos_degree)
+    base_offset = multiply(core_sos_rank, sharded_block_size)
+    base_offset_br = broadcast(reshape(base_offset, (1, 1)), (1, sharded_block_size), [0, 1])
+    block_offset = reshape(iota(s32, (sharded_block_size,), [0]), (1, sharded_block_size))
+    block_offset = add(block_offset, base_offset_br)
+    block_offset = broadcast(block_offset, [n_active_blocks, sharded_block_size], [0, 1])
+    block_idx = iota(s32, (n_active_blocks, sharded_block_size), [0])
+    block_idx = multiply(block_idx, block_size)
+    block_idx = reshape(add(block_idx, block_offset), (n_active_blocks * sharded_block_size,))
+    # select active index
+    active_idx = index_select(block_idx, dim=0, index=cached_to_contexted_idx)
+    # modify active_idx to account the padding blocks
+    offset = full(0, s32, active_idx.sizes)
+    seq_lens_cumsum = cumsum(num_keys, dim=0)
+    sharded_seq_lens_cumsum = cumsum(sharded_seq_lens, dim=0)
+    seq_lens_pad = multiply(divide(add(num_keys, block_size-1), block_size), block_size)
+    seq_lens_pad_cumsum = cumsum(seq_lens_pad, dim=0)
+    for i in range(1, max_num_seqs):
+        prev_seq_id = s32.Constant(constant_value=i-1)
+        seq_id = s32.Constant(constant_value=i)
+        prev_seq_len = dynamic_slice_along(seq_lens_cumsum, dim=0, start=prev_seq_id, size=1)
+        prev_seq_len_pad = dynamic_slice_along(seq_lens_pad_cumsum, dim=0, start=prev_seq_id, size=1)
+        prev_num_tokens = dynamic_slice_along(sharded_seq_lens_cumsum, dim=0, start=prev_seq_id, size=1)
+        cur_num_tokens = dynamic_slice_along(sharded_seq_lens_cumsum, dim=0, start=seq_id, size=1)
+        num_pad_tokens = reshape(subtract(prev_seq_len_pad, prev_seq_len), (1, ))
+        mask_offset = iota(s32, active_idx.sizes, [0])
+        left_mask = compare(mask_offset, broadcast(prev_num_tokens, active_idx.sizes, [0]), "GE")
+        right_mask = compare(mask_offset, broadcast(cur_num_tokens, active_idx.sizes, [0]), "LT")
+        mask = logical_and(left_mask, right_mask)
+        offset = add(offset, multiply(cast(mask, s32), broadcast(num_pad_tokens, active_idx.sizes, [0])))
+        
+    active_idx = subtract(active_idx, offset)
+    prior_mask = index_select(prior_mask, dim=2, index=active_idx)
+
+    # mask padding
+    b = iota(s32, prior_mask.sizes, [2])
+    total_num_keys = reshape(reduce_sum(sharded_seq_lens, dim=0), (1, 1, 1))
+    right_mask = compare(b, broadcast(total_num_keys, prior_mask.sizes, [0, 1, 2]), "LT")
+    prior_mask = logical_and(prior_mask, right_mask)
     return prior_mask, active_mask
 
 

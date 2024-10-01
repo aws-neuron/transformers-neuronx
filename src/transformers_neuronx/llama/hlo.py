@@ -140,6 +140,14 @@ class LlamaForSamplingNoEmbeddingHlo:
         cached_mask = None
         cached_to_contexted = None
         active_to_contexted = None
+        core_id = None
+        if (self.neuron_config.shard_over_sequence or
+                (self.neuron_config.sequence_parallel_norm and self.neuron_config.on_device_embedding)):
+            core_id, *rst = weights
+        if self.neuron_config.shard_over_sequence:
+            n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
+            cores_per_kv_head = self.config.tp_degree // n_kv_heads
+            self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree
         if self.neuron_config.optimized_paged_attention and len(last_token_id.sizes) == 2:
             # For decoding with multiple KV cache blocks:
             # - cache_ids are used as context_lens
@@ -154,16 +162,30 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_to_seq = attention_utils.block_to_seq_indexing(
                 context_lens=cache_ids, num_seqs=max_num_seqs, num_blocks=self.num_active_blocks, block_size=block_size)
         elif self.neuron_config.enable_chunked_prefill:
-            context_lens_2d = hlo.unsqueeze(context_lens, 1)
-            block_tables = attention_utils.active_block_tables(
-                block_tables=block_tables, context_lens=context_lens_2d,
-                num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+            # - cache_ids are used as position_ids of each token
+            # - start_ids are used as slot_mapping
+            # - last_token_id is used as new token length for each sequence
+            context_lens_2d = hlo.unsqueeze(context_lens, 1)        
             seq_lens = hlo.add(context_lens, last_token_id)
             block_size = self.neuron_config.continuous_batching.block_size
-            max_num_keys = self.num_active_blocks * block_size + self.n_positions
-            cached_mask, cached_to_contexted, active_to_contexted = \
-                attention_utils.contexted_kv_indexing(query_lens=last_token_id, key_lens=seq_lens,
-                                                      max_num_keys=max_num_keys, block_size=block_size)
+            if self.neuron_config.shard_over_sequence:
+                sharded_block_size = block_size // cores_per_kv_head
+                block_tables = attention_utils.active_block_tables(
+                    block_tables=block_tables, context_lens=hlo.unsqueeze(seq_lens, 1),
+                    num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+                start_ids = attention_utils.sharded_slot_mapping(start_ids, cache_ids, block_size, core_id, sos_degree=cores_per_kv_head)
+                max_num_keys = self.num_active_blocks * sharded_block_size
+                cached_to_contexted, cached_to_contexted_idx, sharded_seq_lens = attention_utils.sharded_kv_indexing(
+                    seq_lens, max_num_keys, block_size, block_tables, core_id, sos_degree=cores_per_kv_head
+                )
+            else:
+                block_tables = attention_utils.active_block_tables(
+                    block_tables=block_tables, context_lens=context_lens_2d,
+                    num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
+                max_num_keys = self.num_active_blocks * block_size + self.n_positions
+                cached_mask, cached_to_contexted, active_to_contexted = \
+                    attention_utils.contexted_kv_indexing(query_lens=last_token_id, key_lens=seq_lens,
+                                                          max_num_keys=max_num_keys, block_size=block_size)
 
         head_dim = self.config.attention_head_size
         position_ids = cache_ids if position_ids is None else position_ids
@@ -173,18 +195,19 @@ class LlamaForSamplingNoEmbeddingHlo:
             interpolation_factor=self.config.position_interpolation_factor,
             rope_scaling=self.config.rope_scaling
         )
-        core_id = None
-        if (self.neuron_config.shard_over_sequence or
-                (self.neuron_config.sequence_parallel_norm and self.neuron_config.on_device_embedding)):
-            core_id, *rst = weights
-        # flash decoding
-        if self.neuron_config.shard_over_sequence:
-            n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
-            cores_per_kv_head = self.config.tp_degree // n_kv_heads
-            self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree
+
+        # flash decoding 
+        if self.neuron_config.shard_over_sequence and not self.neuron_config.enable_chunked_prefill:
             cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, start_ids,
                                                                         core_id, self.n_positions,
                                                                         cores_per_kv_head=self.cores_per_kv_head)
+        elif self.neuron_config.shard_over_sequence and self.neuron_config.enable_chunked_prefill:
+            _, n_active_tokens = cache_ids.sizes
+            batch_size = self.neuron_config.continuous_batching.max_num_seqs
+            mask, active_mask = hlo.sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
+                last_token_id, seq_lens, n_active_tokens, max_num_keys, batch_size, sharded_seq_lens,
+                cached_to_contexted_idx, self.num_active_blocks, block_size, core_id, cores_per_kv_head
+            )
         else:
             mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
                                                    last_token_id=last_token_id, num_active_blocks=self.num_active_blocks,
@@ -724,20 +747,44 @@ class LlamaForSamplingNoEmbeddingHlo:
 
             if context is None:
                 if self.neuron_config.enable_chunked_prefill:
-                    # S = Q @ K
-                    cached_keys_gathered = attention_utils.gather_blocks(cached_keys, block_tables=block_tables, neuron_config=self.neuron_config)
-                    contexted_keys = attention_utils.contexted_kv(cached_keys_gathered, key, cached_mask, cached_to_contexted, active_to_contexted)
-                    score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads,
-                                            tp_degree=tp_degree, neuron_config=self.neuron_config)
+                    if self.neuron_config.shard_over_sequence:
+                        # Update KV cache
+                        updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                                       key, value, start_ids, neuron_config=self.neuron_config)
+                        # Communication 1: all-gather query from cores
+                        query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, n_head, tp_degree)
+                        # S = Q @ K (This matmul wastes some computation)
+                        contexted_keys = attention_utils.gather_sharded_kv(updated_keys, active_idx=cached_to_contexted)
+                        score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads, 
+                                                tp_degree=tp_degree, neuron_config=self.neuron_config)
+                        score = attention.mask(score, mask, tp_degree=tp_degree)
+                        # Communication 2: softmax correction
+                        score = attention_utils.sharded_softmax_correction(score, dim=3, tp_degree=tp_degree, sos_degree=self.cores_per_kv_head)
+                        # Value Combination
+                        contexted_values = attention_utils.gather_sharded_kv(updated_values, active_idx=cached_to_contexted)
+                        context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads, dtype=score.scribe.f32,
+                                                             tp_degree=tp_degree, neuron_config=self.neuron_config, skip_softmax=True)
+                        # Communication 3: reduce-scatter partial context
+                        num_groups = tp_degree // self.cores_per_kv_head
+                        replica_groups = utils.build_replica_groups(num_groups=num_groups,
+                                                                    group_size=self.cores_per_kv_head, interleave=False)
+                        context = hlo.reduce_scatter_sum(context, tp_degree=self.cores_per_kv_head, dim=2, replica_groups=replica_groups)
+                        context = hlo.cast(context, hidden.dtype)
+                    else:
+                        # S = Q @ K
+                        cached_keys_gathered = attention_utils.gather_blocks(cached_keys, block_tables=block_tables, neuron_config=self.neuron_config)
+                        contexted_keys = attention_utils.contexted_kv(cached_keys_gathered, key, cached_mask, cached_to_contexted, active_to_contexted)
+                        score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads,
+                                                tp_degree=tp_degree, neuron_config=self.neuron_config)
 
-                    score = attention.mask(score, mask, tp_degree=tp_degree)
+                        score = attention.mask(score, mask, tp_degree=tp_degree)
 
-                    # C = softmax(Sa, Sp) @ (Va, Vp)
-                    cached_values_gathered = attention_utils.gather_blocks(cached_values, block_tables=block_tables, neuron_config=self.neuron_config)
-                    contexted_values = attention_utils.contexted_kv(cached_values_gathered, value, cached_mask,
-                                                                    cached_to_contexted, active_to_contexted)
-                    context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads,
-                                                         tp_degree=tp_degree, neuron_config=self.neuron_config)
+                        # C = softmax(Sa, Sp) @ (Va, Vp)
+                        cached_values_gathered = attention_utils.gather_blocks(cached_values, block_tables=block_tables, neuron_config=self.neuron_config)
+                        contexted_values = attention_utils.contexted_kv(cached_values_gathered, value, cached_mask,
+                                                                        cached_to_contexted, active_to_contexted)
+                        context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads,
+                                                             tp_degree=tp_degree, neuron_config=self.neuron_config)
                 else:
                     # S = Q @ K
 
@@ -747,7 +794,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                     context = attention.context_combined(score, value, n_kv_heads=self.config.num_key_value_heads,
                                                         tp_degree=tp_degree, neuron_config=self.neuron_config)
 
-            if self.neuron_config.shard_over_sequence:
+            if self.neuron_config.shard_over_sequence and not self.neuron_config.enable_chunked_prefill:
                 cache_ids, value, key = flash_decoding.select_values_within_bound(cache_ids,
                                                                                   value,
                                                                                   key,
@@ -762,8 +809,9 @@ class LlamaForSamplingNoEmbeddingHlo:
                 else:
                     updated_keys, updated_values = key, value
             else:
-                updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
-                                                                               key, value, start_ids, neuron_config=self.neuron_config)
+                if not (self.neuron_config.enable_chunked_prefill and self.neuron_config.shard_over_sequence):
+                    updated_keys, updated_values = attention.fused_kv_update_cache(cached_keys, cached_values, cache_ids,
+                                                                                   key, value, start_ids, neuron_config=self.neuron_config)
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
