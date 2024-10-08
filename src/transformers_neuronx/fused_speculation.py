@@ -157,21 +157,28 @@ class FusedSpeculativeDecoder(torch.nn.Module):
  
             # Create lists to aggregate outputs (used for token acceptance)
             draft_logits = list()
+            draft_probs = list()
+            draft_indices = list()
             draft_tokens = [tokens]
             prior_ids = [cache_ids]
  
             for _ in range(self.k):
                 tensors = cache_ids, *rest
                 logits, caches = draft._hlo_unroll(tokens, tensors, caches, layers_weights, pre_layer_params, lm_head_params)
-                tokens = draft._hlo_generation(logits, generation_params)
+                tokens, probs, indices = draft._hlo_generation(logits, generation_params, return_probs=True)
  
                 # Update cache to next position
                 cache_ids = hlo.add(cache_ids, 1)
  
                 # Aggregate individual outputs
                 draft_logits.append(logits)
+                draft_probs.append(probs)
+                draft_indices.append(indices)
                 draft_tokens.append(hlo.cast(tokens, s32))
                 prior_ids.append(cache_ids)
+
+            draft_probs = hlo.concatenate(draft_probs, 1)
+            draft_indices = hlo.concatenate(draft_indices, 1)
  
             # Execute final iteration in case all tokens are accepted.
             tensors = cache_ids, *rest
@@ -194,33 +201,42 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             tensors = cache_ids, *rest
             target_scores, caches = target._hlo_unroll(tokens, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
             target._hlo_cache_aliases(in_caches, caches)
-
-            # Rebase the target probabilities in case of rejection
-            rebased_draft_scores = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
-            rebased_target_scores = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
-            rebased_draft_scores = hlo.pad(rebased_draft_scores, dim=1, size=1, value=0.0)
-            rebased_target_scores = hlo.subtract(rebased_target_scores, rebased_draft_scores)
-            rebased_target_scores = hlo.clamp(rebased_target_scores, minimum=0.0)
-            target_ids = target._hlo_generation(rebased_target_scores, generation_params)
-            target_ids = hlo.cast(target_ids, s32)
- 
             target_out_caches = itertools.chain(*caches)
- 
+
+            # Adjust the target probabilities in case of rejection
+            target_probs, target_indices = target._hlo_generation(target_scores, generation_params, early_return=True)
+
+            adjusted_target_probs = hlo.speculative_adjust_distribution(
+                    draft_probs,
+                    draft_indices,
+                    target_probs,
+                    target_indices,
+                    self.k)
+
+            generation_config = target.neuron_config.on_device_generation
+            target_ids = hlo.multinomial(adjusted_target_probs, dim=2, deterministic=generation_config.deterministic)
+            target_ids = hlo.gather(target_indices, 2, target_ids)
+            target_ids = hlo.squeeze(target_ids, 2)
+            target_ids = hlo.cast(target_ids, target_ids.scribe.s32)
+
             # NOTE: Exclude the input token during the speculative token selection
             draft_ids = hlo.concatenate(draft_tokens[1:], 1)
- 
-            draft_ids = hlo.transpose(draft_ids, 0, 1)
-            target_ids = hlo.transpose(target_ids, 0, 1)
- 
+            
+            sliced_target_indices = hlo.slice_along(target_indices, 1, limit=self.k)
+            sliced_target_probs = hlo.slice_along(target_probs, 1, limit=self.k) 
+
             next_tokens, index, *mask = hlo.speculative_token_selection(
-                draft_ids, target_ids, draft_scores, target_scores,
+                draft_ids, target_ids, 
+                draft_indices, draft_probs, 
+                sliced_target_indices, sliced_target_probs,
                 tp_degree=self.tp_degree,
                 pad_token_id=self.pad_token_id,
                 deterministic_threshold=self.deterministic_threshold, output_mask=self.output_scores
             )
+
             index = hlo.reshape(index, (batch_size, 1))
             next_token_id = hlo.gather(next_tokens, 1, index)
- 
+
             # Retrieve the target model output scores for the selected tokens
             target_output_scores = None
             if self.output_scores:
@@ -370,7 +386,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         # Preallocate state tensors
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
         sequences[:, :start] = input_ids
-        if batch_size>1:
+        if batch_size > 1:
             cache_ids = torch.count_nonzero(attention_mask,dim=1).view(-1, 1)
             positions = torch.count_nonzero(attention_mask,dim=1).view(-1, 1) + torch.arange(self.k + 1, dtype=torch.int64).repeat((batch_size, 1))
             sequences.scatter_(1, torch.count_nonzero(attention_mask,dim=1).view(-1, 1), token_id)
@@ -457,6 +473,7 @@ class FusedSpeculativeDecoder(torch.nn.Module):
         return sequences[:, :ends.max().item()]
     # add this to the base CR
 
+
     def speculative_iteration(
             self,
             input_ids: torch.Tensor,
@@ -494,68 +511,72 @@ class FusedSpeculativeDecoder(torch.nn.Module):
             self.draft(input_ids, cache_ids, start_ids)
             return target_next_id, torch.tensor([[1]] * batch_size)
 
-        seq_ids = start_ids
+        seq_ids = start_ids.flatten().to(torch.long)
         # TODO: enable multiple bucket in batch dimension
         graph_batch_size = self.batch_sizes[0]
-        full_input_ids, cache_ids_pad, seq_ids_pad = self.handle_padding_list(
-            [input_ids, cache_ids, seq_ids],
-            seq_ids,
-            graph_batch_size
-        )
+
+        full_input_ids, cache_ids_pad, seq_ids_pad = [
+            self.preprocess_input(tensor=t, seq_ids=seq_ids, target_batch_size=graph_batch_size)
+            for t in [input_ids, cache_ids, seq_ids] 
+        ]
+
         seq_ids_pad = seq_ids_pad.view(-1)
         tokens, counts, token_id, *score = self.speculator.execute(full_input_ids, cache_ids_pad, seq_ids_pad,
                                                                    return_ranks=1)
-        output_tokens, output_counts = self.handle_padding_list([tokens, counts], seq_ids, batch_size)
+        output_tokens, output_counts = [
+            self.postprocess_output(tensor=t, seq_ids=seq_ids)
+            for t in [tokens, counts]
+        ]
+
         return output_tokens, output_counts
 
-    def handle_padding_list(
-            self,
-            tensor_list: List[torch.Tensor],
-            seq_ids: torch.Tensor,
-            target_batch_size: int
-    ) -> List[torch.Tensor]:
-        return [self.handle_padding(tensor, seq_ids, target_batch_size) for tensor in tensor_list]
-
-    def handle_padding(
-            self,
-            tensor: torch.Tensor,
-            seq_ids: torch.Tensor,
-            target_batch_size: int
-    ) -> torch.Tensor:
+    
+    def preprocess_input(self, tensor: torch.Tensor, seq_ids: torch.Tensor, target_batch_size: int):
         """
-         add or remove padding for when running batch size is different from target_batch_size(neff batch size)
-         i.e. input_tensor [[2],[3]], seq_ids: [2, 1] target_batch_size:3 -> [[0], [2], [3]]
-              input_tensor [2, 1]   , seq_ids: [2, 1] target_batch_size:3-> [0, 2, 1]
-              input_tensor [[1,2,3,4],[11,12,13,14],[21,22,23,24]], seq_ids: [0, 2, 1] taget_batch_size:2
-              ->[[11,12,13,14],[21,22,23,24]]
-            input_tensor [6,6,6], seq_ids: [0, 2, 1] target_batch_size:2 ->[6,6]
+        Sorts tensor in batch dimensions based on sequence ids.
+        Zero pads tensor in batch dimensions when running batch size is smaller than target batch size.
+
+        Example:
+            tensor [[1],[2],[3]], seq_ids: [0, 1, 2] target_batch_size:3 -> [[1], [2], [3]]
+            tensor [[1],[2],[3]], seq_ids: [2, 0, 1] target_batch_size:3 -> [[2], [3], [1]]
+            tensor [[2],[3]], seq_ids: [2, 1] target_batch_size:3 -> [[0], [3], [2]]
+
+        Args:
+            tensor:
+                The input tensor to be processed. first dimension is batch. dim_size >=1
+            seq_ids:
+                The positions in the KV cache that should be returned. Expected to be 1-dimensional 
+                torch.LongTensor.
+             target_batch_size:
+                Batch size the full input tensor should have
+        """
+        original_shape = tensor.shape
+        new_shape = (target_batch_size,) + original_shape[1:]
+        output_tensor = torch.zeros(new_shape, dtype=tensor.dtype)
+        output_tensor[seq_ids] = tensor
+        return output_tensor
+    
+
+    def postprocess_output(self, tensor: torch.Tensor, seq_ids: torch.LongTensor):
+        """
+        Removes padding from output tensor by selecting only the sequences passed in original seq_ids. 
+        Returns output in order of seq_ids.
+
+        Example:
+            tensor [[1],[2],[3]], seq_ids: [0, 1, 2] -> [[1], [2], [3]]
+            tensor [[1],[2],[3]], seq_ids: [1, 0] -> [[2], [1]]
 
          Args:
              tensor:
-                 The input tensor to be processed. first dimension is batch. dim_size >=1
+                The output tensor to be processed. first dimension is batch. dim_size >=1
              seq_ids:
-                 The positions in the KV cache that should be updated.
-             target_batch_size:
-                 batch size the output tensor should have
+                The positions in the KV cache that should be returned. Expected to be 1-dimensional 
+                torch.LongTensor.
 
-         Returns:
-             tensors, first dimension is the target batch size.
-         """
+        """
 
-        original_shape = tensor.shape
-        current_batch_size = original_shape[0]
+        return tensor[seq_ids]
 
-        if current_batch_size == target_batch_size:
-            return tensor
-
-        new_shape = (target_batch_size,) + original_shape[1:]
-        output_tensor = torch.zeros(new_shape, dtype=tensor.dtype)
-        for idx, seq_id in enumerate(seq_ids):
-            if current_batch_size < target_batch_size:
-                output_tensor[seq_id] = tensor[idx]
-            else:
-                output_tensor[idx] = tensor[seq_id]
-        return output_tensor
 
     def prepare_cache_ids(self, cache_ids: torch.Tensor, batch: int, seq_len: int) -> List[torch.Tensor]:
             """

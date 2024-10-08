@@ -69,8 +69,6 @@ class MixtralForSampling(base.NeuronModelBase):
     def load_weights(self):
         self.materialize_embeddings()
 
-        ops.init()
-
         for layer in self.chkpt_model.model.layers:
             layer.materialize()
             attn = layer.self_attn

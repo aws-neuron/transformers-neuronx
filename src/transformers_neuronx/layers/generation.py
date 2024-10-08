@@ -14,11 +14,20 @@
 # ==============================================================================
 from transformers_neuronx import hlo, config
 
-def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1):
-
+def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1, early_return=False, return_probs=False):
     logits = mask_logits(logits, logits_indices, config.vocab_size)
     if not config.dynamic and not config.do_sample:
-        return greedy_search(logits, tp_degree=tp_degree)
+        tokens = greedy_search(logits, tp_degree=tp_degree)
+        if early_return or return_probs:
+            batch_size, n_active_tokens = tokens.sizes
+            probs = hlo.full(1.0, logits.dtype, [batch_size, n_active_tokens, 1])
+            indices = hlo.reshape(tokens, [batch_size, n_active_tokens, 1])
+            if early_return:
+                return probs, indices
+            else: # return probs
+                return tokens, probs, indices
+        else:
+            return tokens
 
     if not config.per_batch_line:
         return sample(
@@ -30,7 +39,9 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
             global_top_k=config.global_top_k,
             tp_degree=tp_degree,
             dynamic=config.dynamic,
-            deterministic=config.deterministic
+            deterministic=config.deterministic,
+            early_return=early_return,
+            return_probs=return_probs,
         )
 
     if config.global_top_k is not None:
@@ -45,6 +56,8 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
         logits, indices = hlo.topk(logits, k=config.global_top_k, dim=2, tp_degree=tp_degree)
 
     tokens = []
+    probs = []
+    rindices = []
     for batch_line in range(batch_size):
         logits_slice = hlo.slice_along(logits, 0, start=batch_line, limit=batch_line+1)
         indices_slice = None if indices is None else hlo.slice_along(indices, 0, start=batch_line, limit=batch_line+1)
@@ -65,11 +78,31 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
             permute=False, # we already permuted
             tp_degree=tp_degree,
             dynamic=config.dynamic,
-            deterministic=config.deterministic,                        
-        )    
-        tokens.append(token)
-    returned_tokens = hlo.concatenate(tokens, dimension=0)
-    return returned_tokens
+            deterministic=config.deterministic,
+            early_return=early_return,
+            return_probs=return_probs,
+        )
+        if early_return:
+            probs.append(token[0])
+            rindices.append(token[1])
+        elif return_probs:
+            tokens.append(token[0])
+            probs.append(token[1])
+            rindices.append(token[2])
+        else:
+            tokens.append(token)
+    if early_return:
+        returned_probs = hlo.concatenate(probs, dimension=0)
+        returned_indices = hlo.concatenate(rindices, dimension=0)
+        return returned_probs, returned_indices
+    elif return_probs:
+        returned_probs = hlo.concatenate(probs, dimension=0)
+        returned_tokens = hlo.concatenate(tokens, dimension=0)
+        returned_indices = hlo.concatenate(rindices, dimension=0)
+        return returned_tokens, returned_probs, returned_indices
+    else:
+        returned_tokens = hlo.concatenate(tokens, dimension=0)
+        return returned_tokens
 
 def mask_logits(logits, indices, model_vocab_size):
     vocab_size, n_active_tokens, _ = logits.sizes
@@ -86,13 +119,15 @@ def greedy_search(logits, *, tp_degree=1, permute=True):
     return hlo.argmax(logits, 2, tp_degree=tp_degree) # shape: batch_size, n_active_tokens
 
 
-def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, global_top_k=None, tp_degree=1, dynamic=False, deterministic=False, indices=None, permute=True):
+def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None, global_top_k=None, tp_degree=1, dynamic=False, deterministic=False, indices=None, permute=True, early_return=False, return_probs=False):
 
     if global_top_k is not None:
         assert dynamic is True, "Dynamic on device generation must be enabled when global_top_k is set."
 
     if permute:
         logits = hlo.permute(logits, (2, 1, 0))
+
+    _, _, orig_vocab_size = logits.sizes
 
     if global_top_k is not None:
         logits, indices = hlo.topk(logits, k=global_top_k, dim=2, tp_degree=tp_degree)
@@ -101,7 +136,17 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
 
     # NOTE: Compiler failures can occur when batch != 1
     if top_k == 1 and batch_size == 1 and indices is None:
-        return greedy_search(logits, tp_degree=tp_degree, permute=False)
+        tokens = greedy_search(logits, tp_degree=tp_degree, permute=False)
+        if early_return or return_probs:
+            batch_size, n_active_tokens = tokens.sizes
+            probs = hlo.full(1.0, logits.dtype, [batch_size, n_active_tokens, 1])
+            indices = hlo.reshape(tokens, [batch_size, n_active_tokens, 1])
+            if early_return:
+                return probs, indices
+            else: # return probs
+                return tokens, probs, indices
+        else:
+            return tokens
 
     if temperature is not None and temperature != 1.0:
         if hlo._is_hlo_scalar(temperature):
@@ -125,10 +170,15 @@ def sample(logits, *, top_k=50, top_p=1.0, top_p_min_tokens=1, temperature=None,
 
     probs = hlo.softmax(logits, dim=2)
 
+    if early_return:
+        return probs, indices
+
     # Final sample after filtering TopP/TopK
     samples = hlo.multinomial(probs, dim=2, deterministic=deterministic)
     if indices is not None:
         tokens = hlo.gather(indices, 2, samples)
     else:
         tokens = samples
+    if return_probs:
+        return hlo.squeeze(tokens, 2), probs, indices
     return hlo.squeeze(tokens, 2)

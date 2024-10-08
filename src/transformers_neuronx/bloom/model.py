@@ -69,8 +69,6 @@ class BloomForSampling(base.NeuronModelBase):
     def load_weights(self):
         self.materialize_embeddings()
 
-        ops.init()
-
         n_head = self.config.n_head
         hidden_size = self.config.hidden_size
         for layer in self.chkpt_model.transformer.h:

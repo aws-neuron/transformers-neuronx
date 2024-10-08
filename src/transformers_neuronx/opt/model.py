@@ -90,7 +90,6 @@ class OPTForSampling(base.NeuronModelBase):
         self.num_processed_tokens = 0
 
     def load_weights(self):
-        ops.init()
         self.materialize_embeddings()
         for layer in self.chkpt_model.model.decoder.layers:
             layer.materialize()
