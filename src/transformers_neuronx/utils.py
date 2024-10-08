@@ -292,7 +292,7 @@ def is_attn_node_interleaved(n_heads, n_kv_heads, tp_degree):
     n_nodes = tp_degree // TRN1_WORLD_SIZE
     return bool(TRN1_WORLD_SIZE % group_size) and bool(n_nodes == group_size)
 
-def build_replica_groups(num_groups, group_size, interleave=False):
+def build_replica_groups(num_groups, group_size, interleave=False, topoaware=False):
     """
     Construct replica_groups to handle "intra-group" reduce operations.
 
@@ -307,12 +307,21 @@ def build_replica_groups(num_groups, group_size, interleave=False):
         group_size = 3
         num_groups = 2
         replica_groups = [[0, 1, 2], [3, 4, 5]]
+
+    topoaware: optimized communication for trn1 instances to fully use to 2D communication topo.    
     """
     if interleave:
         limit = num_groups*group_size
         ncs = list(range(limit))
         slices = [slice(i, limit, num_groups) for i in range(num_groups)]
         replica_groups = [ncs[s] for s in slices]
+    elif topoaware:
+        assert num_groups == 8
+        assert group_size == 4
+        replica_groups = [
+            [0, 2, 4, 6], [8, 10, 12, 14], [16, 18, 20, 22], [24, 26, 28, 30],
+            [1, 9, 17, 25], [3, 11, 19, 27], [5, 13, 21, 29], [7, 15, 23, 31]
+        ]
     else:
         replica_groups = [
             [nc for nc in range(group_size * group, group_size * group + group_size)]
