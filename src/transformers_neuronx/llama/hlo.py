@@ -671,7 +671,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                         if not self.neuron_config.duplicate_q_weight_sos:
                             query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, n_head, tp_degree, topoaware=self.neuron_config.topo_aware_sharding)
                         # S = Q @ K (This matmul wastes some computation)
-                        contexted_keys = attention_utils.gather_sharded_kv(cached_keys, key, active_idx=cached_to_contexted, active_token_idx=active_to_contexted)
+                        contexted_keys = attention_utils.gather_sharded_kv(cached_keys, active_idx=cached_to_contexted, active_tokens=key, active_token_idx=active_to_contexted)
                         score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads, 
                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
                         score = attention.mask(score, mask, tp_degree=tp_degree)
@@ -685,7 +685,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
                         # Value Combination
                         score = hlo.cast(score, cached_values.dtype)
-                        contexted_values = attention_utils.gather_sharded_kv(cached_values, value, active_idx=cached_to_contexted, active_token_idx=active_to_contexted)
+                        contexted_values = attention_utils.gather_sharded_kv(cached_values, active_idx=cached_to_contexted, active_tokens=value, active_token_idx=active_to_contexted)
                         context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads, dtype=score.scribe.f32,
                                                              tp_degree=tp_degree, neuron_config=self.neuron_config, skip_softmax=True)
                         # Communication 2: softmax correction
