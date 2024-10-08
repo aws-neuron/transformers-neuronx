@@ -53,24 +53,7 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         return tensors, dims
 
-    def token_tree_inputs(self, scribe, dtype, n_active_tokens, batch_size):
-        tensors, dims = self.inputs(scribe, dtype, n_active_tokens, batch_size)
-        s32 = scribe.s32
-        cache_2d = self.neuron_config and self.neuron_config.use_2d_cache_ids
-        # Allow tree based speculation inputs
-        if cache_2d:
-            position_sizes = batch_size, n_active_tokens
-            previous_cache_ids = s32[position_sizes].Parameter(parameter_number=6)
-            reorder_mapping = s32[position_sizes].Parameter(parameter_number=7)
-        else:
-            previous_cache_ids = s32[n_active_tokens].Parameter(parameter_number=6)
-            reorder_mapping = s32[n_active_tokens].Parameter(parameter_number=7)
-        seq_slice_dim = 1 if cache_2d else 0
-
-        return (*tensors, previous_cache_ids, reorder_mapping), (*dims, seq_slice_dim, seq_slice_dim)
-
     def eagle_draft_inputs(self, scribe, dtype, n_active_tokens, batch_size, token_tree=False, k=0, n_leaves=0, depth=0, n_entrees=0, width=0):
-        # Should use token_tree_inputs
         tensors, dims = self.inputs(scribe, dtype, n_active_tokens, batch_size)
         hidden_sizes = batch_size, n_active_tokens, self.config.hidden_size
         prev_hidden = dtype[hidden_sizes].Parameter(parameter_number=6)
@@ -90,8 +73,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         position_ids = s32[pos_sizes].Parameter(parameter_number=12)
         path_sizes = n_leaves, depth
         all_paths = s32[path_sizes].Parameter(parameter_number=13)
-        mask_sizes = n_entrees, width
-        path_mask = s32[mask_sizes].Parameter(parameter_number=14)
         return (*tensors,
                 prev_hidden,
                 tree_mask,
@@ -100,8 +81,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                 cache_gather_indices,
                 cache_scatter_indices,
                 position_ids,
-                all_paths,
-                path_mask), (*dims, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+                all_paths), (*dims, 1, 1, 1, 1, 1, 1, 1, 1)
 
     def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights):
         core_id = None
@@ -123,10 +103,6 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.neuron_config.attention_layout == LAYOUT_HSB:
             hidden = hlo.transpose210(hidden)
         return hidden
-
-    def token_tree_embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, previous_cache_ids, reorder_mapping,
-                             *weights):
-        return self.embedding(input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights)
 
     def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
         # TODO: move this fallback calculation to decoder.py
@@ -218,15 +194,6 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id, \
                block_tables, cached_mask, cached_to_contexted, active_to_contexted
-
-    def token_tree_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, previous_cache_ids, reorder_mapping, *weights):
-        hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id = self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights)
-        if self.neuron_config.on_device_embedding:
-            embed_weight, token_tree_mask = weights
-        else:
-            token_tree_mask, *rst = weights
-        active_mask = hlo.token_tree_attention_mask(token_tree_mask, active_mask)
-        return hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, previous_cache_ids, reorder_mapping, mask, active_mask, core_id
 
     def eagle_draft_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
         if self.config.bias:
@@ -449,56 +416,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             if is_first_last_layer or not enable_qkv_kernel:
                 return hlo.add(mlp_hidden, hidden), out_attn_k_cache, out_attn_v_cache
             return (hidden, mlp_hidden, attn_output), out_attn_k_cache, out_attn_v_cache
-
-    def token_tree_layer(
-            self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq,
-            previous_cache_ids, reorder_mapping,
-            mask, active_mask, core_id,
-            attn_k_cache, attn_v_cache,
-            pre_attn_ln_weight, pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
-            attn_q_weight, attn_q_scales, attn_q_bias,
-            attn_k_weight, attn_k_scales, attn_k_bias,
-            attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias,
-            post_attn_ln_weight, post_attn_ln_bias,
-            pre_mlp_ln_weight, pre_mlp_ln_bias,
-            mlp_in_weight, mlp_in_scales, mlp_in_bias,
-            mlp_out_weight, mlp_out_scales, mlp_out_bias,
-            post_mlp_ln_weight, post_mlp_ln_bias,
-            in0_weight, in0_scales,
-            in1_weight, in1_scales,
-            out_weight, out_scales,
-            is_first_last_layer=False,
-    ):
-        eps = self.config.rms_norm_eps
-        is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
-        ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
-        reordered_attn_k_cache, reordered_attn_v_cache = attention.reorder_kv_cache(attn_k_cache, attn_v_cache, previous_cache_ids, reorder_mapping, neuron_config=self.neuron_config)
-        attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
-            reordered_attn_k_cache, reordered_attn_v_cache,
-            attn_q_weight, attn_q_scales, attn_q_bias,
-            attn_k_weight, attn_k_scales, attn_k_bias,
-            attn_v_weight, attn_v_scales, attn_v_bias,
-            attn_out_weight, attn_out_scales, attn_out_bias
-        )
-        hidden = hlo.add(attn_output, hidden)
-        gated_mlp = hlo.gated_mlp_bsh if is_bsh else hlo.gated_mlp
-        rms_norm_dim = 2 if is_bsh else 0
-        norm_hidden = hlo.rms_norm(hidden, pre_mlp_ln_weight, eps, dim=rms_norm_dim, neuron_config=self.neuron_config, tp_degree=self.config.tp_degree)
-        mlp_hidden = gated_mlp(
-            norm_hidden,
-            in0_weight, in1_weight, out_weight,
-            in0_scales=in0_scales,
-            in1_scales=in1_scales,
-            out_scales=out_scales,
-            activation_function='silu',
-            tp_degree=self.config.tp_degree,
-            neuron_config=self.neuron_config
-        )
-        res_hidden = hlo.add(mlp_hidden, hidden)
-        return res_hidden, out_attn_k_cache, out_attn_v_cache
 
     def ln_lm_head(self, hidden, last_token_id, rms_weight, unused_bias, lm_head_weight, lm_head_bias, return_all_outputs=True):
         logits = transformer.rms_lm_head(self.config.tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm_head_bias, return_all_outputs, eps=self.config.rms_norm_eps, neuron_config=self.neuron_config)

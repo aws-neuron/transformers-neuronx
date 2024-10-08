@@ -149,7 +149,24 @@ class ParallelTensorManipulator:
 
     def slice_on_nc(self, tensors, dim, start, end, step):
         return ops.parallel_slice(tensors, dim, start, end, step)
+    
+class CPUTensorManipulator(ParallelTensorManipulator):
 
+    def duplicate(self, tensor):
+        return [tensor.contiguous() for ordinal in range(self.local_tp_degree)][0]
+
+    def shard_along(self, tensor, dim):
+        return self.shard_along_on_cpu(tensor, dim)
+
+    def primary_only(self, tensor):
+        tensors = [tensor]
+        tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.local_tp_degree))
+        return tensors
+
+    def slice_on_nc(self, tensor, dim, start, end, step):
+        index = [slice(None)] * tensor.dim()
+        index[dim] = slice(start, end, step)
+        return tensor[index]
 
 def layers_to_neuron(num_workers, layers, n_positions_list, to_neuron_hooks):
     with ThreadPoolExecutor(num_workers) as pool:

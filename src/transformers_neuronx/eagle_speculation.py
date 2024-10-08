@@ -361,8 +361,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
              cache_gather_indices,
              cache_scatter_indices,
              position_ids, 
-             all_paths, 
-             tree_matrix), inputs_sdim = draft.builder.eagle_draft_inputs(
+             all_paths), inputs_sdim = draft.builder.eagle_draft_inputs(
                 scribe, dtype, 1, batch_size, token_tree=True, k=self.k, n_leaves=self.n_leaves, depth=self.depth, n_entrees=self.tree_matrix.shape[0], width=self.width
             )
 
@@ -425,6 +424,10 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 tokens = hlo.concatenate([orig_tokens, new_tokens], 1)
                 prev_hidden = hlo.concatenate([orig_hidden, new_hidden], 1)
 
+            # Since we are using greedy for draft, we directly set the probs to 1 for draft
+            draft_probs = hlo.full(1.0, logits.dtype, [batch_size, self.k-1, 1])
+            draft_indices = hlo.reshape(new_tokens, [batch_size, self.k-1, 1])
+
             draft_caches = caches
             draft_position_ids = position_ids
 
@@ -470,49 +473,67 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             target_out_caches = itertools.chain(*caches)
 
             # Sample output tokens
-            target_ids = target._hlo_generation(target_scores, generation_params)
-            orig_target_ids = hlo.cast(target_ids, s32)
+            target_probs, target_indices = target._hlo_generation(target_scores, generation_params, early_return=True)
+            orig_indices = target_indices
+            orig_probs = target_probs
 
             # Rebase the target probabilities in case of rejection
-            # TODO: This needs to be fixed!!
-            rebased_draft_scores = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
-            rebased_target_scores = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
-            rebased_target_scores = hlo.subtract(rebased_target_scores, rebased_draft_scores)
-            rebased_target_scores = hlo.clamp(rebased_target_scores, minimum=0.0)
-            target_ids = target._hlo_generation(rebased_target_scores, generation_params)
-            target_ids = hlo.cast(target_ids, s32)
+            # We first collect all possible paths for draft and targets
+            draft_ids = hlo.broadcast(tokens, [batch_size, self.n_leaves, self.k], [0, 2])
+            partial_all_paths = hlo.slice_along(all_paths, 1, limit=self.depth, start=1)
+            partial_all_paths = hlo.broadcast(partial_all_paths, [batch_size, self.n_leaves, self.depth-1], [1, 2])
 
+            draft_ids = hlo.gather(draft_ids, 2, partial_all_paths)
+            draft_indices = hlo.reshape(draft_ids, [batch_size * self.n_leaves, self.depth-1, 1])
+            draft_probs = hlo.full(1.0, logits.dtype, [batch_size * self.n_leaves, self.depth-1, 1])
 
-            n_entrees = self.tree_matrix.shape[0]
-   
-            draft_ids = hlo.transpose(tokens, 0, 1) # (k, batch_size)
-            draft_ids = hlo.reshape(draft_ids, [self.k, 1, batch_size])
-            draft_ids = hlo.broadcast(draft_ids, [self.k, n_entrees, batch_size], [0, 1, 2])
+            _, _, vocab_size = target_indices.sizes
+            target_indices = hlo.broadcast(target_indices, [batch_size, self.n_leaves, self.k, vocab_size], [0, 2, 3])
+            all_paths = hlo.broadcast(all_paths, [batch_size, self.n_leaves, self.depth, vocab_size], [1, 2])
+            target_indices = hlo.gather(target_indices, 2, all_paths)
+            target_indices = hlo.reshape(target_indices, [batch_size * self.n_leaves, self.depth, vocab_size])
+            target_indices = hlo.cast(target_indices, draft_indices.dtype)
 
-            tree_matrix = hlo.transpose(tree_matrix, 0, 1)
-            tree_matrix = hlo.reshape(tree_matrix, [self.width, n_entrees, 1])
-            tree_matrix = hlo.broadcast(tree_matrix, [self.width, n_entrees, batch_size], [0, 1, 2])
+            target_probs = hlo.broadcast(target_probs, [batch_size, self.n_leaves, self.k, vocab_size], [0, 2, 3])
+            target_probs = hlo.gather(target_probs, 2, all_paths)
+            target_probs = hlo.reshape(target_probs, [batch_size * self.n_leaves, self.depth, vocab_size])
 
-            draft_ids = hlo.gather(draft_ids, 0, tree_matrix) # (self.width, self.k-1, batch_size)
-            debugs.append(tokens)
-            debugs.append(draft_ids)
+            # Then we get the adjusted probs for each possible path
+            adjusted_target_probs = hlo.speculative_adjust_distribution(
+                    draft_probs,
+                    draft_indices,
+                    target_probs,
+                    target_indices,
+                    self.depth-1)
 
-            draft_probabilities = hlo.softmax(draft_scores, dim=0, tp_degree=self.tp_degree)
-            target_probabilities = hlo.softmax(target_scores, dim=0, tp_degree=self.tp_degree)
+            generation_config = target.neuron_config.on_device_generation
+            target_ids = hlo.multinomial(adjusted_target_probs, dim=2, deterministic=generation_config.deterministic)
+            target_ids = hlo.gather(target_indices, 2, target_ids)
+            target_ids = hlo.squeeze(target_ids, 2)
+            target_ids = hlo.cast(target_ids, target_ids.scribe.s32)
 
-            if self.tp_degree > 1:
-                draft_probabilities = hlo.all_gather(draft_probabilities, dim=0, tp_degree=self.tp_degree)
-                target_probabilities = hlo.all_gather(target_probabilities, dim=0, tp_degree=self.tp_degree)
+            draft_ids = hlo.reshape(draft_ids, [batch_size * self.n_leaves, self.depth-1])
 
-            draft_probs = hlo.gather(draft_probabilities, 0, draft_ids) # (self.width, self.k-1, batch_size)
-            target_probs = hlo.gather(target_probabilities, 0, draft_ids)
+            sliced_target_indices = hlo.slice_along(target_indices, 1, limit=self.depth-1)
+            sliced_target_probs = hlo.slice_along(target_probs, 1, limit=self.depth-1) 
+
+            next_tokens, index, *mask = hlo.speculative_token_selection(
+                draft_ids, target_ids, 
+                draft_indices, draft_probs, 
+                sliced_target_indices, sliced_target_probs,
+                tp_degree=self.tp_degree,
+                pad_token_id=self.pad_token_id,
+                deterministic_threshold=None, output_mask=self.output_scores
+            )
+
+            next_tokens = hlo.reshape(next_tokens, [batch_size, self.n_leaves, self.depth])
+            index = hlo.reshape(index, [batch_size, self.n_leaves])
+
+            counts = hlo.add(index, 1)
 
             outputs = [
-                tokens,
-                target_ids,
-                orig_target_ids,
-                draft_probs,
-                target_probs,
+                next_tokens,
+                counts,
                 hidden,
             ]
  
@@ -712,74 +733,20 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                     cache_scatter_indices,
                     position_ids, 
                     all_paths, 
-                    self.tree_matrix, 
                     return_ranks=1)
 
-            draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
+            next_tokens, counts, hidden, *debugs = outputs
 
-            if not self.greedy:
-                # Recontruct the target ids: the rejected draft ids will be replaced with target ids sampled from adjusted distribution
-                target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
-            else:
-                target_ids = orig_target_ids
 
-            partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(batch_size, -1, -1) - 1
-            draft_ids = draft_ids[:, 1:].reshape(batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
-            draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
-            draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
-
-            target_ids = target_ids.reshape(batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
-            _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-            target_ids = torch.gather(target_ids, 2, _all_paths)
-
-            if not self.greedy:
-                # Prepare the draft and target distributions. Here we construct probs for all possible paths of a given tree
-                draft_probs = torch.transpose(draft_probs, 0, 2).reshape(batch_size, -1)
-                target_probs = torch.transpose(target_probs, 0, 2).reshape(batch_size, -1)
-
-                mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(batch_size, -1)
-                draft_probs = torch.gather(draft_probs, 1, mask_indices)
-                target_probs = torch.gather(target_probs, 1, mask_indices)
-
-                draft_probs = draft_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-                target_probs = target_probs.reshape(batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-
-                draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
-                target_probs = torch.gather(target_probs, 2, partial_all_paths)
-
-                # Accept or reject the tokens according to a certain distribution
-                ratio = torch.div(target_probs, draft_probs)
-                ratio = torch.clamp(ratio, max=1.0)
-                #dist = torch.rand(ratio.shape)
-                dist = torch.full(ratio.shape, 0.5)
-                accepted_mask = torch.lt(dist, ratio)
-            else:
-                # For greedy we directly compare target with draft
-                accepted_mask = torch.eq(target_ids, draft_ids)[:, :, :-1]
-
-            # Post-processing the accepted mask
-            # 1. We mask out the invalid tokens (i.e., the padding tokens for each path)
-            # 2. We find the consecutive accepted tokens
-            _mask = token_mask.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-            accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
-            pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(batch_size, self.n_leaves, self.depth-1) + 1
-            accepted_mask = torch.eq(accepted_mask, pos)
-
-            # Construct the final accepted tokens using accepted mask, draft_ids, and reconstructed target_ids
-            # True in accepted mask means draft is taken, otherwise, target is taken
-            # Note that we need to pad a False to the accepted mask: we always accept one extra token with target prediction
-            accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
-            tokens = torch.where(accepted_mask, draft_ids, target_ids)
-
+            # Post-processing for preparing the next iteration
             # We all the paths and the right tokens, we find the longest accepted path
             # If two paths have the same token counts, we accept from the highest probabilites
             # (Note that probabilites are already sorted because of topk)
-            counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
             counts = torch.clamp(counts, max=max_accepted)
             max_path = torch.argmax(counts, dim=1, keepdim=True)
             counts = torch.gather(counts, 1, max_path)
-            max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
-            tokens = torch.gather(tokens, 1, max_path)
+            max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, next_tokens.shape[-1])
+            tokens = torch.gather(next_tokens, 1, max_path)
             tokens = torch.reshape(tokens, (batch_size, -1))
 
             # Post-processing for preparing the next iteration
