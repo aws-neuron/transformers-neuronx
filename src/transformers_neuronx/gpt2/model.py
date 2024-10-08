@@ -72,7 +72,6 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.tag = tag
 
     def load_weights(self):
-        ops.init()
         self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:
@@ -323,7 +322,6 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.num_processed_tokens = 0
 
     def load_weights(self):
-        ops.init()
         self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:

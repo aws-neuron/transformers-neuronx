@@ -1154,7 +1154,6 @@ def reduce_max(tensor, dim, keepdim=False):
 
     return value
 
-
 def reduce_sum(tensor, dim, keepdim=False):
 
     dtype = tensor.dtype
@@ -3690,34 +3689,124 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
 
     return updated_keys, updated_values
 
+def select_from(
+    to_indices,
+    from_indices,
+    from_values,
+    default_values=None,
+):
+    """
+    Select the values from a given indices. We only support last dim for comparison
+
+    Example:
+        # 1. If to_indices has the same shape as from_indices
+        to_indices = [1, 4, 2, 3, 6]
+        from_indices = [4, 5, 3, 2, 7]
+        from_values = [20, 21, 22, 23, 24]
+        default_values = [0, 0, 0, 0, 0]
+
+        outputs = [0, 20, 23, 22, 0]
+
+        # 2. If to_indices is one rank lower than from_indices
+        to_indices = [3]
+        from_indices = [4, 5, 3, 2, 7]
+        from_values = [20, 21, 22, 23, 24]
+        default_values = [0]
+
+        outputs = [22]
+
+        # 3. If from_indices is one rank lower than to_indices
+        to_indices = [1, 4, 2, 3, 6]
+        from_indices = [3]
+        from_values = [22]
+        default_values = [0]
+
+        outputs = [0, 0, 0, 22, 0]
+    """
+    to_sizes = to_indices.sizes
+    from_sizes = from_indices.sizes
+
+    if default_values is None:
+        default_values = full(0, from_values.dtype, to_sizes)
+
+    if to_sizes == from_sizes:
+        size = to_sizes[-1]
+        rank = len(to_sizes)
+        new_sizes = *to_sizes, size
+
+        to_indices = broadcast(to_indices, new_sizes, [0, 1, 3])
+        from_indices = broadcast(from_indices, new_sizes, [0, 1, 2])
+        eq = cast(equal(to_indices, from_indices), to_indices.scribe.s32)
+        d = dict(
+                lhs_contracting_dimensions=[2],
+                lhs_batch_dimensions=[0, 1],
+                rhs_contracting_dimensions=[2],
+                rhs_batch_dimensions=[0, 1])
+        # TODO: need to fix this for non-zero defaul values
+        # from_values = [batch, k, topk]
+        # eq = [batch, k, topk, topk]
+        # output = [batch, k, topk]
+        to_values = dot_general(from_values, eq, d)
+    elif len(to_sizes) < len(from_sizes):
+        to_indices = broadcast(to_indices, from_sizes, [0, 1])
+        default_values = broadcast(default_values, from_sizes, [0, 1])
+        eq = equal(to_indices, from_indices)
+        to_values = masked_select(eq, from_values, default_values)
+        to_values = reduce_sum(to_values, dim=2)
+    else:
+        from_indices = broadcast(from_indices, to_sizes, [0, 1, 2])
+        from_values = broadcast(from_values, to_sizes, [0, 1, 2])
+        eq = cast(equal(to_indices, from_indices), from_values.dtype)
+        print(from_indices.sizes, eq.sizes, from_values.sizes) 
+        to_values = multiply(from_values, eq)
+
+    return to_values
+
+
+def speculative_adjust_distribution(
+    draft_probs,    # (batch, k, vocab_size)
+    draft_indices,  # (batch, k, vocab_size)
+    target_probs,   # (batch, k+1, vocab_size)
+    target_indices, # (batch, k+1, vocab_size)
+    k,
+):
+    """
+    With the provided draft and target probabilities, calculate the adjusted target probs
+    """
+    sliced_target_indices = slice_along(target_indices, 1, limit=k)
+    sliced_target_probs = slice_along(target_probs, 1, limit=k)
+    last_target_probs = slice_along(target_probs, 1, limit=k+1, start=k)
+
+    adjusted_draft_probs = select_from(sliced_target_indices, draft_indices, draft_probs)
+    adjusted_target_probs = subtract(sliced_target_probs, adjusted_draft_probs)
+    adjusted_target_probs = clamp(adjusted_target_probs, minimum=0.0)
+    probs_sizes = adjusted_target_probs.sizes
+
+    adjusted_sum = reduce_sum(adjusted_target_probs, dim=2)
+    adjusted_sum = broadcast(adjusted_sum, probs_sizes, [0, 1])
+    adjusted_target_probs = divide(adjusted_target_probs, adjusted_sum)
+    adjusted_target_probs = concatenate([adjusted_target_probs, last_target_probs], 1)
+
+    return adjusted_target_probs
 
 def speculative_mask(
-    draft_ids,           # shape: (k, batch_size)
-    draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-    target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+    draft_ids,             # shape: (batch_size, k)
+    draft_probs_indices,   # shape: (batch_size, k, vocab_size_tp)
+    draft_probs,           # shape: (batch_size, k, vocab_size_tp)
+    target_probs_indices,  # shape: (batch_size, k, vocab_size_tp)
+    target_probs,          # shape: (btach_size, k, vocab_size_tp)
     tp_degree=1,
     deterministic_threshold=None,
 ):
     s32 = draft_ids.scribe.s32
 
-    # Convert score into probabilities
-    draft_probabilities = softmax(draft_scores, dim=0, tp_degree=tp_degree)
-    target_probabilities = softmax(target_scores, dim=0, tp_degree=tp_degree)
-
-    # For simplicity all-gather the scores
-    if tp_degree > 1:
-        draft_probabilities = all_gather(draft_probabilities, dim=0, tp_degree=tp_degree)
-        target_probabilities = all_gather(target_probabilities, dim=0, tp_degree=tp_degree)
-
-    vocab_size, k, batch_size = draft_scores.sizes
+    batch_size, k, vocab_size = draft_probs.sizes
 
     # Gather the target/draft probabilities corresponding to draft sampling predictions
-    index = reshape(draft_ids, (1, k, batch_size))
-    target_probs = slice_along(target_probabilities, 1, limit=k)
-    target_probs = gather(target_probs, 0, index)
-    draft_probs = gather(draft_probabilities, 0, index)
-    target_probs = squeeze(target_probs, 0)              # shape: (k, batch_size)
-    draft_probs = squeeze(draft_probs, 0)                # shape: (k, batch_size)
+    target_probs_indices = cast(target_probs_indices, s32)
+    draft_probs_indices = cast(draft_probs_indices, s32)
+    target_probs = select_from(draft_ids, target_probs_indices, target_probs)
+    draft_probs = select_from(draft_ids, draft_probs_indices, draft_probs)
 
     # Compare ratio of probabilities at locations to a random sample
     ratio = divide(target_probs, draft_probs) # shape: (k, batch_size)
@@ -3730,22 +3819,24 @@ def speculative_mask(
 
     # Mask out all tokens past the accepted token
     accepted_mask = cast(accepted_mask, s32)
-    accepted_cumsum = cumsum(accepted_mask, dim=0)
-    positions = iota(s32, (k, batch_size), 0)
+    accepted_cumsum = cumsum(accepted_mask, dim=1)
+    positions = iota(s32, (batch_size, k), 1)
     positions = add(positions, 1)
     accepted_mask = equal(accepted_cumsum, positions) # shape: (k, batch_size)
 
     # Compute index of *final* accepted token per batch line
-    accepted_mask = pad(accepted_mask, dim=0, size=1, value=False)
+    accepted_mask = pad(accepted_mask, dim=1, size=1, value=False)
 
-    return accepted_mask # (k + 1, batch_size)
+    return accepted_mask # (batch_size, k + 1)
 
 
 def speculative_token_selection(
-        draft_ids,           # shape: (k, batch_size)
-        target_ids,          # shape: (k + 1, batch_size)
-        draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-        target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+        draft_ids,           # shape: (batch_size, k)
+        target_ids,          # shape: (batch_size, k+1)
+        draft_probs_indices,
+        draft_probs,         # shape: (batch_size, k+1, vocab_size_tp)
+        target_probs_indices,
+        target_probs,        # shape: (batch_size, k+1, vocab_size_tp)
         tp_degree=1,
         pad_token_id=0,
         deterministic_threshold=None,
@@ -3781,9 +3872,11 @@ def speculative_token_selection(
     s32 = draft_ids.scribe.s32
 
     accepted_mask = speculative_mask(
-        draft_ids,           # shape: (k, batch_size)
-        draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-        target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+        draft_ids,           # shape: (batch_size, k)
+        draft_probs_indices,
+        draft_probs,        # shape: (batch_size, k+1, vocab_size_tp)
+        target_probs_indices,
+        target_probs,       # shape: (batch_size, k+1, vocab_size_tp)
         tp_degree=tp_degree,
         deterministic_threshold=deterministic_threshold,
     )
@@ -3792,17 +3885,14 @@ def speculative_token_selection(
     # Note:
     # - When all rejected: Mask will select target in all positions (position 0 required)
     # - When all accepted: Mask will select draft in all positons but the last
-    draft_ids = pad(draft_ids, dim=0, size=1, value=0)
+    draft_ids = pad(draft_ids, dim=1, size=1, value=0)
     tokens = masked_select(accepted_mask, draft_ids, target_ids)
 
     # Zero-out tokens beyond the used tokens
-    positions = iota(s32, tokens.sizes, 0)
-    index = reduce_sum(cast(accepted_mask, s32), dim=0)
-    mask = greater_equal(broadcast(index, tokens.sizes, [1]), positions)
+    positions = iota(s32, tokens.sizes, 1)
+    index = reduce_sum(cast(accepted_mask, s32), dim=1)
+    mask = greater_equal(broadcast(index, tokens.sizes, [0]), positions)
     tokens = masked_select(mask, tokens, pad_token_id)
-
-    # Transpose back to SB -> BS layout
-    tokens = transpose(tokens, 0, 1)
 
     if output_mask:
         # Transpose back to SB -> BS layout

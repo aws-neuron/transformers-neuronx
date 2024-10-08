@@ -120,7 +120,6 @@ class LlamaForSampling(base.NeuronModelBase):
         self.materialize_embeddings()
         if self.neuron_config.is_eagle_draft:
             self.chkpt_model.model.fc.materialize()
-        ops.init()
 
         for layer_id, layer in enumerate(self.chkpt_model.model.layers):
             if layer_id not in self.layers_after_partition:
