@@ -252,8 +252,15 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None
 
 
 def dot_general(lhs, rhs, dimension_numbers, dtype=None):
-    # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
-
+    """
+    General dot product. Allows contracting and batch dimension numbers to be specified for both the lhs and rhs.
+    Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
+    
+    Args:
+        lhs, rhs: operands
+        dimension_numbers: contracting and batch dimension numbers
+        dtype: output tensor dtype, the same data type as lhs by default.
+    """
     dtype = dtype if dtype else lhs.dtype
     lhs_sizes = lhs.sizes
     rhs_sizes = rhs.sizes
@@ -877,12 +884,6 @@ def softmax(logits, dim=None, tp_degree=1):
     if tp_degree > 1:
         maximum = all_reduce_max(maximum, tp_degree=tp_degree)
     maximum = broadcast(maximum, logits.sizes, dims)
-
-    # cast to FP32 for better numerical stability
-    dtype = logits.dtype
-    f32 = logits.scribe.f32
-    maximum = cast(maximum, f32)
-    logits = cast(logits, f32)
 
     difference = subtract(logits, maximum)
     exponential = exp(difference)

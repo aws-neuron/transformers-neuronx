@@ -20,7 +20,7 @@ from transformers_neuronx.layers import attention
     Helper functions for shard over sequence / Flash decoding implementaions
 """
 
-def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree):
+def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree, topoaware=False):
 
     # Communication 1: all-gather query from cores
     # Notice that this is not necessary for context encoding because we don't read from the KV cache
@@ -30,7 +30,7 @@ def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree):
     interleave=False
     n_kv_heads = tp_degree // cores_per_kv_head
     interleave = utils.is_attn_node_interleaved(n_heads, n_kv_heads, tp_degree)
-    replica_groups = utils.build_replica_groups(num_groups, group_size, interleave=interleave)
+    replica_groups = utils.build_replica_groups(num_groups, group_size, interleave=interleave, topoaware=topoaware)
     # Query shape: n_active_tokens, n_seqs, n_heads_tp, d_head
     query = hlo.all_gather(query, 2, tp_degree, replica_groups)
     return query
