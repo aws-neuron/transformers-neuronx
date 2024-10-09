@@ -893,8 +893,7 @@ def softmax(logits, dim=None, tp_degree=1):
         denominator = all_reduce_sum(denominator, tp_degree=tp_degree)
     denominator = broadcast(denominator, logits.sizes, dims)
 
-    output = divide(exponential, denominator)
-    return cast(output, dtype)
+    return divide(exponential, denominator)
 
 
 def transfer_with_static_ring(shape):
@@ -3303,8 +3302,8 @@ def decoder_attention_block_diagonal_causal_from_bottomright_mask(num_queries, n
 
 
 def sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
-        num_queries, num_keys, max_num_queries, max_num_keys, max_num_seqs, sharded_seq_lens,
-        cached_to_contexted_idx, n_active_blocks, block_size, core_id, sos_degree):
+        num_queries, num_keys, max_num_queries, max_num_keys, max_num_seqs, position_ids, sharded_seq_lens,
+        cached_to_contexted_idx, n_active_blocks, block_size, core_sos_rank, sos_degree):
     """
     Creates block diagonal causal masks for multiple prompts in shard over sequence strategy.
 
@@ -3328,7 +3327,7 @@ def sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
         4    <12, 8>,         |                  |                    (seq 1)
         6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
 
-    core_id = 0                          core_id = 2
+    core_sos_rank = 0                    core_sos_rank = 2
     active_mask (NC0) = [                active_mask (NC2) = [
         [1, 1, 0, 0, 0, 0, 0, 0, 0],         [1, 1, 0, 0, 0, 0, 0],
         [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 0, 0, 0],
@@ -3347,56 +3346,63 @@ def sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
     function decoder_attention_block_diagonal_causal_from_bottomright_mask), and then slice
     the mask to the corresponding sharded region.
     """
-    # first compute the full mask
-    max_num_keys_global = max_num_keys * sos_degree
-    prior_mask, active_mask = decoder_attention_block_diagonal_causal_from_bottomright_mask(
-        num_queries, num_keys, max_num_queries, max_num_keys_global, max_num_seqs
-    )
-    # then generate the index of sharded blocks
-    # - block_tables: [n_active_blocks]
-    # > slot_mapping = np.arange(block_size).reshape(1, block_size) \
-    #                 * np.reshape(block_tables, (n_active_blocks, 1))
     s32 = num_queries.scribe.s32
     sharded_block_size = block_size // sos_degree
-    core_sos_rank = remainder(cast(core_id, s32), sos_degree)
+    num_queries_cumsum = concatenate([full(0, s32, [1]), cumsum(num_queries, dim=0)], dimension=0)
+    sharded_seq_lens_cumsum = concatenate([full(0, s32, [1]), cumsum(sharded_seq_lens, dim=0)], dimension=0)
+
+    def _sequence_id_gen(seq_id, seq_lens_cumsum, idx, max_len, seq_arr):
+        start = slice_along(seq_lens_cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        end = slice_along(seq_lens_cumsum, dim=0, limit=seq_id+2, start=seq_id+1)
+        start = broadcast(start, [max_len], [0])
+        end = broadcast(end, [max_len], [0])
+        mask = cast(logical_and(greater_equal(idx, start), less(idx, end)), s32)
+        id_arr = multiply(full(seq_id, s32, [max_len]), mask)
+        seq_arr = add(multiply(seq_arr, subtract(1, mask)), id_arr)
+        return seq_arr
+
+    seq_id_x = full(max_num_seqs + 1, s32, [max_num_queries])
+    seq_id_y = full(max_num_keys + 1, s32, [max_num_keys])
+    idx_x = iota(s32, (max_num_queries,), [0])
+    idx_y = iota(s32, (max_num_keys,), [0])
+    for seq_id in range(max_num_seqs):
+        seq_id_x = _sequence_id_gen(seq_id, num_queries_cumsum, idx_x, max_num_queries, seq_id_x)
+        seq_id_y = _sequence_id_gen(seq_id, sharded_seq_lens_cumsum, idx_y, max_num_keys, seq_id_y)
+    seq_id_x = broadcast(seq_id_x, [max_num_queries, max_num_keys], [0])
+    seq_id_y = broadcast(seq_id_y, [max_num_queries, max_num_keys], [1])
+    seq_mask = equal(seq_id_x, seq_id_y)
+
+    seq_num_blocks = divide(add(num_keys, block_size - 1), block_size)
+    seq_num_blocks_cumsum = concatenate([full(0, s32, [1]), cumsum(seq_num_blocks, dim=0)], dimension=0)
+    seq_block_idx = full(n_active_blocks + 1, s32, [n_active_blocks])
+    idx = iota(s32, (n_active_blocks,), [0])
+    for seq_id in range(max_num_seqs):
+        start = slice_along(seq_num_blocks_cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        end = slice_along(seq_num_blocks_cumsum, dim=0, limit=seq_id+2, start=seq_id+1)
+        start = broadcast(start, [n_active_blocks], [0])
+        end = broadcast(end, [n_active_blocks], [0])
+        mask = cast(logical_and(greater_equal(idx, start), less(idx, end)), s32)
+        id_arr = multiply(subtract(idx, start), mask)
+        seq_block_idx = add(multiply(seq_block_idx, subtract(1, mask)), id_arr)
+
     base_offset = multiply(core_sos_rank, sharded_block_size)
     base_offset_br = broadcast(reshape(base_offset, (1, 1)), (1, sharded_block_size), [0, 1])
     block_offset = reshape(iota(s32, (sharded_block_size,), [0]), (1, sharded_block_size))
     block_offset = add(block_offset, base_offset_br)
     block_offset = broadcast(block_offset, [n_active_blocks, sharded_block_size], [0, 1])
-    block_idx = iota(s32, (n_active_blocks, sharded_block_size), [0])
-    block_idx = multiply(block_idx, block_size)
-    block_idx = reshape(add(block_idx, block_offset), (n_active_blocks * sharded_block_size,))
-    # select active index
-    active_idx = index_select(block_idx, dim=0, index=cached_to_contexted_idx)
-    # modify active_idx to account the padding blocks
-    offset = full(0, s32, active_idx.sizes)
-    seq_lens_cumsum = cumsum(num_keys, dim=0)
-    sharded_seq_lens_cumsum = cumsum(sharded_seq_lens, dim=0)
-    seq_lens_pad = multiply(divide(add(num_keys, block_size-1), block_size), block_size)
-    seq_lens_pad_cumsum = cumsum(seq_lens_pad, dim=0)
-    for i in range(1, max_num_seqs):
-        prev_seq_id = s32.Constant(constant_value=i-1)
-        seq_id = s32.Constant(constant_value=i)
-        prev_seq_len = dynamic_slice_along(seq_lens_cumsum, dim=0, start=prev_seq_id, size=1)
-        prev_seq_len_pad = dynamic_slice_along(seq_lens_pad_cumsum, dim=0, start=prev_seq_id, size=1)
-        prev_num_tokens = dynamic_slice_along(sharded_seq_lens_cumsum, dim=0, start=prev_seq_id, size=1)
-        cur_num_tokens = dynamic_slice_along(sharded_seq_lens_cumsum, dim=0, start=seq_id, size=1)
-        num_pad_tokens = reshape(subtract(prev_seq_len_pad, prev_seq_len), (1, ))
-        mask_offset = iota(s32, active_idx.sizes, [0])
-        left_mask = compare(mask_offset, broadcast(prev_num_tokens, active_idx.sizes, [0]), "GE")
-        right_mask = compare(mask_offset, broadcast(cur_num_tokens, active_idx.sizes, [0]), "LT")
-        mask = logical_and(left_mask, right_mask)
-        offset = add(offset, multiply(cast(mask, s32), broadcast(num_pad_tokens, active_idx.sizes, [0])))
-        
-    active_idx = subtract(active_idx, offset)
-    prior_mask = index_select(prior_mask, dim=2, index=active_idx)
+    seq_block_idx = reshape(seq_block_idx, (n_active_blocks, 1))
+    seq_block_idx = broadcast(seq_block_idx, [n_active_blocks, sharded_block_size], [0, 1])
+    kv_position_id = add(multiply(seq_block_idx, block_size), block_offset)
+    kv_position_id = reshape(kv_position_id, (n_active_blocks * sharded_block_size,))
+    kv_position_id = index_select(kv_position_id, dim=0, index=cached_to_contexted_idx)
+    kv_position_id = broadcast(kv_position_id, [max_num_queries, max_num_keys], [1])
+    position_ids = reshape(position_ids, (max_num_queries,))
+    position_ids = broadcast(position_ids, [max_num_queries, max_num_keys], [0])
+    causal_mask = greater_equal(position_ids, kv_position_id)
 
-    # mask padding
-    b = iota(s32, prior_mask.sizes, [2])
-    total_num_keys = reshape(reduce_sum(sharded_seq_lens, dim=0), (1, 1, 1))
-    right_mask = compare(b, broadcast(total_num_keys, prior_mask.sizes, [0, 1, 2]), "LT")
-    prior_mask = logical_and(prior_mask, right_mask)
+    prior_mask = logical_and(seq_mask, causal_mask)
+    prior_mask = unsqueeze(prior_mask, 0)
+    active_mask = None
     return prior_mask, active_mask
 
 
