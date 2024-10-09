@@ -1519,12 +1519,14 @@ class DecoderLayer(torch.nn.Module):
                 n_head_per_core = n_heads // 32
                 q_shape = (self.attn_k_weight.shape[0], 32, n_head_per_core, self.attention_head_size)
                 kv_shape = (self.attn_v_weight.shape[0], 32, self.attention_head_size)
+                wo_shape = (self.attn_out_weight.shape[0], 32, n_head_per_core * self.attention_head_size)
                 if self.neuron_config.duplicate_q_weight_sos:
                     n_head_per_core = n_head_per_core * 4
                     q_shape = (self.attn_k_weight.shape[0], 32, n_head_per_core, self.attention_head_size)
-                self.attn_q_weight = self.attn_q_weight.reshape(q_shape)[:, ranks, :, :].reshape(self.attn_q_weight.shape[0], -1)
-                self.attn_k_weight = self.attn_k_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_k_weight.shape[0], -1)
-                self.attn_v_weight = self.attn_v_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_v_weight.shape[0], -1)
+                self.attn_q_weight = self.attn_q_weight.reshape(q_shape)[:, ranks, :, :].reshape(self.attn_q_weight.shape)
+                self.attn_k_weight = self.attn_k_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_k_weight.shape)
+                self.attn_v_weight = self.attn_v_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_v_weight.shape)
+                self.attn_out_weight = self.attn_out_weight.reshape(wo_shape)[:, ranks, :].reshape(self.attn_out_weight.shape)
 
             if node_interleaving:
                 n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE

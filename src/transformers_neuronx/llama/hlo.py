@@ -145,15 +145,26 @@ class LlamaForSamplingNoEmbeddingHlo:
             seq_lens = hlo.add(context_lens, last_token_id)
             block_size = self.neuron_config.continuous_batching.block_size
             if self.neuron_config.shard_over_sequence:
+                if self.neuron_config.topo_aware_sharding:
+                    num_groups = n_kv_heads
+                    even_rank = hlo.divide(hlo.remainder(core_id, num_groups), 2)
+                    odd_rank = hlo.divide(core_id, num_groups)
+                    is_odd = hlo.cast(hlo.remainder(core_id, 2), core_id.scribe.pred)
+                    core_sos_rank = hlo.masked_select(is_odd, odd_rank, even_rank)
+                else:
+                    core_sos_rank = hlo.remainder(core_id, cores_per_kv_head)
+                core_sos_rank = hlo.cast(core_sos_rank, seq_lens.scribe.s32)
                 sharded_block_size = block_size // cores_per_kv_head
                 block_tables = attention_utils.active_block_tables(
                     block_tables=block_tables, context_lens=hlo.unsqueeze(seq_lens, 1),
                     num_active_blocks=self.num_active_blocks, neuron_config=self.neuron_config)
-                start_ids, active_token_mask = attention_utils.sharded_slot_mapping(start_ids, cache_ids, block_size, core_id, sos_degree=cores_per_kv_head)
-                max_num_keys = self.num_active_blocks * sharded_block_size + min(sharded_block_size, 16)
+                start_ids, active_token_mask = attention_utils.sharded_slot_mapping(
+                    start_ids, cache_ids, block_size, core_sos_rank, sos_degree=cores_per_kv_head
+                )
+                max_num_keys = (self.num_active_blocks + 1) * sharded_block_size
                 _, n_active_tokens = cache_ids.sizes
                 cached_to_contexted, cached_to_contexted_idx, active_to_contexted, sharded_seq_lens = attention_utils.sharded_kv_indexing(
-                    seq_lens, last_token_id, cache_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_id, active_token_mask, 
+                    seq_lens, last_token_id, cache_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_sos_rank, active_token_mask, 
                     sos_degree=cores_per_kv_head
                 )
             else:
@@ -183,8 +194,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             _, n_active_tokens = cache_ids.sizes
             batch_size = self.neuron_config.continuous_batching.max_num_seqs
             mask, active_mask = hlo.sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
-                last_token_id, seq_lens, n_active_tokens, max_num_keys, batch_size, sharded_seq_lens,
-                cached_to_contexted_idx, self.num_active_blocks, block_size, core_id, cores_per_kv_head
+                last_token_id, seq_lens, n_active_tokens, max_num_keys, batch_size, cache_ids, sharded_seq_lens,
+                cached_to_contexted_idx, self.num_active_blocks + 1, block_size, core_sos_rank, cores_per_kv_head
             )
         else:
             mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,

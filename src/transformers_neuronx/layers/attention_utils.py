@@ -401,7 +401,7 @@ def contexted_kv(cached_keys, active_keys, cached_mask, cached_to_ctx, active_to
     return merged_keys
 
 
-def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_id, sos_degree=1):
+def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_sos_rank, sos_degree=1):
     """
     Mask the slot mapping in shard over sequence strategy.
 
@@ -425,11 +425,11 @@ def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_id, sos_de
         6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
 
     Args:    
-        slot_mapping = [5, 20, 21, 22, 23, 24, 36, 37, 38, 39, 40]
-        position_ids = [5, 8, 9, 10, 11, 12, 0, 1, 2, 3, 4]
-        block_size   = 6
-        core_id      = 2
-        sos_degree   = 3
+        slot_mapping  = [5, 20, 21, 22, 23, 24, 36, 37, 38, 39, 40]
+        position_ids  = [5, 8, 9, 10, 11, 12, 0, 1, 2, 3, 4]
+        block_size    = 6
+        core_sos_rank = 2
+        sos_degree    = 3
         
         We first map slot_mapping from global view to local view.
         slot_mapping = [1, 6, 7, 6, 7, 8, 12, 13, 12, 13, 12]
@@ -437,15 +437,14 @@ def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_id, sos_de
     OUTPUTS:
         masked_slotmapping = [1, x, x, 6, 7, x, x, x, x, x, 12]
 
-    In this example, we only leave the slot mapping on NC2 (core_id = 2), and x represents masked out.
+    In this example, we only leave the slot mapping on NC2 (core_sos_rank = 2), and x represents masked out.
     """
     sharded_block_size = block_size // sos_degree
     # build mask
     flat_position_ids = hlo.reshape(position_ids, (position_ids.sizes[1],))
     mapped_position_ids = hlo.divide(flat_position_ids, sharded_block_size)
     token_on_sos_rank = hlo.remainder(mapped_position_ids, sos_degree)
-    core_id = hlo.cast(core_id, slot_mapping.scribe.s32)
-    core_sos_rank = hlo.broadcast(hlo.remainder(core_id, sos_degree), slot_mapping.sizes, [0])
+    core_sos_rank = hlo.broadcast(core_sos_rank, slot_mapping.sizes, [0])
     mask = hlo.cast(hlo.equal(token_on_sos_rank, core_sos_rank), slot_mapping.dtype)
 
     # convert global slot_mapping to local slot_mapping
@@ -454,7 +453,7 @@ def sharded_slot_mapping(slot_mapping, position_ids, block_size, core_id, sos_de
     return masked_slot_mapping, mask
 
 
-def sharded_kv_indexing(seq_lens, new_token_lens, position_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_id, active_token_mask, sos_degree=1):
+def sharded_kv_indexing(seq_lens, new_token_lens, position_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_sos_rank, active_token_mask, sos_degree=1):
     """
     Select KV cache blocks and gather assigned blocks into output buffer for shard over sequence strategy.
 
@@ -479,9 +478,9 @@ def sharded_kv_indexing(seq_lens, new_token_lens, position_ids, max_num_keys, n_
         6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
 
     Args:
-        seq_lens     = [6, 13, 5]
-        context_lens = [5,  8, 0]
-        core_id      = 2
+        seq_lens      = [6, 13, 5]
+        context_lens  = [5,  8, 0]
+        core_sos_rank = 2
 
     OUTPUTS:
         active_idx = [0, 1,   # seq 0
@@ -496,7 +495,6 @@ def sharded_kv_indexing(seq_lens, new_token_lens, position_ids, max_num_keys, n_
     # compute sharded_seq_lens
     base_num_blocks = hlo.divide(seq_lens, block_size)
     remainder = hlo.subtract(seq_lens, hlo.multiply(base_num_blocks, block_size))
-    core_sos_rank = hlo.remainder(hlo.cast(core_id, s32), sos_degree)
     core_sos_rank_br = hlo.broadcast(hlo.multiply(core_sos_rank, sharded_block_size), remainder.sizes, [0])
     core_remainder = hlo.subtract(remainder, core_sos_rank_br)
     core_remainder = hlo.minimum(hlo.maximum(core_remainder, 0), sharded_block_size)
@@ -637,7 +635,13 @@ def sharded_softmax_correction(context, max_score_local, l_sum_score_local, core
     max_score_br = hlo.broadcast(max_score, all_max_scores.sizes, broadcast_dimensions=[0, 2, 3])
 
     # scale output
-    core_sos_rank = hlo.remainder(core_id, sos_degree)
+    if topoaware:
+        even_rank = hlo.divide(hlo.remainder(core_id, num_groups), 2)
+        odd_rank = hlo.divide(core_id, num_groups)
+        is_odd = hlo.cast(hlo.remainder(core_id, 2), core_id.scribe.pred)
+        core_sos_rank = hlo.masked_select(is_odd, odd_rank, even_rank)
+    else:
+        core_sos_rank = hlo.remainder(core_id, sos_degree)
     all_l_sums = hlo.reshape(all_l_sums, (1, sos_degree, n_head_per_core, num_tokens))
     scaling_factor = hlo.exp(hlo.subtract(all_max_scores, max_score_br))
     l_sum = hlo.reduce_sum(hlo.multiply(all_l_sums, scaling_factor), dim=1)
