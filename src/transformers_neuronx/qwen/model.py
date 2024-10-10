@@ -110,9 +110,9 @@ class QwenForSampling(base.NeuronModelBase):
                 is_unit_scale = False
             new_layer = self.decoder_lm_head.new_layer(is_unit_scale=is_unit_scale)
             new_layer.add_pre_attention_layer_norm(layer.input_layernorm.weight.detach(), None)
-            new_layer.add_attention_query(attn.q_proj.weight.detach().T, None)
-            new_layer.add_attention_key(attn.k_proj.weight.detach().T, None)
-            new_layer.add_attention_value(attn.v_proj.weight.detach().T, None)
+            new_layer.add_attention_query(attn.q_proj.weight.detach().T, attn.q_proj.bias.detach())
+            new_layer.add_attention_key(attn.k_proj.weight.detach().T, attn.k_proj.bias.detach())
+            new_layer.add_attention_value(attn.v_proj.weight.detach().T, attn.v_proj.bias.detach())
             if self.neuron_config and self.neuron_config.attn_output_transposed:
                 new_layer.add_attention_output(attn.o_proj.weight.T.detach(), None, sharding=0, transposed=True)
             else:

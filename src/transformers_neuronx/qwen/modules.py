@@ -68,9 +68,9 @@ class QwenAttention(module.LowMemoryModule):
         self.head_dim = self.hidden_size // self.num_heads
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
-        self.q_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
-        self.k_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
-        self.v_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=False, dtype=dtype)
+        self.q_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=True, dtype=dtype)
+        self.k_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=True, dtype=dtype)
+        self.v_proj = module.LowMemoryLazyLinear(self.num_heads * self.head_dim, bias=True, dtype=dtype)
         self.o_proj = module.LowMemoryLazyLinear(self.hidden_size, bias=False, dtype=dtype)
 
 
