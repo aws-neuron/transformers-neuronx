@@ -22,6 +22,7 @@ from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdap
 
 from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling
+from transformers_neuronx.qwen.model import QwenForSampling
 from transformers_neuronx.gpt2.model import GPT2ForSamplingWithContextBroadcasting
 from transformers_neuronx.gptneox.model import GPTNeoXForSampling
 from transformers_neuronx.gptj.model import GPTJForSampling
