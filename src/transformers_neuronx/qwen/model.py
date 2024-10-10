@@ -356,7 +356,7 @@ class QwenForSampling(base.NeuronModelBase):
             context_length -= prefixed_length
             sequence_length -= prefixed_length
 
-        result = sampling.sample_qwen(
+        result = sampling.sample_llama(
             self, input_ids, start_ids, sequence_length,
             eos_token_id=self.config.eos_token_id if eos_token_override is None else eos_token_override,
             top_k=top_k, top_p=top_p, temperature=temperature, streamer=streamer,
