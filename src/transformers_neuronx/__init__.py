@@ -20,6 +20,7 @@ from transformers_neuronx.sparse_attn_utils import SparseAttnConfig
 from transformers_neuronx.config import NeuronConfig, QuantizationConfig, ContinuousBatchingConfig, GenerationConfig
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
+from transformers_neuronx.qwen.model import QwenForSampling
 from transformers_neuronx.bloom.model import BloomForSampling
 from transformers_neuronx.llama.model import LlamaForSampling
 from transformers_neuronx.gpt2.model import GPT2ForSamplingWithContextBroadcasting
