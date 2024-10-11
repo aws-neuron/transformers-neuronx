@@ -23,18 +23,18 @@ from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB, KV_SHARD_PAD
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.qwen.config import QwenConfig
-from transformers_neuronx.qwen.modules import QwenForCausalLM
-from transformers_neuronx.qwen.hlo import QwenForSamplingNoEmbeddingHlo
+from transformers_neuronx.qwen2.config import Qwen2Config
+from transformers_neuronx.qwen2.modules import Qwen2ForCausalLM
+from transformers_neuronx.qwen2.hlo import Qwen2ForSamplingNoEmbeddingHlo
 import warnings
 
-class QwenForSampling(base.NeuronModelBase):
+class Qwen2ForSampling(base.NeuronModelBase):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,
                  neuron_config=None, prefixed_length=0, **kwargs):
-        config = QwenConfig(config, n_positions, batch_size, amp, tp_degree)
-        super().__init__(QwenForCausalLM, config)
+        config = Qwen2Config(config, n_positions, batch_size, amp, tp_degree)
+        super().__init__(Qwen2ForCausalLM, config)
         self.context_pre_hook = None
         self.context_hook = None
         self.config = config
@@ -81,7 +81,7 @@ class QwenForSampling(base.NeuronModelBase):
 
         self.batch_sizes = bucket.batch_sizes(batch_size)
         self.context_batch_sizes = [1] if self.neuron_config and self.neuron_config.continuous_batching else self.batch_sizes
-        hlo_builder = QwenForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
+        hlo_builder = Qwen2ForSamplingNoEmbeddingHlo(config, neuron_config=self.neuron_config)
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
@@ -365,7 +365,7 @@ class QwenForSampling(base.NeuronModelBase):
 
         return result
 
-class FIDQwenForSampling(QwenForSampling):
+class FIDQwen2ForSampling(Qwen2ForSampling):
 
     def __init__(self, config, *, n_positions=2048, batch_size=1, amp='f32', tp_degree=2,
                  context_length_estimate=None, context_unroll=None, unroll=None,

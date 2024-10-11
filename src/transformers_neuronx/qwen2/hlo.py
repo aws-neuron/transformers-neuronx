@@ -18,7 +18,7 @@ from transformers_neuronx import hlo, utils
 from transformers_neuronx import constants
 from transformers_neuronx import utils
 from transformers_neuronx.layers import transformer, rotary, attention, attention_utils, flash_decoding
-from transformers_neuronx.qwen.config import QwenConfig
+from transformers_neuronx.qwen2.config import Qwen2Config
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.hlo import quantize_kv_cache_direct_cast, dequantize_kv_cache_direct_cast
@@ -26,10 +26,10 @@ from transformers_neuronx.hlo import quantize_kv_cache_direct_cast, dequantize_k
 from transformers_neuronx.nki.compile import nki_call
 
 
-class QwenForSamplingNoEmbeddingHlo:
+class Qwen2ForSamplingNoEmbeddingHlo:
 
     def __init__(self,
-        config: QwenConfig,
+        config: Qwen2Config,
         neuron_config: Optional[NeuronConfig] = None
     ):
         self.config = config

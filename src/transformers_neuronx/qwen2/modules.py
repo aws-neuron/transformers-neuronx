@@ -17,13 +17,13 @@ from transformers_neuronx import module
 from transformers_neuronx import utils
 
 
-class QwenForCausalLM(module.PretrainedModel):
+class Qwen2ForCausalLM(module.PretrainedModel):
 
     def __init__(self, config):
         super().__init__()
         dtype, _, _ = utils.parse_amp(config.amp)
         dtype = dtypes.to_torch_dtype(dtype)
-        self.model = QwenModel(config)
+        self.model = Qwen2Model(config)
         self.lm_head = module.LowMemoryLazyLinear(config.vocab_size, dtype=dtype, bias=False)
 
     def get_tied_parameters(self):
@@ -33,33 +33,33 @@ class QwenForCausalLM(module.PretrainedModel):
         return self.model
 
 
-class QwenModel(module.LowMemoryModule):
+class Qwen2Model(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
         self.embed_tokens = module.LowMemoryEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = module.LowMemoryModuleList([QwenDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = QwenRMSNorm(config)
+        self.layers = module.LowMemoryModuleList([Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = Qwen2RMSNorm(config)
 
 
-class QwenRMSNorm(module.LowMemoryModule):
+class Qwen2RMSNorm(module.LowMemoryModule):
 
     def __init__(self, config) -> None:
         super().__init__()
         self.weight = module.UninitializedParameter()
 
 
-class QwenDecoderLayer(module.LowMemoryModule):
+class Qwen2DecoderLayer(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
-        self.self_attn = QwenAttention(config)
-        self.mlp = QwenMLP(config)
-        self.input_layernorm = QwenRMSNorm(config)
-        self.post_attention_layernorm = QwenRMSNorm(config)
+        self.self_attn = Qwen2Attention(config)
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config)
+        self.post_attention_layernorm = Qwen2RMSNorm(config)
 
 
-class QwenAttention(module.LowMemoryModule):
+class Qwen2Attention(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
@@ -74,7 +74,7 @@ class QwenAttention(module.LowMemoryModule):
         self.o_proj = module.LowMemoryLazyLinear(self.hidden_size, bias=False, dtype=dtype)
 
 
-class QwenMLP(module.LowMemoryModule):
+class Qwen2MLP(module.LowMemoryModule):
 
     def __init__(self, config):
         super().__init__()
