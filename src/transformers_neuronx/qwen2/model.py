@@ -375,7 +375,7 @@ class FIDQwen2ForSampling(Qwen2ForSampling):
                         tp_degree=tp_degree, context_length_estimate=context_length_estimate,
                         context_unroll=context_unroll, unroll=unroll, neuron_config=neuron_config,
                         reorder_cache=False, **kwargs)
-        assert len(self.decoder_lm_head.batch_size) == 1, "FIDQwenForSampling does not support compilation for \
+        assert len(self.decoder_lm_head.batch_size) == 1, "FIDQwen2ForSampling does not support compilation for \
             multiple batch sizes"
         self.batch_size = self.decoder_lm_head.batch_size[0]
         self.bos_token_id = self.config.bos_token_id
@@ -389,7 +389,7 @@ class FIDQwen2ForSampling(Qwen2ForSampling):
         They will be mixed and generate a single output sequence.
         """
 
-        # In FID-Qwen, first, context encoding is done w/ generating any output token for context
+        # In FID-Qwen2, first, context encoding is done w/ generating any output token for context
         # Here batch-size are different context+queries of single run
 
         offset = 0
@@ -410,7 +410,7 @@ class FIDQwen2ForSampling(Qwen2ForSampling):
         input_ids = input_ids.reshape(fused_batch_size, context_length)
 
         # Run the model
-        result = sampling.sample_qwen(self, input_ids, start_ids, sequence_length,
+        result = sampling.sample_llama(self, input_ids, start_ids, sequence_length,
                                           eos_token_id=self.config.eos_token_id, top_k=top_k, streamer=streamer)
 
         return result

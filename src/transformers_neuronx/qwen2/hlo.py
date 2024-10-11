@@ -302,7 +302,7 @@ class Qwen2ForSamplingNoEmbeddingHlo:
         key = hlo.slice_along(nki_output, -1, (n_heads_tp+n_kv_heads_tp)*slice_lim, start=n_heads_tp*slice_lim)
         value = hlo.slice_along(nki_output, -1, (n_heads_tp+2*n_kv_heads_tp)*slice_lim, start=(n_heads_tp+n_kv_heads_tp)*slice_lim)
 
-        # shard over head (qwen/hlo.py)
+        # shard over head (qwen2/hlo.py)
         active_q_sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
         active_kv_sizes = n_active_tokens, n_seqs, n_kv_heads_tp, d_head
         query = hlo.reshape(query, active_q_sizes)
