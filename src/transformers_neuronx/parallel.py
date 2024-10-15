@@ -153,7 +153,7 @@ class ParallelTensorManipulator:
 class CPUTensorManipulator(ParallelTensorManipulator):
 
     def duplicate(self, tensor):
-        return [tensor.contiguous() for ordinal in range(self.local_tp_degree)][0]
+        return [tensor.contiguous() for _ in range(self.local_tp_degree)]
 
     def shard_along(self, tensor, dim):
         return self.shard_along_on_cpu(tensor, dim)
