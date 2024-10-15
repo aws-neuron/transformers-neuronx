@@ -610,7 +610,7 @@ def gather_sharded_kv(kv_cache, active_idx, active_tokens=None, active_token_idx
     return active_kv_cache
 
 
-def sharded_softmax_correction(context, max_score_local, l_sum_score_local, core_id, tp_degree, sos_degree=1, topoaware=False):
+def sharded_softmax_correction(context, max_score_local, l_sum_score_local, core_id, tp_degree, sos_degree=1):
     """
     Correct the softmax scores for shard over sequence strategy.
 
@@ -620,7 +620,7 @@ def sharded_softmax_correction(context, max_score_local, l_sum_score_local, core
     group_size = sos_degree
     num_groups = tp_degree // sos_degree
     replica_groups = utils.build_replica_groups(num_groups=num_groups, group_size=group_size,
-                                                interleave=False, topoaware=topoaware)
+                                                interleave=False)
 
     # 1. all-gather to get the global max and denominator
     payload = hlo.concatenate((max_score_local, l_sum_score_local), dimension=1)
@@ -635,13 +635,7 @@ def sharded_softmax_correction(context, max_score_local, l_sum_score_local, core
     max_score_br = hlo.broadcast(max_score, all_max_scores.sizes, broadcast_dimensions=[0, 2, 3])
 
     # scale output
-    if topoaware:
-        even_rank = hlo.divide(hlo.remainder(core_id, num_groups), 2)
-        odd_rank = hlo.divide(core_id, num_groups)
-        is_odd = hlo.cast(hlo.remainder(core_id, 2), core_id.scribe.pred)
-        core_sos_rank = hlo.masked_select(is_odd, odd_rank, even_rank)
-    else:
-        core_sos_rank = hlo.remainder(core_id, sos_degree)
+    core_sos_rank = hlo.remainder(core_id, sos_degree)
     all_l_sums = hlo.reshape(all_l_sums, (1, sos_degree, n_head_per_core, num_tokens))
     scaling_factor = hlo.exp(hlo.subtract(all_max_scores, max_score_br))
     l_sum = hlo.reduce_sum(hlo.multiply(all_l_sums, scaling_factor), dim=1)
