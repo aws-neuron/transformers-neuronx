@@ -1511,23 +1511,6 @@ class DecoderLayer(torch.nn.Module):
                     q_bias = q_bias.repeat(1, self.kv_replication, 1)
                     self.attn_q_bias = q_bias.reshape(-1)
 
-            if self.neuron_config.topo_aware_sharding:
-                row_ranks = torch.arange(16).reshape(4, 4, 1)
-                col_ranks = 16 + torch.transpose(torch.arange(16).reshape(4, 4, 1), 0, 1)
-                ranks = torch.concat([row_ranks, col_ranks], dim=2).reshape(-1)
-
-                n_head_per_core = n_heads // 32
-                q_shape = (self.attn_k_weight.shape[0], 32, n_head_per_core, self.attention_head_size)
-                kv_shape = (self.attn_v_weight.shape[0], 32, self.attention_head_size)
-                wo_shape = (self.attn_out_weight.shape[0], 32, n_head_per_core * self.attention_head_size)
-                if self.neuron_config.duplicate_q_weight_sos:
-                    n_head_per_core = n_head_per_core * 4
-                    q_shape = (self.attn_k_weight.shape[0], 32, n_head_per_core, self.attention_head_size)
-                self.attn_q_weight = self.attn_q_weight.reshape(q_shape)[:, ranks, :, :].reshape(self.attn_q_weight.shape)
-                self.attn_k_weight = self.attn_k_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_k_weight.shape)
-                self.attn_v_weight = self.attn_v_weight.reshape(kv_shape)[:, ranks, :].reshape(self.attn_v_weight.shape)
-                self.attn_out_weight = self.attn_out_weight.reshape(wo_shape)[:, ranks, :].reshape(self.attn_out_weight.shape)
-
             if node_interleaving:
                 n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE
                 self.attn_q_weight = interleave_by_node(self.attn_q_weight, dim=1, n_nodes=n_nodes)

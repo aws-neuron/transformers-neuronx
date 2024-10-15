@@ -98,8 +98,6 @@ class LlamaForSampling(base.NeuronModelBase):
             # for KV cache active blocks and the context length estimate bucket for number of queries)
             self.context_batch_sizes = block_sizes
 
-            if self.neuron_config.shard_over_sequence and config.num_key_value_heads == 8 and tp_degree == TRN1_WORLD_SIZE:
-                self.neuron_config.topo_aware_sharding = True
         self.decoder_param_set = decoder.DecoderLmHeadForSamplingNoEmbedding(
             tp_degree=tp_degree, n_positions_list=self.token_buckets, n_active_tokens=1, batch_size=self.batch_sizes,
             attention_head_size=config.attention_head_size, amp=amp,
