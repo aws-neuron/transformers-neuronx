@@ -834,15 +834,27 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def save_presharded_weights(self, directory):
         save_dict = {}
         for key, value in self.__dict__.items():
+            cpu_tensor = None
             if isinstance(value, torch.Tensor) and value.device.type == 'xla':
                 cpu_tensor = ops.parallel_cpu(value)
+            elif self._cpu_compile:
+                if isinstance(value, list) and len(value) == self.tp_degree and isinstance(value[0], torch.Tensor):
+                    cpu_tensor = value
+                elif isinstance(value, torch.Tensor):
+                    cpu_tensor = [value.contiguous()]
+            if cpu_tensor is not None:
                 for i in range(len(cpu_tensor)):
-                    save_dict[f'{key}*{i}'] = cpu_tensor[i]
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i].detach().clone()
+            del cpu_tensor
 
         for i, param in enumerate(self.pre_layer_parameters):
-            cpu_tensor = ops.parallel_cpu(param)
+            if self._cpu_compile:
+                cpu_tensor = param
+            else:
+                cpu_tensor = ops.parallel_cpu(param)
             for j in range(len(cpu_tensor)):
-                save_dict[f'pre_layer_parameter{i}*{j}'] = cpu_tensor[j]
+                save_dict[f'pre_layer_parameter{i}*{j}'] = cpu_tensor[j].detach().clone()
+            del cpu_tensor
 
         save_file(save_dict, os.path.join(directory, 'DecoderLMHead.safetensors'))
 
@@ -1682,15 +1694,28 @@ class DecoderLayer(torch.nn.Module):
     def save_presharded_weights(self, directory):
         save_dict = {}
         for key, value in self.__dict__.items():
+            cpu_tensor = None
             if isinstance(value, torch.Tensor) and value.device.type == 'xla':
                 cpu_tensor = ops.parallel_cpu(value)
+            elif self._cpu_compile:
+                if isinstance(value, list) and len(value) == self.tp_degree and isinstance(value[0], torch.Tensor):
+                    cpu_tensor = value
+                elif isinstance(value, torch.Tensor):
+                    cpu_tensor = [value.contiguous()]
+            if cpu_tensor is not None:
                 for i in range(len(cpu_tensor)):
-                    save_dict[f'{key}*{i}'] = cpu_tensor[i]
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i].detach().clone()
+            del cpu_tensor
 
         for i, param in enumerate(self.extra_parameters):
             if param is None:
                 # save an empty tensor
                 cpu_tensor = [torch.tensor([])]
+            elif self._cpu_compile:
+                if isinstance(param, list):
+                    cpu_tensor = [tensor.detach().contiguous() for tensor in param]
+                else:
+                    cpu_tensor = [param.detach().contiguous()]
             else:
                 cpu_tensor = ops.parallel_cpu(param)
             for j in range(len(cpu_tensor)):
@@ -1928,8 +1953,9 @@ class DecoderLayer(torch.nn.Module):
 
     def reset(self):
         for batch_size in self.batch_sizes:
+            # CPU compilation sometimes returns tensors in a list, eg. [tensor(...), tensor(...)]
             if isinstance(self.attn_k_cache[batch_size], list):
-                self.attn_k_cache[batch_size] = self.attn_k_cache[batch_size][0]
+                self.attn_k_cache[batch_size] = torch.cat(self.attn_k_cache[batch_size])
             zero_cache = torch.zeros(self.attn_k_cache[batch_size].shape, dtype=self.attn_k_cache[batch_size].dtype)
             zero_cache = [zero_cache for _ in range(self.neuron_config.get_local_tp(self.tp_degree))]
             if not self._cpu_compile:
@@ -2040,8 +2066,8 @@ class MaybeParallelTensorManipulator:
         tensors = self.manipulator.shard_along_on_cpu(tensor, dim)
         tensors = self.transform_and_tile_weight_layout(tensors, weight_tiling)
         if not self.use_cpu:
-            tensor = ops.parallel_to_nc(tensors)
-        return tensor
+            tensors = ops.parallel_to_nc(tensors)
+        return tensors
 
 
 class DecoderParameterBuilder:
@@ -2168,7 +2194,8 @@ class DecoderProgram:
             tensor = tensor.to(buf.dtype)
             tensor = process_input_tensors(tensor, idx)
             assert buf.shape == tensor[0].shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor[0].shape}) have different shapes!"
-            ops.parallel_write(buf, tensor)
+            if not self._cpu_compile:
+                ops.parallel_write(buf, tensor)
 
     def run(self, bucket_id):
         raise NotImplementedError(DecoderProgram)
