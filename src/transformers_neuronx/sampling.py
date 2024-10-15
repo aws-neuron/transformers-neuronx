@@ -95,8 +95,8 @@ def sample_tokens(
                 "We are making the assumption that all the sequences progress at the same rate in naive continuous batching. "
                 "Please make sure you are running naive continuous batching which is enabled by adding the --continuous_batching flag in generation_demo."
             )
-            cache_ids=cache_ids.unsqueeze(0).expand(batch_size,1) 
-        
+            cache_ids=cache_ids.unsqueeze(0).expand(batch_size,1)
+
         next_tokens = model(next_tokens, cache_ids, start_ids)
 
     if streamer:
@@ -220,13 +220,13 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
             cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
             mask = cumulative_probs < top_p
 
-            # Per the original paper (https://arxiv.org/pdf/1904.09751.pdf, page 4 bottom), this filter include the minimal 
-            # subset of tokens (in descending sorted order of scores) with cumulative probability >= top_p. This means that 
-            # we need an extra token, in addition to those filtered by above logic (cumulative_probs < top_p). We do this by 
+            # Per the original paper (https://arxiv.org/pdf/1904.09751.pdf, page 4 bottom), this filter include the minimal
+            # subset of tokens (in descending sorted order of scores) with cumulative probability >= top_p. This means that
+            # we need an extra token, in addition to those filtered by above logic (cumulative_probs < top_p). We do this by
             # inserting a True column and the head of the mask (therefore shifting the rest of mask to the right by one),
             # and dropping the last column of the mask.
             mask = torch.concat((torch.ones([mask.shape[0], 1], dtype=torch.bool), mask[:, :-1]), axis=-1)
-            
+
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
             sorted_scores = sorted_scores[:, :n_to_keep]
@@ -351,7 +351,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         # this means that, while every sequence in the batch has the same length, a sequence that
         # encounters eos_token_id earlier will be filled with eos_token_ids post the first appearance
         # of eos_token_id.
-        # no need to set positions that are already eos                        
+        # no need to set positions that are already eos
         token = torch.where(torch.logical_and(done_flags, ~eos_flags), eos_token_id[0], inputs)
         tokens.append(token)
 
@@ -369,7 +369,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 
         # forward pass to get next token
         cache_ids = cache_ids + 1
-        
+
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
@@ -382,7 +382,7 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0,
                  streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, cache_ids=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
-    
+
     # populate key/value caches according to the prompt text
     next_token_scores = model(input_ids, cache_ids, start_ids)
     if cache_ids is not None and model.neuron_config.use_2d_cache_ids:
@@ -397,7 +397,7 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
 #TODO Leverage Generation Args data class as input args
 def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
- 
+
     # sample
     probs = torch.nn.functional.softmax(top_values, dim=-1)
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)

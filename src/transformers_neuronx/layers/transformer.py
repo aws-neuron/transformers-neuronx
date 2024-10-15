@@ -124,13 +124,14 @@ def inputs(scribe, dtype, batch_size, n_active_tokens, hidden_size, neuron_confi
     else:
         last_token_id = s32[1].Parameter(parameter_number=3)
 
-    # add block tables and context lens parameters as single length tensors 
+    # add block tables and context lens parameters as single length tensors
     # when chunked prefill is not enabled. In this case, these inputs are not used
     # but are kept for consistency and are defined as length 1 tensors.
     if not block_table:
         block_table = s32[1].Parameter(parameter_number=4)
     if not context_lens:
         context_lens = s32[1].Parameter(parameter_number=5)
+
 
     sequence_slice_dimensions = (
         1,                        # hidden        | In both HSB/BSH the sequence dim is 1
@@ -171,7 +172,7 @@ def ln_lm_head(tp_degree, hidden, last_token_id, ln_f_weight, ln_f_bias, lm_head
         hidden_size, n_active_tokens, batch_size = hidden.sizes
 
     if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query:
-        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large 
+        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large
         # tensor). Since we only need last_token_id, we can first pick out last_token_id % seq_shard_len from each tp rank,
         # then all-gather only this part, and then pick out the last_token_id // seq_shard_len to pick out the hidden coming
         # from the correct rank.
@@ -242,8 +243,8 @@ def rms_lm_head(tp_degree, hidden, last_token_id, rms_weight, lm_head_weight, lm
     dtype = hidden.dtype
     is_eagle_model = neuron_config.is_eagle_target or neuron_config.is_eagle_draft
 
-    if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query:
-        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large 
+    if neuron_config and neuron_config.is_sequence_parallel and not return_all_outputs and not neuron_config.use_1d_query and not is_eagle_model:
+        # For sequence parallel norm, we need to gather the hidden but we don't need the full hidden (which creates a large
         # tensor). Since we only need last_token_id, we can first pick out last_token_id % seq_shard_len from each tp rank,
         # then all-gather only this part, and then pick out the last_token_id // seq_shard_len to pick out the hidden coming
         # from the correct rank.

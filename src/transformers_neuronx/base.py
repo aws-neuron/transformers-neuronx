@@ -96,7 +96,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             else:
                 self.load_weights()
             self.compile(parallel_degree=self.neuron_config.compilation_worker_count)
-    
+
     def load_presharded_weights(self):
         assert self.neuron_config.on_device_embedding, "on_device_embedding must be True to save and load presharded weights"
         ops.init()
@@ -105,10 +105,10 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         for i in range(self.decoder_lm_head.num_layers):
             new_layer = self.decoder_lm_head.new_layer()
             new_layer.load_presharded_weights(ps_dir)
-        
+
         self.decoder_lm_head.load_presharded_weights(ps_dir)
         self.init_rest_of_model()
-    
+
     def _save_presharded_weights(self, directory):
         self.decoder_lm_head.save_presharded_weights(directory)
         for layer in self.decoder_lm_head.layers:
@@ -205,9 +205,9 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
     def decode(self, hidden, *args):
         """A helper function for decoding (token-generation)
-        This function simply called decoder_lm_head. 
+        This function simply called decoder_lm_head.
         It is defined as a function to enable wrapping with a decorator and measuring its runtime.
-        """ 
+        """
         return self.decoder_lm_head(hidden, *args)
 
     def context(self, hidden, cache_ids, start_ids, last_token_id, *rest):
@@ -266,7 +266,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                     seq_lens = context_lens + last_token_id
                     n_active_blocks = ((seq_lens+block_size-1) // block_size).sum().item()
                     active_block_bucket = bucket.find(self.context_batch_sizes, n_active_blocks)
-                    # we use the model indexed by estimate (i.e., number of queries) and 
+                    # we use the model indexed by estimate (i.e., number of queries) and
                     # active_block_bucket (i.e., number of active KV cache blocks)
                     model = self.decoder_lm_head_for_context[estimate, active_block_bucket]
                 else:
@@ -340,7 +340,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
         """
         batch_size, context_length = input_ids.shape
 
-        # define for chunked_prefill (set to size 1 zero tensor when no chunked prefill 
+        # define for chunked_prefill (set to size 1 zero tensor when no chunked prefill
         # (unused in that case))
         block_tables = torch.tensor([0])
         context_lens = torch.tensor([0])
@@ -402,8 +402,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
                         # finally we set "context_length" to the total length of queries. We use the context
                         # encoding model with the queries being the active tokens and hence context_length
-                        # refers to the active tokens (number of queries). This is not to be confused with 
-                        # context_lens from input_metadata which refers to the past tokens for each request. 
+                        # refers to the active tokens (number of queries). This is not to be confused with
+                        # context_lens from input_metadata which refers to the past tokens for each request.
                         context_length = query_lens.sum().item()
                     elif self.neuron_config.paged_attention:
                         # For context encoding phase of paged attention, we get prompt_lens from input_metadata.
@@ -454,7 +454,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 assert (cache_ids.ndim == 2) and (cache_ids.shape[0] == 1), \
                     f"cache_ids is expected to be a 1xN matrix, but its shape is {cache_ids.shape}"
                 if self.neuron_config.enable_chunked_prefill:
-                    # in this case, just pad with 0s 
+                    # in this case, just pad with 0s
                     cache_ids = utils.pad(cache_ids, 1, estimate, left=False)
                     return cache_ids
                 start_idx = cache_ids[0, -1].item() + 1
@@ -658,7 +658,7 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             all_logits = []
             cache_ids, start_ids, last_token_id = args[0], args[1], args[2]
             if self.neuron_config.is_eagle_draft:
-                priv_hiddens = args[3]
+                prev_hiddens = args[5]
             for iter_id in range(n_iters):
                 start_idx = iter_id*running_batch_size
                 end_idx = (iter_id+1)*running_batch_size
@@ -670,9 +670,11 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
                 start_ids_per_batch = start_ids[start_idx:end_idx]
                 last_token_id_per_batch = last_token_id[start_idx:end_idx]
                 if self.neuron_config.is_eagle_draft:
-                    priv_hidden_per_batch = priv_hiddens[start_idx:end_idx, ...]
+
+                    # Chuncked prefill is not enabled for Eagle right now, setting block_tables and context_lens to default values
+                    prev_hidden_per_batch = prev_hiddens[start_idx:end_idx, ...]
                     logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
-                                            start_ids_per_batch, last_token_id_per_batch, priv_hidden_per_batch)
+                        start_ids_per_batch, last_token_id_per_batch, torch.tensor([0]), torch.tensor([0]), prev_hidden_per_batch)
                 else:
                     logits_per_batch = self.context(hidden_per_batch, cache_ids_per_batch,
                                                 start_ids_per_batch, last_token_id_per_batch)

@@ -87,7 +87,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         core_id = None
         if ((self.neuron_config.shard_over_sequence or self.neuron_config.sequence_parallel_norm)
                 and self.neuron_config.on_device_embedding):
-            core_id, embed_weight = weights
+            core_id, embed_weight, *rst = weights
         else:
             embed_weight, *rst = weights
         dtype = getattr(input_ids.scribe, self.config.amp)
@@ -200,22 +200,28 @@ class LlamaForSamplingNoEmbeddingHlo:
                block_tables, cached_mask, cached_to_contexted, active_to_contexted
 
     def eagle_draft_pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=None):
-        if self.config.bias:
-            embed_weight, fc_weight, fc_bias, *rst = weights
+
+        if ((self.neuron_config.shard_over_sequence or self.neuron_config.sequence_parallel_norm)
+                and self.neuron_config.on_device_embedding):
+            core_id, embed_weight, *rst = weights
         else:
-            embed_weight, fc_weight, *rst = weights
+            embed_weight, *rst = weights
+
+        if self.config.bias:
+            fc_weight, fc_bias, *rst = rst
+        else:
+            fc_weight, *rst = rst
             fc_bias = None
         hidden = hlo.dot_add(fc_weight, hidden, fc_bias, 0, 2, 0)
         hidden = hlo.permute(hidden, [1, 2, 0])
         hidden = hlo.all_gather(hidden, 2, self.config.tp_degree)
         #hidden = hlo.dot_add(hidden, fc_weight, fc_bias, 2, 0, 2)
-        return self.pre_layer(hidden, cache_ids, start_ids, last_token_id, *weights, position_ids=position_ids)
+        return self.pre_layer(hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, *weights, position_ids=position_ids)
 
     def layer(self, hidden, last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id,
             block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -262,7 +268,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -320,7 +325,6 @@ class LlamaForSamplingNoEmbeddingHlo:
             block_tables, cached_mask, cached_to_contexted, active_to_contexted,
             attn_k_cache, attn_v_cache,
             pre_attn_ln_weight, pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,
             attn_v_weight, attn_v_scales, attn_v_bias,
@@ -351,13 +355,12 @@ class LlamaForSamplingNoEmbeddingHlo:
             mlp_isa_kernel(hidden, ln_w, gate_w, up_w, down_w, out, "MLP", fused_rmsnorm=fused_rmsnorm)
 
         if enable_qkv_kernel:
-            assert fused_pre_attn_ln_qkv_weight is not None
             fused_out = self.fused_rmsnorm_qkv(
-                hidden, None, eps,
+                hidden, pre_attn_ln_weight, eps,
                 cache_ids, start_ids, last_token_id, block_to_seq, pos_embed, mask, active_mask, core_id,
                 block_tables, cached_mask, cached_to_contexted, active_to_contexted,
                 attn_k_cache, attn_v_cache,
-                fused_pre_attn_ln_qkv_weight, attn_q_scales, attn_q_bias,
+                attn_q_weight, attn_q_scales, attn_q_bias,
                 attn_k_weight, attn_k_scales, attn_k_bias, # should be none
                 attn_v_weight, attn_v_scales, attn_v_bias, # should be none
                 attn_out_weight, attn_out_scales, attn_out_bias
@@ -436,13 +439,13 @@ class LlamaForSamplingNoEmbeddingHlo:
         attn_out_weight, attn_out_scales, attn_out_bias
     ):
         from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
-        def _kernel(h, w, output):
-            return rmsnorm_qkv_isa_kernel(h, w, output, "QKV")
+        def _kernel(h, w, ln_w, output):
+            return rmsnorm_qkv_isa_kernel(h, w, ln_w, output, "QKV")
 
-        def _fused_out_kernel(h0, h1, h2, w, output):
+        def _fused_out_kernel(h0, h1, h2, w, ln_w, output):
             # This kernel will perform h0 = h0 + h1 + h2 (writing results in-place to an input buffer
             # FIXME: allow for multiple outputs
-            return rmsnorm_qkv_isa_fused_add_kernel(h0, h1, h2, w, output, "QKV")
+            return rmsnorm_qkv_isa_fused_add_kernel(h0, h1, h2, w, ln_w, output, "QKV")
 
         fused_add = False
         if isinstance(hidden, tuple):
@@ -468,11 +471,11 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         if fused_add:
             nki_output = nki_call(_fused_out_kernel,
-                                hidden, mlp_out, attn_out, attn_q_weight,
+                                hidden, mlp_out, attn_out, attn_q_weight, pre_attn_ln_weight,
                                 output_HloShapes=[hidden.dtype[n_seqs, n_active_tokens, hidden_size_tp]])
         else:
             nki_output = nki_call(_kernel,
-                                hidden, attn_q_weight,
+                                hidden, attn_q_weight, pre_attn_ln_weight,
                                 output_HloShapes=[hidden.dtype[n_seqs, n_active_tokens, hidden_size_tp]])
         slice_lim = nki_output.sizes[-1] // (n_heads_tp + 2 * n_kv_heads_tp)
         query = hlo.slice_along(nki_output, -1, n_heads_tp*slice_lim, start=0)
