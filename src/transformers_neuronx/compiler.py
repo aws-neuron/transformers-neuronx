@@ -232,7 +232,7 @@ class DataTypeConverter:
             F8E4M3FN INT8     float8_e4m3fn
         '''
         # Note that for FP8 we map metaneff datatype to int8, since from the runtime perspective these datatypes are functionally equivalent (for fp8 storage only)
-        # Within Tnx, we no longer use the metaneff flow, so this would not matter anyway. 
+        # Within Tnx, we no longer use the metaneff flow, so this would not matter anyway.
         name_mapping = dedent(name_mapping)
         name_mapping = name_mapping.lstrip().strip()
         self.hlo2metaneff_mapping = {}
@@ -388,10 +388,10 @@ class Executor:
             result: The output tensors from each rank concatenated along dim 0.
         """
         casted = []
-        for cpu, buf in zip(inputs, self.inputs):
+        for i, (cpu, buf) in enumerate(zip(inputs, self.inputs)):
             if cpu.shape != buf.shape:
                 raise AssertionError(
-                    f"Input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
+                    f"{i+1}th input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
                 )
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)

@@ -180,7 +180,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         decoder_lm_head = {}
         if context_batch_sizes:
             # if context_batch_sizes is passed we directly use it. This is useful for cases
-            # like chunked prefill where batch size bucket is used for the number of active KV cache 
+            # like chunked prefill where batch size bucket is used for the number of active KV cache
             # blocks.
             self.context_batch_sizes = context_batch_sizes
         elif self.prompt_batch_size:
@@ -290,7 +290,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             builder=self.builder,
             tag=f"window-width{n_active_tokens}",
         )
-        assert self.neuron_config.shard_over_sequence is False, "flash decoding not supported with windowed context encoder"
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         return decoder_lm_head
 
@@ -669,6 +668,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         This is the special unroll function that returns the output hidden for EAGLE target model
         """
         last_token_id = tensors[2]
+
         hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
         hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params, position_ids=position_ids)
         # tensors = last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
@@ -1259,7 +1259,6 @@ class DecoderLayer(torch.nn.Module):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
-        self.fused_pre_attn_ln_qkv_weight = None
         self.attn_q_weight = None
         self.attn_q_scales = None
         self.attn_q_bias = None
@@ -1500,14 +1499,15 @@ class DecoderLayer(torch.nn.Module):
 
             if self.neuron_config.shard_over_sequence and self.neuron_config.duplicate_q_weight_sos:
                 q_weight = self.attn_q_weight
+
                 n_kv_head = n_kv_heads_padded // self.kv_replication
-                q_weight = q_weight.reshape(-1, n_kv_head, self.n_head_padded // n_kv_head, self.attn_q_weight.shape[-1] // self.n_head_padded)
+                q_weight = q_weight.reshape(self.attn_q_weight.shape[0], n_kv_head, self.n_head_padded // n_kv_head, self.attn_q_weight.shape[-1] // self.n_head_padded)
                 q_weight = q_weight.repeat(1, 1, self.kv_replication, 1)
-                self.attn_q_weight = q_weight.reshape(-1, self.kv_replication*self.attn_q_weight.shape[-1])
+                self.attn_q_weight = q_weight.reshape(self.attn_q_weight.shape[0], self.kv_replication*self.attn_q_weight.shape[-1])
 
                 if self.attn_q_bias is not None:
                     q_bias = self.attn_q_bias
-                    q_bias = q_bias.reshape(n_kv_heads_padded, self.n_head_padded // n_kv_heads_padded, self.attn_q_bias.shape[-1] // self.n_head_padded)
+                    q_bias = q_bias.reshape(n_kv_head, self.n_head_padded // n_kv_head, self.attn_q_bias.shape[-1] // self.n_head_padded)
                     q_bias = q_bias.repeat(1, self.kv_replication, 1)
                     self.attn_q_bias = q_bias.reshape(-1)
 
@@ -1600,7 +1600,7 @@ class DecoderLayer(torch.nn.Module):
 
         if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
             self.fused_pre_attn_ln_qkv_weight = (fused_qkv_weight.T * self.pre_attn_ln_weight.to(dtype=fused_qkv_weight.dtype)).T
-        
+
         maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, on_cpu=self._cpu_compile, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
@@ -1615,7 +1615,6 @@ class DecoderLayer(torch.nn.Module):
             qkv_weight_sharder = maybe_shard_along
         if self.neuron_config and self.neuron_config.fuse_qkv:
             self.attn_q_weight = qkv_weight_sharder(fused_qkv_weight, dim=1, weight_tiling=qkv_tiling)
-            self.fused_pre_attn_ln_qkv_weight = maybe_shard_along(self.fused_pre_attn_ln_qkv_weight, dim=1) # do not tile weights here
             self.attn_q_bias = maybe_shard_along(fused_qkv_bias, dim=0)
             self.attn_q_scales = maybe_shard_along(fused_qkv_scales, dim=0)
         else:
@@ -1803,7 +1802,6 @@ class DecoderLayer(torch.nn.Module):
         return [
             self.pre_attn_ln_weight,
             self.pre_attn_ln_bias,
-            self.fused_pre_attn_ln_qkv_weight,
             self.attn_q_weight,
             self.attn_q_scales,
             self.attn_q_bias,
@@ -1871,7 +1869,6 @@ class DecoderLayer(torch.nn.Module):
         (
             pre_attn_ln_weight,
             pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
             attn_q_weight,
             attn_q_scales,
             attn_q_bias,
@@ -1903,7 +1900,6 @@ class DecoderLayer(torch.nn.Module):
         return [
             pre_attn_ln_weight,
             pre_attn_ln_bias,
-            fused_pre_attn_ln_qkv_weight,
             attn_q_weight,
             attn_q_scales,
             attn_q_bias,
@@ -1946,7 +1942,6 @@ class DecoderLayer(torch.nn.Module):
     def assign_parameters(self, layer):
         self.pre_attn_ln_weight = layer.pre_attn_ln_weight
         self.pre_attn_ln_bias = layer.pre_attn_ln_bias
-        self.fused_pre_attn_ln_qkv_weight = layer.fused_pre_attn_ln_qkv_weight
         self.attn_q_weight = layer.attn_q_weight
         self.attn_q_scales = layer.attn_q_scales
         self.attn_q_bias = layer.attn_q_bias
@@ -2702,5 +2697,3 @@ def get_attribute_names(safetensors_file):
         attr_names.add(attr_name)
 
     return attr_names
-
-

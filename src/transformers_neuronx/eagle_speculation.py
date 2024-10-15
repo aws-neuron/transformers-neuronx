@@ -1,8 +1,8 @@
 import itertools
 from typing import Optional, List, Dict
- 
+
 import torch
- 
+
 from transformers_neuronx import compiler
 from transformers_neuronx import utils
 from transformers_neuronx import hlo
@@ -12,21 +12,21 @@ from transformers_neuronx import base
 from transformers_neuronx.layers.attention import fused_kv_update_cache
 from transformers_neuronx.util.token_tree import validate_token_tree, generate_attention_mask
 from transformers_neuronx.config import GenerationConfig
- 
-from transformers_neuronx import global_debugger
+from transformers_neuronx.fused_speculation import FusedSpeculativeBase, PseudoAcceptorSampler
 
-class EagleSpeculativeDecoder(torch.nn.Module):
+
+class EagleSpeculativeDecoder(FusedSpeculativeBase):
     """
     A speculative decoder which fuses the compute of the draft & target models.
- 
+
     This is based on the original DeepMind paper.
     Reference: https://arxiv.org/pdf/2302.01318.pdf
- 
+
     Compared with the regular `SpeculativeGenerator`, the purpose of this
     implementation is to avoid the typical overheads associated with CPU
     sampling. This can be especially impactful when using very fast draft
     models.
- 
+
     Unlike the CPU sampling implementation, this version of the speculative
     decoder *always* executes k + 1 draft iterations in order to populate
     the draft model KV cache invariant to the number of token rejections. This
@@ -34,7 +34,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
     performed on CPU if the `draft` model is relatively slow and if the `k` value
     is small. This is because the CPU implementation has the ability to skip
     the final draft execution when there is at least 1 rejection.
- 
+
     Arguments:
         draft: A fast and less accurate model to perform `k` speculations with.
         target: A slower and more accurate model which consumes speculated
@@ -53,7 +53,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         output_scores: Flag that indicates whether to construct the fused model
             so that it will return the target model scores during sampling.
     """
- 
+
     def __init__(
             self,
             draft: base.NeuronModelBase,
@@ -65,9 +65,11 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             output_scores: Optional[bool] = False,
             token_tree: Optional[Dict[int, List[int]]] = None,
             greedy: Optional[bool] = False,
+            debug: Optional[bool] = False,
+            simulation_acceptance_length: Optional[float] = None,
         ) -> None:
         super().__init__()
- 
+
         assert draft.neuron_config.on_device_embedding == True, (
             "The draft model must enable on-device embedding."
         )
@@ -96,9 +98,9 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         assert token_tree is not None, (
             "Need to provide a token tree."
         )
- 
+
         # FIXME: Add more validation to ensure draft/target compatibility
- 
+
         # User-provided attributes
         self.draft = draft
         self.target = target
@@ -116,7 +118,12 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         self.eos_token_id = eos_token_id
         self.output_scores = output_scores
         self.greedy = greedy
- 
+        self.debug = debug
+
+        self.sampler = None
+        if simulation_acceptance_length is not None:
+            self.sampler = PseudoAcceptorSampler(simulation_acceptance_length)
+
         # Derived attributes
         self.neuron_config = self.target.neuron_config
         self.tp_degree = self.target.decoder_lm_head.tp_degree
@@ -126,7 +133,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         self.batch_sizes = self.target.batch_sizes
         self.max_position = buckets[-1]
         self.vocab_size = self.target.config.vocab_size
- 
+
         # Internal attributes
         self.speculator = None
         self.hidden = {}
@@ -199,7 +206,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         Helper function for getting the matrix representing the flattened tree structure
         Each entrance/row corresponds to a node in the tree
         Each element of the row represents the child of the node
-        
+
         Example:
         tree: {0: [1, 2], 1: [3, 4], 2: [5], 3: [6]}
         tree_matrix
@@ -225,10 +232,10 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         """
         Helper function for reconstructing the probabilities from tree matrix
         Each prob in the element represents the prob of a node in the tree
-        
+
         Example:
         tree: {0: [1, 2], 1: [3, 4], 2:[5], 3: [6]}
-        flattened_probs: 
+        flattened_probs:
         [[1, 2, 3, 4, 5, 0, 6, 0, ...]]
         node_indices: [1, 2, 3, 4, 5, 7]
         """
@@ -245,7 +252,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         """
         Helper function for getting all possible paths from a tree
         A mask is also returned for specifying which values are valid
-        
+
         Example:
         tree: {0: [1, 2], 1: [3, 4], 2:[5], 3: [6]}
         all_path:
@@ -259,7 +266,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         """
         paths = []
         max_len = 1
-        
+
         def dfs(k, path):
             nonlocal paths
             nonlocal max_len
@@ -309,7 +316,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         dfs(0)
 
         return new_target_ids
-            
+
     def _get_cache_update_indices(self, cache_ids, all_paths, index):
         """
         Helper function for getting the cache update indices given the accepted path
@@ -328,15 +335,15 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         return cache_gather_indices, cache_scatter_indices
 
     def hlo(self, batch_size=1, n_positions=128):
- 
+
         draft = self.draft.decoder_lm_head
         target = self.target.decoder_lm_head
- 
+
         draft.builder.n_positions = n_positions
         target.builder.n_positions = n_positions
         draft.builder.n_active_tokens = self.k
         target.builder.n_active_tokens = self.k
-        
+
         num_inputs = 0
         num_outputs = 0
 
@@ -348,31 +355,31 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             debugs = []
 
             # Allocate global inputs
-            (tokens, 
-             cache_ids, 
-             start_ids, 
+            (tokens,
+             cache_ids,
+             start_ids,
              last_token_id,
              block_tables,
              context_lens,
-             prev_hidden, 
-             tree_mask, 
-             update_indices, 
+             prev_hidden,
+             tree_mask,
+             update_indices,
              hidden_update_indices,
              cache_gather_indices,
              cache_scatter_indices,
-             position_ids, 
+             position_ids,
              all_paths), inputs_sdim = draft.builder.eagle_draft_inputs(
                 scribe, dtype, 1, batch_size, token_tree=True, k=self.k, n_leaves=self.n_leaves, depth=self.depth, n_entrees=self.tree_matrix.shape[0], width=self.width
             )
 
             nonlocal num_inputs
             num_inputs = len(inputs_sdim)
- 
+
             # Allocate Parameters for weight/cache tensors
             param_builder = decoder.DecoderParameterBuilder(scribe, num_inputs)
             draft_in_caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, draft_generation_params = draft._hlo_parameters(n_positions, batch_size, param_builder)
 
-            # Reorder KV cache based on previous acceptance results 
+            # Reorder KV cache based on previous acceptance results
             caches = []
             cache = draft_in_caches[0][0]
             # TODO: Add check for BSH layout
@@ -411,7 +418,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
 
             hidden_update_indices = hlo.reshape(hidden_update_indices, [batch_size, self.k-1, 1])
             hidden_update_indices = hlo.broadcast(hidden_update_indices, [batch_size, self.k-1, hidden_size], [0, 1, 2])
- 
+
             for _ in range(self.depth-1):
                 tensors = draft_cache_ids, start_ids, last_token_id, block_tables, context_lens, prev_hidden
                 logits, new_hidden, caches = draft._hlo_eagle_draft_unroll(tokens, tensors, caches, draft_layers_weights, draft_pre_layer_params, draft_lm_head_params, tree_mask, position_ids)
@@ -515,11 +522,11 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             draft_ids = hlo.reshape(draft_ids, [batch_size * self.n_leaves, self.depth-1])
 
             sliced_target_indices = hlo.slice_along(target_indices, 1, limit=self.depth-1)
-            sliced_target_probs = hlo.slice_along(target_probs, 1, limit=self.depth-1) 
+            sliced_target_probs = hlo.slice_along(target_probs, 1, limit=self.depth-1)
 
             next_tokens, index, *mask = hlo.speculative_token_selection(
-                draft_ids, target_ids, 
-                draft_indices, draft_probs, 
+                draft_ids, target_ids,
+                draft_indices, draft_probs,
                 sliced_target_indices, sliced_target_probs,
                 tp_degree=self.tp_degree,
                 pad_token_id=self.pad_token_id,
@@ -536,7 +543,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 counts,
                 hidden,
             ]
- 
+
             # Retrieve the target model output scores for the selected tokens
             target_output_scores = None
             if self.output_scores:
@@ -545,7 +552,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 target_scores = hlo.permute(target_scores, (2, 1, 0)) # (vocab, k + 1, batch_size) -> (batch_size, k + 1, vocab)
                 mask = hlo.broadcast(mask, target_scores.sizes, [0, 1]) # (batch_size, k + 1) -> (batch_size, k + 1, vocab)
                 target_output_scores = hlo.masked_select(mask, target_scores, float('-inf'))
- 
+
             outputs = outputs + debugs
             if self.output_scores:
                 outputs.append(target_output_scores)
@@ -562,16 +569,16 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             num_inputs,
             num_outputs,
         )
- 
+
     def to_neuron(self, workers=None):
 
         sizes = list(itertools.product(self.batch_sizes, self.buckets))
- 
+
         hlo_modules = list()
         for (batch_size, sequence_length) in sizes:
             hlo_module, num_inputs, num_outputs = self.hlo(batch_size, sequence_length)
             hlo_modules.append(hlo_module)
- 
+
         selector = program.FusedSpeculativeSelector(sizes, self.k)
         self.speculator = program.BucketedParallelProgram(
             hlo_modules,
@@ -593,7 +600,92 @@ class EagleSpeculativeDecoder(torch.nn.Module):
     def update_generation_config(self, generation_config: GenerationConfig):
         self.draft.update_generation_config(generation_config)
         self.target.update_generation_config(generation_config)
- 
+
+    def _sample_loop(
+        self,
+        batch_size,
+        token_id,
+        cache_ids,
+        start_ids,
+        hidden,
+        tree_mask,
+        update_indices,
+        hidden_update_indices,
+        cache_gather_indices,
+        cache_scatter_indices,
+        all_paths,
+        max_accepted,
+    ):
+        last_token_id = torch.as_tensor([0], dtype=torch.int32).expand(batch_size)
+        position_ids = self._get_position_ids(batch_size, cache_ids)
+        block_tables = torch.as_tensor([0])
+        context_lens = torch.as_tensor([0])
+
+        if self.debug:
+            print("speculator inputs:",
+                    "full_input_ids", token_id,
+                    "cache_ids_pad", cache_ids,
+                    "seq_ids_pad", start_ids,
+                    "hidden_pad", hidden[:, :, 10])
+
+        outputs = self.speculator.execute(
+                token_id,
+                cache_ids,
+                start_ids,
+                last_token_id,
+                block_tables,
+                context_lens,
+                hidden,
+                tree_mask,
+                update_indices,
+                hidden_update_indices,
+                cache_gather_indices,
+                cache_scatter_indices,
+                position_ids,
+                all_paths,
+                return_ranks=1)
+
+        next_tokens, counts, hidden, *debugs = outputs
+
+
+
+
+        # Post-processing for preparing the next iteration
+        # We all the paths and the right tokens, we find the longest accepted path
+        # If two paths have the same token counts, we accept from the highest probabilites
+        # (Note that probabilites are already sorted because of topk)
+        counts = torch.clamp(counts, max=max_accepted)
+        max_path = torch.argmax(counts, dim=1, keepdim=True)
+        counts = torch.gather(counts, 1, max_path)
+        max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, next_tokens.shape[-1])
+        tokens = torch.gather(next_tokens, 1, max_path)
+        tokens = torch.reshape(tokens, (batch_size, -1))
+
+        # Post-processing for preparing the next iteration
+        # Get the last token, which becomes the input to the next iteration
+        token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
+
+
+        if self.debug:
+            print("speculator outputs:",
+                    "next_tokens", next_tokens,
+                    "counts", counts,
+                    "token_id", token_id,
+                    "next_hidden", hidden[:, :, 10])
+
+        # Get the new ordering of the cache ids
+        cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids, all_paths, max_path)
+
+        # Ger the correct hidden value according to the accepted token
+        _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
+        path = torch.gather(_all_paths, 1, max_path)
+        _counts = counts.to(torch.int64).reshape(batch_size, 1, -1) - 1
+        path = torch.gather(path, -1, _counts)
+        path = path.expand(-1, -1, hidden.shape[-1])
+        hidden = torch.gather(hidden, 1, path)
+
+        return token_id, cache_gather_indices, cache_scatter_indices, hidden, tokens, counts
+
     def sample(
         self,
         input_ids: torch.Tensor,
@@ -604,7 +696,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
     ):
         """
         Sample tokens using the fully fused speculative graph.
- 
+
         Args:
             input_ids: The tokenized input identifiers.
             start_ids: The offset from the beginning of each input in a batch.
@@ -617,7 +709,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 `streamer` object with padding included. The value will be the
                 `pad_token_id` provided at construction. The streamer should
                 handle special tokens to eliminate these identifiers.
- 
+
         Returns:
             tokens: The generated sequences.
             scores: (optional) The target model scores if output_scores is set.
@@ -640,7 +732,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             sequence_length = self.max_position - self.k # type: int
         # FIXME: Loosen this restriction to sequence_length <= max_position
         assert sequence_length <= self.max_position - self.k
- 
+
         batch_size, start = input_ids.shape
         if start_ids is None:
             start_ids = torch.arange(batch_size)
@@ -652,21 +744,30 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         draft_attention_mask = attention_mask[:, 1:]
         cache_ids = torch.arange(start).reshape(1, start).expand(batch_size, start)
         draft_cache_ids = torch.arange(start-1).reshape(1, start-1).expand(batch_size, start-1).mul(draft_attention_mask)
- 
+
         # The streamer should send back the input tokens to conform to
         # huggingface behavior.
         # Reference: https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/generation/utils.py#L1410-L1411
         if streamer:
             streamer.put(input_ids)
- 
+
         # Context encoding
         # FIXME: populate scores with the context encoding logits
+
+
         token_id, hidden = self.target(input_ids, cache_ids=cache_ids, start_ids=start_ids)
 
         if streamer:
             streamer.put(token_id)
-        outputs = self.draft(input_ids[:,1:], cache_ids=draft_cache_ids, start_ids=start_ids, prev_hidden=hidden)
 
+        if self.debug:
+            print("draft ctx inputs:",
+                    "token_id", input_ids[:,1:],
+                    "cache_ids", draft_cache_ids,
+                    "start_ids", start_ids,
+                    "hidden", hidden[:, :, 10])
+
+        outputs = self.draft(input_ids[:,1:], cache_ids=draft_cache_ids, start_ids=start_ids, prev_hidden=hidden)
 
         # Preallocate state tensors
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
@@ -681,17 +782,17 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         if self.output_scores:
             # We cut off the first `start` tokens when returning scores
             scores = torch.full((list(sequences.shape) + [self.vocab_size]), self.pad_token_id, dtype=torch.float32)
- 
+
         # A tensor which keeps track of which sequences are done
         done = torch.full((batch_size, 1), False)
- 
+
         # A tensor which keeps track of the sequence ends
         ends = torch.full((batch_size,), sequence_length, dtype=torch.int32)
- 
+
         # Tensors to track local batch positions/masking for early stop
         batch_positions = torch.arange(self.depth).unsqueeze(0)
         batch_mask = torch.full((batch_size, self.depth), False)
- 
+
         # Minor optimization: Convert token types to tensors to avoid casting
         eos_token = None
         if self.eos_token_id is not None:
@@ -713,65 +814,29 @@ class EagleSpeculativeDecoder(torch.nn.Module):
 
         while True:
 
-            last_token_id = torch.as_tensor([0], dtype=torch.int32).expand(batch_size)
-            position_ids = self._get_position_ids(batch_size, cache_ids)
-            block_tables = torch.as_tensor([0])
-            context_lens = torch.as_tensor([0])
-
-            outputs = self.speculator.execute(
-                    token_id, 
-                    cache_ids, 
-                    start_ids, 
-                    last_token_id, 
-                    block_tables,
-                    context_lens,
-                    hidden, 
-                    tree_mask, 
-                    update_indices, 
-                    hidden_update_indices,
-                    cache_gather_indices,
-                    cache_scatter_indices,
-                    position_ids, 
-                    all_paths, 
-                    return_ranks=1)
-
-            next_tokens, counts, hidden, *debugs = outputs
-
-
-            # Post-processing for preparing the next iteration
-            # We all the paths and the right tokens, we find the longest accepted path
-            # If two paths have the same token counts, we accept from the highest probabilites
-            # (Note that probabilites are already sorted because of topk)
-            counts = torch.clamp(counts, max=max_accepted)
-            max_path = torch.argmax(counts, dim=1, keepdim=True)
-            counts = torch.gather(counts, 1, max_path)
-            max_path = torch.reshape(max_path, (batch_size, -1, 1)).expand(-1, -1, next_tokens.shape[-1])
-            tokens = torch.gather(next_tokens, 1, max_path)
-            tokens = torch.reshape(tokens, (batch_size, -1))
-
-            # Post-processing for preparing the next iteration
-            # Get the last token, which becomes the input to the next iteration
-            token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
-
-            # Get the new ordering of the cache ids
-            cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids, all_paths, max_path)
-
-            # Ger the correct hidden value according to the accepted token
-            _all_paths = all_paths.reshape(1, -1, self.depth).expand(batch_size, -1, -1)
-            path = torch.gather(_all_paths, 1, max_path)
-            _counts = counts.to(torch.int64).reshape(batch_size, 1, -1) - 1
-            path = torch.gather(path, -1, _counts)
-            path = path.expand(-1, -1, hidden.shape[-1])
-            hidden = torch.gather(hidden, 1, path)
+            token_id, cache_gather_indices, cache_scatter_indices, hidden, tokens, counts = self._sample_loop(
+                batch_size,
+                token_id,
+                cache_ids,
+                start_ids,
+                hidden,
+                tree_mask,
+                update_indices,
+                hidden_update_indices,
+                cache_gather_indices,
+                cache_scatter_indices,
+                all_paths,
+                max_accepted,
+            )
 
             for batch in range(batch_size):
                 if not done[batch]:
                     accepts += counts
                     iters[batch] += 1
                     rate[batch][counts[0][0]] += 1
- 
+
             if eos_token is not None:
- 
+
                 # Do a minimal check for the eos_token to keep the happy-path fast
                 # We only need to check once per sequence
                 finished = []
@@ -787,16 +852,16 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                         ends[seq] = cache_ids[seq][0].int() + pos.int() + 2
                         done[seq] = True
                         batch_mask[seq] = torch.greater(batch_positions, pos)
- 
+
                 # Always fill tokens after the eos_token with the pad_token.
                 # This needs to be done prior to the streamer call to avoid
                 # streaming back outputs beyond the stop token.
                 tokens.masked_fill_(batch_mask, self.pad_token_id)
- 
+
                 # If a stop token was just found, set future batches to be padded
                 if finished.numel():
                     batch_mask.logical_or_(done)
- 
+
             if streamer:
                 streamer.put(tokens)
 
@@ -808,7 +873,7 @@ class EagleSpeculativeDecoder(torch.nn.Module):
                 scores.scatter_(1, scores_positions, score)
             positions += counts
             cache_ids += counts
- 
+
             # Clamp the cache_ids to the sequence length so that any batch lines
             # that have not reached the end can continue. For batch lines that
             # are complete this populates garbage data into KV cache tail beyond
@@ -816,13 +881,13 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             positions = torch.clamp(positions, max=sequence_length)
             cache_ids = torch.clamp(cache_ids, max=sequence_length)
             done.logical_or_(torch.eq(cache_ids, sequence_length))
- 
+
             if done.all().item():
                 break
- 
+
         if streamer:
             streamer.end()
- 
+
         if self.output_scores:
             return sequences[:, :ends.max().item()], scores[:, start:ends.max().item(), :]
         return sequences[:, :ends.max().item()], rate, iters
@@ -859,11 +924,27 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         # in continuous batching, we need to identify new request and do context decoding
         do_context_decoding = (min_values_per_row == 0).any()
         if do_context_decoding:
+            if self.debug:
+                print("target ctx inputs:",
+                        "token_id", input_ids,
+                        "cache_ids", cache_ids,
+                        "start_ids", start_ids)
+
             target_next_id, hidden = self.target(input_ids, cache_ids, start_ids)
+
+            if self.debug:
+                    print("draft ctx inputs:",
+                            "token_id", input_ids[:,1:],
+                            "cache_ids", cache_ids,
+                            "start_ids", start_ids,
+                            "hidden", hidden[:, :, 10])
+
             outputs = self.draft(input_ids[:,1:], cache_ids=cache_ids[:,:-1], start_ids=start_ids, prev_hidden=hidden)
             next_cache_ids = torch.count_nonzero(cache_ids, dim=1).view(-1, 1)
             gather_index = next_cache_ids.reshape(batch_size, -1, 1).expand(-1, -1, hidden.shape[-1])
             hidden = torch.gather(hidden, 1, gather_index)
+            if self.debug:
+                print("hidden_gather_indx", gather_index[:, :, 0])
             ctr = 0
             for i in start_ids:
                 self.hidden[i.item()]=hidden[ctr].unsqueeze(0) if hidden.shape[0] > 1 else hidden
@@ -882,100 +963,47 @@ class EagleSpeculativeDecoder(torch.nn.Module):
         cache_gather_indices = torch.cat(indv_cache_gather_indices, dim=0)
         cache_scatter_indices = torch.cat(indv_cache_scatter_indices, dim=0)
         cache_ids = cache_ids - 1
-        full_input_ids, cache_ids_pad, hidden_pad, cache_gather_indices_pad, cache_scatter_indices_pad = self.handle_padding_list(
-            [input_ids, cache_ids, hidden, cache_gather_indices, cache_scatter_indices],
-            seq_ids,
-            graph_batch_size
-        )
+        # full_input_ids, cache_ids_pad, hidden_pad, cache_gather_indices_pad, cache_scatter_indices_pad = self.handle_padding_list(
+        #     [input_ids, cache_ids, hidden, cache_gather_indices, cache_scatter_indices],
+        #     seq_ids,
+        #     graph_batch_size
+        # )
+
+        def pad(tensor, seq_ids, target_batch):
+
+            padded_tensor = torch.zeros([target_batch] + list(tensor.shape[1:]), dtype=tensor.dtype)
+
+            padded_tensor[seq_ids] = tensor
+
+            return padded_tensor
+
+        full_input_ids, cache_ids_pad, hidden_pad, cache_gather_indices_pad, cache_scatter_indices_pad = [
+            pad(t, seq_ids, graph_batch_size)
+            for t in [input_ids, cache_ids, hidden, cache_gather_indices, cache_scatter_indices]
+        ]
+
         seq_ids_pad = torch.arange(graph_batch_size)
 
-        last_token_id = torch.as_tensor([0], dtype=torch.int32).expand(graph_batch_size)
-        block_tables = torch.as_tensor([0])
-        context_lens = torch.as_tensor([0])
         tree_mask = generate_attention_mask(self.token_tree)
         update_indices = self._get_update_indices(graph_batch_size)
         hidden_update_indices = self._get_hidden_update_indices(graph_batch_size)
-        position_ids = self._get_position_ids(graph_batch_size, cache_ids_pad)
         all_paths, token_mask, max_accepted = self._get_all_paths()
         max_accepted = max_accepted.reshape(1, self.n_leaves).expand(graph_batch_size, -1)
 
-        outputs = self.speculator.execute(
+        token_id, cache_gather_indices, cache_scatter_indices, hidden, tokens, counts = self._sample_loop(
+            graph_batch_size,
             full_input_ids,
             cache_ids_pad,
             seq_ids_pad,
-            last_token_id,
-            block_tables,
-            context_lens,
             hidden_pad,
             tree_mask,
             update_indices,
             hidden_update_indices,
             cache_gather_indices_pad,
             cache_scatter_indices_pad,
-            position_ids,
             all_paths,
-            self.tree_matrix,
-            return_ranks=1
+            max_accepted,
         )
-
-        draft_ids, target_ids, orig_target_ids, draft_probs, target_probs, hidden, *debugs = outputs
-        target_ids = self._reconstruct_target_ids(target_ids, orig_target_ids)
-
-        mask_indices = self._get_node_indices().reshape(1, self.k-1).expand(graph_batch_size, -1)
-
-        draft_probs = torch.transpose(draft_probs, 0, 2).reshape(graph_batch_size, -1)
-        target_probs = torch.transpose(target_probs, 0, 2).reshape(graph_batch_size, -1)
-
-        draft_probs = torch.gather(draft_probs, 1, mask_indices)
-        target_probs = torch.gather(target_probs, 1, mask_indices)
-
-        draft_probs = draft_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-        target_probs = target_probs.reshape(graph_batch_size, 1, -1).expand(-1, self.n_leaves, -1)
-
-        partial_all_paths = all_paths[:, 1:].reshape(1, self.n_leaves, self.depth-1).expand(graph_batch_size, -1, -1) - 1
-
-        draft_probs = torch.gather(draft_probs, 2, partial_all_paths)
-        target_probs = torch.gather(target_probs, 2, partial_all_paths)
-
-        ratio = torch.div(target_probs, draft_probs)
-        ratio = torch.clamp(ratio, max=1.0)
-        #dist = torch.rand(ratio.shape)
-        dist = torch.full(ratio.shape, 0.5)
-
-        accepted_mask = torch.lt(dist, ratio)
-
-        _mask = token_mask.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-        accepted_mask = torch.cumsum(accepted_mask.to(torch.int64), dim=2) * _mask[:, :, 1:]
-        pos = torch.arange(self.depth-1).reshape(1, 1, self.depth-1).expand(graph_batch_size, self.n_leaves, self.depth-1) + 1
-        accepted_mask = torch.eq(accepted_mask, pos)
-
-        counts = torch.sum(accepted_mask.to(torch.int64), dim=2) + 1
-        accepted_mask = torch.nn.functional.pad(accepted_mask, (0, 1), value=False)
-
-        draft_ids = draft_ids[:, 1:].reshape(graph_batch_size, 1, self.k-1).expand(-1, self.n_leaves, -1)
-        draft_ids = torch.gather(draft_ids, 2, partial_all_paths)
-        draft_ids = torch.nn.functional.pad(draft_ids, (0, 1), value=0)
-
-        target_ids = target_ids.reshape(graph_batch_size, 1, self.k).expand(-1, self.n_leaves, -1)
-        _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-        target_ids = torch.gather(target_ids, 2, _all_paths)
-
-        tokens = torch.where(accepted_mask, draft_ids, target_ids)
-
-        counts = torch.clamp(counts, max=max_accepted)
-        max_path = torch.argmax(counts, dim=1, keepdim=True)
-        counts = torch.gather(counts, 1, max_path)
-        max_path = torch.reshape(max_path, (graph_batch_size, -1, 1)).expand(-1, -1, tokens.shape[-1])
-        tokens = torch.gather(tokens, 1, max_path)
-        tokens = torch.reshape(tokens, (graph_batch_size, -1))
-        token_id = torch.gather(tokens, 1, counts.to(torch.int64)-1)
-        cache_gather_indices, cache_scatter_indices = self._get_cache_update_indices(cache_ids_pad, all_paths, max_path)
-        _all_paths = all_paths.reshape(1, -1, self.depth).expand(graph_batch_size, -1, -1)
-        path = torch.gather(_all_paths, 1, max_path)
-        _counts = counts.to(torch.int64).reshape(graph_batch_size, 1, -1) - 1
-        path = torch.gather(path, -1, _counts)
-        path = path.expand(-1, -1, hidden.shape[-1])
-        hidden = torch.gather(hidden, 1, path)
 
         output_tokens, output_counts, output_hidden, output_cache_gather_indices, output_cache_scatter_indices = self.handle_padding_list(
             [tokens, counts, hidden, cache_gather_indices, cache_scatter_indices],
@@ -987,11 +1015,8 @@ class EagleSpeculativeDecoder(torch.nn.Module):
             self.cache_scatter_indices[i.item()]=torch.unsqueeze(output_cache_scatter_indices[ctr], 0)
             ctr = ctr + 1
 
-        result_tokens = torch.full_like(output_tokens, fill_value=self.pad_token_id)
-        for i in range(output_tokens.size(0)):
-            result_tokens[i, :output_counts[i].item()] = output_tokens[i, :output_counts[i].item()]
+        return self.speculative_iteration_post_process(output_tokens, output_counts)
 
-        return result_tokens, output_counts
 
     def handle_padding_list(
             self,
