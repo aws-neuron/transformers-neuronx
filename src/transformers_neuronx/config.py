@@ -327,10 +327,6 @@ class NeuronConfig():
 
         self.shard_over_sequence = shard_over_sequence
 
-        # For shard over sequeunce with paged attention and chunked prefill
-        # on trn1n.32xlarge instance with 8 GQA group, we can organize gourps along rows and cols
-        self.topo_aware_sharding = False
-
         self.is_sequence_parallel = False
 
         self.attn_output_transposed = attn_output_transposed
