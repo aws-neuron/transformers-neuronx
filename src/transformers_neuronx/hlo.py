@@ -1943,7 +1943,7 @@ def dynamic_slice_along(tensor, dim, start, size):
         f"Parameter 'size' must be an integer. Found type={type(size)}"
     )
     assert not isinstance(start, int), (
-        f"Parameter 'start' must be a tensor. Found type={type(size)}"
+        f"Parameter 'start must be a tensor. Found type={type(size)}"
 )
     assert len(start.sizes) == 0, (
         f"Parameter 'start' must be a scalar. Found shape={start.sizes}"

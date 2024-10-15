@@ -325,7 +325,6 @@ class OPTForSamplingNoEmbeddingHlo:
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,
               pre_attn_ln_weight, pre_attn_ln_bias,
-              fused_pre_attn_ln_qkv_weight,
               attn_q_weight, attn_q_scales, attn_q_bias,
               attn_k_weight, attn_k_scales, attn_k_bias,
               attn_v_weight, attn_v_scales, attn_v_bias,
