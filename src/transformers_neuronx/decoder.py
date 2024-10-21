@@ -2243,6 +2243,8 @@ class DecoderProgram:
                     # don't slice because we pass full KV cache for each bucket
                     cache_slice = cache
                 else:
+                    if self.neuron_config.shard_over_sequence:
+                        end = npos // layer.kv_replication
                     cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
                 input_tensors.append(cache_slice)
                 output_tensors.append(cache_slice)
