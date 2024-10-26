@@ -3821,7 +3821,7 @@ def speculative_mask(
         random = full_like(ratio, deterministic_threshold)
     else:
         random = random_uniform(ratio.dtype, ratio.sizes)
-    accepted_mask = less(random, ratio) # shape: (k, batch_size)
+    accepted_mask = less_equal(random, ratio) # shape: (k, batch_size)
 
     # Mask out all tokens past the accepted token
     accepted_mask = cast(accepted_mask, s32)
