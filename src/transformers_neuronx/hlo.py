@@ -3817,11 +3817,12 @@ def speculative_mask(
     # Compare ratio of probabilities at locations to a random sample
     ratio = divide(target_probs, draft_probs) # shape: (k, batch_size)
     ratio = clamp(ratio, maximum=1.0)
+    ratio = cast(ratio, ratio.scribe.f32)
     if deterministic_threshold:
         random = full_like(ratio, deterministic_threshold)
     else:
         random = random_uniform(ratio.dtype, ratio.sizes)
-    accepted_mask = less_equal(random, ratio) # shape: (k, batch_size)
+    accepted_mask = less(random, ratio) # shape: (k, batch_size)
 
     # Mask out all tokens past the accepted token
     accepted_mask = cast(accepted_mask, s32)
