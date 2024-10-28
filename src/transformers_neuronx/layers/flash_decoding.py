@@ -25,7 +25,7 @@ def gather_query_group(query, cores_per_kv_head, n_heads, tp_degree):
     # Communication 1: all-gather query from cores
     # Notice that this is not necessary for context encoding because we don't read from the KV cache
     cores_per_q_head = tp_degree // n_heads
-    group_size = cores_per_kv_head // cores_per_q_head if cores_per_q_head else cores_per_kv_head
+    group_size = cores_per_kv_head # note this cores per kv head is already divide by cores_per_q_head
     num_groups = tp_degree // group_size 
     interleave=False
     n_kv_heads = tp_degree // cores_per_kv_head
@@ -61,9 +61,11 @@ def context(past_scores, active_score, past_values, active_values,
     # How many cores should compute each head collectively
     # All cores that hold the KV cache for the same head should communicate here
     cores_per_kv_head = tp_degree // n_kv_heads
+    cores_per_q_head = tp_degree // n_heads
+    cores_per_kv_head = cores_per_kv_head // cores_per_q_head if cores_per_q_head else cores_per_kv_head
     if cores_per_kv_head > 1:
         group_size = cores_per_kv_head
-        num_groups = n_kv_heads
+        num_groups = tp_degree // group_size
     else:
         # MHA case, assume all cores will have all heads in cache and kv sharded by seq
         num_groups = 1
@@ -164,7 +166,7 @@ def context(past_scores, active_score, past_values, active_values,
 
     # Communication 3: send the results of other Q heads back to their corresponding cores
     # Also gather the results of the current Q head from other cores
-    assert output.sizes[1] == group_size*size , f"n_heads {n_heads} after gather not matching kv_replication x n_heads_tp {group_size}x {size}"
+    assert output.sizes[1] == group_size*size , f"n_heads {output.sizes[1]} after gather not matching kv_replication x n_heads_tp {group_size}x {size}"
     apply_fn = hlo.gen_add_func(output.dtype)
     output = hlo.reduce_scatter(output, dim=1, replica_groups=replica_groups, to_apply=apply_fn)
     assert output.sizes[1] == size , f"n_heads post scatter size mismatch, check replica_groups {replica_groups}"
@@ -174,8 +176,8 @@ def context(past_scores, active_score, past_values, active_values,
     # multiplied with its corresponding weights, and then an all-reduce is used to sum
     # results for all heads together.
     # We need a scaling here because multiple cores hold the same result
-    if cores_per_q_head:
-        output = hlo.divide(output, cores_per_q_head)
+    #if cores_per_q_head: # we do zero padding now, so enable once replication is done
+    #    output = hlo.divide(output, cores_per_q_head)
     return output
 
 
