@@ -585,7 +585,9 @@ class FusedSpeculativeDecoder(FusedSpeculativeBase):
                     "hidden", hidden[:, :, 10])
 
         if self.is_eagle:
-            self.draft(input_ids[:, 1:], cache_ids=cache_ids[:, :-1], start_ids=start_ids, prev_hidden=hidden)
+            # skip draft ctx if the prompt length is 1
+            if input_ids.shape[-1] > 1:
+                self.draft(input_ids[:, 1:], cache_ids=cache_ids[:, :-1], start_ids=start_ids, prev_hidden=hidden)
         else:
             self.draft(input_ids, cache_ids=cache_ids, start_ids=start_ids)
 
@@ -792,7 +794,9 @@ class FusedSpeculativeDecoder(FusedSpeculativeBase):
                             "start_ids", start_ids,
                             "hidden", target_next_hidden[:, :, 10])
 
-                self.draft(input_ids[:, 1:], cache_ids=cache_ids[:, :-1], start_ids=start_ids, prev_hidden=target_next_hidden)
+                # skip draft ctx if the prompt length is 1s
+                if input_ids.shape[-1] > 1:
+                    self.draft(input_ids[:, 1:], cache_ids=cache_ids[:, :-1], start_ids=start_ids, prev_hidden=target_next_hidden)
                 gather_index = torch.count_nonzero(cache_ids, dim=1).reshape(batch_size, -1, 1).expand(-1, -1, target_next_hidden.shape[-1]).to(dtype=torch.int64)
                 hidden = torch.gather(target_next_hidden, 1, gather_index)
 

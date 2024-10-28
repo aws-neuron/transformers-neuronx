@@ -350,7 +350,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
             last_token_id = torch.zeros(batch_size, dtype=torch.int32)
         else:
             last_token_id = torch.as_tensor([0], dtype=torch.int32)
-        if context_length == 1 and not self.neuron_config.enable_chunked_prefill:
+        if context_length == 1 and not self.neuron_config.enable_chunked_prefill \
+                and not ((cache_ids is None or (cache_ids.flatten()[0].item() == 0)) and (self.neuron_config.is_eagle_draft or self.neuron_config.is_eagle_target)):
             # token generation
             if self.neuron_config.paged_attention:
                 max_num_seqs = self.neuron_config.continuous_batching.max_num_seqs
@@ -498,7 +499,8 @@ class NeuronModelBase(module.WrappingCheckpointCompatibleModel):
 
         batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
 
-        if (n_active_tokens > 1 and cache_ids.flatten()[0].item() == 0) or self.neuron_config.enable_chunked_prefill:
+        if (((self.neuron_config.is_eagle_draft or self.neuron_config.is_eagle_target) \
+                or n_active_tokens > 1) and cache_ids.flatten()[0].item() == 0) or self.neuron_config.enable_chunked_prefill:
             # context encoding
             n_active_seqs, n_active_tokens = input_ids.shape
             continuous_batching_n_positions = bucket.find(self.context_buckets, n_active_tokens)
