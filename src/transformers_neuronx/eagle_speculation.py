@@ -767,7 +767,9 @@ class EagleSpeculativeDecoder(FusedSpeculativeBase):
                     "start_ids", start_ids,
                     "hidden", hidden[:, :, 10])
 
-        outputs = self.draft(input_ids[:,1:], cache_ids=draft_cache_ids, start_ids=start_ids, prev_hidden=hidden)
+        # we should skip draft ctx if the prompt length is 1
+        if input_ids.shape[-1] > 1:
+            outputs = self.draft(input_ids[:,1:], cache_ids=draft_cache_ids, start_ids=start_ids, prev_hidden=hidden)
 
         # Preallocate state tensors
         sequences = torch.full((batch_size, sequence_length + self.k + 1), self.pad_token_id, dtype=torch.int32)
@@ -939,7 +941,10 @@ class EagleSpeculativeDecoder(FusedSpeculativeBase):
                             "start_ids", start_ids,
                             "hidden", hidden[:, :, 10])
 
-            outputs = self.draft(input_ids[:,1:], cache_ids=cache_ids[:,:-1], start_ids=start_ids, prev_hidden=hidden)
+            # skip draft ctx if the prompt length is 1
+            if input_ids.shape[-1] > 1:
+                outputs = self.draft(input_ids[:,1:], cache_ids=cache_ids[:,:-1], start_ids=start_ids, prev_hidden=hidden)
+
             next_cache_ids = torch.count_nonzero(cache_ids, dim=1).view(-1, 1)
             gather_index = next_cache_ids.reshape(batch_size, -1, 1).expand(-1, -1, hidden.shape[-1])
             hidden = torch.gather(hidden, 1, gather_index)
