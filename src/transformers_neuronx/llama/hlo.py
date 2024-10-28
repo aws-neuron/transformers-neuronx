@@ -124,6 +124,8 @@ class LlamaForSamplingNoEmbeddingHlo:
             n_kv_heads = self.config.num_key_value_heads if hasattr(self.config, "num_key_value_heads") else self.config.num_attention_heads
             cores_per_kv_head = self.config.tp_degree // n_kv_heads
             self.cores_per_kv_head  = cores_per_kv_head if cores_per_kv_head > 1 else self.config.tp_degree
+            cores_per_q_head = self.config.tp_degree // self.config.num_attention_heads
+            self.cores_per_kv_head = self.cores_per_kv_head // cores_per_q_head if cores_per_q_head else self.cores_per_kv_head
         if self.neuron_config.optimized_paged_attention and len(last_token_id.sizes) == 2:
             # For decoding with multiple KV cache blocks:
             # - cache_ids are used as context_lens
@@ -532,7 +534,7 @@ class LlamaForSamplingNoEmbeddingHlo:
         if self.config.num_key_value_heads is not None:
             n_head = self.config.num_attention_heads
             n_kv_head = self.config.num_key_value_heads
-            n_head, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
+            n_head_padded, n_kv_head_padded = utils.get_qkv_padding(n_head, n_kv_head, tp_degree, self.neuron_config)
             n_kv_heads_tp = n_kv_head_padded // tp_degree
 
         # Q = (hidden @ wQ) + bQ
@@ -748,9 +750,9 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         # O = (C @ wO) + bO
         output = attention.output(context, out_weight, out_scales, out_bias, tp_degree, self.neuron_config)
-        cores_per_attn_head = tp_degree // self.config.num_attention_heads
-        if cores_per_attn_head and not self.neuron_config.shard_over_sequence:
-            output = hlo.divide(output, cores_per_attn_head)
+       # we do zero padding so disable now
+       #  if cores_per_attn_head and not self.neuron_config.shard_over_sequence:
+       #      output = hlo.divide(output, cores_per_attn_head)
         return output, updated_keys, updated_values
 
 
