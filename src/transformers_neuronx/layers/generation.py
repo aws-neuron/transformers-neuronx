@@ -14,7 +14,7 @@
 # ==============================================================================
 from transformers_neuronx import hlo, config
 
-def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1, early_return=False, return_probs=False):
+def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=1, early_return=False, return_probs=False, seq_ids=None):
     logits = mask_logits(logits, logits_indices, config.vocab_size)
     if not config.dynamic and not config.do_sample:
         tokens = greedy_search(logits, tp_degree=tp_degree)
@@ -62,10 +62,9 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
         logits_slice = hlo.slice_along(logits, 0, start=batch_line, limit=batch_line+1)
         indices_slice = None if indices is None else hlo.slice_along(indices, 0, start=batch_line, limit=batch_line+1)
       
-        batch_line_top_k = config.top_k if hlo._is_hlo_scalar(config.top_k) else hlo.get_hlo_scalar_by_index(config.top_k, batch_line)
-        batch_line_top_p = config.top_p if hlo._is_hlo_scalar(config.top_p) else hlo.get_hlo_scalar_by_index(config.top_p, batch_line)
-        batch_line_temperature = config.temperature if hlo._is_hlo_scalar(config.temperature) else hlo.get_hlo_scalar_by_index(config.temperature, batch_line)
-        batch_line_top_p_min_tokens =  config.top_p_min_tokens if hlo._is_hlo_scalar(config.top_p_min_tokens) else  hlo.get_hlo_scalar_by_index(config.top_p_min_tokens, batch_line)
+        batch_line_top_k, batch_line_top_p, batch_line_temperature, batch_line_top_p_min_tokens = sampling_params_for_batch_line(
+            seq_ids, batch_line, config
+        )
 
         token = sample(
             logits_slice,
@@ -103,6 +102,22 @@ def generate(logits, logits_indices, config: config.GenerationConfig, tp_degree=
     else:
         returned_tokens = hlo.concatenate(tokens, dimension=0)
         return returned_tokens
+
+
+def sampling_params_for_batch_line(seq_ids, batch_line: int, config: config.GenerationConfig):
+    if seq_ids is not None:
+        seq_id_for_batch = hlo.slice_along(seq_ids, 0, start=batch_line, limit=batch_line+1)
+        batch_line_top_k = hlo.reshape(hlo.index_select(config.top_k, 0, seq_id_for_batch), [])
+        batch_line_top_p = hlo.reshape(hlo.index_select(config.top_p, 0, seq_id_for_batch), [])
+        batch_line_temperature = hlo.reshape(hlo.index_select(config.temperature, 0, seq_id_for_batch), [])
+        batch_line_top_p_min_tokens = hlo.reshape(hlo.index_select(config.top_p_min_tokens, 0, seq_id_for_batch), [])
+    else:
+        batch_line_top_k = config.top_k if hlo._is_hlo_scalar(config.top_k) else hlo.get_hlo_scalar_by_index(config.top_k, batch_line)     
+        batch_line_top_p = config.top_p if hlo._is_hlo_scalar(config.top_p) else hlo.get_hlo_scalar_by_index(config.top_p, batch_line)
+        batch_line_temperature = config.temperature if hlo._is_hlo_scalar(config.temperature) else hlo.get_hlo_scalar_by_index(config.temperature, batch_line)
+        batch_line_top_p_min_tokens =  config.top_p_min_tokens if hlo._is_hlo_scalar(config.top_p_min_tokens) else  hlo.get_hlo_scalar_by_index(config.top_p_min_tokens, batch_line)
+    return (batch_line_top_k, batch_line_top_p, batch_line_temperature, batch_line_top_p_min_tokens)
+
 
 def mask_logits(logits, indices, model_vocab_size):
     vocab_size, n_active_tokens, _ = logits.sizes
