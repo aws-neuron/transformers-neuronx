@@ -698,7 +698,6 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         return logits, hidden, out_caches
 
     def _hlo_fully_unrolled(self, n_positions, batch_size):
-
         self.builder.n_positions = n_positions
         if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
             self.builder.num_active_blocks = batch_size
@@ -733,7 +732,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             else:
                 logits, out_caches = self._hlo_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
             self._hlo_cache_aliases(in_caches, out_caches)
-            output = self._hlo_generation(logits, generation_params)
+            output = self._hlo_generation(logits, generation_params, start_ids=tensors[1])
 
             # Set the output
             out_caches = itertools.chain(*out_caches)
@@ -1006,11 +1005,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 next_tok_id = scribe.s32[batch_size].Parameter(parameter_number=1)
             else:
                 next_tok_id = scribe.s32[1].Parameter(parameter_number=1)
-            param_builder = DecoderParameterBuilder(scribe, 2)
+            start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+            param_builder = DecoderParameterBuilder(scribe, 3)
             ln_f_weight, ln_f_bias, head_weight, head_bias = self._hlo_lm_head_params(param_builder)
-            gneration_params = self._hlo_generation_params(param_builder)
+            generation_params = self._hlo_generation_params(param_builder)
             logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, return_all_outputs=self.return_all_outputs)
-            output = self._hlo_generation(logits, gneration_params)
+            output = self._hlo_generation(logits, generation_params, start_ids=start_ids)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores]
@@ -1034,7 +1034,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 params.append(param)
         return params
 
-    def _hlo_generation(self, logits, params, early_return=False, return_probs=False):
+    def _hlo_generation(self, logits, params, early_return=False, return_probs=False, start_ids=None):
         generation_config = self.neuron_config.on_device_generation
         if generation_config is None:
             return logits
@@ -1045,6 +1045,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.neuron_config.on_device_generation.top_p = top_p
             self.neuron_config.on_device_generation.temperature = temperature
             self.neuron_config.on_device_generation.top_p_min_tokens = top_p_min_tokens
+        
+        seq_ids = start_ids if self.neuron_config.continuous_batching is not None else None
         return generation.generate(
             logits,
             logits_indices,
@@ -1052,6 +1054,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             tp_degree=self.tp_degree,
             early_return=early_return,
             return_probs=return_probs,
+            seq_ids=seq_ids,
         )
 
     # Mainly used for serialization purposes.
@@ -2458,10 +2461,12 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
         hidden_buffers = list()
         last_token_id_buffers = list()
+        start_ids_buffers = list()
         for input_buffer in self.input_buffers:
-            hidden_buffer, _, _, last_token_id_buffer, *_ = input_buffer
+            hidden_buffer, _, start_ids_buffer, last_token_id_buffer, *_ = input_buffer
             hidden_buffers.append(hidden_buffer)
             last_token_id_buffers.append(last_token_id_buffer)
+            start_ids_buffers.append(start_ids_buffer)
 
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
@@ -2480,7 +2485,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
         if self.neuron_config.is_valid_lm_head():
             for head_idx in range(0,len(self.ln_lm_head_kernels)):
                 output_tensors = [*self.logits_buffer[head_idx]] if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target else [self.logits_buffer[head_idx]]
-                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], output_tensors)
+                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], start_ids_buffers[head_idx], *ln_lm_head_params], output_tensors)
                 self.ln_lm_head_kernels[head_idx].build()
                 self.ln_lm_head_kernels[head_idx].load()
 
