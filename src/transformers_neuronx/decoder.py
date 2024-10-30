@@ -367,13 +367,13 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_lm_head_params.append(self.logits_indices)
             if self.neuron_config.on_device_generation.dynamic:
                 config = self.neuron_config.on_device_generation
-                self.top_k = manipulator.duplicate(torch.tensor(config.top_k))
+                self.top_k = manipulator.duplicate(torch.tensor(config.top_k, dtype=torch.int32))
                 self.generation_inputs.append(self.top_k)
-                self.top_p = manipulator.duplicate(torch.tensor(config.top_p))
+                self.top_p = manipulator.duplicate(torch.tensor(config.top_p, dtype=torch.float32))
                 self.generation_inputs.append(self.top_p)
-                self.temperature = manipulator.duplicate(torch.tensor(config.temperature))
+                self.temperature = manipulator.duplicate(torch.tensor(config.temperature, dtype=torch.float32))
                 self.generation_inputs.append(self.temperature)
-                self.top_p_min_tokens = manipulator.duplicate(torch.tensor(config.top_p_min_tokens))
+                self.top_p_min_tokens = manipulator.duplicate(torch.tensor(config.top_p_min_tokens, dtype=torch.int32))
                 self.generation_inputs.append(self.top_p_min_tokens)
                 # FIXME: Use a better mechanism to pass extra params into the model
                 ln_lm_head_params += self.generation_inputs
@@ -1107,11 +1107,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def update_generation_config(self, generation_config: config.GenerationConfig):
         self.validate_generation_configs(generation_config)
         num_cores = self.neuron_config.get_local_tp(self.tp_degree)
-        duplicate = lambda tensor: [torch.tensor(tensor) for _ in range(num_cores)]
-        ops.parallel_write(self.top_k, duplicate(generation_config.top_k))
-        ops.parallel_write(self.top_p, duplicate(generation_config.top_p))
-        ops.parallel_write(self.temperature, duplicate(generation_config.temperature))
-        ops.parallel_write(self.top_p_min_tokens, duplicate(generation_config.top_p_min_tokens))
+        duplicate = lambda tensor, dtype: [torch.tensor(tensor, dtype=dtype) for _ in range(num_cores)]
+        ops.parallel_write(self.top_k, duplicate(generation_config.top_k, dtype=torch.int32))
+        ops.parallel_write(self.top_p, duplicate(generation_config.top_p, dtype=torch.float32))
+        ops.parallel_write(self.temperature, duplicate(generation_config.temperature, dtype=torch.float32))
+        ops.parallel_write(self.top_p_min_tokens, duplicate(generation_config.top_p_min_tokens, dtype=torch.int32))
 
 
 def read_n_position(hlo_module, num_inputs):
