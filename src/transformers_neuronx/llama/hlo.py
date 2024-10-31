@@ -143,7 +143,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             # - cache_ids are used as position_ids of each token
             # - start_ids are used as slot_mapping
             # - last_token_id is used as new token length for each sequence
-            context_lens_2d = hlo.unsqueeze(context_lens, 1)        
+            context_lens_2d = hlo.unsqueeze(context_lens, 1)
             seq_lens = hlo.add(context_lens, last_token_id)
             block_size = self.neuron_config.continuous_batching.block_size
             if self.neuron_config.shard_over_sequence:
@@ -159,7 +159,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                 max_num_keys = (self.num_active_blocks + 1) * sharded_block_size
                 _, n_active_tokens = cache_ids.sizes
                 cached_to_contexted, cached_to_contexted_idx, active_to_contexted, sharded_seq_lens = attention_utils.sharded_kv_indexing(
-                    seq_lens, last_token_id, cache_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_sos_rank, active_token_mask, 
+                    seq_lens, last_token_id, cache_ids, max_num_keys, n_active_tokens, block_size, block_tables, core_sos_rank, active_token_mask,
                     sos_degree=cores_per_kv_head
                 )
             else:
@@ -180,7 +180,7 @@ class LlamaForSamplingNoEmbeddingHlo:
             rope_scaling=self.config.rope_scaling
         )
 
-        # flash decoding 
+        # flash decoding
         if self.neuron_config.shard_over_sequence and not self.neuron_config.enable_chunked_prefill:
             cache_ids, mask, active_mask = flash_decoding.convert_attn_mask_and_cache_id(cache_ids, start_ids,
                                                                         core_id, self.n_positions,
@@ -559,9 +559,15 @@ class LlamaForSamplingNoEmbeddingHlo:
 
         if (active_mask is None and not self.neuron_config.enable_chunked_prefill) and self.neuron_config.shard_over_sequence and self.neuron_config.duplicate_q_weight_sos:
             # slice on computed qeury when sos and duplicate Q weights is on
-            kv_replication_constant = core_id.dtype.Constant(constant_value=self.neuron_config.kv_replication)
-            slice_start = hlo.remainder(hlo.reshape(core_id,[]), kv_replication_constant)
+
+            # q / kv -> number of q per core after replication
+            # core_id % tp/kv -> kv replication degree on cores
+            # q / tp -> actual q per core before replication
+            slice_start = hlo.remainder(hlo.reshape(core_id,[]), core_id.dtype.Constant(constant_value=self.neuron_config.kv_replication))
             slice_size = self.neuron_config.n_head_padded // tp_degree
+
+            slice_start = hlo.multiply(slice_start, slice_start.dtype.Constant(constant_value=slice_size))
+
             query = hlo.dynamic_slice_along(query, 2, start=slice_start, size=slice_size)
 
         # Q = Rotate(Q)
@@ -681,7 +687,7 @@ class LlamaForSamplingNoEmbeddingHlo:
                             query = flash_decoding.gather_query_group(query, self.cores_per_kv_head, n_head, tp_degree)
                         # S = Q @ K (This matmul wastes some computation)
                         contexted_keys = attention_utils.gather_sharded_kv(cached_keys, active_idx=cached_to_contexted, active_tokens=key, active_token_idx=active_to_contexted)
-                        score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads, 
+                        score = attention.score(query, contexted_keys, n_kv_heads=self.config.num_key_value_heads,
                                                 tp_degree=tp_degree, neuron_config=self.neuron_config)
                         score = attention.mask(score, mask, tp_degree=tp_degree)
                         # FlashAttention-Style Communication
@@ -698,11 +704,11 @@ class LlamaForSamplingNoEmbeddingHlo:
                         context = attention.context_combined(score, contexted_values, n_kv_heads=self.config.num_key_value_heads, dtype=score.scribe.f32,
                                                              tp_degree=tp_degree, neuron_config=self.neuron_config, skip_softmax=True)
                         # Communication 2: softmax correction
-                        context = attention_utils.sharded_softmax_correction(context, max_score_local, l_sum_score_local, core_id, tp_degree=tp_degree, 
+                        context = attention_utils.sharded_softmax_correction(context, max_score_local, l_sum_score_local, core_id, tp_degree=tp_degree,
                                                                              sos_degree=self.cores_per_kv_head)
                         # Communication 3: reduce-scatter partial context
                         num_groups = tp_degree // self.cores_per_kv_head
-                        replica_groups = utils.build_replica_groups(num_groups=num_groups, group_size=self.cores_per_kv_head, 
+                        replica_groups = utils.build_replica_groups(num_groups=num_groups, group_size=self.cores_per_kv_head,
                                                                     interleave=False)
                         context = hlo.reduce_scatter_sum(context, tp_degree=self.cores_per_kv_head, dim=2, replica_groups=replica_groups)
                         context = hlo.cast(context, hidden.dtype)
