@@ -13,20 +13,18 @@
 # limitations under the License.
 # ==============================================================================
 import torch
-import os
+import warnings
+
+from transformers_neuronx import base
+from transformers_neuronx import bucket
 from transformers_neuronx import decoder
-from transformers_neuronx import module
-from transformers_neuronx import ops
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
-from transformers_neuronx import bucket
-from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB, KV_SHARD_PAD, TRN1_WORLD_SIZE
 from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.constants import LAYOUT_HSB, KV_SHARD_PAD
 from transformers_neuronx.llama.config import LlamaConfig
-from transformers_neuronx.llama.modules import LlamaForCausalLM
 from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
-import warnings
+from transformers_neuronx.llama.modules import LlamaForCausalLM
 
 
 class LlamaForSampling(base.NeuronModelBase):
@@ -116,8 +114,6 @@ class LlamaForSampling(base.NeuronModelBase):
 
     def load_weights(self):
         self.materialize_embeddings()
-        if self.neuron_config.is_eagle_draft:
-            self.chkpt_model.model.fc.materialize()
 
         for layer_id, layer in enumerate(self.chkpt_model.model.layers):
             if layer_id not in self.layers_after_partition:
@@ -195,6 +191,7 @@ class LlamaForSampling(base.NeuronModelBase):
                                                 allow_quantize=True, out_feature_dim=0)
             new_layer.to_neuron()
             layer.nullify()
+        
         # Adding core_id for sos or seq-norm (vocab parallel is used as default with seq-par norm)
         add_core_id = (self.neuron_config.shard_over_sequence or
                        (self.neuron_config.sequence_parallel_norm and self.neuron_config.on_device_embedding))
@@ -209,10 +206,13 @@ class LlamaForSampling(base.NeuronModelBase):
             ln_f = self.chkpt_model.model.norm
             ln_f.materialize()
             self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), None)
+            ln_f.nullify()
 
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
+        lm_head.nullify()
+
         if self.neuron_config.on_device_embedding:
             if self.neuron_config.sequence_parallel_norm:
                 self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=0,
@@ -221,17 +221,23 @@ class LlamaForSampling(base.NeuronModelBase):
                 self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.embed_tokens.weight, sharding=1,
                                                              allow_pad=True)
         if self.neuron_config.is_eagle_draft:
+            self.chkpt_model.model.fc.materialize()
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.fc.weight.detach().T, sharding=1, allow_pad=True)
             if self.chkpt_model.model.fc.bias is not None:
                 self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.fc.bias.detach(), sharding=0, allow_pad=True)
-        lm_head.nullify()
+            self.chkpt_model.model.fc.nullify()
 
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
 
     def materialize_embeddings(self):
         # Materialize the embedding to CPU
         self.chkpt_model.model.embed_tokens.materialize()
+
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.model.embed_tokens.nullify()
 
     def init_rest_of_model(self):
         # Pipeline sparallel deosn't support executor right now

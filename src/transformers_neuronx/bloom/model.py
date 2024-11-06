@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import torch
-import math
-import warnings
-
 from transformers_neuronx import decoder
-from transformers_neuronx import module
-from transformers_neuronx import ops
 from transformers_neuronx import sampling
-from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
@@ -138,6 +131,7 @@ class BloomForSampling(base.NeuronModelBase):
         ln_f = self.chkpt_model.transformer.ln_f
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        ln_f.nullify()
 
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
@@ -151,12 +145,18 @@ class BloomForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.transformer.word_embeddings_layernorm.bias)
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
 
     def materialize_embeddings(self):
         # Materialize the embedding to CPU
         self.chkpt_model.transformer.word_embeddings.materialize()
         self.chkpt_model.transformer.word_embeddings_layernorm.materialize()
     
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.transformer.word_embeddings.nullify()
+            self.chkpt_model.transformer.word_embeddings_layernorm.nullify()     
+
     def init_rest_of_model(self):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:

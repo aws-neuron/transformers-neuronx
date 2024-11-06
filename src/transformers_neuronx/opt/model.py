@@ -115,9 +115,12 @@ class OPTForSampling(base.NeuronModelBase):
                 )
             new_layer.to_neuron()
             layer.nullify()
+
         ln_f = self.chkpt_model.model.decoder.final_layer_norm
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        ln_f.nullify()
+
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
@@ -125,12 +128,19 @@ class OPTForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_tokens.weight.detach(), sharding=1, allow_pad=True)
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_positions.weight.detach(), sharding=1, allow_pad=True)
         lm_head.nullify()
+
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
     
     def materialize_embeddings(self):
         self.chkpt_model.model.decoder.embed_tokens.materialize()
         self.chkpt_model.model.decoder.embed_positions.materialize()
+
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.model.decoder.embed_tokens.nullify()
+            self.chkpt_model.model.decoder.embed_positions.nullify()
     
     def init_rest_of_model(self):
         if self.context_buckets:

@@ -15,12 +15,9 @@
 import os
 import warnings
 import torch
-from transformers import PreTrainedModel
-from transformers.utils import ModelOutput
 from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
-from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
@@ -29,7 +26,7 @@ from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
+from transformers_neuronx.gpt2.config import GPT2Config
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
@@ -123,6 +120,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         ln_f = self.chkpt_model.transformer.ln_f
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        ln_f.nullify()
+
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         if self.neuron_config.on_device_embedding:
@@ -132,11 +131,17 @@ class GPT2ForSampling(base.NeuronModelBase):
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
 
     def materialize_embeddings(self):
         self.chkpt_model.transformer.wte.materialize()
         self.chkpt_model.transformer.wpe.materialize()
     
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.transformer.wte.nullify()
+            self.chkpt_model.transformer.wpe.nullify()
+
     def init_rest_of_model(self):
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.

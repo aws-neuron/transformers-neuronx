@@ -12,16 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-import torch
-import os
 from transformers_neuronx import decoder
-from transformers_neuronx import module
-from transformers_neuronx import ops
 from transformers_neuronx import sampling
-from transformers_neuronx import utils
 from transformers_neuronx import bucket
 from transformers_neuronx import base
-from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
+from transformers_neuronx.constants import LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
 from transformers_neuronx.mistral.config import MistralConfig
 from transformers_neuronx.mistral.modules import MistralForCausalLM
@@ -68,7 +63,6 @@ class MistralForSampling(base.NeuronModelBase):
     def load_weights(self):
         self.materialize_embeddings()
 
-
         for layer in self.chkpt_model.model.layers:
             layer.materialize()
             attn = layer.self_attn
@@ -99,6 +93,7 @@ class MistralForSampling(base.NeuronModelBase):
         ln_f = self.chkpt_model.model.norm
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), None)
+        ln_f.nullify()
 
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
@@ -109,11 +104,16 @@ class MistralForSampling(base.NeuronModelBase):
 
         self.decoder_lm_head.to_neuron()
         self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
 
     def materialize_embeddings(self):
         # Materialize the embedding to CPU
         self.chkpt_model.model.embed_tokens.materialize()
     
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.model.embed_tokens.nullify()
+
     def init_rest_of_model(self):
         self.decoder_lm_head.use_executor = True
 
