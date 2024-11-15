@@ -204,13 +204,16 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
 
     dtype = hidden.dtype
     scribe = hidden.scribe
-    f32 = scribe.f32
+    if neuron_config and neuron_config.bf16_rms_norm:
+        scribe_dtype = scribe.bf16
+    else:
+        scribe_dtype = scribe.f32
 
-    hidden = cast(hidden, f32)
+    hidden = cast(hidden, scribe_dtype)
 
     square = multiply(hidden, hidden)
     variance = reduce_mean(square, dim)
-    eps = full(eps, f32, batch_shapes)
+    eps = full(eps, scribe_dtype, batch_shapes)
     mean_eps = add(variance, eps)
     mean_rsqrt = rsqrt(mean_eps)
     rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
@@ -220,7 +223,7 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
         scaled = cast(scaled, dtype)
         return scaled
 
-    weight = cast(weight, f32)
+    weight = cast(weight, scribe_dtype)
     weight_br = broadcast(weight, size, [dim])
     result = multiply(scaled, weight_br)
     result = cast(result, dtype)
@@ -240,9 +243,14 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None
         return rms_norm_legacy(hidden, weight, eps, dim, neuron_config, tp_degree)
     scribe = hidden.scribe
     backend_config = str(dim).encode()
-    eps = hidden.scribe.f32.Constant(constant_value=eps)
-    f32 = scribe.f32
-    hidden = cast(hidden, f32)
+    if neuron_config and neuron_config.bf16_rms_norm:
+        eps = hidden.scribe.bf16.Constant(constant_value=eps)
+        bf16 = scribe.bf16
+        hidden = cast(hidden, bf16)
+    else:
+        eps = hidden.scribe.f32.Constant(constant_value=eps)
+        f32 = scribe.f32
+        hidden = cast(hidden, f32)
 
     result = dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
     if neuron_config and neuron_config.is_sequence_parallel:

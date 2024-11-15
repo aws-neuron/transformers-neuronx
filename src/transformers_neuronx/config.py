@@ -175,6 +175,8 @@ class NeuronConfig():
 	        execution. Supported for llama models.
         sequence_parallel_norm_threshold: Sets the minimum threshold to shard rms_norm
             sequences. Use with sequence_parallel_norm.
+        bf16_rms_norm: Uses BF16 weights and hidden states input for RMS norm operations.
+            By default, the RMS norm operates on FP32 dtype of inputs.
         on_device_embedding: Enables the input embedding to be performed on
             Neuron. By default, the embedding is computed on CPU.
         on_device_generation: Enables token generation to be performed on Neuron
@@ -213,6 +215,7 @@ class NeuronConfig():
         group_query_attention: Optional[GQA] = None,
         sequence_parallel_norm: bool = False,
         sequence_parallel_norm_threshold: int = 2048,
+        bf16_rms_norm: bool = False,
         on_device_embedding: bool = False,
         on_device_generation: Optional[GenerationConfig] = None,
         all_reduce_dtype: Optional[str] = None,
@@ -282,6 +285,7 @@ class NeuronConfig():
         assert sequence_parallel_norm_threshold > 0, (
             f"sequence_parallel_norm_threshold={sequence_parallel_norm_threshold} must be greater than zero"
         )
+        self.bf16_rms_norm = bf16_rms_norm
         self.on_device_embedding = on_device_embedding
         self.on_device_generation = on_device_generation
         self.qkv_tiling = qkv_tiling
