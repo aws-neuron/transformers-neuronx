@@ -398,6 +398,12 @@ class PretrainedModel(LowMemoryModule):
         def _sanity_check(**kwargs):
             context_length_estimate = kwargs.get("context_length_estimate", None)
             n_positions = kwargs.get("n_positions", 2048)
+            max_n_pos = max(n_positions) if isinstance(n_positions, list) else n_positions
+            max_cle = max(context_length_estimate) if isinstance(context_length_estimate, list) else context_length_estimate
+            # max_n_pos or max_cle could be None if customer intends to use defaults
+            if isinstance(max_n_pos, int) and isinstance(max_cle, int): 
+                assert max_n_pos >= max_cle, \
+                    f"Max context_length_estimate {max_cle} cannot be more than max n_positions {max_n_pos}."
             neuron_config = kwargs.get("neuron_config", None)
             bsh_cache_layout = False
             if neuron_config is not None:
