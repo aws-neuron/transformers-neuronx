@@ -42,6 +42,12 @@ class LlamaConfig:
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
+        self.rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling_type = self.rope_scaling.get("rope_type", self.rope_scaling.get("type", None)) if self.rope_scaling is not None else None
+        if self.rope_scaling is not None and rope_scaling_type not in {'default', 'llama3'}:
+            raise ValueError(f"Only default and llama3 ropes scaling types are currently supported. Received {rope_scaling_type}")
+        self.is_eagle = getattr(config, "is_eagle", False)
+        self.bias = getattr(config, "bias", True)
 
         utils.maybe_override_attributes(self, kwargs)
 
@@ -50,4 +56,5 @@ class LlamaConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
+        self.model_type = 'llama'
 

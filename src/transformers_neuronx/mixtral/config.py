@@ -42,7 +42,7 @@ class MixtralConfig:
         self.rotary_percentage = getattr(config, "rotary_percentage", 1)
         self.rope_theta = getattr(config, "rope_theta", 1e6)
         self.position_interpolation_factor = getattr(config, "position_interpolation_factor", None)
-        self.window_size = getattr(config, "sliding_window", None)
+        self.sliding_window = getattr(config, "sliding_window", None)
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_local_experts = config.num_local_experts
 
@@ -53,6 +53,7 @@ class MixtralConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
+        self.model_type = 'mixtral'
 
         # Check values of tp_degree
         # The MoE implementation supports 1) tp_degree is divisible by num_local_experts or 2) num_local_experts is divisible by tp_degree

@@ -31,8 +31,13 @@ from transformers_neuronx import quantize
 from transformers_neuronx import constants
 from transformers_neuronx import global_debugger
 from transformers_neuronx.layers import generation
-from transformers_neuronx.config import NeuronConfig
+from transformers_neuronx.config import NeuronConfig, GenerationConfig
 from transformers_neuronx.utils import interleave_qkv
+from transformers_neuronx.util.token_tree import generate_attention_mask
+from transformers_neuronx.llama.hlo import LlamaForSamplingNoEmbeddingHlo
+
+from safetensors.torch import save_file
+from safetensors import safe_open
 
 
 class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerializer):
@@ -40,7 +45,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def __init__(self, tp_degree, n_positions_list, n_active_tokens, batch_size,
                  attention_head_size, amp, num_layers, n_head=None, n_kv_head=0,
                  unroll=None, neuron_config=None, allow_pad=True, prefixed_length=0,
-                 return_all_outputs=True, builder=None, tag=None, prompt_batch_size=None):
+                 return_all_outputs=True, builder=None, tag=None, prompt_batch_size=None, token_tree=None):
         super().__init__()
         if unroll is None:
             unroll = num_layers
@@ -84,7 +89,9 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.need_reorder_cache = False
         self.builder = builder
         self.check_gqa_fallback()
+        self.token_tree = token_tree
         self.tag = tag
+        self._cpu_compile = False
 
     @property
     def bsh_cache_layout(self):
@@ -107,11 +114,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if gqa is None:
             # MHA Early exit - This avoids emitting irrelevant GQA warnings
             if self.n_head == self.n_kv_head:
-                warnings.warn(
-                        f'Cannot enable shard_over_sequence when a n_heads ({self.n_head}) == n_kv_heads ({self.n_kv_head})'
-                        f'disabling shard over sequence'
-                    )
-                self.neuron_config.shard_over_sequence = False
+                if self.neuron_config.shard_over_sequence:
+                    warnings.warn(
+                            f'Cannot enable shard_over_sequence when a n_heads ({self.n_head}) == n_kv_heads ({self.n_kv_head})'
+                            f'disabling shard over sequence'
+                        )
+                    self.neuron_config.shard_over_sequence = False
                 return
             self.neuron_config.group_query_attention = constants.GQA.SHARD_OVER_HEADS
 
@@ -167,10 +175,15 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             )
             self.neuron_config.group_query_attention = constants.GQA.REPLICATED_HEADS
 
-    def init_context_decoder(self, unroll, buckets, model_obj):
+    def init_context_decoder(self, unroll, buckets, model_obj, context_batch_sizes=None):
         cls = type(self)
         decoder_lm_head = {}
-        if self.prompt_batch_size:
+        if context_batch_sizes:
+            # if context_batch_sizes is passed we directly use it. This is useful for cases
+            # like chunked prefill where batch size bucket is used for the number of active KV cache
+            # blocks.
+            self.context_batch_sizes = context_batch_sizes
+        elif self.prompt_batch_size:
             self.context_batch_sizes = [self.prompt_batch_size]
         elif self.neuron_config and self.neuron_config.continuous_batching:
             self.context_batch_sizes = [1]
@@ -221,7 +234,8 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             builder=self.builder,
             tag="token",
         )
-        base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
+        if not self.neuron_config.enable_chunked_prefill: # skip token model for chunked prefill due to not needed and also compiler error
+            base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
         decoder_lm_head.add_inputs_builder(self.builder.inputs)
         if hasattr(self.builder, 'pre_layer'):
             decoder_lm_head.add_pre_layer_builder(self.builder.pre_layer)
@@ -231,7 +245,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             decoder_lm_head.add_embedding_builder(self.builder.embedding)
         return decoder_lm_head
 
-    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None):
+    def init_speculative_decoder(self, unroll, buckets, model_obj, n_active_tokens, batch_size=None, token_tree=None):
         cls = type(self)
         decoder_lm_head = cls(
             tp_degree=self.tp_degree,
@@ -248,6 +262,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             allow_pad=True,
             return_all_outputs=True,
             builder=self.builder,
+            token_tree=token_tree,
             tag=f"speculation-k{n_active_tokens}",
         )
         base.NeuronModelBase.register_for_serialization(model_obj,decoder_lm_head)
@@ -306,11 +321,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def add_post_layer_builder(self, builder):
         self.post_layer_builder = builder
 
-    def new_layer(self):
+    def new_layer(self, is_unit_scale=False):
+        # handle cases where some layers are not quantized with unit scale
         *_, n_positions = self.n_positions_list
         layer = DecoderLayer(self.tp_degree, n_positions, self.batch_size, self.attention_head_size,
                              amp=self.amp, neuron_config=self.neuron_config, allow_pad=self.allow_pad, n_active_tokens=self.n_active_tokens,
-                             n_head=self.n_head, n_kv_head=self.n_kv_head)
+                             n_head=self.n_head, n_kv_head=self.n_kv_head, layer_num=len(self.layers),
+                             is_unit_scale=is_unit_scale)
+        layer._cpu_compile = self._cpu_compile
         self.layers.append(layer)
         return layer
 
@@ -323,16 +341,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         self.lm_head_bias = bias
 
     def to_neuron(self):
-        manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
+        # validate on device generation params
+        if self.neuron_config.on_device_generation:
+            self.validate_generation_configs(self.neuron_config.on_device_generation)
 
-        extras = []
-        for param, dim, allow_pad in self.pre_layer_parameters:
-            if allow_pad:
-                if param.shape[dim] % self.tp_degree != 0:
-                    size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
-                    param = utils.pad(param, dim, size)
-            extras.append(manipulator.duplicate_or_shard_along(param, dim))
-        self.pre_layer_parameters = extras
+        manipulator = MaybeParallelTensorManipulator(self.tp_degree, on_cpu=self._cpu_compile, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
+        self.pre_layer_parameters = self._prepare_pre_layer_params(manipulator, self.pre_layer_parameters)
 
         self.ln_f_weight = manipulator.duplicate(self.ln_f_weight)
         self.ln_f_bias = manipulator.duplicate(self.ln_f_bias)
@@ -353,18 +367,21 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             ln_lm_head_params.append(self.logits_indices)
             if self.neuron_config.on_device_generation.dynamic:
                 config = self.neuron_config.on_device_generation
-                self.top_k = manipulator.duplicate(torch.tensor(config.top_k))
+                self.top_k = manipulator.duplicate(torch.tensor(config.top_k, dtype=torch.int32))
                 self.generation_inputs.append(self.top_k)
-                self.top_p = manipulator.duplicate(torch.tensor(config.top_p))
+                self.top_p = manipulator.duplicate(torch.tensor(config.top_p, dtype=torch.float32))
                 self.generation_inputs.append(self.top_p)
-                self.temperature = manipulator.duplicate(torch.tensor(config.temperature))
+                self.temperature = manipulator.duplicate(torch.tensor(config.temperature, dtype=torch.float32))
                 self.generation_inputs.append(self.temperature)
-                self.top_p_min_tokens = manipulator.duplicate(torch.tensor(config.top_p_min_tokens))
+                self.top_p_min_tokens = manipulator.duplicate(torch.tensor(config.top_p_min_tokens, dtype=torch.int32))
                 self.generation_inputs.append(self.top_p_min_tokens)
                 # FIXME: Use a better mechanism to pass extra params into the model
                 ln_lm_head_params += self.generation_inputs
         self.ln_lm_head_params = ln_lm_head_params
+        self.finish_program_setup()
 
+
+    def finish_program_setup(self):
         self.program = self._build_program()
         # setup_reorder_cache needs to be able to be called before compilation
         # and after compilation for backwards compatability.
@@ -375,9 +392,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         if self.need_reorder_cache:
             self.program.setup_reorder_cache(also_compile_now=False)
 
+        if self.neuron_config.shard_over_sequence:
+            assert self.tp_degree%self.n_kv_head == 0, f"tp_degree {self.tp_degree} not divisble by n_kv_heads {self.n_kv_head} shard_over_sequence is not supported"
+            self.kv_replication = self.tp_degree//self.n_kv_head
 
     def build_weight_shared(self, n_positions_list=None, n_active_tokens=None, batch_size=None,
-                            unroll=None, share_caches=False, new=None):
+                            unroll=None, share_caches=False, new=None, embed_weight=None):
         if new == None:
             cls = type(self)
             new = cls(
@@ -386,11 +406,18 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 unroll=self.unroll, neuron_config=self.neuron_config, allow_pad=self.allow_pad,
                 prefixed_length=self.prefixed_length, return_all_outputs=self.return_all_outputs
             )
-        new.add_inputs_builder(self.inputs_builder)
-        new.add_pre_layer_builder(self.pre_layer_builder)
-        new.add_layer_builder(self.layer_builder)
+        if new.token_tree is not None:
+            new.add_inputs_builder(self.builder.token_tree_inputs)
+            new.add_embedding_builder(self.builder.token_tree_embedding)
+            new.add_pre_layer_builder(self.builder.token_tree_pre_layer)
+            new.add_layer_builder(self.builder.token_tree_layer)
+        else:
+            new.add_inputs_builder(self.inputs_builder)
+            new.add_embedding_builder(self.embedding_builder)
+            new.add_pre_layer_builder(self.pre_layer_builder)
+            new.add_layer_builder(self.layer_builder)
         new.add_ln_lm_head_builder(self.ln_lm_head_builder)
-        new.add_embedding_builder(self.embedding_builder)
+        new._cpu_compile = self._cpu_compile
         if self.neuron_config.log_softmax_scores:
             new.add_post_layer_builder(self.post_layer_builder)
         for layer in self.layers:
@@ -404,7 +431,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             else:
                 new_layer.init_caches()
             new_layer.extra_parameters = layer.extra_parameters
-        new.pre_layer_parameters = self.pre_layer_parameters
+        if new.token_tree is not None:
+            if self.neuron_config.on_device_embedding:
+                new.add_pre_layer_parameter(embed_weight, sharding=1, allow_pad=True)
+            new.add_pre_layer_parameter(generate_attention_mask(new.token_tree))
+            manipulator = MaybeParallelTensorManipulator(self.tp_degree, on_cpu=self._cpu_compile, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(new.tp_degree))
+            new.pre_layer_parameters = self._prepare_pre_layer_params(manipulator, new.pre_layer_parameters)
+        else:
+            new.pre_layer_parameters = self.pre_layer_parameters
         new.add_final_layer_norm(self.ln_f_weight, self.ln_f_bias)
         new.add_lm_head(self.lm_head_weight, self.lm_head_bias)
         ln_lm_head_params = [new.ln_f_weight, new.ln_f_bias, new.lm_head_weight]
@@ -451,12 +485,19 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         batch_size = start_ids.shape[0]
         # With 2D cache_ids, take largest cache_id and use the power-of-two policy to find the appropriate bucket.
         if self.neuron_config and self.neuron_config.use_2d_cache_ids:
-            # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH]. 
+            # Enabling Output bucketing for continuous batching with SBH cache layout out of available cache layouts[SBH, BSH].
             if self.neuron_config.cache_layout == constants.LAYOUT_SBH:
                 bucket_id = self.program.find_bucket_id(cache_ids.max().item())
+                batch_size, _ = cache_ids.shape
+            # Enabling Output bucketing for Paged attention with BSH cache layout.
+            elif self.bsh_cache_layout and self.neuron_config.optimized_paged_attention:
+                bucket_id = 0
+                batch_size = self.program.find_block_bucket_size(context_length=inputs[1],block_size=self.neuron_config.continuous_batching.block_size)
             else:
-                bucket_id = 0     
-            batch_size, _ = cache_ids.shape
+                bucket_id = 0
+                batch_size, _ = cache_ids.shape
+        elif self.neuron_config and self.neuron_config.shard_over_sequence:
+             bucket_id = self.program.find_bucket_id(cache_ids.item() + self.kv_replication - 1)
         else:
             bucket_id = self.program.find_bucket_id(cache_ids.item())
         if self.use_executor:
@@ -471,7 +512,10 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def forward(self, *inputs):
         hidden, cache_ids, start_ids, *_ = inputs
-        batch_size = start_ids.shape[0]
+        batch_size = 1 if self.neuron_config.use_1d_query else start_ids.shape[0]
+        if self.neuron_config.enable_chunked_prefill:
+            batch_size = self.batch_size[0] # in this case batch size is single element list
+            assert len(self.batch_size) == 1
         sequence_dim, *_ = self.inputs_sdim
         sequence_length = hidden.shape[sequence_dim]
         if sequence_length == 1:
@@ -496,8 +540,14 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             # When context_length == m * n_active_tokens, bucket-size of n_active_tokens should be chosen.
             # This is useful for Fusion-In-Decoder case, where 2nd n_active_tokens don't need to attend to
             # 1st n_active_tokens.
-            bucket_id = self.program.find_bucket_id(max_id)
+            if self.neuron_config.enable_chunked_prefill:
+                bucket_id = self.program.find_bucket_id(self.n_active_tokens - 1) # can't use max_id since it can be high
+            else:
+                bucket_id = self.program.find_bucket_id(max_id)
             if self.use_executor:
+                if self.neuron_config and self.neuron_config.sequence_parallel_norm:
+                    self.program.inputs_host_to_device(input_tensors, batch_size)
+                    input_tensors = []
                 outputs = self.program.execute(bucket_id, batch_size, *input_tensors, return_ranks=self.return_ranks)
             else:
                 self.program.inputs_host_to_device(input_tensors, batch_size)
@@ -521,18 +571,47 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         position_ids.masked_fill_(position_ids < 0, 0)
         return position_ids, start_ids
 
+    def _prepare_pre_layer_params(self, manipulator, pre_layer_parameters):
+        extras = []
+        for param, dim, allow_pad in pre_layer_parameters:
+            if allow_pad and dim is not None:
+                if param.shape[dim] % self.tp_degree != 0:
+                    size = utils.round_up_to_divisor(param.shape[dim], self.tp_degree)
+                    param = utils.pad(param, dim, size)
+            extras.append(manipulator.duplicate_or_shard_along(param, dim))
+        return extras
+
     def _build_program(self):
         hlo_modules = dict()
         debug_tensors = dict()
         # for pipeline parallel: only do FullyUnrolled when there is valid ln_lm_head
         if self.unroll == self.num_layers and self.neuron_config.is_valid_lm_head() and not self.neuron_config.is_pp():
-            for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
-                hlo_modules[npos,batch_size], debug_tensors[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
-            num_inputs = len(self.inputs_sdim)
-            batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
-                if self.neuron_config.continuous_batching else None
-            program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length,
-                                                  batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag)
+            # For page attention we are replacing the batch size with the active blocks,
+            # And the n_positions used for the various block sizes corresponded to the max n_position.
+            if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+                # do not compile token decoder for chunked prefill
+                if self.neuron_config.enable_chunked_prefill:
+                    return None
+                # Taking block sizes based on n_positions,block_size for bucketing.
+                block_sizes = [n_pos * self.neuron_config.continuous_batching.max_num_seqs // self.neuron_config.continuous_batching.block_size for n_pos in self.n_positions_list]
+                assert max(block_sizes) <= self.neuron_config.continuous_batching.num_blocks, "Too few blocks allocated, consider increasing gpu_memory_utilization or override"
+                # Taking max of n_positions_list for building bucketing for paged attention token gen.
+                pa_npos = [max(self.n_positions_list)]
+                for npos,block_size in itertools.product(pa_npos, block_sizes):
+                    hlo_modules[npos,block_size], debug_tensors[npos,block_size] = self._hlo_fully_unrolled(npos, block_size)
+                num_inputs = len(self.inputs_sdim)
+                batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                    if self.neuron_config.continuous_batching else None
+                program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, pa_npos, block_sizes, self.prefixed_length,
+                                                    batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag, on_cpu=self._cpu_compile)
+            else:
+                for npos,batch_size in itertools.product(self.n_positions_list, self.batch_size):
+                    hlo_modules[npos,batch_size], debug_tensors[npos,batch_size] = self._hlo_fully_unrolled(npos, batch_size)
+                num_inputs = len(self.inputs_sdim)
+                batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                    if self.neuron_config.continuous_batching else None
+                program = DecoderProgramFullyUnrolled(self.neuron_config, self.layers, hlo_modules, debug_tensors, num_inputs, self.tp_degree, self.n_positions_list, self.batch_size, self.prefixed_length,
+                                                    batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag, on_cpu=self._cpu_compile)
         else:
 
             if utils.amp_is_u8(self.amp):
@@ -552,9 +631,11 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 if self.neuron_config.on_device_embedding:
                     ode_hlo_modules = [self._hlo_embedding_layer(batch_size) for batch_size in self.batch_size]
                     ode_num_inputs = len(self.ode_sdim)
+                batch_size_for_shared_caches = self.neuron_config.continuous_batching.batch_size_for_shared_caches \
+                if self.neuron_config.continuous_batching else None
                 program = DecoderProgramMultiLayer(self.neuron_config, self.layers, ode_hlo_modules, ode_num_inputs, hlo_modules, debug_tensors, ln_lm_head_hlo_modules, num_inputs,
                                                     self.num_layers, self.unroll, self.tp_degree,
-                                                    self.n_positions_list, self.batch_size, self.prefixed_length, tag=self.tag)
+                                                    self.n_positions_list, self.batch_size, self.prefixed_length, batch_size_for_shared_caches=batch_size_for_shared_caches, tag=self.tag, on_cpu=self._cpu_compile)
         return program
 
     def _hlo_embedding_layer(self, batch_size):
@@ -582,32 +663,84 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         logits = self.ln_lm_head_builder(hidden, last_token_id, *lm_head_params, return_all_outputs=self.return_all_outputs)
         return logits, out_caches
 
+    def _hlo_eagle_target_unroll(self, hidden, tensors, layers_caches, layers_weights, pre_layer_params, lm_head_params, tree_mask=None, position_ids=None):
+        """
+        This is the special unroll function that returns the output hidden for EAGLE target model
+        """
+        last_token_id = tensors[2]
+
+        hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
+        hidden, tensors = self._hlo_pre_layer(hidden, tensors, pre_layer_params, position_ids=position_ids)
+        # tensors = last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
+        if tree_mask is not None:
+            active_mask = tensors[6]
+            tensors[6] = hlo.token_tree_attention_mask(tree_mask, active_mask)
+        hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights, alias_caches=False)
+        logits, hidden = self.ln_lm_head_builder(hidden, last_token_id, *lm_head_params, return_all_outputs=self.return_all_outputs)
+        return logits, hidden, out_caches
+
+    def _hlo_eagle_draft_unroll(self, hidden, tensors, layers_caches, layers_weights, pre_layer_params, lm_head_params, tree_mask=None, position_ids=None):
+        """
+        This is the special unroll function that returns the output hidden for EAGLE draft model.
+        """
+        last_token_id = tensors[2]
+        prev_hidden = tensors[5]
+        tensors = tensors[0:5]
+        hidden = self._hlo_embedding(hidden, tensors, pre_layer_params)
+        hidden = hlo.concatenate([hidden, prev_hidden], 2)
+        hidden, *tensors = self.builder.eagle_draft_pre_layer(hidden, *tensors, *pre_layer_params, position_ids=position_ids)
+        # tensors = last_token_id, pos_embed, cache_ids, start_ids, block_to_seq, mask, active_mask, core_id
+        if tree_mask is not None:
+            active_mask = tensors[6]
+            tensors[6] = hlo.token_tree_attention_mask(tree_mask, active_mask)
+        hidden, out_caches = self._hlo_layers(hidden, tensors, self.layers, layers_caches, layers_weights, alias_caches=False)
+        logits, hidden = self.ln_lm_head_builder(hidden, last_token_id, *lm_head_params, return_all_outputs=self.return_all_outputs)
+        return logits, hidden, out_caches
+
     def _hlo_fully_unrolled(self, n_positions, batch_size):
-
         self.builder.n_positions = n_positions
-
+        if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+            self.builder.num_active_blocks = batch_size
+        if self.neuron_config.enable_chunked_prefill and self.n_active_tokens == n_positions:
+            self.builder.num_active_blocks = batch_size
+            batch_size = 1
         def fully_unrolled(scribe):
             amp, quantized, dequantized = utils.parse_amp(self.amp)
             dtype = getattr(scribe, amp)
 
+            # Page attention parameters
+            if self.neuron_config.optimized_paged_attention and self.n_active_tokens == 1:
+                (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                    scribe, dtype, self.n_active_tokens, self.neuron_config.continuous_batching.max_num_seqs)
+            elif self.neuron_config.is_eagle_draft:
+                (hidden, *tensors), self.inputs_sdim = self.builder.eagle_draft_inputs(
+                    scribe, dtype, self.n_active_tokens, batch_size)
             # Create user parameters
-            (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
-                scribe, dtype, self.n_active_tokens, batch_size)
+            else:
+                (hidden, *tensors), self.inputs_sdim = self.inputs_builder(
+                    scribe, dtype, self.n_active_tokens, batch_size)
             param_builder = DecoderParameterBuilder(scribe, len(self.inputs_sdim))
 
             # Create inputs for all weights & caches
             in_caches, layers_weights, pre_layer_params, lm_head_params, generation_params = self._hlo_parameters(n_positions, batch_size, param_builder)
 
             # Unroll the graph
-            logits, out_caches = self._hlo_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
+            if self.neuron_config.is_eagle_target:
+                logits, hidden, out_caches = self._hlo_eagle_target_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
+            elif self.neuron_config.is_eagle_draft:
+                logits, hidden, out_caches = self._hlo_eagle_draft_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
+            else:
+                logits, out_caches = self._hlo_unroll(hidden, tensors, in_caches, layers_weights, pre_layer_params, lm_head_params)
             self._hlo_cache_aliases(in_caches, out_caches)
-            output = self._hlo_generation(logits, generation_params)
+            output = self._hlo_generation(logits, generation_params, start_ids=tensors[1])
 
             # Set the output
             out_caches = itertools.chain(*out_caches)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores, *out_caches]
+            elif self.neuron_config.is_eagle_target:
+                outputs = [output, hidden, *out_caches]
             else:
                 outputs = [output, *out_caches]
 
@@ -697,6 +830,61 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
         return parameters
 
+    def save_presharded_weights(self, directory):
+        save_dict = {}
+        for key, value in self.__dict__.items():
+            cpu_tensor = None
+            if isinstance(value, torch.Tensor) and value.device.type == 'xla':
+                cpu_tensor = ops.parallel_cpu(value)
+            elif self._cpu_compile:
+                if isinstance(value, list) and len(value) == self.tp_degree and isinstance(value[0], torch.Tensor):
+                    cpu_tensor = value
+                elif isinstance(value, torch.Tensor):
+                    cpu_tensor = [value.contiguous()]
+            if cpu_tensor is not None:
+                for i in range(len(cpu_tensor)):
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i].detach().clone()
+            del cpu_tensor
+
+        for i, param in enumerate(self.pre_layer_parameters):
+            if self._cpu_compile:
+                cpu_tensor = param
+            else:
+                cpu_tensor = ops.parallel_cpu(param)
+            for j in range(len(cpu_tensor)):
+                save_dict[f'pre_layer_parameter{i}*{j}'] = cpu_tensor[j].detach().clone()
+            del cpu_tensor
+
+        save_file(save_dict, os.path.join(directory, 'DecoderLMHead.safetensors'))
+
+    def load_presharded_weights(self, ps_dir):
+        with safe_open(os.path.join(ps_dir, f"DecoderLMHead.safetensors"), framework='pt') as f:
+            lm_head_attr_names = get_attribute_names(f)
+            presharded_weights_to_neuron(f, self, lm_head_attr_names)
+
+        self.format_pre_layer_parameters()
+        self.format_ln_lm_head_params_and_generation_inputs()
+        self.finish_program_setup()
+
+    def format_pre_layer_parameters(self):
+        # deal with the pre_layer_parameters (decoder_lm_head only)
+        i = 0
+        self.pre_layer_parameters = []
+        while True:
+            pre_layer_parameter = getattr(self, f"pre_layer_parameter{i}", None)
+            if pre_layer_parameter is None:
+                break
+            self.pre_layer_parameters.append(pre_layer_parameter)
+            i+=1
+
+    def format_ln_lm_head_params_and_generation_inputs(self):
+        ln_lm_head_params = [self.ln_f_weight, self.ln_f_bias, self.lm_head_weight, self.lm_head_bias, self.logits_indices]
+        generation_inputs = [self.top_k, self.top_p, self.temperature, self.top_p_min_tokens]
+        ln_lm_head_params = [param for param in ln_lm_head_params if param is not None]
+        generation_inputs = [param for param in generation_inputs if param is not None]
+        self.generation_inputs = generation_inputs
+        self.ln_lm_head_params = ln_lm_head_params + generation_inputs
+
     def valid_parameters(self, n_positions, batch_size):
         parameters = self.all_parameters(n_positions, batch_size)
         return [par for par in parameters if par is not None]
@@ -709,9 +897,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             params.append(param)
         return params
 
-    def _hlo_pre_layer(self, hidden, tensors, params):
+    def _hlo_pre_layer(self, hidden, tensors, params, position_ids=None):
         if self.pre_layer_builder is not None:
-            (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
+            if self.neuron_config.is_eagle_draft or self.neuron_config.is_eagle_target:
+                (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params, position_ids=position_ids)
+            else:
+                (hidden, *tensors) = self.pre_layer_builder(hidden, *tensors, *params)
         return hidden, tensors
 
     def _hlo_embedding(self, hidden, tensors, params):
@@ -729,11 +920,17 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
         layers_caches = []
         dim_size = {1: n_positions} if self.bsh_cache_layout else {0: n_positions}
         if self.neuron_config.continuous_batching:
-            batch_size = self.neuron_config.continuous_batching.batch_size_for_shared_caches
+            batch_size = self.neuron_config.continuous_batching.max_num_seqs
+            if self.neuron_config.paged_attention:
+                block_size = self.neuron_config.continuous_batching.block_size
+                dim_size = {1: block_size} if self.bsh_cache_layout else {0: block_size}
         for layer in layers:
             layer_caches = []
             if self.neuron_config.shard_over_sequence:
-                dim_size = {k:n_positions//layer.kv_replication for k in dim_size.keys()}
+                if self.neuron_config.enable_chunked_prefill:
+                    dim_size = {k:block_size//layer.kv_replication for k in dim_size.keys()}
+                else:
+                    dim_size = {k:n_positions//layer.kv_replication for k in dim_size.keys()}
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
                 par = param_builder.from_tensor(cache, dim_size=dim_size)
                 layer_caches.append(par)
@@ -746,11 +943,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
 
     def _hlo_layers(self, hidden, tensors, layers, layers_caches, layers_weights, alias_caches=True):
         output_caches = []
-        for layer, caches, weights in zip(layers, layers_caches, layers_weights):
+        for idx, (layer, caches, weights) in enumerate(zip(layers, layers_caches, layers_weights)):
             in_caches = [maybe_transfer_with_static_ring(cache) for cache in caches]
             weights = [maybe_transfer_with_static_ring(weight) for weight in weights]
             weights = layer.hlo_maybe_dequantize_weights(weights)
-            hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
+            is_first_last_layer = True if idx == 0 or idx == len(layers) - 1 else False
+            if isinstance(self.layer_builder.__self__, LlamaForSamplingNoEmbeddingHlo):
+                # Positional information is needed for fused residual adds in kernels in Llama 3
+                hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights, is_first_last_layer=is_first_last_layer)
+            else:
+                hidden, *out_caches = self.layer_builder(hidden, *tensors, *in_caches, *weights)
             output_caches.append(out_caches)
 
         if alias_caches:
@@ -803,11 +1005,12 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 next_tok_id = scribe.s32[batch_size].Parameter(parameter_number=1)
             else:
                 next_tok_id = scribe.s32[1].Parameter(parameter_number=1)
-            param_builder = DecoderParameterBuilder(scribe, 2)
+            start_ids = scribe.s32[batch_size].Parameter(parameter_number=2)
+            param_builder = DecoderParameterBuilder(scribe, 3)
             ln_f_weight, ln_f_bias, head_weight, head_bias = self._hlo_lm_head_params(param_builder)
-            gneration_params = self._hlo_generation_params(param_builder)
+            generation_params = self._hlo_generation_params(param_builder)
             logits = self.ln_lm_head_builder(hidden, next_tok_id, ln_f_weight, ln_f_bias, head_weight, head_bias, return_all_outputs=self.return_all_outputs)
-            output = self._hlo_generation(logits, gneration_params)
+            output = self._hlo_generation(logits, generation_params, start_ids=start_ids)
             if self.neuron_config.log_softmax_scores:
                 logits, scores = self._hlo_post_layer(logits)
                 outputs = [logits, scores]
@@ -831,7 +1034,7 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
                 params.append(param)
         return params
 
-    def _hlo_generation(self, logits, params):
+    def _hlo_generation(self, logits, params, early_return=False, return_probs=False, start_ids=None):
         generation_config = self.neuron_config.on_device_generation
         if generation_config is None:
             return logits
@@ -842,11 +1045,16 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
             self.neuron_config.on_device_generation.top_p = top_p
             self.neuron_config.on_device_generation.temperature = temperature
             self.neuron_config.on_device_generation.top_p_min_tokens = top_p_min_tokens
+        
+        seq_ids = start_ids if self.neuron_config.continuous_batching is not None else None
         return generation.generate(
             logits,
             logits_indices,
             config=generation_config,
             tp_degree=self.tp_degree,
+            early_return=early_return,
+            return_probs=return_probs,
+            seq_ids=seq_ids,
         )
 
     # Mainly used for serialization purposes.
@@ -854,13 +1062,56 @@ class DecoderLmHeadForSamplingNoEmbedding(torch.nn.Module, base.NeuronBaseSerial
     def get_all_kernels(self):
         return self.program.get_kernels()
 
+    def validate_generation_configs(self, generation_config: GenerationConfig):
+        current_generation_config = self.neuron_config.on_device_generation
+        if  current_generation_config:
+            assert generation_config.per_batch_line == current_generation_config.per_batch_line, f"Invalid new generation config. \n \
+            Recieved new generation config with per_batch_line = {generation_config.per_batch_line},\n \
+            while current generation config has per_batch_line = {current_generation_config.per_batch_line}"
+
+        batch_size = self.batch_size if isinstance(self.batch_size,int) else self.batch_size[0]
+
+        if generation_config.per_batch_line:
+            if not isinstance(generation_config.top_k, list):
+                generation_config.top_k = [generation_config.top_k] * batch_size
+
+            if not isinstance(generation_config.top_p, list):
+                generation_config.top_p = [generation_config.top_p] * batch_size
+
+            if not isinstance(generation_config.temperature, list):
+                generation_config.temperature = [generation_config.temperature] * batch_size
+
+            if not isinstance(generation_config.top_p_min_tokens, list):
+                generation_config.top_p_min_tokens = [generation_config.top_p_min_tokens] * batch_size
+
+            # check all sampling parameters lists are of same size
+
+            assert len(generation_config.top_k) \
+                   == len(generation_config.top_p) \
+                   == len(generation_config.temperature)  \
+                   == len(generation_config.top_p_min_tokens)  \
+                   == batch_size, f"For per batch-line sampling, sampling parameters top_k, top_p, \
+                   top_p_min_tokens, temperature must be of same size as bach_size. \n \
+                   Recieved len(top_k):  {len(generation_config.top_k)} \n \
+                   len(top_p): {len(generation_config.top_p)} \n \
+                   len(top_p_min_tokens): {len(generation_config.top_p_min_tokens)} \n \
+                   len(temperature): {len(generation_config.temperature)} \n \
+                   batch_size: {batch_size}"
+        else:
+            assert not isinstance(generation_config.top_k, list) \
+               and not isinstance(generation_config.top_p, list) \
+               and not isinstance(generation_config.top_p_min_tokens, list) \
+               and not isinstance(generation_config.temperature, list) \
+               , f"Sampling parameters cannot be of type list when per_batch_line = False"
+
     def update_generation_config(self, generation_config: config.GenerationConfig):
+        self.validate_generation_configs(generation_config)
         num_cores = self.neuron_config.get_local_tp(self.tp_degree)
-        duplicate = lambda tensor: [torch.tensor(tensor) for _ in range(num_cores)]
-        ops.parallel_write(self.top_k, duplicate(generation_config.top_k))
-        ops.parallel_write(self.top_p, duplicate(generation_config.top_p))
-        ops.parallel_write(self.temperature, duplicate(generation_config.temperature))
-        ops.parallel_write(self.top_p_min_tokens, duplicate(generation_config.top_p_min_tokens))
+        duplicate = lambda tensor, dtype: [torch.tensor(tensor, dtype=dtype) for _ in range(num_cores)]
+        ops.parallel_write(self.top_k, duplicate(generation_config.top_k, dtype=torch.int32))
+        ops.parallel_write(self.top_p, duplicate(generation_config.top_p, dtype=torch.float32))
+        ops.parallel_write(self.temperature, duplicate(generation_config.temperature, dtype=torch.float32))
+        ops.parallel_write(self.top_p_min_tokens, duplicate(generation_config.top_p_min_tokens, dtype=torch.int32))
 
 
 def read_n_position(hlo_module, num_inputs):
@@ -1018,7 +1269,8 @@ class MaybePadder:
 class DecoderLayer(torch.nn.Module):
 
     def __init__(self, tp_degree, n_positions, batch_size, attention_head_size, n_head, amp,
-                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None):
+                 n_kv_head=0, neuron_config=None, allow_pad=False, n_active_tokens=None, layer_num=None,
+                 is_unit_scale=False):
         super().__init__()
         self.pre_attn_ln_weight = None
         self.pre_attn_ln_bias = None
@@ -1072,7 +1324,10 @@ class DecoderLayer(torch.nn.Module):
         self.tp_degree = tp_degree
         self.amp = amp
         dtype, _, _ = utils.parse_amp(amp)
-        self.cache_dtype = dtypes.to_torch_dtype(dtype)
+        if neuron_config and neuron_config.kv_cache_quant:
+            self.cache_dtype = dtypes.to_torch_dtype(neuron_config.kv_cache_quant.quant_dtype)
+        else:
+            self.cache_dtype = dtypes.to_torch_dtype(dtype)
         self.neuron_config = NeuronConfig() if neuron_config is None else neuron_config
         self.extra_parameters = []
         self.allow_pad = allow_pad
@@ -1081,6 +1336,9 @@ class DecoderLayer(torch.nn.Module):
         self.mlp_out_sharding = 0
         self.mlp_out_transposed = True
         self.kv_replication  = 1 # default value to denote weight replication factor
+        self.layer_num = layer_num
+        self.is_unit_scale = is_unit_scale
+        self._cpu_compile = False
 
     def add_parameter(self, param, sharding=None, allow_pad=False, allow_quantize=False,
                       out_feature_dim=1, allow_transform=False):
@@ -1134,8 +1392,8 @@ class DecoderLayer(torch.nn.Module):
         self.post_mlp_ln_bias = bias
 
     def to_neuron(self):
-
         # If we allow padding then we need to pad non-sharded QKV weight dimensions
+        self.neuron_config.n_head_padded = self.n_head
         if self.allow_pad:
             # Hidden size padding
             _, hidden_size = self.attn_q_weight.shape
@@ -1143,6 +1401,7 @@ class DecoderLayer(torch.nn.Module):
 
             n_head_padded, n_kv_heads_padded = utils.get_qkv_padding(n_heads, self.n_kv_head, self.tp_degree, self.neuron_config)
             self.n_head_padded = n_head_padded
+            self.neuron_config.n_head_padded = self.n_head_padded
 
             hidden_size_padded = hidden_size_padded_qkv = n_head_padded * self.attention_head_size
             if self.neuron_config.group_query_attention == constants.GQA.ALL_GATHER_HEADS:
@@ -1181,11 +1440,23 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_weight = qkv_maybe_pad(self.attn_q_weight, dim=1)
             self.attn_q_bias = qkv_maybe_pad(self.attn_q_bias, dim=0)
 
+            node_interleaving = False
+            if self.neuron_config.shard_over_sequence:
+                node_interleaving = utils.is_attn_node_interleaved(n_heads, self.n_kv_head, self.tp_degree)
+                if node_interleaving:
+                    replica_groups = utils.build_replica_groups(group_size=self.kv_replication,
+                                                                 num_groups=self.tp_degree//self.kv_replication, interleave=True)
+                    warnings.warn(f"[SOS] qkv node_inerleaving enabled with replica {replica_groups}")
+
             if n_kv_heads_padded != self.n_kv_head:
 
                 if n_kv_heads_padded % self.n_kv_head == 0:
                     ratio = int(n_kv_heads_padded / self.n_kv_head)
                 else:
+                    ratio = int((n_kv_heads_padded - extra_heads) / self.n_kv_head)
+
+                # Full replication: replicate KV heads to original Q heads and then do padding
+                if n_head_padded == n_kv_heads_padded and extra_heads > 0:
                     ratio = int((n_kv_heads_padded - extra_heads) / self.n_kv_head)
 
                 def repeat(weight):
@@ -1220,6 +1491,8 @@ class DecoderLayer(torch.nn.Module):
                     self.attn_v_bias = repeat(self.attn_v_bias)
                     self.n_kv_head *= ratio
                 self.kv_replication = ratio
+                # FIXME: As a workaround to get kv_replication info (after padding) in HLO construction
+                self.neuron_config.kv_replication = self.kv_replication
 
             if self.n_head == self.n_kv_head:
                 self.attn_k_weight = qkv_maybe_pad(self.attn_k_weight, dim=1)
@@ -1227,6 +1500,41 @@ class DecoderLayer(torch.nn.Module):
 
                 self.attn_v_weight = qkv_maybe_pad(self.attn_v_weight, dim=1)
                 self.attn_v_bias = qkv_maybe_pad(self.attn_v_bias, dim=0)
+
+            def interleave_by_node(tensor, dim, n_nodes):
+                if tensor is None:
+                    return tensor
+                shape = tensor.shape
+                assert shape[dim] % n_nodes == 0 , f"cannot interleave across node for tensor shape {shape}"\
+                                                     f" and n_nodes {n_nodes}"
+                stride = constants.TRN1_WORLD_SIZE
+                view_shape = (stride, shape[0]//stride,shape[1]) if dim == 0 else (shape[0],stride, shape[1]//stride)
+                return (tensor.reshape(view_shape).permute(1, 0, 2).reshape(shape) if dim == 0
+                                else tensor.reshape(view_shape).permute(0, 2, 1).reshape(shape))
+
+            if self.neuron_config.shard_over_sequence and self.neuron_config.duplicate_q_weight_sos:
+                q_weight = self.attn_q_weight
+
+                n_kv_head = n_kv_heads_padded // self.kv_replication
+                q_weight = q_weight.reshape(self.attn_q_weight.shape[0], n_kv_head, self.n_head_padded // n_kv_head, self.attn_q_weight.shape[-1] // self.n_head_padded)
+                q_weight = q_weight.repeat(1, 1, self.kv_replication, 1)
+                self.attn_q_weight = q_weight.reshape(self.attn_q_weight.shape[0], self.kv_replication*self.attn_q_weight.shape[-1])
+
+                if self.attn_q_bias is not None:
+                    q_bias = self.attn_q_bias
+                    q_bias = q_bias.reshape(n_kv_head, self.n_head_padded // n_kv_head, self.attn_q_bias.shape[-1] // self.n_head_padded)
+                    q_bias = q_bias.repeat(1, self.kv_replication, 1)
+                    self.attn_q_bias = q_bias.reshape(-1)
+
+            if node_interleaving:
+                n_nodes = self.tp_degree // constants.TRN1_WORLD_SIZE
+                self.attn_q_weight = interleave_by_node(self.attn_q_weight, dim=1, n_nodes=n_nodes)
+                self.attn_k_weight = interleave_by_node(self.attn_k_weight, dim=1, n_nodes=n_nodes)
+                self.attn_v_weight = interleave_by_node(self.attn_v_weight, dim=1, n_nodes=n_nodes)
+                self.attn_q_bias = interleave_by_node(self.attn_q_bias, dim=0, n_nodes=n_nodes)
+                self.attn_k_bias = interleave_by_node(self.attn_k_bias, dim=0, n_nodes=n_nodes)
+                self.attn_v_bias = interleave_by_node(self.attn_v_bias, dim=0, n_nodes=n_nodes)
+
 
             if self.neuron_config and self.neuron_config.fuse_qkv:
                 fused_qkv_weight = interleave_qkv(self.attn_q_weight, self.attn_k_weight, self.attn_v_weight, self.tp_degree, dim=1)
@@ -1243,6 +1551,8 @@ class DecoderLayer(torch.nn.Module):
                 self.attn_v_bias = None
             if self.attn_out_pad:
                 self.attn_out_weight = attn_out_maybe_pad(self.attn_out_weight, dim=self.attn_out_sharding)
+            if node_interleaving:
+                self.attn_out_weight = interleave_by_node(self.attn_out_weight, dim=self.attn_out_sharding, n_nodes=n_nodes)
             # Intermediate MLP layer padding
             if self.mlp_in_weight is not None:
                 _, intermediate_size = self.mlp_in_weight.shape
@@ -1255,6 +1565,10 @@ class DecoderLayer(torch.nn.Module):
 
                 self.mlp_in_weight = maybe_pad(self.mlp_in_weight, dim=1)
                 self.mlp_in_bias = maybe_pad(self.mlp_in_bias, dim=0)
+                if self.neuron_config.fuse_mlp:
+                    intermediate_size = intermediate_size // 2
+                    intermediate_size_padded = utils.round_up_to_divisor(intermediate_size, self.tp_degree)
+                    maybe_pad = MaybePadder(intermediate_size_padded)
                 self.mlp_out_weight = maybe_pad(self.mlp_out_weight, dim=self.mlp_out_sharding)
 
         if utils.amp_is_u8(self.amp):
@@ -1267,12 +1581,16 @@ class DecoderLayer(torch.nn.Module):
         if self.neuron_config and self.neuron_config.quant:
             if self.mlp_in_weight is not None:
                 self.mlp_in_weight, self.mlp_in_scales = \
-                    quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant)
+                    quantize.maybe_quantize_weights(self.mlp_in_weight, self.neuron_config.quant,
+                                                    is_unit_scale=self.is_unit_scale)
                 self.mlp_out_weight, self.mlp_out_scales = \
                     quantize.maybe_quantize_weights(self.mlp_out_weight, self.neuron_config.quant,
-                                                    out_feature_dim = 1 if self.mlp_out_transposed else 0)
+                                                    out_feature_dim = 1 if self.mlp_out_transposed else 0,
+                                                    is_unit_scale=self.is_unit_scale)
 
             if self.neuron_config.quant.quantize_attn:
+                assert "self_attn" not in self.neuron_config.quant.no_quantize_list, "self attn quantization not " \
+                                                                                     "allowed for this model"
                 if self.neuron_config.fuse_qkv:
                     fused_qkv_weight, fused_qkv_scales = \
                         quantize.maybe_quantize_weights(fused_qkv_weight, self.neuron_config.quant)
@@ -1295,7 +1613,10 @@ class DecoderLayer(torch.nn.Module):
                     contract_dims=self.attn_out_contract_dims,
                 )
 
-        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
+        if self.neuron_config and self.neuron_config.fused_rmsnorm_qkv:
+            self.fused_pre_attn_ln_qkv_weight = (fused_qkv_weight.T * self.pre_attn_ln_weight.to(dtype=fused_qkv_weight.dtype)).T
+
+        maybe_manipulator = MaybeParallelTensorManipulator(self.tp_degree, on_cpu=self._cpu_compile, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         maybe_duplicate = maybe_manipulator.duplicate
         maybe_shard_along = maybe_manipulator.shard_along
         maybe_primary_only = maybe_manipulator.primary_only
@@ -1313,8 +1634,8 @@ class DecoderLayer(torch.nn.Module):
             self.attn_q_scales = maybe_shard_along(fused_qkv_scales, dim=0)
         else:
             self.attn_q_weight = qkv_weight_sharder(self.attn_q_weight, dim=1, weight_tiling=qkv_tiling)
-            self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
             self.attn_q_bias = maybe_shard_along(self.attn_q_bias, dim=0)
+            self.attn_q_scales = maybe_shard_along(self.attn_q_scales, dim=0)
         self.attn_k_weight = qkv_weight_sharder(self.attn_k_weight, dim=1, weight_tiling=qkv_tiling)
         self.attn_k_scales = maybe_shard_along(self.attn_k_scales, dim=0)
         self.attn_k_bias = maybe_shard_along(self.attn_k_bias, dim=0)
@@ -1354,7 +1675,8 @@ class DecoderLayer(torch.nn.Module):
                 # the layer arguments
                 if self.neuron_config and self.neuron_config.quant:
                     param, scales = quantize.maybe_quantize_weights(param, self.neuron_config.quant,
-                                                                    out_feature_dim=out_feature_dim)
+                                                                    out_feature_dim=out_feature_dim,
+                                                                    is_unit_scale=self.is_unit_scale)
                     scales_dim = 0 if dim == out_feature_dim else None
                     scales = maybe_manipulator.duplicate_or_shard_along(scales, scales_dim)
                 else:
@@ -1370,8 +1692,63 @@ class DecoderLayer(torch.nn.Module):
                 extras.append(scales)
 
         self.extra_parameters = extras
-
         self.init_caches()
+
+    def save_presharded_weights(self, directory):
+        save_dict = {}
+        for key, value in self.__dict__.items():
+            cpu_tensor = None
+            if isinstance(value, torch.Tensor) and value.device.type == 'xla':
+                cpu_tensor = ops.parallel_cpu(value)
+            elif self._cpu_compile:
+                if isinstance(value, list) and len(value) == self.tp_degree and isinstance(value[0], torch.Tensor):
+                    cpu_tensor = value
+                elif isinstance(value, torch.Tensor):
+                    cpu_tensor = [value.contiguous()]
+            if cpu_tensor is not None:
+                for i in range(len(cpu_tensor)):
+                    save_dict[f'{key}*{i}'] = cpu_tensor[i].detach().clone()
+            del cpu_tensor
+
+        for i, param in enumerate(self.extra_parameters):
+            if param is None:
+                # save an empty tensor
+                cpu_tensor = [torch.tensor([])]
+            elif self._cpu_compile:
+                if isinstance(param, list):
+                    cpu_tensor = [tensor.detach().contiguous() for tensor in param]
+                else:
+                    cpu_tensor = [param.detach().contiguous()]
+            else:
+                cpu_tensor = ops.parallel_cpu(param)
+            for j in range(len(cpu_tensor)):
+                save_dict[f'extra_parameter{i}*{j}'] = cpu_tensor[j]
+
+        save_file(save_dict, os.path.join(directory, f"decoder_layer_{self.layer_num}.safetensors"))
+
+    def load_presharded_weights(self, ps_dir):
+        # only need to get names for first layer
+        with safe_open(os.path.join(ps_dir, f"decoder_layer_{self.layer_num}.safetensors"), framework='pt') as f:
+            layer_attr_names = get_attribute_names(f)
+            presharded_weights_to_neuron(f, self, layer_attr_names)
+            self.format_extra_parameters()
+            for batch_size in self.batch_sizes:
+                self.init_caches()
+
+    def format_extra_parameters(self):
+        # deal with the extra_parameters (decoder_layer only)
+        i = 0
+        self.extra_parameters = []
+        while True:
+            extra_param = getattr(self, f"extra_parameter{i}", None)
+            if extra_param is not None:
+                if extra_param == 'None':
+                    self.extra_parameters.append(None)
+                else:
+                    self.extra_parameters.append(extra_param)
+            else: # Previous parameter was the last one
+                break
+            i+=1
 
     @property
     def shard_over_batch(self):
@@ -1389,30 +1766,49 @@ class DecoderLayer(torch.nn.Module):
         # NeuronCores.
         if self.allow_pad and not self.shard_over_batch:
             n_heads_kv_cache = utils.round_up_to_divisor(self.n_kv_head, self.tp_degree)
+        block_size = self.neuron_config.continuous_batching.block_size if self.neuron_config.paged_attention else self.n_positions
+        # Select manipulator based on device
+        if self._cpu_compile:
+            manipulator = parallel.CPUTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
+        else:
+            manipulator = parallel.ParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         # Separate KV cache for each batch size
-        manipulator = parallel.ParallelTensorManipulator(self.tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(self.tp_degree))
         for batch_size in self.batch_sizes:
+            num_blocks = self.neuron_config.continuous_batching.num_blocks if self.neuron_config.paged_attention else batch_size
             if self.bsh_cache_layout:
-                cache_shape = [batch_size, self.n_positions, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [batch_size, self.n_positions, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+                cache_shape = [num_blocks, block_size, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [num_blocks, block_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
             else:
-                cache_shape = [self.n_positions, batch_size, n_heads_kv_cache, self.attention_head_size]
-                self.cache_shape[batch_size] = [self.n_positions, batch_size, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
-            cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+                cache_shape = [block_size, num_blocks, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [block_size, num_blocks, n_heads_kv_cache // self.tp_degree, self.attention_head_size]
+            if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn:
+                int8_cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8) #Cannot directly use fp8: *** RuntimeError: "fill_cpu" not implemented for 'Float8_e4m3fn'
+                cpu_cache= int8_cpu_cache.to(torch.float8_e4m3fn)
+            else:
+                cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
             if self.shard_over_batch:
                 assert not self.bsh_cache_layout, "shard-over-batch for GQA with BSH cache layout is not supported."
-                self.cache_shape[batch_size] = [self.n_positions, batch_size // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
+                self.cache_shape[batch_size] = [block_size, num_blocks // self.tp_degree, n_heads_kv_cache, self.attention_head_size]
                 self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
                 self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
             elif self.neuron_config.shard_over_sequence:
                 # note here we use kv_replication since self.n_kv_head is replicated
                 # for SOS we need original n_kv_head before replication
                 kv_replication = self.kv_replication
-                cache_shape = [self.n_positions*self.tp_degree//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
-                cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
-                self.cache_shape[batch_size] = [self.n_positions//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
-                self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
-                self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                if self.neuron_config.paged_attention:
+                    cache_shape = [num_blocks, block_size*self.tp_degree//kv_replication, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    cpu_cache = torch.zeros(cache_shape, dtype=self.cache_dtype)
+                    self.cache_shape[batch_size] = [num_blocks, block_size//kv_replication, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+                    self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=1))
+                else:
+                    cache_shape = [self.n_positions*self.tp_degree//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    cpu_cache = torch.zeros(cache_shape, dtype=torch.uint8).to(torch.float8_e4m3fn) \
+                        if hasattr(torch, 'float8_e4m3fn') and self.cache_dtype==torch.float8_e4m3fn \
+                        else torch.zeros(cache_shape, dtype=self.cache_dtype)
+                    self.cache_shape[batch_size] = [self.n_positions//kv_replication, batch_size, n_heads_kv_cache//self.tp_degree, self.attention_head_size]
+                    self.attn_k_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
+                    self.attn_v_cache[batch_size] = (manipulator.shard_along(cpu_cache, dim=0))
             else:
                 assert (n_heads_kv_cache >= self.tp_degree) and (n_heads_kv_cache % self.tp_degree == 0), \
                     f"cannot shard along kv_heads dimension: n_kv_head={n_heads_kv_cache}, tp_degree={self.tp_degree}"
@@ -1560,10 +1956,17 @@ class DecoderLayer(torch.nn.Module):
 
     def reset(self):
         for batch_size in self.batch_sizes:
+            # CPU compilation sometimes returns tensors in a list, eg. [tensor(...), tensor(...)]
+            if isinstance(self.attn_k_cache[batch_size], list):
+                self.attn_k_cache[batch_size] = torch.cat(self.attn_k_cache[batch_size])
             zero_cache = torch.zeros(self.attn_k_cache[batch_size].shape, dtype=self.attn_k_cache[batch_size].dtype)
             zero_cache = [zero_cache for _ in range(self.neuron_config.get_local_tp(self.tp_degree))]
-            ops.parallel_write(self.attn_k_cache[batch_size], zero_cache)
-            ops.parallel_write(self.attn_v_cache[batch_size], zero_cache)
+            if not self._cpu_compile:
+                ops.parallel_write(self.attn_k_cache[batch_size], zero_cache)
+                ops.parallel_write(self.attn_v_cache[batch_size], zero_cache)
+            else:
+                self.attn_k_cache[batch_size] = zero_cache
+                self.attn_v_cache[batch_size] = zero_cache
 
     def assign_parameters(self, layer):
         self.pre_attn_ln_weight = layer.pre_attn_ln_weight
@@ -1608,8 +2011,12 @@ class DecoderLayer(torch.nn.Module):
 
 class MaybeParallelTensorManipulator:
 
-    def __init__(self, tp_degree, rank_id=0, local_tp_degree=None):
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=rank_id, local_tp_degree=local_tp_degree)
+    def __init__(self, tp_degree, on_cpu=False, rank_id=0, local_tp_degree=None):
+        self.use_cpu = on_cpu
+        if on_cpu:
+            self.manipulator = parallel.CPUTensorManipulator(tp_degree, rank_id=rank_id, local_tp_degree=local_tp_degree)
+        else:
+            self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=rank_id, local_tp_degree=local_tp_degree)
 
     def duplicate(self, tensor):
         if tensor is None:
@@ -1632,7 +2039,7 @@ class MaybeParallelTensorManipulator:
             return self.duplicate(tensor)
         return self.shard_along(tensor, dim)
 
-    def transform_and_tile_weight_layout(self, tensors, weight_tiling=False):
+    def transform_and_tile_weight_layout(self, tensors, weight_tiling=False, permute_order=[1, 2, 0, 3]):
         if tensors is None:
             return None
 
@@ -1649,7 +2056,7 @@ class MaybeParallelTensorManipulator:
                                  N // constants.TILE_SIZE,
                                  constants.TILE_SIZE]
                 tensor = tensor.reshape(reshape_sizes) \
-                               .permute([1, 2, 0, 3])
+                               .permute(permute_order)
                 tensor = tensor.contiguous()
                 new_tensors.append(tensor)
             return new_tensors
@@ -1661,8 +2068,10 @@ class MaybeParallelTensorManipulator:
             return None
         tensors = self.manipulator.shard_along_on_cpu(tensor, dim)
         tensors = self.transform_and_tile_weight_layout(tensors, weight_tiling)
-        tensor = ops.parallel_to_nc(tensors)
-        return tensor
+        if not self.use_cpu:
+            tensors = ops.parallel_to_nc(tensors)
+        return tensors
+
 
 class DecoderParameterBuilder:
 
@@ -1674,6 +2083,9 @@ class DecoderParameterBuilder:
     def from_tensor(self, tensor, dim_size=None):
         if tensor is None:
             return None
+        # Tensor may be a list of tensors (e.g. [tensor(...)]) during CPU compilation flow
+        if isinstance(tensor, list):
+            tensor = tensor[0]
         name = self.dtype_converter.torch2name(tensor.dtype)
         dtype = getattr(self.scribe, name)
         sizes = list(tensor.shape)
@@ -1686,7 +2098,7 @@ class DecoderParameterBuilder:
 
 class DecoderProgram:
 
-    def __init__(self, neuron_config, layers, hlo_modules : dict, debug_tensors: dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False, tag=None):
+    def __init__(self, neuron_config, layers, hlo_modules : dict, debug_tensors: dict, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=False, tag=None, num_exec_repetition=1, on_cpu=False):
         # Each hlo module corresponds to one npos and one batch_size
         # hlo_modules is a 2D map (i,j) i is npos , j is batch_size
         self.neuron_config = neuron_config
@@ -1704,8 +2116,13 @@ class DecoderProgram:
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
             kernel_tag = f"seqlen{npos}-batch{batch_size}"
             if tag is not None:
-                kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
-            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag)
+                if self.neuron_config.optimized_paged_attention and tag == 'token':
+                    kernel_tag = f"{tag}-seqlen{npos}-block{batch_size}"
+                else:
+                    kernel_tag = f"{tag}-seqlen{npos}-batch{batch_size}"
+                if self.neuron_config.enable_chunked_prefill:
+                    kernel_tag = f"{tag}-chunked-prefill-chunksize{npos}-block{batch_size}"
+            self.kernels[npos,batch_size] = compiler.ParallelKernel(hlo_modules[npos, batch_size], self.neuron_config.get_local_tp(tp_degree), self.neuron_config.get_g_start_device_id(tp_degree), self.neuron_config.get_g_device_count(tp_degree), tag=kernel_tag, num_exec_repetition=num_exec_repetition)
         self.debug_tensors = debug_tensors
         self.debug_output_buffers = dict()
         for npos, batch_size in itertools.product(self.n_positions_list, self.batch_sizes):
@@ -1716,15 +2133,20 @@ class DecoderProgram:
             self.debug_output_buffers[npos,batch_size] = {name: compiler.gen_zero_output_from_shape_proto(shape) for name, shape in debug_tensor_names_and_shapes}
         # self.n_positions_list = [read_n_position(hm, num_inputs) for hm in hlo_modules]
         self.n_active_tokens = read_n_active_tokens(first_hlo)
-        self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
         self.tp_degree = tp_degree
         self.need_reorder_cache = False
         self.tag = tag
+        self._cpu_compile = on_cpu
+        # Select manipulator based on device
+        if self._cpu_compile:
+            self.manipulator = parallel.CPUTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
+        else:
+            self.manipulator = parallel.ParallelTensorManipulator(tp_degree, rank_id=self.neuron_config.rank_id, local_tp_degree=self.neuron_config.get_local_tp(tp_degree))
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=1):
         self.input_buffers = [[self.manipulator.duplicate(buf) for buf in input_buffers_for_batch_size] for input_buffers_for_batch_size in self.input_buffers]
         if self.logits_buffer:
-            if self.neuron_config.log_softmax_scores:
+            if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target:
                 self.logits_buffer = [[self.manipulator.duplicate(buf) for buf in logits_buffer_batch_size] for logits_buffer_batch_size in self.logits_buffer]
             else:
                 self.logits_buffer = [self.manipulator.duplicate(buf) for buf in self.logits_buffer]
@@ -1747,17 +2169,36 @@ class DecoderProgram:
     def find_bucket_id(self, length):
         return next(idx for idx, npos in enumerate(self.n_positions_list) if npos >= length+1)
 
+    def find_block_bucket_size(self, context_length, block_size):
+        n_active_blocks = ((context_length+block_size-1) // block_size).sum().item()
+        active_block = bucket.find(self.batch_sizes, n_active_blocks)
+        return active_block
+
     def inputs_host_to_device(self, input_tensors, batch_size):
+
+        def process_input_tensors(tensor, idx):
+            # process input_ids
+            if idx == 0 and self.neuron_config.sequence_parallel_norm and not self.neuron_config.on_device_embedding:
+                n_active_tokens = tensor.shape[1]
+                if n_active_tokens > self.neuron_config.sequence_parallel_norm_threshold:
+                    return self.manipulator.shard_along_on_cpu(tensor, 1)
+            # handle the rest of the inputs
+            return self.manipulator.duplicate_on_cpu(tensor)
+
         # This means there is a separate neff for embedding so the inputs will be the input_ids
         if self.neuron_config.on_device_embedding and isinstance(self, DecoderProgramMultiLayer):
             input_buffers = self.input_ids_buffer[self.batch_sizes.index(batch_size)]
         else:
             input_buffers = self.input_buffers[self.batch_sizes.index(batch_size)]
-        for buf, tensor in zip(input_buffers, input_tensors):
-            assert buf.shape == tensor.shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor.shape}) have different shapes!"
+        # TODO: Check how to handle this corner condition.
+        if len(input_tensors) == 5 and len(input_buffers) == 6:
+            input_buffers.pop(3)
+        for idx, (buf, tensor) in enumerate(zip(input_buffers, input_tensors)):
             tensor = tensor.to(buf.dtype)
-            tensor = self.manipulator.duplicate_on_cpu(tensor)
-            ops.parallel_write(buf, tensor)
+            tensor = process_input_tensors(tensor, idx)
+            assert buf.shape == tensor[0].shape, f"Copying tensor from host to device: buffer ({buf.shape}) and tensor ({tensor[0].shape}) have different shapes!"
+            if not self._cpu_compile:
+                ops.parallel_write(buf, tensor)
 
     def run(self, bucket_id):
         raise NotImplementedError(DecoderProgram)
@@ -1767,7 +2208,7 @@ class DecoderProgram:
         if self.logits_buffer:
             if self.tp_degree == self.neuron_config.get_local_tp(self.tp_degree):
 
-                if self.neuron_config.log_softmax_scores:
+                if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target:
                     return [self.manipulator.unshard_along(val, dim=0) for val in self.logits_buffer[idx]]
                 else:
                     logits = self.manipulator.unshard_along(self.logits_buffer[idx], dim=0)
@@ -1801,7 +2242,13 @@ class DecoderProgram:
             batch_size = self.batch_size_for_shared_caches
         for layer in layers:
             for cache in layer.attn_k_cache[batch_size], layer.attn_v_cache[batch_size]:
-                cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
+                if self.neuron_config.paged_attention:
+                    # don't slice because we pass full KV cache for each bucket
+                    cache_slice = cache
+                else:
+                    if self.neuron_config.shard_over_sequence:
+                        end = npos // layer.kv_replication
+                    cache_slice = self.manipulator.slice_on_nc(cache, 0, start=0, end=end, step=1)
                 input_tensors.append(cache_slice)
                 output_tensors.append(cache_slice)
         for layer in layers:
@@ -1880,11 +2327,11 @@ class DecoderProgram:
 
 class DecoderProgramFullyUnrolled(DecoderProgram):
 
-    def __init__(self, neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None, tag=None):
-        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag)
+    def __init__(self, neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None, tag=None, on_cpu=False):
+        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag, on_cpu=on_cpu)
         hlos_for_input = list()
         hlos_for_input = [hlo_modules[self.n_positions_list[0],batch_size] for batch_size in self.batch_sizes]
-        if self.neuron_config.log_softmax_scores:
+        if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target:
             self.logits_buffer = [[compiler.gen_zero_output(hlo, 0), compiler.gen_zero_output(hlo, 1)] for hlo in hlos_for_input]
         else:
             self.logits_buffer = [compiler.gen_zero_output(hlo, 0) for hlo in hlos_for_input]
@@ -1903,7 +2350,7 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         for bs_idx, batch_size in enumerate(self.batch_sizes):
             for npos in self.n_positions_list:
                 input_tensors = [*self.input_buffers[bs_idx]]
-                if self.neuron_config.log_softmax_scores:
+                if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target:
                     output_tensors = [*self.logits_buffer[bs_idx]]
                 else:
                     output_tensors = [self.logits_buffer[bs_idx]]
@@ -1925,7 +2372,10 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
         for bs_idx, batch_size in enumerate(self.batch_sizes):
             for npos in self.n_positions_list:
                 input_tensors = [*self.input_buffers[bs_idx]]
-                output_tensors = [self.logits_buffer[bs_idx]]
+                if self.neuron_config.is_eagle_target:
+                    output_tensors = [*self.logits_buffer[bs_idx]]
+                else:
+                    output_tensors = [self.logits_buffer[bs_idx]]
                 executor = self.kernels[npos,batch_size].build_executor(self.memories[npos,batch_size], input_tensors, output_tensors)
                 self.executors[npos,batch_size] = executor
 
@@ -1954,13 +2404,14 @@ class DecoderProgramFullyUnrolled(DecoderProgram):
 
 class DecoderProgramMultiLayer(DecoderProgram):
 
-    def __init__(self, neuron_config, layers, ode_hlo_modules, ode_num_inputs, hlo_modules, debug_tensors, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, tag=None):
-        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, tag=tag)
+    def __init__(self, neuron_config, layers, ode_hlo_modules, ode_num_inputs, hlo_modules, debug_tensors, ln_lm_head_hlo_modules, num_inputs, num_layers, unroll, tp_degree, n_positions_list, batch_sizes, prefixed_length=0, batch_size_for_shared_caches=None,tag=None,on_cpu=False):
         if num_layers % unroll:
             raise ValueError(f'unroll={unroll} does not divide num_layers={num_layers}')
+        self.num_exec_repetition = num_layers // unroll
+        super().__init__(neuron_config, layers, hlo_modules, debug_tensors, num_inputs, tp_degree, n_positions_list, batch_sizes, prefixed_length, batch_size_for_shared_caches, tag=tag, num_exec_repetition=self.num_exec_repetition, on_cpu=on_cpu)
         self.num_layers = num_layers
         assert len(ln_lm_head_hlo_modules) == len(batch_sizes)
-        if self.neuron_config.log_softmax_scores:
+        if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target:
             self.logits_buffer = [[compiler.gen_zero_output(hm, 0), compiler.gen_zero_output(hm, 1)] for hm in ln_lm_head_hlo_modules]
         else:
             self.logits_buffer = [compiler.gen_zero_output(hm) for hm in ln_lm_head_hlo_modules]
@@ -1982,7 +2433,7 @@ class DecoderProgramMultiLayer(DecoderProgram):
             self.ode_executors = []
 
     def setup(self, layers, pre_layer_params, ln_lm_head_params):
-        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_layers // self.unroll)
+        super().setup(layers, pre_layer_params, ln_lm_head_params, io_ring_cache_size=self.num_exec_repetition)
 
         if self.neuron_config.on_device_embedding:
             for i in range(len(self.input_ids_buffer)):
@@ -2010,10 +2461,12 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
         hidden_buffers = list()
         last_token_id_buffers = list()
+        start_ids_buffers = list()
         for input_buffer in self.input_buffers:
-            hidden_buffer, _, _, last_token_id_buffer, *_ = input_buffer
+            hidden_buffer, _, start_ids_buffer, last_token_id_buffer, *_ = input_buffer
             hidden_buffers.append(hidden_buffer)
             last_token_id_buffers.append(last_token_id_buffer)
+            start_ids_buffers.append(start_ids_buffer)
 
         multi_layer_starts = range(0, len(layers), self.unroll)
         multi_layers = [layers[start:start+self.unroll] for start in multi_layer_starts]
@@ -2031,8 +2484,8 @@ class DecoderProgramMultiLayer(DecoderProgram):
 
         if self.neuron_config.is_valid_lm_head():
             for head_idx in range(0,len(self.ln_lm_head_kernels)):
-                output_tensors = [*self.logits_buffer[head_idx]] if self.neuron_config.log_softmax_scores else [self.logits_buffer[head_idx]]
-                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], *ln_lm_head_params], output_tensors)
+                output_tensors = [*self.logits_buffer[head_idx]] if self.neuron_config.log_softmax_scores or self.neuron_config.is_eagle_target else [self.logits_buffer[head_idx]]
+                self.ln_lm_head_memories[head_idx].setup([hidden_buffers[head_idx], last_token_id_buffers[head_idx], start_ids_buffers[head_idx], *ln_lm_head_params], output_tensors)
                 self.ln_lm_head_kernels[head_idx].build()
                 self.ln_lm_head_kernels[head_idx].load()
 
@@ -2254,3 +2707,27 @@ class FastCacheBroadcaster(base.NeuronBaseSerializer):
 
     def get_all_kernels(self):
         return [self.cache_broadcast_kernel]
+
+# loads weights from safetensors files and puts them on neuron while assigning
+# them to the corresponding attribute of decoder_layer_or_head
+def presharded_weights_to_neuron(safetensors_file, decoder_layer_or_head, attr_names):
+    for attr_name in attr_names:
+        shards = []
+        i = 0
+        while True:
+            if f"{attr_name}*{i}" not in safetensors_file.keys():
+                break
+            shards.append(safetensors_file.get_tensor(f"{attr_name}*{i}"))
+            i+=1
+        if all([torch.numel(shard) == 0 for shard in shards]):
+            setattr(decoder_layer_or_head, attr_name, 'None')
+        else:
+            setattr(decoder_layer_or_head, attr_name, ops.parallel_to_nc(shards))
+
+def get_attribute_names(safetensors_file):
+    attr_names = set()
+    for key in safetensors_file.keys():
+        attr_name, shard_id = key.split('*')
+        attr_names.add(attr_name)
+
+    return attr_names

@@ -81,47 +81,55 @@ def batch_norm(tensor, feature_index, epsilon=1e-5):
     return bn_tuple
 
 
-def layer_norm(hidden, weight, bias):
+def layer_norm(hidden, weight, bias, neuron_config=None, tp_degree=None):
     scribe = hidden.scribe
     dtype = hidden.dtype
     f32 = scribe.f32
     hidden_size, n_active_tokens, batch_size = input_sizes = hidden.sizes
     norm_size = n_active_tokens * batch_size
     sizes = hidden_size, norm_size
-    hidden = dtype[sizes].Reshape(hidden)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = reshape(hidden, sizes)
+    hidden = cast(hidden, f32)
     bn_tuple = batch_norm(hidden, feature_index=1)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-    weight_br = f32[sizes].Broadcast(weight, dimensions=[0])
-    output = f32[sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[sizes].Broadcast(bias, dimensions=[0])
-    output = f32[sizes].Add(output, bias_br)
-    output = dtype[sizes].Convert(output)
-    output = dtype[input_sizes].Reshape(output)
+    weight_br = broadcast(weight, sizes, [0])
+    output = multiply(bn_output, weight_br)
+    bias_br = broadcast(bias, sizes, [0])
+    output = add(output, bias_br)
+    output = cast(output, dtype)
+    output = reshape(output, input_sizes)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 1, tp_degree, replica_groups=None)
+
     return output
 
 
-def layer_norm_bsh(hidden, weight, bias):
+def layer_norm_bsh(hidden, weight, bias, neuron_config=None, tp_degree=None):
     scribe = hidden.scribe
     dtype = hidden.dtype
     f32 = scribe.f32
     batch_size, n_active_tokens, hidden_size = input_sizes = hidden.sizes
     norm_size = n_active_tokens * batch_size
     sizes = norm_size, hidden_size
-    hidden = dtype[sizes].Reshape(hidden)
-    hidden = f32[sizes].Convert(hidden)
+    hidden = reshape(hidden, sizes)
+    hidden = cast(hidden, f32)
     bn_tuple = batch_norm(hidden, feature_index=0)
     bn_output = get_tuple_element(bn_tuple, tuple_index=0)
-    weight_br = f32[sizes].Broadcast(weight, dimensions=[1])
-    output = f32[sizes].Multiply(bn_output, weight_br)
-    bias_br = f32[sizes].Broadcast(bias, dimensions=[1])
-    output = f32[sizes].Add(output, bias_br)
-    output = dtype[sizes].Convert(output)
-    output = dtype[input_sizes].Reshape(output)
+    weight_br = broadcast(weight, sizes, [1])
+    output = multiply(bn_output, weight_br)
+    bias_br = broadcast(bias, sizes, [1])
+    output = add(output, bias_br)
+    output = cast(output, dtype)
+    output = reshape(output, input_sizes)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 0, tp_degree, replica_groups=None)
+
     return output
 
 
-def group_norm(hidden, weight, bias, num_groups = 1):
+def group_norm(hidden, weight, bias, num_groups=1, neuron_config=None, tp_degree=None):
     """
     Perform GroupNorm on input with shape (H, S, B).
     """
@@ -164,6 +172,10 @@ def group_norm(hidden, weight, bias, num_groups = 1):
     bias_br = broadcast(bias, input_sizes, broadcast_dimensions=[0])
     output = add(output, bias_br)
     output = cast(output, dtype)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        return all_gather(output, 1, tp_degree, replica_groups=None)
+
     return output
 
 
@@ -192,13 +204,16 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
 
     dtype = hidden.dtype
     scribe = hidden.scribe
-    f32 = scribe.f32
+    if neuron_config and neuron_config.bf16_rms_norm:
+        scribe_dtype = scribe.bf16
+    else:
+        scribe_dtype = scribe.f32
 
-    hidden = cast(hidden, f32)
+    hidden = cast(hidden, scribe_dtype)
 
     square = multiply(hidden, hidden)
     variance = reduce_mean(square, dim)
-    eps = full(eps, f32, batch_shapes)
+    eps = full(eps, scribe_dtype, batch_shapes)
     mean_eps = add(variance, eps)
     mean_rsqrt = rsqrt(mean_eps)
     rsqrt_br = broadcast(mean_rsqrt, size, batch_dims)
@@ -208,10 +223,13 @@ def rms_norm_legacy(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degr
         scaled = cast(scaled, dtype)
         return scaled
 
-    weight = cast(weight, f32)
+    weight = cast(weight, scribe_dtype)
     weight_br = broadcast(weight, size, [dim])
     result = multiply(scaled, weight_br)
     result = cast(result, dtype)
+
+    if neuron_config and neuron_config.is_sequence_parallel:
+        result = all_gather(result, 1, tp_degree, replica_groups=None)
 
     return result
 
@@ -225,17 +243,33 @@ def rms_norm(hidden, weight, eps=1e-6, dim=2, neuron_config=None, tp_degree=None
         return rms_norm_legacy(hidden, weight, eps, dim, neuron_config, tp_degree)
     scribe = hidden.scribe
     backend_config = str(dim).encode()
-    eps = hidden.scribe.f32.Constant(constant_value=eps)
-    f32 = scribe.f32
-    hidden = cast(hidden, f32)
+    if neuron_config and neuron_config.bf16_rms_norm:
+        eps = hidden.scribe.bf16.Constant(constant_value=eps)
+        bf16 = scribe.bf16
+        hidden = cast(hidden, bf16)
+    else:
+        eps = hidden.scribe.f32.Constant(constant_value=eps)
+        f32 = scribe.f32
+        hidden = cast(hidden, f32)
 
-    return dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+    result = dtype[shape].CustomCall(hidden, weight, eps, custom_call_target="AwsNeuronRmsNorm", backend_config=backend_config,)
+    if neuron_config and neuron_config.is_sequence_parallel:
+        result = all_gather(result, 1, tp_degree, replica_groups=None)
+
+    return result
 
 
-def dot_general(lhs, rhs, dimension_numbers):
-    # Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
-
-    dtype = lhs.dtype
+def dot_general(lhs, rhs, dimension_numbers, dtype=None):
+    """
+    General dot product. Allows contracting and batch dimension numbers to be specified for both the lhs and rhs.
+    Reference: https://www.tensorflow.org/xla/operation_semantics#dotgeneral
+    
+    Args:
+        lhs, rhs: operands
+        dimension_numbers: contracting and batch dimension numbers
+        dtype: output tensor dtype, the same data type as lhs by default.
+    """
+    dtype = dtype if dtype else lhs.dtype
     lhs_sizes = lhs.sizes
     rhs_sizes = rhs.sizes
     dot_dims = dict(lhs_contracting_dimensions=dimension_numbers.get("lhs_contracting_dimensions", [0]),
@@ -262,6 +296,11 @@ def dot_general(lhs, rhs, dimension_numbers):
 
     dot_sizes = lhs_batch_sizes + lhs_free_sizes + rhs_free_sizes
     output_dot = dtype[dot_sizes].Dot(lhs, rhs, dot_dimension_numbers=dot_dims)
+    return output_dot
+
+
+def blockwise_qk_matmul(query, keys, neuron_config):
+    output_dot = hlo.full(0, )
     return output_dot
 
 
@@ -333,7 +372,7 @@ def dot_add(
     """
 
     lhs, rhs, _ = canonicalize_lhs_rhs_dtype(lhs, rhs, neuron_config)
-    enable_quantize = neuron_config is not None and neuron_config.quant is not None
+    enable_quantize = neuron_config is not None and neuron_config.quant is not None and scales is not None
 
     if not isinstance(lhs_contracting_dimension, list):
         lhs_contracting_dimension = [lhs_contracting_dimension]
@@ -462,8 +501,11 @@ def get_activation(activation_function: Union[str, Callable]) -> Callable:
     return activation
 
 
-def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
+def mlp(hidden, in_weight, in_bias, out_weight, out_bias,
+        activation_function, tp_degree,
+        dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None,
+        neuron_config=None, transposed=False,
+):
     # single:
     #   hidden: [h, a, b]
     #   in_weight: [h, 4h]
@@ -489,13 +531,21 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         assert hidden_size % constants.TILE_SIZE == 0, \
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
             f"in order to use weight tiling."
+
+        bias_dimension = 1
+
         hidden_tiled_sizes = hidden_size // constants.TILE_SIZE, constants.TILE_SIZE, batch_size * n_active_tokens,
         hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden = dot_0120_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(
+            hidden, in_weight, in_bias, [0,1],
+            [neuron_config.mlp_in_weight_tiling_permute_order.index(0), neuron_config.mlp_in_weight_tiling_permute_order.index(1)],
+            bias_dimension, in_scales, neuron_config)
         hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden = get_activation(activation_function)(hidden)
-        hidden = dot_1220_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, out_weight, out_bias, [1,2],
+            [neuron_config.mlp_out_weight_tiling_permute_order.index(0), neuron_config.mlp_out_weight_tiling_permute_order.index(1)],
+            bias_dimension, out_scales, neuron_config)
     else:
         # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
         hidden = dot00_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
@@ -518,13 +568,20 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, t
         hidden = reshape(hidden, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if neuron_config is not None and neuron_config.is_sequence_parallel:
+        hidden = reduce_scatter_sum(hidden, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+    else:
+        hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+
     # Transpose back to HSB if applicable
     return permute(hidden, (2, 1, 0)) if is_bsh else hidden
 
 
-def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_function, tp_degree,
-            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None, neuron_config=None, transposed=False):
+def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias,
+            activation_function, tp_degree,
+            dequant_dtype=None, u8_bounds=None, in_scales=None, out_scales=None,
+            neuron_config=None, transposed=False,
+):
     # single:
     #   hidden: [b, a, h]
     #   in_weight: [h, 4h]
@@ -550,13 +607,23 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
         assert hidden_size % constants.TILE_SIZE == 0, \
             f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
             f"in order to use weight tiling."
+
+        lhs_contracting_dimensions = [1,2]
+
+        bias_dimension = 1
         hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden = dot_1220_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, in_weight, in_bias,
+            lhs_contracting_dimensions,
+            [neuron_config.mlp_in_weight_tiling_permute_order.index(0), neuron_config.mlp_in_weight_tiling_permute_order.index(1)],
+            bias_dimension, in_scales, neuron_config)
         hidden_tiled_sizes = hidden.sizes[0], hidden.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
         hidden = reshape(hidden, hidden_tiled_sizes)
         hidden = get_activation(activation_function)(hidden)
-        hidden = dot_1220_add1(hidden, out_weight, out_bias, out_scales, neuron_config)
+        hidden = dot_with_tiled_weight_add(hidden, out_weight, out_bias,
+            lhs_contracting_dimensions,
+            [neuron_config.mlp_out_weight_tiling_permute_order.index(0), neuron_config.mlp_out_weight_tiling_permute_order.index(1)],
+            bias_dimension, out_scales, neuron_config)
     else:
         hidden = dot10_add1(hidden, in_weight, in_bias, in_scales, neuron_config)
         hidden = get_activation(activation_function)(hidden)
@@ -564,7 +631,12 @@ def mlp_bsh(hidden, in_weight, in_bias, out_weight, out_bias, activation_functio
     hidden = reshape(hidden, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    return all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if neuron_config is not None and neuron_config.is_sequence_parallel:
+        hidden = reduce_scatter_sum(hidden, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+    else:
+        hidden = all_reduce_sum(hidden, tp_degree, dtype=dtype, replica_groups=replica_groups)
+
+    return hidden
 
 
 def gated_mlp_bsh(
@@ -605,35 +677,68 @@ def gated_mlp_bsh(
     hidden_r_sizes = batch_size * n_active_tokens, hidden_size
 
     hidden = reshape(hidden, hidden_r_sizes)
-    if neuron_config is not None and neuron_config.weight_tiling:
-        assert hidden_size % constants.TILE_SIZE == 0, \
-            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
-            f"in order to use weight tiling."
-        hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
-        hidden = reshape(hidden, hidden_tiled_sizes)
-        hidden_active  = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
-        hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
-        hidden_active = reshape(hidden_active, hidden_tiled_sizes)
-        hidden_active = get_activation(activation_function)(hidden_active)
-        hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
-        hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
-        hidden_states = multiply(hidden_active, hidden_linear)
-        result = dot_1220_add1(hidden_states, out_weight, out_bias,
-                        scales=out_scales, neuron_config=neuron_config)
-    else:
+    if neuron_config is not None and neuron_config.fused_rmsnorm_mlp:
         hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
                                scales=in0_scales, neuron_config=neuron_config)
         hidden_active = get_activation(activation_function)(hidden_active)
         hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
                                scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
-        result = dot11_add1(hidden_states, out_weight, out_bias,
+        result = dot10_add1(hidden_states, out_weight, out_bias,
                         scales=out_scales, neuron_config=neuron_config)
+    elif neuron_config is not None and neuron_config.weight_tiling:
+        assert hidden_size % constants.TILE_SIZE == 0, \
+            f"hidden size needs to be divisible by {constants.TILE_SIZE}" \
+            f"in order to use weight tiling."
+        hidden_tiled_sizes = batch_size * n_active_tokens, hidden_size // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden = reshape(hidden, hidden_tiled_sizes)
+        hidden_active = dot_1220_add1(hidden, in0_weight, in0_bias, in0_scales, neuron_config)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_tiled_sizes = hidden_active.sizes[0], 2, hidden_active.sizes[1] // (2 * constants.TILE_SIZE), \
+                                 constants.TILE_SIZE
+        else:
+            hidden_tiled_sizes = hidden_active.sizes[0], hidden_active.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+        hidden_active = reshape(hidden_active, hidden_tiled_sizes)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_gate = slice_along(hidden_active, 1, limit=1, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2, start=1)
+            hidden_gate = squeeze(hidden_gate, dim=1)
+            hidden_linear = squeeze(hidden_linear, dim=1)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot_1220_add1(hidden, in1_weight, in1_bias, in1_scales, neuron_config)
+            hidden_linear = reshape(hidden_linear, hidden_tiled_sizes)
+        hidden_states = multiply(hidden_active, hidden_linear)
+        result = dot_1220_add1(hidden_states, out_weight, out_bias,
+                        scales=out_scales, neuron_config=neuron_config)
+    else:
+        hidden_active = dot10_add1(hidden, in0_weight, in0_bias,
+                               scales=in0_scales, neuron_config=neuron_config)
+        if neuron_config and neuron_config.fuse_mlp:
+            size = hidden_active.sizes[1]//2
+            hidden_gate = slice_along(hidden_active, 1, limit=size, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2*size, start=size)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot10_add1(hidden, in1_weight, in1_bias,
+                               scales=in1_scales, neuron_config=neuron_config)
+        hidden_states = multiply(hidden_active, hidden_linear)
+        if neuron_config is not None and neuron_config.mlp_out_weight_transpose:
+            result = dot10_add1(hidden_states, out_weight, out_bias,
+                            scales=out_scales, neuron_config=neuron_config)
+        else:
+            result = dot11_add1(hidden_states, out_weight, out_bias,
+                            scales=out_scales, neuron_config=neuron_config)
     result = reshape(result, hidden_sizes)
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+        if neuron_config is not None and neuron_config.is_sequence_parallel:
+            result = reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+        else:
+            result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
     return result
 
 
@@ -686,27 +791,48 @@ def gated_mlp(
 
         hidden_active = dot_0120_add1(hidden, in0_weight, in0_bias,
                                       scales=in0_scales, neuron_config=neuron_config)
-        hidden_active = get_activation(activation_function)(hidden_active)
-        hidden_linear = dot_0120_add1(hidden, in1_weight, in1_bias,
-                                      scales=in1_scales, neuron_config=neuron_config)
+        if neuron_config and neuron_config.fuse_mlp:
+            hidden_tiled_sizes = n_active_tokens * batch_size, 2, hidden_active.sizes[1] // (2 * constants.TILE_SIZE), \
+                                 constants.TILE_SIZE
+            hidden_active = reshape(hidden_active, hidden_tiled_sizes)
+            hidden_gate = slice_along(hidden_active, 1, limit=1, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2, start=1)
+            hidden_gate = squeeze(hidden_gate, dim=1)
+            hidden_linear = squeeze(hidden_linear, dim=1)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+            hidden_states = multiply(hidden_active, hidden_linear)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
+            hidden_linear = dot_0120_add1(hidden, in1_weight, in1_bias,
+                                          scales=in1_scales, neuron_config=neuron_config)
 
-        hidden_states = multiply(hidden_active, hidden_linear)
-        hidden_states_tiled_sizes = hidden_states.sizes[0], hidden_states.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
-        hidden_states = reshape(hidden_states, hidden_states_tiled_sizes)
+            hidden_states = multiply(hidden_active, hidden_linear)
+            hidden_states_tiled_sizes = hidden_states.sizes[0], hidden_states.sizes[1] // constants.TILE_SIZE, constants.TILE_SIZE
+            hidden_states = reshape(hidden_states, hidden_states_tiled_sizes)
 
         result = dot_1220_add1(hidden_states, out_weight, out_bias,
                                scales=out_scales, neuron_config=neuron_config)
     else:
         # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
         hidden_active = dot00_add1(hidden, in0_weight, in0_bias, scales=in0_scales, neuron_config=neuron_config)
-        hidden_active = get_activation(activation_function)(hidden_active)
+        if neuron_config and neuron_config.fuse_mlp:
+            size = hidden_active.sizes[1]//2
+            hidden_gate = slice_along(hidden_active, 1, limit=size, start=0)
+            hidden_linear = slice_along(hidden_active, 1, limit=2*size, start=size)
+            hidden_active = get_activation(activation_function)(hidden_gate)
+        else:
+            hidden_active = get_activation(activation_function)(hidden_active)
 
-        # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
-        hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
+            # (h, b * s) @ (h, i) contract=(0, 0) => (b * s, i)
+            hidden_linear = dot00_add1(hidden, in1_weight, in1_bias, scales=in1_scales, neuron_config=neuron_config)
         hidden_states = multiply(hidden_active, hidden_linear)
 
-        # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
-        result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+        if neuron_config is not None and neuron_config.mlp_out_weight_transpose:
+            # (b * s, i) @ (i, h) contract=(1, 0) => (b * s, h)
+            result = dot10_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
+        else:
+            # (b * s, i) @ (h, i) contract=(1, 1) => (b * s, h)
+            result = dot11_add1(hidden_states, out_weight, out_bias, scales=out_scales, neuron_config=neuron_config)
 
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
@@ -720,7 +846,10 @@ def gated_mlp(
 
     if not return_partial:
         dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-        result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+        if neuron_config is not None and neuron_config.is_sequence_parallel:
+            result = reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+        else:
+            result = all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     return permute(result, (2, 1, 0)) if is_bsh else result
@@ -779,8 +908,37 @@ def transfer_with_static_ring(shape):
     custom_call_target = 'AwsNeuronTransferWithStaticRing'
     return shape.dtype[shape.sizes].CustomCall(shape, custom_call_target=custom_call_target)
 
+def token_tree_attention_mask(full_token_tree_attention_mask, active_mask):
+    """
+    The full_token_tree_attention_mask is loaded as a weight of the speculation model and contains
+    the attention mask for the whole tree structure.
+    This method is used to extract the active attention mask corresponding to a tree structure
+    that is a sub tree of the full token tree but only till a given level.
+    So this is extracting a top left prefix of the full_token_tree_attention_mask based on the
+    number of nodes in the sub tree which is determined by the size of active_mask.
 
-def attention_mask(cache_ids, start_ids, n_positions):
+    Eg:
+
+       Full token tree : {0:[1], 1:[2], 2:[3]}
+       Corresponding full_token_tree_attention_mask : [[1, 0, 0, 0],[1, 1, 0, 0],[1, 1, 1, 0], [1, 1, 1, 1]]
+       sub tree as part of draft speculation loop : {0:[1], 1:[2]}
+       So the shape of the active_mask will be (B = 1, SL = 3, SL = 3)
+       Final mask returned will then be [[[True, False, False],[True, True, False],[True, True, True]]]
+       of shape (B=1, SL=3, SL=3) which is the upper left 3x3 matrix of the full_token_tree_attention_mask matrix
+    """
+    batch, seq_len, *_ = active_mask.sizes
+    # Keep required rows
+    row_sliced_token_tree_active_mask = slice_along(full_token_tree_attention_mask, 0, seq_len)
+    # Keep required columns
+    col_sliced_token_tree_active_mask = slice_along(row_sliced_token_tree_active_mask, 1, seq_len)
+    # Broadcast to accomodate correct shape of the mask
+    token_tree_active_mask = broadcast(col_sliced_token_tree_active_mask, active_mask.sizes, [1,2])
+    # Convert to pred
+    pred_token_tree_active_mask = equal(token_tree_active_mask, 1)
+    return pred_token_tree_active_mask
+
+
+def attention_mask(cache_ids, start_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None, context_lens=None):
     """
     Create decomposed prior/active attention masks.
 
@@ -823,6 +981,10 @@ def attention_mask(cache_ids, start_ids, n_positions):
         return decoder_attention_mask_lhs_aligned(
             cache_ids,
             n_positions,
+            last_token_id=last_token_id,
+            num_active_blocks=num_active_blocks,
+            neuron_config=neuron_config,
+            context_lens=context_lens,
         )
     else:
         n_active_tokens, = cache_ids.sizes
@@ -999,7 +1161,6 @@ def reduce_max(tensor, dim, keepdim=False):
 
     return value
 
-
 def reduce_sum(tensor, dim, keepdim=False):
 
     dtype = tensor.dtype
@@ -1161,6 +1322,54 @@ def unsqueeze(tensor, dim):
     return dtype[size].Reshape(tensor)
 
 
+def gather_select_reduce(tensor, dim, index):
+    """
+    Gather elements from a `tensor` along `dim` at the given `index`
+    using select and reduce op.
+    """
+    assert dim <= len(tensor.sizes)
+
+    # Must have the same rank
+    tensor_sizes = list(tensor.sizes)
+    index_sizes = list(index.sizes)
+    assert len(tensor_sizes) == len(index_sizes)
+
+    index_broadcast_dims = list()
+    input_broadcast_dims = list()
+    sizes = list()
+
+    for i in range(0, len(index_sizes)):
+        if i < dim:
+            input_broadcast_dims.append(i)
+            index_broadcast_dims.append(i)
+        elif i == dim:
+            sizes.append(tensor_sizes[i])
+            input_broadcast_dims.append(i)
+            index_broadcast_dims.append(i + 1)
+        else:
+            input_broadcast_dims.append(i + 1)
+            index_broadcast_dims.append(i + 1)
+        sizes.append(index_sizes[i])
+
+    cast_index = broadcast(index, sizes, index_broadcast_dims)
+    ref_iota = iota(index.dtype, sizes, dim)
+    mask = equal(cast_index, ref_iota)
+
+    cast_input = broadcast(tensor, sizes, input_broadcast_dims)
+    zero_full = full(0, cast_input.dtype, cast_input.sizes)
+    masked_input = cast_input.dtype[cast_input.sizes].Select(mask, cast_input, zero_full)
+
+    def reducer(scribe):
+        p0 = dtype.Parameter(parameter_number=0)
+        p1 = dtype.Parameter(parameter_number=1)
+        return dtype.Add(p0, p1)
+
+    dtype = masked_input.dtype
+    zero = dtype.Constant(constant_value=0)
+    result = dtype[tensor_sizes].Reduce(masked_input, zero, dimensions=[dim], to_apply=reducer)
+    return result
+
+
 def gather(tensor, dim, index):
     """
     Gather elements from a `tensor` along `dim` at the given `index`
@@ -1300,15 +1509,13 @@ def _embedding(weight, index, dtype=None):
     )
 
     n_embedding, embedding_dim = weight.sizes
-    if dtype is None:
-        dtype = weight.dtype
 
     # Linearize index tensor to gather from 0th dimension
     n_index = functools.reduce(operator.mul, index.sizes, 1)
     linear_index = reshape(index, n_index)
 
     # Gather
-    result = dtype[n_index, embedding_dim].Gather(
+    result = weight.dtype[n_index, embedding_dim].Gather(
         weight,
         linear_index,
         gather_dimension_numbers=dict(
@@ -1319,12 +1526,14 @@ def _embedding(weight, index, dtype=None):
         ),
         gather_slice_sizes=[1, embedding_dim],
     )
+    if dtype != result.dtype:
+        result = cast(result, dtype)
 
     # Reshape embedding tensor to look like the original index shape
     return reshape(result, (*index.sizes, embedding_dim))
 
 
-def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
+def embedding(weight, index, tp_degree=1, dim=1, dtype=None, core_id=None, sequence_parallel=False):
     """
     An embedding operation analogous to torch.nn.Embedding
 
@@ -1364,15 +1573,18 @@ def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
 
     # Case 2: Partitioned vocabulary - Sum masked embeddings
     if dim == 0:
+        if core_id is None:
 
-        raise NotImplementedError(
-            f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
-        )
-
+            raise NotImplementedError(
+                f'Embedding `dim` may not be 0. ReplicaId instruction unsupported'
+            )
+            replica_id = index.dtype.ReplicaId() # XXX: Unsupported
+        else:
+            replica_id = reshape(core_id,[])
+        replica_id = cast(replica_id, index.dtype)
         pred = index.scribe.pred
 
         # Compute embedding mask
-        replica_id = index.dtype.ReplicaId() # XXX: Unsupported
         vocab_size = index.dtype.Constant(constant_value=partition_size)
         one = index.dtype.Constant(constant_value=1)
 
@@ -1394,13 +1606,17 @@ def embedding(weight, index, tp_degree=1, dim=1, dtype=None):
         zero = result.dtype.Constant(constant_value=0)
         zero_br = result.dtype[result.sizes].Broadcast(zero, dimensions=[])
         masked_result = result.dtype[result.sizes].Select(mask_br, result, zero_br)
-
+        if sequence_parallel:
+            add_fn = gen_add_func(masked_result.dtype)
+            replica_groups = utils.build_replica_groups(1, group_size=tp_degree)
+            return reduce_scatter(masked_result, dim=1, replica_groups=replica_groups, to_apply=add_fn)
         # Combine embeddings from all partitions
         return all_reduce_sum(masked_result, tp_degree=tp_degree)
 
     # Case 3: Partitioned embedding: Concatenate embedding pieces
     if dim == 1:
         # Using BSH, concatenate along the last dim
+        assert sequence_parallel is False, "sequence_parallel with dim=1 is not compatible for BSH layout"
         return all_gather(result, 2, tp_degree=tp_degree)
 
     raise NotImplementedError(
@@ -1472,6 +1688,17 @@ def dequantize(tensor, scales, neuron_config: NeuronConfig, scales_dim):
     tensor = dtype[tensor.sizes].Convert(tensor)
     return tensor
 
+def quantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
+    scribe = tensor.scribe
+    quant_dtype = getattr(scribe, neuron_config.kv_cache_quant.quant_dtype)
+    quantized_tensor = quant_dtype[tensor.sizes].Convert(tensor)
+    return quantized_tensor
+
+def dequantize_kv_cache_direct_cast(tensor, neuron_config: NeuronConfig):
+    scribe = tensor.scribe
+    dequant_dtype = getattr(scribe, neuron_config.kv_cache_quant.dequant_dtype)
+    dequantized_tensor = dequant_dtype[tensor.sizes].Convert(tensor)
+    return dequantized_tensor
 
 def reduce_mean(tensor, dims, keepdim=False):
 
@@ -1571,12 +1798,9 @@ def all_reduce_mean(tensor, tp_degree, dtype=None, replica_groups=None):
     return global_mean
 
 
-
 def cumsum(tensor, dim):
 
-    # NOTE: This is behind a flag because support of the required
-    #       instructions are not yet fully available.
-    if is_floating_point(tensor) and os.environ.get('NEURON_INTERNAL_FAST_CUMSUM', None) == '1':
+    if is_floating_point(tensor):
         return _cumsum_fast(tensor, dim)
 
     scribe = tensor.scribe
@@ -1614,7 +1838,10 @@ def cumsum(tensor, dim):
 
 def _cumsum_fast(tensor, dim):
 
-    from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
+    try:
+        from neuronxcc.nki._private_kernels.cumsum import cumsum as nki_cumsum
+    except ImportError:
+        from neuronxcc.nki.kernels.cumsum import cumsum as nki_cumsum
 
     scribe = tensor.scribe
     last = len(tensor.sizes) - 1
@@ -1638,14 +1865,9 @@ def _cumsum_fast(tensor, dim):
         tensor = reshape(tensor, (elements, tensor.sizes[last]))
         reshaped = True
 
-    # Note: NKI kernel does not yet have broad type support
-    tensor = cast(tensor, f32)
-
     def _cumsum(inputs, output):
         return nki_cumsum(inputs, output, axis=1)
     result = nki_call(_cumsum, tensor, output_HloShapes=tensor.dtype[tensor.sizes])
-
-    result = cast(result, dtype)
 
     if reshaped:
         result = reshape(result, shape)
@@ -1708,7 +1930,7 @@ def slice_along(tensor, dim, limit, start=0, stride=1):
     dimensions[dim] = dict(start=start, limit=limit, stride=stride)
 
     sizes = list(tensor.sizes)
-    sizes[dim] = (limit - start)//stride
+    sizes[dim] = (limit - start + stride - 1)//stride
 
     return tensor.dtype[sizes].Slice(
         tensor,
@@ -1729,8 +1951,8 @@ def dynamic_slice_along(tensor, dim, start, size):
         f"Parameter 'size' must be an integer. Found type={type(size)}"
     )
     assert not isinstance(start, int), (
-        f"Parameter 'start' must be a tensor. Found type={type(size)}"
-    )
+        f"Parameter 'start must be a tensor. Found type={type(size)}"
+)
     assert len(start.sizes) == 0, (
         f"Parameter 'start' must be a scalar. Found shape={start.sizes}"
     )
@@ -2222,7 +2444,14 @@ def multinomial(probabilities, dim, deterministic=False):
     cumprob = cumsum(probabilities, dim)
 
     sizes = list(probabilities.sizes)
-    sizes.pop(dim)
+    vocab_size = sizes.pop(dim)
+    # Fix to ensure cumprob add up to 1.0 to prevent chance of
+    # generating sample with value of vocab_size when cumprob is < 1.0.
+    # As an example, cumprob can be 0.996 or 1.007 due to floating point accumulation error.
+    max_prob = slice_along(cumprob, dim, vocab_size, start=vocab_size-1, stride=1)
+    max_prob = broadcast(max_prob, cumprob.sizes, list(range(len(cumprob.sizes))))
+    cumprob = divide(cumprob, max_prob)
+
     if deterministic:
         uniform = full(0.5, dtype, sizes)
     else:
@@ -2417,6 +2646,11 @@ def multiply(lhs, rhs):
     _check_binary_arguments(lhs, rhs)
     return lhs.dtype[lhs.sizes].Multiply(lhs, rhs)
 
+def minimum(lhs, rhs):
+    lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
+    _check_binary_arguments(lhs, rhs)
+    return lhs.dtype[lhs.sizes].Minimum(lhs, rhs)
+
 def maximum(lhs, rhs):
     lhs, rhs = _binary_primitive_broadcast(lhs, rhs)
     _check_binary_arguments(lhs, rhs)
@@ -2474,6 +2708,9 @@ def reshape(tensor, shape):
     )
     return tensor.dtype[shape].Reshape(tensor)
 
+def get_hlo_scalar_by_index(tensor, index):
+    assert index < tensor.sizes[0]
+    return reshape(slice_along(tensor, 0, start=index, limit=index+1), [])
 
 def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
     operand_rank = len(operands.sizes)
@@ -2496,6 +2733,8 @@ def scatter(operands, scatter_indices, updates, scatter_dims, to_apply):
         "Each updates array must be of rank (update_window_dims.size + scatter_indices.rank - 1)"
     dtype = updates.dtype
     updated_sizes = operands.sizes
+    assert scatter_indices.sizes[0] == updates.sizes[0], \
+        "update window size must match betwen scatter_indices and updates."
     updated = dtype[updated_sizes].Scatter(
         operands, scatter_indices, updates, scatter_dimension_numbers=scatter_dims, to_apply=to_apply)
     return updated
@@ -2517,6 +2756,26 @@ def reduce_scatter(tensor, dim, replica_groups, to_apply, dtype=None):
     output = all_reduce_dtype[size].ReduceScatter(tensor,  dimensions = [dim],
                                         replica_groups = replica_groups, to_apply=to_apply)
     return output
+
+
+def reduce_scatter_sum(tensor, tp_degree, dim, dtype=None, replica_groups=None):
+
+    if tp_degree == 1:
+        return tensor
+
+    to_apply = gen_add_func(tensor.dtype)
+
+    if replica_groups is None:
+        replica_groups = [list(range(tp_degree))]
+
+    return reduce_scatter(
+        tensor,
+        dim=dim,
+        replica_groups=replica_groups,
+        to_apply=to_apply,
+        dtype=dtype,
+    )
+
 
 def sin(tensor):
     sizes = tensor.sizes
@@ -2815,7 +3074,7 @@ def decoder_attention_mask_window(cache_ids, start_ids, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned(cache_ids, n_positions):
+def decoder_attention_mask_lhs_aligned(cache_ids, n_positions, last_token_id=None, num_active_blocks=None, neuron_config=None, context_lens=None):
     """
     Create attention masks for LHS-aligned sequences.
 
@@ -2829,12 +3088,23 @@ def decoder_attention_mask_lhs_aligned(cache_ids, n_positions):
         active_mask: The attention mask to apply to the active tokens.
     """
     batch_size, n_active_tokens = cache_ids.sizes
-    if n_active_tokens == n_positions:
+    if neuron_config and neuron_config.enable_chunked_prefill and n_active_tokens == n_positions:
+        batch_size = neuron_config.continuous_batching.max_num_seqs
+        seq_lens = add(context_lens, last_token_id) # last_token_id is query_lens
+        block_size = neuron_config.continuous_batching.block_size
+        return decoder_attention_block_diagonal_causal_from_bottomright_mask(
+            num_queries=last_token_id, num_keys=seq_lens, max_num_queries=n_active_tokens, max_num_keys=block_size*num_active_blocks+n_active_tokens, max_num_seqs=batch_size)
+    elif n_active_tokens == n_positions:
         # Context Encoding
-        return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
+        if neuron_config and neuron_config.use_1d_query:
+            # For concatenated prompt encoding (1D query), last_token_id is used as prompt_lens
+            return decoder_attention_block_diagonal_causal_mask(last_token_id, n_positions)
+        else:
+            return decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions)
     else:
         # Token generation
-        return decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions)
+        return decoder_attention_mask_lhs_aligned_token(
+            cache_ids, n_positions, num_active_blocks=num_active_blocks, neuron_config=neuron_config)
 
 
 def decoder_attention_mask_lhs_aligned_context(cache_ids, n_positions):
@@ -2938,7 +3208,303 @@ def decoder_attention_block_diagonal_causal_mask(prompt_lens, n_positions):
     return prior_mask, active_mask
 
 
-def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions):
+def decoder_attention_block_diagonal_causal_from_bottomright_mask(num_queries, num_keys, max_num_queries, max_num_keys, max_num_seqs):
+    """
+    Creates block diagonal causal masks for multiple prompts.
+
+    This mask is dynamic and depends on the input prompt lengths.
+
+    Example:
+        num_queries = [2, 3, 1, 0], num_keys = [4, 5, 4, 0], max_num_queries = 8, max_num_keys = 16, max_num_seqs = 4
+
+        prior_mask = [
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 1st sequence
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 1st sequence
+            [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], # At position 3 attend to 2nd sequence
+            [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], # At position 4 attend to 2nd sequence
+            [0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], # At position 5 attend to 2nd sequence
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0], # At position 3 attend to 3rd sequence
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # padding
+        ]
+        active_mask = None
+
+    Args:
+        prompt_lens: The list of prompt lengths.
+        n_positions: The total size of the KV cache to consider. This is
+            equal to the current bucket size.
+
+    Returns:
+        prior_mask: The attention mask to apply to the KV cache.
+        active_mask: The attention mask to apply to the active tokens (None).
+
+    For each sequence, we start from building a triangle mask with an offset.
+    As shown in the following figure, with
+
+      ri = q_cumsum[seq_id]
+      ci = k_cumsum[seq_id]
+      nr = num_queries[seq_id]
+      nc = num_keys[seq_id]
+
+    we can trim the triangle mask from different directions, in order to get the desired shape.
+
+                 (0, ci+nc-ri-nr)
+    +--------------------+----------------------------------+
+    |                      \                                |
+    |                        \   (ri, ci+nc-nr)             |
+    |                          \   |                        |
+    |   (ri, ci)                 \       (ri, ci+nc)        |
+    |       +----------------------+ - - - +                |
+    |       | xxxxxxxxxxxxxxxxxxxxxx \     |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxx \   |                |
+    |       | xxxxxxxxxxxxxxxxxxxxxxxxxx \ |                |
+    |       +------------------------------+                |
+    |   (ri+nr, ci)                      (ri+nr, ci+nc)     |
+    |                                                       |
+    +-------------------------------------------------------+
+    """
+
+    s32 = num_queries.scribe.s32
+    pred = num_queries.scribe.pred
+    sizes = max_num_queries, max_num_keys
+    num_queries = cast(num_queries, s32)
+    num_keys = cast(num_keys, s32)
+
+    # Constants to be used in the loop
+    a = iota(s32, sizes, [0])
+    b = iota(s32, sizes, [1])
+    q_cumsum = concatenate([full(0, s32, [1]), cumsum(num_queries, dim=0)], dimension=0)
+    k_cumsum = concatenate([full(0, s32, [1]), cumsum(num_keys, dim=0)], dimension=0)
+
+    # broadcast to size
+    def _br(x):
+        return broadcast(x, sizes, [0])
+
+    prior_mask = full(0, dtype=pred, sizes=sizes)
+    for idx in range(max_num_seqs):
+        seq_id = s32.Constant(constant_value=idx)
+        ri = dynamic_slice_along(q_cumsum, dim=0, start=seq_id, size=1)
+        ci = dynamic_slice_along(k_cumsum, dim=0, start=seq_id, size=1)
+        nr = dynamic_slice_along(num_queries, dim=0, start=seq_id, size=1)
+        nc = dynamic_slice_along(num_keys, dim=0, start=seq_id, size=1)
+
+        # a_offset = ci+nc-ri-nr
+        # new_mask = (a + a_offset) >= b
+        a_offset = subtract(add(ci, nc), add(ri, nr))
+        new_mask = compare(add(a, _br(a_offset)), b, "GE")
+
+        # left_mask = b >= ci
+        # top_mask = a >= ri
+        # bottom_mask = a < (ri+nr)
+        left_mask = compare(b, _br(ci), "GE")
+        top_mask = compare(a, _br(ri), "GE")
+        bottom_mask = compare(a, _br(add(ri, nr)), "LT")
+        new_mask = logical_and(logical_and(logical_and(new_mask, left_mask), top_mask), bottom_mask)
+
+        prior_mask = logical_or(prior_mask, new_mask)
+
+    # [n_positions, n_positions] -> [1, n_positions, n_positions]
+    prior_mask = unsqueeze(prior_mask, dim=0)
+    active_mask = None
+    return prior_mask, active_mask
+
+
+def sharded_decoder_attention_block_diagonal_causal_from_bottomright_mask(
+        num_queries, num_keys, max_num_queries, max_num_keys, max_num_seqs, position_ids, sharded_seq_lens,
+        cached_to_contexted_idx, n_active_blocks, block_size, core_sos_rank, sos_degree):
+    """
+    Creates block diagonal causal masks for multiple prompts in shard over sequence strategy.
+
+    Example:
+
+    INPUTS:
+    num_queries   = [1,  5, 5]
+    num_keys      = [6, 13, 5]
+    block_size    = 6
+    sos_degree    = 3
+    -->
+    KV cache in cache block format: (position_id, slot_mapping) 
+    new token: <position_id, slot_mapping>
+    We suppose all the tokens have been written into the KV cache.
+
+    Block ID
+             <---- NC0 ---->  | <---- NC1 ---->  | <---- NC2 ----> 
+        0    (0, 0), (1, 1)   | (2, 0), (3, 1)   | (4, 0), <5, 1>     (seq 0)
+        2    (0, 4), (1, 5)   | (2, 4), (3, 5)   | (4, 4), (5, 5)     (seq 1)
+        3    (6, 6), (7, 7)   | <8, 6>, <9, 7>   | <10, 6>, <11, 7>   (seq 1)
+        4    <12, 8>,         |                  |                    (seq 1)
+        6    <0, 12>, <1, 13> | <2, 12>, <3, 13> | <4, 12>,           (seq 2)
+
+    core_sos_rank = 0                    core_sos_rank = 2
+    active_mask (NC0) = [                active_mask (NC2) = [
+        [1, 1, 0, 0, 0, 0, 0, 0, 0],         [1, 1, 0, 0, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 0, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 1, 0, 0, 0],         [0, 0, 1, 1, 1, 1, 0],
+        [0, 0, 1, 1, 1, 1, 1, 0, 0],         [0, 0, 1, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1, 1],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0, 0],         [0, 0, 0, 0, 0, 0, 1],
+    ]                                    ]
+        
+    In this function, we will first compute the full mask for the non-sharded case (with 
+    function decoder_attention_block_diagonal_causal_from_bottomright_mask), and then slice
+    the mask to the corresponding sharded region.
+    """
+    s32 = num_queries.scribe.s32
+    sharded_block_size = block_size // sos_degree
+    num_queries_cumsum = concatenate([full(0, s32, [1]), cumsum(num_queries, dim=0)], dimension=0)
+    sharded_seq_lens_cumsum = concatenate([full(0, s32, [1]), cumsum(sharded_seq_lens, dim=0)], dimension=0)
+
+    def _sequence_id_gen(seq_id, seq_lens_cumsum, idx, max_len, seq_arr):
+        start = slice_along(seq_lens_cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        end = slice_along(seq_lens_cumsum, dim=0, limit=seq_id+2, start=seq_id+1)
+        start = broadcast(start, [max_len], [0])
+        end = broadcast(end, [max_len], [0])
+        mask = cast(logical_and(greater_equal(idx, start), less(idx, end)), s32)
+        id_arr = multiply(full(seq_id, s32, [max_len]), mask)
+        seq_arr = add(multiply(seq_arr, subtract(1, mask)), id_arr)
+        return seq_arr
+
+    seq_id_x = full(max_num_seqs + 1, s32, [max_num_queries])
+    seq_id_y = full(max_num_keys + 1, s32, [max_num_keys])
+    idx_x = iota(s32, (max_num_queries,), [0])
+    idx_y = iota(s32, (max_num_keys,), [0])
+    for seq_id in range(max_num_seqs):
+        seq_id_x = _sequence_id_gen(seq_id, num_queries_cumsum, idx_x, max_num_queries, seq_id_x)
+        seq_id_y = _sequence_id_gen(seq_id, sharded_seq_lens_cumsum, idx_y, max_num_keys, seq_id_y)
+    seq_id_x = broadcast(seq_id_x, [max_num_queries, max_num_keys], [0])
+    seq_id_y = broadcast(seq_id_y, [max_num_queries, max_num_keys], [1])
+    seq_mask = equal(seq_id_x, seq_id_y)
+
+    seq_num_blocks = divide(add(num_keys, block_size - 1), block_size)
+    seq_num_blocks_cumsum = concatenate([full(0, s32, [1]), cumsum(seq_num_blocks, dim=0)], dimension=0)
+    seq_block_idx = full(n_active_blocks + 1, s32, [n_active_blocks])
+    idx = iota(s32, (n_active_blocks,), [0])
+    for seq_id in range(max_num_seqs):
+        start = slice_along(seq_num_blocks_cumsum, dim=0, limit=seq_id+1, start=seq_id)
+        end = slice_along(seq_num_blocks_cumsum, dim=0, limit=seq_id+2, start=seq_id+1)
+        start = broadcast(start, [n_active_blocks], [0])
+        end = broadcast(end, [n_active_blocks], [0])
+        mask = cast(logical_and(greater_equal(idx, start), less(idx, end)), s32)
+        id_arr = multiply(subtract(idx, start), mask)
+        seq_block_idx = add(multiply(seq_block_idx, subtract(1, mask)), id_arr)
+
+    base_offset = multiply(core_sos_rank, sharded_block_size)
+    base_offset_br = broadcast(reshape(base_offset, (1, 1)), (1, sharded_block_size), [0, 1])
+    block_offset = reshape(iota(s32, (sharded_block_size,), [0]), (1, sharded_block_size))
+    block_offset = add(block_offset, base_offset_br)
+    block_offset = broadcast(block_offset, [n_active_blocks, sharded_block_size], [0, 1])
+    seq_block_idx = reshape(seq_block_idx, (n_active_blocks, 1))
+    seq_block_idx = broadcast(seq_block_idx, [n_active_blocks, sharded_block_size], [0, 1])
+    kv_position_id = add(multiply(seq_block_idx, block_size), block_offset)
+    kv_position_id = reshape(kv_position_id, (n_active_blocks * sharded_block_size,))
+    kv_position_id = index_select(kv_position_id, dim=0, index=cached_to_contexted_idx)
+    kv_position_id = broadcast(kv_position_id, [max_num_queries, max_num_keys], [1])
+    position_ids = reshape(position_ids, (max_num_queries,))
+    position_ids = broadcast(position_ids, [max_num_queries, max_num_keys], [0])
+    causal_mask = greater_equal(position_ids, kv_position_id)
+
+    prior_mask = logical_and(seq_mask, causal_mask)
+    prior_mask = unsqueeze(prior_mask, 0)
+    active_mask = None
+    return prior_mask, active_mask
+
+
+def decoder_attention_mask_lhs_aligned_token(cache_ids, n_positions, num_active_blocks=None, neuron_config=None):
+    if neuron_config and neuron_config.optimized_paged_attention:
+        block_size = neuron_config.continuous_batching.block_size
+        assert isinstance(num_active_blocks, int) and (num_active_blocks is not None), \
+            f"num_active_blocks is expected to be an int, but got {num_active_blocks}"
+        return decoder_attention_mask_lhs_aligned_token_blockwise(cache_ids, block_size=block_size, num_blocks=num_active_blocks)
+    else:
+        return decoder_attention_mask_lhs_aligned_token_padded(cache_ids, n_positions)
+
+
+def decoder_attention_mask_lhs_aligned_token_blockwise(context_lens, block_size, num_blocks):
+    """
+    Creates the block-wise attention mask for decoding with multiple KV cache blocks.
+
+    Example:
+
+    # INPUTS:
+    context_lens: tensor([ 3, 10, 5, 0])
+    block_size: 4
+    num_blocks: 8
+
+    # EXPECTED OUTPUT:
+    # attention mask with 8 blocks total (w/ block_size=4, total elements=32)
+    # 24 active blocks are padded to 32 blocks
+    attention_mask
+    [
+    # seq0 - 3 elements (pad to 4)
+    1,1,1,0,
+
+    # seq1 - 10 elements (pad to 12)
+    1,1,1,1,
+    1,1,1,1,
+    1,1,0,0,
+
+    # seq2 - 5 elements (pad to 8)
+    1,1,1,1,
+    1,0,0,0,
+
+    # pad 8 elements to 32 total elements
+    0,0,0,0,
+    0,0,0,0
+    ]
+
+    Algorithm for implementing block-wise attention mask:
+
+    >>> # plan the output space for the active blocks
+    >>> blocks_cumsum = lax.cumsum((context_lens+block_size-1)//block_size, axis=0)
+    >>>
+    >>> prior_mask = jnp.zeros(num_tokens, dtype=context_lens.dtype)
+    >>> mask_iota = jnp.arange(start=0, stop=num_tokens, dtype=context_lens.dtype)
+    >>> for seq_id in range(max_num_seqs):
+    >>>     start_idx = 0 if seq_id == 0 else blocks_cumsum[seq_id-1] * block_size
+    >>>     end_idx = start_idx + context_lens[seq_id]
+    >>>     mask = jnp.int32(jnp.logical_and(mask_iota >= start_idx, mask_iota < end_idx))
+    >>>     prior_mask = prior_mask + mask
+    """
+    assert len(context_lens.sizes) == 2, "context_lens is expected to be a 2D vector."
+
+    s32 = context_lens.scribe.s32
+    f32 = context_lens.scribe.f32
+    pred = context_lens.scribe.pred
+    max_num_seqs = context_lens.sizes[0]
+    num_tokens = block_size * num_blocks
+
+    # reshape from 2D to 1D vector
+    context_lens = reshape(context_lens, (max_num_seqs,))
+
+    # blocks_cumsum = cumsum((context_lens+block_size-1)//block_size, axis=0)
+    blocks_add = add(context_lens, block_size-1)
+    blocks_div = cast(floor(divide(cast(blocks_add, f32), block_size)), s32)
+    blocks_cumsum = cumsum(blocks_div, dim=0)
+
+    blocks_mul = multiply(blocks_cumsum, block_size)
+    prior_mask = full(0, dtype=pred, sizes=(num_tokens,))
+    mask_iota = iota(s32, (num_tokens,), [0])
+    for seq_id in range(max_num_seqs):
+        zero, prev_seq_id, curr_seq_id = s32.Constant(constant_value=0), s32.Constant(constant_value=seq_id-1), s32.Constant(constant_value=seq_id)
+        start_idx = zero if seq_id == 0 else dynamic_slice_along(blocks_mul, dim=0, start=prev_seq_id, size=1)
+        br_dims = [] if seq_id == 0 else [0]
+        start_idx_br = broadcast(start_idx, out_dim_size=(num_tokens,), broadcast_dimensions=br_dims)
+        end_idx = add(dynamic_slice_along(context_lens, dim=0, start=curr_seq_id, size=1), start_idx)
+        end_idx_br = broadcast(end_idx, out_dim_size=(num_tokens,), broadcast_dimensions=[0])
+        mask = logical_and(greater_equal(mask_iota, start_idx_br), less(mask_iota, end_idx_br))
+        # start_idx is loaded from cumsum of block placement location, therefore the mask update location should never overlap.
+        prior_mask = add(prior_mask, cast(mask, pred))
+    prior_mask = reshape(prior_mask, (num_blocks, 1, block_size))
+    active_mask = full(1, dtype=pred, sizes=(max_num_seqs,1,1))
+    return prior_mask, active_mask
+
+
+def decoder_attention_mask_lhs_aligned_token_padded(cache_ids, n_positions):
     """
     Creates decomposed prior/active masks for LHS-aligned token generation.
 
@@ -3091,7 +3657,7 @@ def masked_select(mask, true_tensor, false_tensor):
     assert dtype == false_tensor.dtype
     assert mask.sizes == true_tensor.sizes == false_tensor.sizes, (
         "Tensor size mismatch."
-        f"mask shape={len(mask.sizes)}, true_tensor shape={len(true_tensor.sizes)}, false_tensor shape={len(false_tensor.sizes)}"
+        f"mask shape={mask.sizes}, true_tensor shape={true_tensor.sizes}, false_tensor shape={false_tensor.sizes}"
     )
     return dtype[mask.sizes].Select(mask, true_tensor, false_tensor)
 
@@ -3116,7 +3682,7 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
     """
     dtype = key.dtype
     assign_func = gen_assign_func(dtype)
-    n_active_tokens, n_head, d_head = key.sizes
+    _, n_active_tokens, n_head, d_head = key.sizes
     n_blocks, block_size, _, _ = key_cache.sizes
     hidden_size = n_head * d_head
 
@@ -3137,65 +3703,158 @@ def reshape_and_cache(key, value, key_cache, value_cache, slot_mapping):
 
     return updated_keys, updated_values
 
+def select_from(
+    to_indices,
+    from_indices,
+    from_values,
+    default_values=None,
+):
+    """
+    Select the values from a given indices. We only support last dim for comparison
+
+    Example:
+        # 1. If to_indices has the same shape as from_indices
+        to_indices = [1, 4, 2, 3, 6]
+        from_indices = [4, 5, 3, 2, 7]
+        from_values = [20, 21, 22, 23, 24]
+        default_values = [0, 0, 0, 0, 0]
+
+        outputs = [0, 20, 23, 22, 0]
+
+        # 2. If to_indices is one rank lower than from_indices
+        to_indices = [3]
+        from_indices = [4, 5, 3, 2, 7]
+        from_values = [20, 21, 22, 23, 24]
+        default_values = [0]
+
+        outputs = [22]
+
+        # 3. If from_indices is one rank lower than to_indices
+        to_indices = [1, 4, 2, 3, 6]
+        from_indices = [3]
+        from_values = [22]
+        default_values = [0]
+
+        outputs = [0, 0, 0, 22, 0]
+    """
+    to_sizes = to_indices.sizes
+    from_sizes = from_indices.sizes
+
+    if default_values is None:
+        default_values = full(0, from_values.dtype, to_sizes)
+
+    if to_sizes == from_sizes:
+        size = to_sizes[-1]
+        rank = len(to_sizes)
+        new_sizes = *to_sizes, size
+
+        to_indices = broadcast(to_indices, new_sizes, [0, 1, 3])
+        from_indices = broadcast(from_indices, new_sizes, [0, 1, 2])
+        eq = cast(equal(to_indices, from_indices), to_indices.scribe.s32)
+        d = dict(
+                lhs_contracting_dimensions=[2],
+                lhs_batch_dimensions=[0, 1],
+                rhs_contracting_dimensions=[2],
+                rhs_batch_dimensions=[0, 1])
+        # TODO: need to fix this for non-zero defaul values
+        # from_values = [batch, k, topk]
+        # eq = [batch, k, topk, topk]
+        # output = [batch, k, topk]
+        to_values = dot_general(from_values, eq, d)
+    elif len(to_sizes) < len(from_sizes):
+        to_indices = broadcast(to_indices, from_sizes, [0, 1])
+        default_values = broadcast(default_values, from_sizes, [0, 1])
+        eq = equal(to_indices, from_indices)
+        to_values = masked_select(eq, from_values, default_values)
+        to_values = reduce_sum(to_values, dim=2)
+    else:
+        from_indices = broadcast(from_indices, to_sizes, [0, 1, 2])
+        from_values = broadcast(from_values, to_sizes, [0, 1, 2])
+        eq = cast(equal(to_indices, from_indices), from_values.dtype)
+        print(from_indices.sizes, eq.sizes, from_values.sizes) 
+        to_values = multiply(from_values, eq)
+
+    return to_values
+
+
+def speculative_adjust_distribution(
+    draft_probs,    # (batch, k, vocab_size)
+    draft_indices,  # (batch, k, vocab_size)
+    target_probs,   # (batch, k+1, vocab_size)
+    target_indices, # (batch, k+1, vocab_size)
+    k,
+):
+    """
+    With the provided draft and target probabilities, calculate the adjusted target probs
+    """
+    sliced_target_indices = slice_along(target_indices, 1, limit=k)
+    sliced_target_probs = slice_along(target_probs, 1, limit=k)
+    last_target_probs = slice_along(target_probs, 1, limit=k+1, start=k)
+
+    adjusted_draft_probs = select_from(sliced_target_indices, draft_indices, draft_probs)
+    adjusted_target_probs = subtract(sliced_target_probs, adjusted_draft_probs)
+    adjusted_target_probs = clamp(adjusted_target_probs, minimum=0.0)
+    probs_sizes = adjusted_target_probs.sizes
+
+    adjusted_sum = reduce_sum(adjusted_target_probs, dim=2)
+    adjusted_sum = broadcast(adjusted_sum, probs_sizes, [0, 1])
+    adjusted_target_probs = divide(adjusted_target_probs, adjusted_sum)
+    adjusted_target_probs = concatenate([adjusted_target_probs, last_target_probs], 1)
+
+    return adjusted_target_probs
 
 def speculative_mask(
-    draft_ids,           # shape: (k, batch_size)
-    draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-    target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+    draft_ids,             # shape: (batch_size, k)
+    draft_probs_indices,   # shape: (batch_size, k, vocab_size_tp)
+    draft_probs,           # shape: (batch_size, k, vocab_size_tp)
+    target_probs_indices,  # shape: (batch_size, k, vocab_size_tp)
+    target_probs,          # shape: (btach_size, k, vocab_size_tp)
     tp_degree=1,
-    deterministic=False,
+    deterministic_threshold=None,
 ):
     s32 = draft_ids.scribe.s32
 
-    # Convert score into probabilities
-    draft_probabilities = softmax(draft_scores, dim=0, tp_degree=tp_degree)
-    target_probabilities = softmax(target_scores, dim=0, tp_degree=tp_degree)
-
-    # For simplicity all-gather the scores
-    if tp_degree > 1:
-        draft_probabilities = all_gather(draft_probabilities, dim=0, tp_degree=tp_degree)
-        target_probabilities = all_gather(target_probabilities, dim=0, tp_degree=tp_degree)
-
-    vocab_size, k, batch_size = draft_scores.sizes
+    batch_size, k, vocab_size = draft_probs.sizes
 
     # Gather the target/draft probabilities corresponding to draft sampling predictions
-    index = reshape(draft_ids, (1, k, batch_size))
-    target_probs = slice_along(target_probabilities, 1, limit=k)
-    target_probs = gather(target_probs, 0, index)
-    draft_probs = gather(draft_probabilities, 0, index)
-    target_probs = squeeze(target_probs, 0)              # shape: (k, batch_size)
-    draft_probs = squeeze(draft_probs, 0)                # shape: (k, batch_size)
+    target_probs_indices = cast(target_probs_indices, s32)
+    draft_probs_indices = cast(draft_probs_indices, s32)
+    target_probs = select_from(draft_ids, target_probs_indices, target_probs)
+    draft_probs = select_from(draft_ids, draft_probs_indices, draft_probs)
 
     # Compare ratio of probabilities at locations to a random sample
     ratio = divide(target_probs, draft_probs) # shape: (k, batch_size)
     ratio = clamp(ratio, maximum=1.0)
-    if deterministic:
-        random = full_like(ratio, 0.5)
+    ratio = cast(ratio, ratio.scribe.f32)
+    if deterministic_threshold:
+        random = full_like(ratio, deterministic_threshold)
     else:
         random = random_uniform(ratio.dtype, ratio.sizes)
     accepted_mask = less(random, ratio) # shape: (k, batch_size)
 
     # Mask out all tokens past the accepted token
     accepted_mask = cast(accepted_mask, s32)
-    accepted_cumsum = cumsum(accepted_mask, dim=0)
-    positions = iota(s32, (k, batch_size), 0)
+    accepted_cumsum = cumsum(accepted_mask, dim=1)
+    positions = iota(s32, (batch_size, k), 1)
     positions = add(positions, 1)
     accepted_mask = equal(accepted_cumsum, positions) # shape: (k, batch_size)
 
     # Compute index of *final* accepted token per batch line
-    accepted_mask = pad(accepted_mask, dim=0, size=1, value=False)
+    accepted_mask = pad(accepted_mask, dim=1, size=1, value=False)
 
-    return accepted_mask # (k + 1, batch_size)
+    return accepted_mask # (batch_size, k + 1)
 
 
 def speculative_token_selection(
-        draft_ids,           # shape: (k, batch_size)
-        target_ids,          # shape: (k + 1, batch_size)
-        draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-        target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+        draft_ids,           # shape: (batch_size, k)
+        target_ids,          # shape: (batch_size, k+1)
+        draft_probs_indices,
+        draft_probs,         # shape: (batch_size, k+1, vocab_size_tp)
+        target_probs_indices,
+        target_probs,        # shape: (batch_size, k+1, vocab_size_tp)
         tp_degree=1,
         pad_token_id=0,
-        deterministic=False,
+        deterministic_threshold=None,
         output_mask=False,
     ):
     """
@@ -3213,7 +3872,7 @@ def speculative_token_selection(
         draft_scores: The raw draft model logit output.
         target_scores: The raw target model logits output.
         tp_degree: The number of ranks to collect across.
-        deterministic: Flag which enables using a constant 0.5 as token
+        deterministic_threshold: Flag that allows this value to be used as the token
             acceptance threshold instead of a random uniform. This is used for
             debug/testing.
         output_mask: Flag that enables returning the token selection mask. This
@@ -3228,28 +3887,27 @@ def speculative_token_selection(
     s32 = draft_ids.scribe.s32
 
     accepted_mask = speculative_mask(
-        draft_ids,           # shape: (k, batch_size)
-        draft_scores,        # shape: (vocab_size_tp, k, batch_size)
-        target_scores,       # shape: (vocab_size_tp, k + 1, batch_size)
+        draft_ids,           # shape: (batch_size, k)
+        draft_probs_indices,
+        draft_probs,        # shape: (batch_size, k+1, vocab_size_tp)
+        target_probs_indices,
+        target_probs,       # shape: (batch_size, k+1, vocab_size_tp)
         tp_degree=tp_degree,
-        deterministic=deterministic,
+        deterministic_threshold=deterministic_threshold,
     )
 
     # Select the final tokens
     # Note:
     # - When all rejected: Mask will select target in all positions (position 0 required)
     # - When all accepted: Mask will select draft in all positons but the last
-    draft_ids = pad(draft_ids, dim=0, size=1, value=0)
+    draft_ids = pad(draft_ids, dim=1, size=1, value=0)
     tokens = masked_select(accepted_mask, draft_ids, target_ids)
 
     # Zero-out tokens beyond the used tokens
-    positions = iota(s32, tokens.sizes, 0)
-    index = reduce_sum(cast(accepted_mask, s32), dim=0)
-    mask = greater_equal(broadcast(index, tokens.sizes, [1]), positions)
+    positions = iota(s32, tokens.sizes, 1)
+    index = reduce_sum(cast(accepted_mask, s32), dim=1)
+    mask = greater_equal(broadcast(index, tokens.sizes, [0]), positions)
     tokens = masked_select(mask, tokens, pad_token_id)
-
-    # Transpose back to SB -> BS layout
-    tokens = transpose(tokens, 0, 1)
 
     if output_mask:
         # Transpose back to SB -> BS layout
@@ -3298,3 +3956,192 @@ def flip(tensor, dims):
     if isinstance(dims, int):
         dims = [dims]
     return tensor.dtype[tensor.sizes].Reverse(tensor, dimensions=dims)
+
+
+def diff(tensor, dim):
+    """
+    Computes the n-th forward difference along the given dimension, where n=1.
+
+    Example:
+    >>> c = tensor([[1, 2, 3], [3, 4, 5]])
+    >>> diff(c, dim=0)
+    tensor([[2, 2, 2]])
+    >>> diff(c, dim=1)
+    tensor([[1, 1],
+            [1, 1]])
+    """
+    o_sizes = tensor.sizes
+    a = slice_along(tensor, dim, limit=o_sizes[dim]-1, start=0)
+    b = slice_along(tensor, dim, limit=o_sizes[dim], start=1)
+    output = subtract(b, a)
+    return output
+
+
+def get_window_indices_from_cache_ids(cache_ids, window_size, n_positions):
+    """
+    Get the sliding-window indices from cache_ids
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    Given a cache_id, the indices would be [cache_id-(w-1), cache_id-(w-2), ..., cache_id-1], w is the window size
+    When cache_id < w-1, the indices would be [0, 1, ..., w-2], we rely on the attention mask to remove the cache with indices of [cache_id, ..., w-1]
+    Arguments:
+        cache_ids: shape (b, s), b is batch size, s is the number of active tokens, s = 1 in token generation
+        window_size: window size in sliding-window attention
+        n_positions: sequence length of k/v cache
+    Return:
+        indices: indices for element in k/v cache corresponding to the sliding window, shape (b, w-1)
+    Example:
+        Denote n as n_positions and w as window_size
+        cache_ids = [[5], [15], [35]], batch size is 3
+        window_size = 8
+        indices = [[0, 1, ..., 6],
+                    [8+n, 9+n, ..., 14+n],
+                    [28+2n, 29+2n, ..., 34+2n]]
+    """
+    dtype = cache_ids.dtype
+    b, s = cache_ids.sizes # s = 1 for token generation
+    sizes = (b, window_size-1)
+
+    # generate matrix of shape (b, w-1)
+    #  [[0, 0, ..., 0],
+    #   [n, n, ..., n],
+    #   [2n, 2n, ..., 2n]]
+    offset = iota(dtype, sizes, [0])
+    offset = multiply(offset, n_positions)
+
+    # cacluate win_start from cache_ids and then broadcast to shape (b, w)
+    # cache_ids = [[5], [15], [35]]
+    # window_size = 8
+    # win_start = [[0], [8], [28]]
+    # after broadcast
+    #  [[0, 0, ..., 0],
+    #   [8, 8, ..., 8],
+    #   [28, 28, ..., 28]]
+    win_start = subtract(cache_ids, window_size-1)
+    win_start = maximum(win_start, 0)
+    win_start = broadcast(win_start, out_dim_size=sizes, broadcast_dimensions=[0, 1])
+
+    # calculate the indices of shape (b, w)
+    # win_indices = win_start + offset
+    #  [[0, 1, ..., 6],
+    #   [8+n, 9+n, ..., 14+n],
+    #   [28+2n, 28+2n, ..., 34+2n]]
+    win_indices = iota(dtype, sizes, [1])
+    win_indices = add(win_start, win_indices)
+    win_indices = add(win_indices, offset)
+
+    return win_indices
+
+
+def window_slice_kv(cache, indices):
+    """
+    Apply sliding-window slicing over k/v cache with provided indices
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    k/v cache layout shall be (b, s, k, h), b: batch size, s: sequence length, k: num of kv heads per tp, h: hidden size
+    For k/v cache of (s, b, k, h) layout, cache needs to be transposed to (b, s, k, h) before calling this function
+    and transposed back to (s, b, k, h) afterwards
+    Arguments:
+        cache: key/value cache, shape (b, s, k, h)
+        indices: (b, w)
+    Return:
+        result: sliced k/v cache, shape (b, w-1, k, h)
+    """
+    sizes = cache.sizes # (b, s, k, h)
+    ind_sizes = indices.sizes # (b, w-1)
+
+    # (b, s, k, h) -> (b*s, k, h)
+    cache = reshape(cache, (sizes[0]*sizes[1], sizes[2], sizes[3]))
+
+    # (b, w-1) -> (b*(w-1),)
+    indices = reshape(indices, (ind_sizes[0]*ind_sizes[1]))
+
+    # (b*s, k, h) -> (b*(w-1), k, h)
+    result = index_select(cache, 0, indices)
+
+    # (b*(w-1), k, h) -> (b, w-1, k, h)
+    result = reshape(result, (ind_sizes[0], ind_sizes[1], sizes[2], sizes[3]))
+
+    return result
+
+
+def window_slice_mask(mask, indices):
+    """
+    Apply sliding-window slice over mask with provided indices
+    This funciton is used in token generation in sliding-window attention for mistral-7b-v0.1
+    mask layout shall be (b, n_active_tokens, s), n_active_tokens=1 for token generation
+    Arguments:
+        mask: (b, 1, s)
+        indices: (b, w)
+    Return:
+        result: sliced mask, shape (b, 1, w-1)
+    """
+    sizes = mask.sizes # (b, 1, s)
+    ind_sizes = indices.sizes # (b, w-1)
+
+    assert sizes[1] == 1, f"window_slice_mask works only for mask dim (b, 1, s), but mask dim[1]: {sizes[1]} != 1"
+
+    # (b, 1, s) -> (b*s,)
+    mask = reshape(mask, (sizes[0]*sizes[2]))
+
+    # (b, w-1) -> (b*(w-1),)
+    indices = reshape(indices, (ind_sizes[0]*ind_sizes[1]))
+
+    # (b*s,) -> (b*(w-1),)
+    result = index_select(mask, 0, indices)
+
+    # (b*(w-1),) -> (b, 1, w-1)
+    result = reshape(result, (ind_sizes[0], 1, ind_sizes[1]))
+
+    return result
+
+
+def sliding_window_slice(cached_keys, cached_values, mask, cache_ids, window_size, n_positions, cache_layout, lhs_aligned):
+        # slice the portion of kv cache and mask inside the sliding window
+        # this function is used in token generation only
+        # for continuous batcing, cache_ids is 2d, shape (b, s), s=1 for token gen
+        # for static batching, cache_ids is 1d, shape (s,), s=1 for token gen
+        use_2d_cache_ids = len(cache_ids.sizes) > 1
+
+        # continuous batching
+        if use_2d_cache_ids:
+            if cache_layout == constants.LAYOUT_BSH:
+                batch_size = list(cached_keys.sizes)[0]
+                seq_len = list(cached_keys.sizes)[1]
+                assert list(cached_keys.sizes)[1] == list(cached_values.sizes)[1] == list(mask.sizes)[2], \
+                    f"Sequence length not equal for K/V cache and mask"
+            elif cache_layout == constants.LAYOUT_SBH:
+                batch_size = list(cached_keys.sizes)[1]
+                seq_len = list(cached_keys.sizes)[0]
+                assert list(cached_keys.sizes)[0] == list(cached_values.sizes)[0] == list(mask.sizes)[2], \
+                    f"Sequence length not equal for K/V cache and mask"
+            else:
+                raise RuntimeError(f"Unsupported cache layout: {cache_layout}")
+
+            if seq_len > window_size:
+                indices = get_window_indices_from_cache_ids(cache_ids, window_size, n_positions)
+                useful_cached_keys = window_slice_kv(cached_keys, indices)
+                useful_cached_values = window_slice_kv(cached_values, indices)
+                useful_mask = window_slice_mask(mask, indices)
+            else:
+                useful_cached_keys, useful_cached_values, useful_mask = cached_keys, cached_values, mask
+        # static batching
+        else:
+            # slice when seq len > window size
+            # cache layout is (s, b, k, h), k is the num of kv heads per tp
+            curr_window_start = subtract(cache_ids, window_size - 1)
+            curr_window_start = maximum(curr_window_start, 0)
+            assert list(cached_keys.sizes)[0] == list(cached_values.sizes)[0] == list(mask.sizes)[2], \
+                f"Sequence length not equal for K/V cache and mask"
+            seq_len = list(cached_keys.sizes)[0]
+            if seq_len > window_size:
+                batch_size = list(cached_keys.sizes)[1]
+                assert (lhs_aligned and batch_size == 1) or (not lhs_aligned), \
+                    f"Sliding-window attention under static batching with lhs alignment only works for batch size 1, but get {batch_size}"
+
+                curr_window_start_scalar = reshape(curr_window_start, [])
+                useful_cached_keys = dynamic_slice_along(cached_keys, dim=0, start=curr_window_start_scalar, size=window_size-1)
+                useful_cached_values = dynamic_slice_along(cached_values, dim=0, start=curr_window_start_scalar, size=window_size-1)
+                useful_mask = dynamic_slice_along(mask, dim=2, start=curr_window_start_scalar, size=window_size-1)
+            else:
+                useful_cached_keys, useful_cached_values, useful_mask = cached_keys, cached_values, mask
+
+        return useful_cached_keys, useful_cached_values, useful_mask

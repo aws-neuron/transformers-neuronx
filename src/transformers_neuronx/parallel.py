@@ -113,9 +113,15 @@ class ParallelTensorManipulator:
         else:
             slice_start = 0
             slice_end = size
-            for start in range(slice_start, slice_end, shard_size):
+            slice_range = range(slice_start, slice_end, shard_size)
+            for start in slice_range:
                 slices[dim] = slice(start, start+shard_size, 1)
                 shard = tensor[tuple(slices)].contiguous()
+                if len(slice_range) == 1:
+                    # edge case for save_presharded flow where something is "sharded"
+                    # but in reality is a no-op causing some tensors to share memory
+                    # safetensors cannot share memory so we make a copy
+                    shard = shard.clone()
                 tensors.append(shard)
         if len(tensors) != self.local_tp_degree:
             raise ValueError(
@@ -143,7 +149,24 @@ class ParallelTensorManipulator:
 
     def slice_on_nc(self, tensors, dim, start, end, step):
         return ops.parallel_slice(tensors, dim, start, end, step)
+    
+class CPUTensorManipulator(ParallelTensorManipulator):
 
+    def duplicate(self, tensor):
+        return [tensor.contiguous() for _ in range(self.local_tp_degree)]
+
+    def shard_along(self, tensor, dim):
+        return self.shard_along_on_cpu(tensor, dim)
+
+    def primary_only(self, tensor):
+        tensors = [tensor]
+        tensors.extend(torch.zeros_like(tensor) for _ in range(1, self.local_tp_degree))
+        return tensors
+
+    def slice_on_nc(self, tensor, dim, start, end, step):
+        index = [slice(None)] * tensor.dim()
+        index[dim] = slice(start, end, step)
+        return tensor[index]
 
 def layers_to_neuron(num_workers, layers, n_positions_list, to_neuron_hooks):
     with ThreadPoolExecutor(num_workers) as pool:

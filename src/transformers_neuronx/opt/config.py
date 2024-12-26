@@ -37,6 +37,7 @@ class OPTConfig:
         self.batch_size = batch_size
         self.amp = amp
         self.tp_degree = tp_degree
+        self.model_type = 'opt'
 
 
 def opt_config_to_gpt2_config(config):

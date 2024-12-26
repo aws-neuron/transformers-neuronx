@@ -16,6 +16,7 @@ from typing import Optional
 
 import torch
 import transformers
+import warnings
 
 from transformers_neuronx.config import GenerationConfig
 from transformers_neuronx.stopping_criteria import StoppingCriteriaList
@@ -38,6 +39,7 @@ def sample_tokens(
         sequence_length: int = 128,
         config: Optional[GenerationConfig] = None,
         streamer: Optional['transformers.generation.streamers.BaseStreamer'] = None,
+        cache_ids: Optional[torch.Tensor] = None,
     ):
     """
     A sampling loop for a model that emits selected tokens.
@@ -48,9 +50,8 @@ def sample_tokens(
     batch_size, start = input_ids.shape
 
     # Populate the KV cache with prompt
-    next_tokens = model(input_ids, None, start_ids)
+    next_tokens = model(input_ids, cache_ids, start_ids)
 
-    cache_ids = torch.arange(start, sequence_length, dtype=torch.int32).split(1)
     tokens = [input_ids]
 
     # Use a default config if none is provided
@@ -60,16 +61,21 @@ def sample_tokens(
     early_stop = False
     if config.eos_token_id is not None:
         done_flags = torch.full((batch_size, 1), False)
-        eos_token = torch.tensor(config.eos_token_id, dtype=torch.int32)
+        eos_token = config.eos_token_id
+        if isinstance(eos_token, int):
+            eos_token = [eos_token]
+        eos_token = torch.tensor(eos_token, dtype=torch.int32)
         early_stop = True
 
     # Generate loop
-    for current, cache_id in zip(range(start + 1, sequence_length + 1), cache_ids):
+    for current in range(start + 1, sequence_length + 1):
 
         if early_stop:
-            done_flags |= (next_tokens == eos_token)
+            eos_flags = torch.isin(next_tokens, eos_token)
+            done_flags |= (eos_flags)
             if batch_size > 1:  # Avoid writing tokens to completed sequnces
-                next_tokens[done_flags] = eos_token
+                # no need to set positions that are already eos
+                next_tokens[torch.logical_and(done_flags, ~eos_flags)] = eos_token[0]
 
         tokens.append(next_tokens)
 
@@ -83,7 +89,15 @@ def sample_tokens(
         if current >= sequence_length:
             break
 
-        next_tokens = model(next_tokens, cache_id, start_ids)
+        cache_ids = torch.as_tensor([current-1], dtype=torch.int32)
+        if model.neuron_config and model.neuron_config.use_2d_cache_ids:
+            warnings.warn(
+                "We are making the assumption that all the sequences progress at the same rate in naive continuous batching. "
+                "Please make sure you are running naive continuous batching which is enabled by adding the --continuous_batching flag in generation_demo."
+            )
+            cache_ids=cache_ids.unsqueeze(0).expand(batch_size,1)
+
+        next_tokens = model(next_tokens, cache_ids, start_ids)
 
     if streamer:
         streamer.end()
@@ -206,13 +220,13 @@ def top_k_top_p_filtering(scores, top_k, top_p, min_tokens_to_keep=1):
             cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_scores, dim=-1, dtype=torch.float32), dim=-1)
             mask = cumulative_probs < top_p
 
-            # Per the original paper (https://arxiv.org/pdf/1904.09751.pdf, page 4 bottom), this filter include the minimal 
-            # subset of tokens (in descending sorted order of scores) with cumulative probability >= top_p. This means that 
-            # we need an extra token, in addition to those filtered by above logic (cumulative_probs < top_p). We do this by 
+            # Per the original paper (https://arxiv.org/pdf/1904.09751.pdf, page 4 bottom), this filter include the minimal
+            # subset of tokens (in descending sorted order of scores) with cumulative probability >= top_p. This means that
+            # we need an extra token, in addition to those filtered by above logic (cumulative_probs < top_p). We do this by
             # inserting a True column and the head of the mask (therefore shifting the rest of mask to the right by one),
             # and dropping the last column of the mask.
             mask = torch.concat((torch.ones([mask.shape[0], 1], dtype=torch.bool), mask[:, :-1]), axis=-1)
-            
+
             mask[:, :min_tokens_to_keep] = True
             n_to_keep = safe_size(mask.int().sum(dim=-1).max().item())
             sorted_scores = sorted_scores[:, :n_to_keep]
@@ -304,18 +318,21 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
     stopping_criteria_list = stopping_criteria_list if stopping_criteria_list is not None else StoppingCriteriaList()
 
 # Flags, one per sequence in a batch, to indicate if a sequence hit eos_token_id
+    if isinstance(eos_token_id, int):
+        eos_token_id = [eos_token_id]
+    eos_token_id = torch.tensor(eos_token_id, dtype=torch.int32)
     done_flags = torch.full((input_ids.size(dim=0), 1), False)
     tokens = [input_ids]
-    _, start = input_ids.shape
-    if cache_ids:
-        start = cache_ids.item()+1
+    _, start_length = input_ids.shape
+    if cache_ids is None:
+        cache_ids = torch.as_tensor([start_length - 1], dtype=torch.int32)
+    else:
+        start_length = max(cache_ids.flatten()).item() + 1
 
-    for cur_len in range(start, sequence_length):
+    for current_length in range(start_length, sequence_length):
 
         if ngram_size:
-            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, cur_len)
-
-        next_len = cur_len + 1
+            next_token_scores = filter_ngrams(ngram_size, torch.cat(tokens, dim=-1), next_token_scores, current_length)
 
         if temperature != 1.0:
             next_token_scores /= temperature
@@ -328,13 +345,14 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         inputs = torch.gather(top_indices, 1, inputs_in_topk)
 
         # Update done flags.
-        done_flags = torch.logical_or(done_flags, inputs == eos_token_id)
+        eos_flags = torch.isin(inputs, eos_token_id)
+        done_flags = torch.logical_or(done_flags, eos_flags)
         # Update token id to be eos_token_id if the corresponding done flag is True. For a batch,
         # this means that, while every sequence in the batch has the same length, a sequence that
         # encounters eos_token_id earlier will be filled with eos_token_ids post the first appearance
         # of eos_token_id.
-
-        token = torch.where(done_flags.eq(True), eos_token_id, inputs)
+        # no need to set positions that are already eos
+        token = torch.where(torch.logical_and(done_flags, ~eos_flags), eos_token_id[0], inputs)
         tokens.append(token)
 
         if streamer is not None and hasattr(streamer, 'response_with_prefix') and streamer.response_with_prefix:
@@ -342,14 +360,16 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
         elif streamer:
             streamer.put(token)
 
-        if next_len >= sequence_length or done_flags.all():
+        next_length = current_length + 1
+        if next_length > sequence_length or done_flags.all():
             break
 
         if stopping_criteria_list(input_ids, probs):
             break
 
         # forward pass to get next token
-        cache_ids = torch.as_tensor([cur_len], dtype=torch.int32)
+        cache_ids = cache_ids + 1
+
         next_token_scores = model(inputs, cache_ids, start_ids)
 
     if streamer:
@@ -362,10 +382,11 @@ def sample_loop_llama(model, input_ids, start_ids, next_token_scores, sequence_l
 def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, top_k=50, top_p=1.0, temperature=1.0,
                  streamer=None, stopping_criteria_list=None, no_repeat_ngram_size=None, cache_ids=None):
     validate_top_k_top_p_min_tokens_to_keep(top_k, top_p, None)
-    
+
     # populate key/value caches according to the prompt text
-    _, start = input_ids.shape
     next_token_scores = model(input_ids, cache_ids, start_ids)
+    if cache_ids is not None and model.neuron_config.use_2d_cache_ids:
+        cache_ids = cache_ids.max(dim=1, keepdim=True).values
     if model.context_hook is not None:
         model.context_hook()
     return sample_loop_llama(
@@ -376,7 +397,7 @@ def sample_llama(model, input_ids, start_ids, sequence_length, eos_token_id=2, t
 #TODO Leverage Generation Args data class as input args
 def select_tokens(next_token_scores, top_k=1, top_p=1.0, temperature=1.0):
     top_values, top_indices = top_k_top_p_filtering(next_token_scores, top_k=top_k, top_p=top_p)
- 
+
     # sample
     probs = torch.nn.functional.softmax(top_values, dim=-1)
     inputs_in_topk = torch.multinomial(probs, num_samples=1, replacement=True)

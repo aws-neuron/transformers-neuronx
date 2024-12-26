@@ -14,17 +14,19 @@
 # ==============================================================================
 import os
 import shlex
+import shutil
 import subprocess
 import hashlib
 import tarfile
-import tempfile
-from contextlib import contextmanager
-import numpy as np
+from contextlib import contextmanager, nullcontext
 from textwrap import dedent
-import torch
 import logging
 import json
 import math
+
+import numpy as np
+import torch
+
 from torch_neuronx.pyhlo import xla_data_pb2
 from torch_neuronx.pyhlo.scribe import HloScribe
 from torch_neuronx.pyhlo.constant.serialize_torch import serialize_torch
@@ -34,6 +36,7 @@ from transformers_neuronx import parallel
 from libneuronxla import neuron_xla_compile
 from libneuronxla.neuron_cc_cache import CacheUrl, create_compile_cache
 from neuronxcc import __version__ as compiler_version
+
 
 def get_hash_module(hlo_module, flags):
     # Hashing is pretty fast and neglegible compared to compilation time
@@ -45,8 +48,29 @@ def get_hash_module(hlo_module, flags):
     hash = str(hash_gen.hexdigest())[:20]
     return hash
 
+
+@contextmanager
+def envvar(key, value):
+    prior = os.environ.pop(key, None)
+    if value is not None:
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        os.environ.pop(key, None)
+        if prior is not None:
+            os.environ[key] = prior
+
+
 def compile_py_func(py_func):
-    return HloScribe(serialize_torch)(py_func).module_proto
+
+    # Adds file/scope metadata during debug dump
+    context = nullcontext()
+    if "NEURONX_DUMP_TO" in os.environ and 'ENABLE_PYHLO_FILE_METADATA' not in os.environ:
+        context = envvar('ENABLE_PYHLO_FILE_METADATA', '1')
+
+    with context:
+        return HloScribe(serialize_torch)(py_func).module_proto
 
 
 def build_kernel(py_func, tp_degree):
@@ -81,9 +105,11 @@ def get_compiler_flags() -> str:
     return ' '.join(flags)
 
 
-def compile_hlo_module(hlo_module, tag=None):
+def compile_hlo_module(hlo_module, tag=None, num_exec_repetition=1):
 
     flags = get_compiler_flags()
+    flags = f'{flags} --execute-repetition={num_exec_repetition}'
+
     module_flag_hash = get_hash_module(hlo_module, flags)
     module_hash = get_hash_module(hlo_module, None)
 
@@ -97,10 +123,8 @@ def compile_hlo_module(hlo_module, tag=None):
         hlo_module_name = f'{tag}-{hlo_module.name}.{compiler_version}.{module_flag_hash}'
 
     if dump:
-
-
-        dump_to = os.environ.get('NEURONX_DUMP_TO', '/tmp')
-        dump_to = os.path.join(dump_to, hlo_module_name)
+        dump_to_parent = os.environ.get('NEURONX_DUMP_TO', '/tmp')
+        dump_to = os.path.join(dump_to_parent, hlo_module_name)
         os.makedirs(dump_to, exist_ok=True)
         hlo_module_path = os.path.join(dump_to, f'{hlo_module_name}.pb')
         hlo_module_path = os.path.realpath(hlo_module_path)
@@ -115,6 +139,10 @@ def compile_hlo_module(hlo_module, tag=None):
             subprocess.check_call(command_line, cwd=dump_to)
         with open(neff_path, 'rb') as f:
             neff_bytes = f.read()
+        try:
+            shutil.copyfile(os.path.join(dump_to_parent, 'neuron_model_config.json'), os.path.join(dump_to, 'neuron_model_config.json'))
+        except FileNotFoundError:
+            pass
     else:
         module_bytes = hlo_module.SerializeToString()
         try:
@@ -201,7 +229,10 @@ class DataTypeConverter:
             F32     FLOAT       float32
             F64     DOUBLE      float64
             BF16    BFLOAT16    bfloat16
+            F8E4M3FN INT8     float8_e4m3fn
         '''
+        # Note that for FP8 we map metaneff datatype to int8, since from the runtime perspective these datatypes are functionally equivalent (for fp8 storage only)
+        # Within Tnx, we no longer use the metaneff flow, so this would not matter anyway.
         name_mapping = dedent(name_mapping)
         name_mapping = name_mapping.lstrip().strip()
         self.hlo2metaneff_mapping = {}
@@ -211,6 +242,8 @@ class DataTypeConverter:
         for line in name_mapping.split('\n'):
             line = line.lstrip().strip()
             pname, dname, tname = line.split()
+            if not hasattr(torch, tname):
+                continue
             primitive_type = getattr(xla_data_pb2.PrimitiveType, pname)
             metaneff_dtype = getattr(metaneff_pb2.MetaTensor.DataType, dname)
             torch_dtype = getattr(torch, tname)
@@ -355,10 +388,10 @@ class Executor:
             result: The output tensors from each rank concatenated along dim 0.
         """
         casted = []
-        for cpu, buf in zip(inputs, self.inputs):
+        for i, (cpu, buf) in enumerate(zip(inputs, self.inputs)):
             if cpu.shape != buf.shape:
                 raise AssertionError(
-                    f"Input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
+                    f"{i+1}th input shape mismatch. Expected {buf.shape}, but got {cpu.shape}"
                 )
             if cpu.dtype != buf.dtype:
                 cpu = cpu.to(buf.dtype)
@@ -444,7 +477,7 @@ def io_ring_cache_context(size):
 
 class ParallelKernel:
     hlo_snapshot_iter = 0
-    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None):
+    def __init__(self, hlo_module, tp_degree, g_start_device_id=0, g_device_count=None, tag=None, num_exec_repetition=1):
         self.hlo_module = hlo_module
         self.tp_degree = tp_degree
         self.neff_bytes = None
@@ -459,6 +492,7 @@ class ParallelKernel:
         self.tag = tag
         self.g_device_count = g_device_count
         self.memories = []
+        self.num_exec_repetition = num_exec_repetition
         self.total_input_tensors_size = get_total_input_tensors_size(self.hlo_module)
         logging.debug(f"Total input tensor size of the module (per rank): {self.total_input_tensors_size / (10**9)} G, whole (all ranks): {self.total_input_tensors_size * tp_degree / (10**9)} G")
 
@@ -467,15 +501,15 @@ class ParallelKernel:
         self.memories.append(memory)
         return memory
 
-    def compile(self):
-        self.build()
+    def compile(self, num_exec_repetition=1):
+        self.build(num_exec_repetition)
         return self.neff_bytes
 
-    def build(self):
+    def build(self, num_exec_repetition=1):
         # Avoid rebuilding NEFF. This path occurs during deserialization
         if self.neff_bytes is not None:
             return
-        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag)
+        self.neff_bytes = compile_hlo_module(self.hlo_module, self.tag, num_exec_repetition)
 
     def load(self, io_ring_cache_size=1):
         assert self.neff_bytes is not None, f"Try to load with neff bytes as None, might due to compilation failure"
@@ -700,3 +734,4 @@ class HLOKernel:
 
     def run(self):
         self.kernel(self.memories)
+

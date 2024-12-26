@@ -90,9 +90,7 @@ class OPTForSampling(base.NeuronModelBase):
         self.num_processed_tokens = 0
 
     def load_weights(self):
-        ops.init()
-        self.chkpt_model.model.decoder.embed_tokens.materialize()
-        self.chkpt_model.model.decoder.embed_positions.materialize()
+        self.materialize_embeddings()
         for layer in self.chkpt_model.model.decoder.layers:
             layer.materialize()
             attn = layer.self_attn
@@ -117,9 +115,12 @@ class OPTForSampling(base.NeuronModelBase):
                 )
             new_layer.to_neuron()
             layer.nullify()
+
         ln_f = self.chkpt_model.model.decoder.final_layer_norm
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        ln_f.nullify()
+
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
@@ -127,8 +128,21 @@ class OPTForSampling(base.NeuronModelBase):
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_tokens.weight.detach(), sharding=1, allow_pad=True)
             self.decoder_lm_head.add_pre_layer_parameter(self.chkpt_model.model.decoder.embed_positions.weight.detach(), sharding=1, allow_pad=True)
         lm_head.nullify()
-        self.decoder_lm_head.to_neuron()
 
+        self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
+    
+    def materialize_embeddings(self):
+        self.chkpt_model.model.decoder.embed_tokens.materialize()
+        self.chkpt_model.model.decoder.embed_positions.materialize()
+
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.model.decoder.embed_tokens.nullify()
+            self.chkpt_model.model.decoder.embed_positions.nullify()
+    
+    def init_rest_of_model(self):
         if self.context_buckets:
             for context_length_estimate in self.context_buckets:
                 for batch_size in self.batch_sizes:
@@ -143,7 +157,7 @@ class OPTForSampling(base.NeuronModelBase):
 
     def forward(self, input_ids, cache_ids=None, start_ids=None):
 
-        inputs, cache_ids, start_ids, last_token_id = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
+        inputs, cache_ids, start_ids, last_token_id, block_tables, context_lens = self._preprocess(input_ids, start_ids=start_ids, cache_ids=cache_ids)
 
         if not self.neuron_config.on_device_embedding:
             inputs = self.chkpt_model.model.decoder.embed_tokens(inputs)
@@ -165,7 +179,7 @@ class OPTForSampling(base.NeuronModelBase):
             if sliding_window_attn_enabled else 0
         curr_window_start = torch.as_tensor([curr_window_start], dtype=torch.int32)
 
-        result = self._forward(inputs, cache_ids, start_ids, last_token_id, curr_window_start)
+        result = self._forward(inputs, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start)
         self.num_processed_tokens += (last_token_id+1)
         return result
 
@@ -282,7 +296,7 @@ class OPTForSamplingNoEmbeddingHlo:
         tensors, dims = transformer.inputs(
             scribe, dtype, batch_size, n_active_tokens, self.hidden_size, self.neuron_config
         )
-        curr_window_start = scribe.s32[1].Parameter(parameter_number=4)
+        curr_window_start = scribe.s32[1].Parameter(parameter_number=6)
         return (*tensors, curr_window_start), (*dims, None)
 
     def embed_positions_ids(self, position_ids, start_ids):
@@ -296,7 +310,7 @@ class OPTForSamplingNoEmbeddingHlo:
         mask = hlo.less(position_ids, zero)
         return hlo.masked_select(mask, zero, position_ids)
 
-    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, curr_window_start, wte, wpe):
+    def embedding(self, input_ids, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start, wte, wpe):
         dtype = getattr(input_ids.scribe, self.amp)
         inputs_embeds = hlo.embedding(wte, input_ids, tp_degree=self.tp_degree, dtype=dtype)
         position_ids = self.embed_positions_ids(cache_ids, start_ids)
@@ -314,8 +328,9 @@ class OPTForSamplingNoEmbeddingHlo:
             hidden = hlo.transpose210(hidden)
         return hidden
 
-    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, curr_window_start, *weights):
-        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions)
+    def pre_layer(self, hidden, cache_ids, start_ids, last_token_id, block_tables, context_lens, curr_window_start, *weights):
+        mask, active_mask = hlo.attention_mask(cache_ids, start_ids, self.n_positions,
+                                               last_token_id=last_token_id, neuron_config=self.neuron_config)
         return hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask
 
     def layer(self, hidden, last_token_id, curr_window_start, cache_ids, start_ids, mask, active_mask, attn_k_cache, attn_v_cache,

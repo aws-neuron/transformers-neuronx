@@ -15,12 +15,9 @@
 import os
 import warnings
 import torch
-from transformers import PreTrainedModel
-from transformers.utils import ModelOutput
 from transformers_neuronx import decoder
 from transformers_neuronx import dtypes
 from transformers_neuronx import module
-from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import sampling
 from transformers_neuronx import utils
@@ -29,7 +26,7 @@ from transformers_neuronx import tensor_pool
 from transformers_neuronx import base
 from transformers_neuronx.constants import LAYOUT_BSH, LAYOUT_HSB
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.gpt2.config import GPT2Config, GPT2HuggingFaceConfig
+from transformers_neuronx.gpt2.config import GPT2Config
 from transformers_neuronx.opt.model import OPTForSamplingNoEmbeddingHlo
 from transformers_neuronx.generation_utils import HuggingFaceGenerationModelAdapter
 
@@ -72,9 +69,7 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.tag = tag
 
     def load_weights(self):
-        ops.init()
-        self.chkpt_model.transformer.wte.materialize()
-        self.chkpt_model.transformer.wpe.materialize()
+        self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:
             layer.materialize()
@@ -125,6 +120,8 @@ class GPT2ForSampling(base.NeuronModelBase):
         ln_f = self.chkpt_model.transformer.ln_f
         ln_f.materialize()
         self.decoder_lm_head.add_final_layer_norm(ln_f.weight.detach(), ln_f.bias.detach())
+        ln_f.nullify()
+
         lm_head = self.chkpt_model.lm_head
         lm_head.materialize()
         if self.neuron_config.on_device_embedding:
@@ -133,6 +130,19 @@ class GPT2ForSampling(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+        self.maybe_nullify_embeddings()
+
+    def materialize_embeddings(self):
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+    
+    def maybe_nullify_embeddings(self):
+        if self.neuron_config.on_device_embedding:
+            self.chkpt_model.transformer.wte.nullify()
+            self.chkpt_model.transformer.wpe.nullify()
+
+    def init_rest_of_model(self):
         # We need to reset once, since there might be NaN initially in KVcache.
         # This is done right after weight loading which is shared for different generation methods.
         self.reset()
@@ -317,9 +327,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.num_processed_tokens = 0
 
     def load_weights(self):
-        ops.init()
-        self.chkpt_model.transformer.wte.materialize()
-        self.chkpt_model.transformer.wpe.materialize()
+        self.materialize_embeddings()
         n_embd = self.config.n_embd
         for layer in self.chkpt_model.transformer.h:
             layer.materialize()
@@ -369,6 +377,13 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         self.decoder_lm_head.add_lm_head(lm_head.weight.detach().T)
         lm_head.nullify()
         self.decoder_lm_head.to_neuron()
+        self.init_rest_of_model()
+    
+    def materialize_embeddings(self):
+        self.chkpt_model.transformer.wte.materialize()
+        self.chkpt_model.transformer.wpe.materialize()
+    
+    def init_rest_of_model(self):
         config = self.config
         # Since GPT2 does not support compilation for multiple batch sizes yet,
         # assert the invariant
@@ -440,7 +455,7 @@ class GPT2ForSamplingWithContextBroadcasting(base.NeuronModelBase):
         is_context_encode = context_length > 1
         estimate = bucket.find(self.context_buckets, context_length)
 
-        inputs, cache_ids, last_token_id = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
+        inputs, cache_ids, last_token_id, *_ = self._prepare_for_par_ctx_rhs_padding(input_ids, cache_ids)
         batch_size, context_length = inputs.shape
 
         model = self.decoder_lm_head

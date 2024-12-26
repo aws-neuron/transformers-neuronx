@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 from transformers_neuronx import GQA
 from transformers_neuronx import NeuronConfig
+from transformers_neuronx.constants import TRN1_WORLD_SIZE
 
 
 def parse_dtype_replica_groups(neuron_config, tp_degree):
@@ -241,7 +242,57 @@ def interleave_qkv(q, k, v, tp_degree, dim=1):
     return tensor
 
 
-def build_replica_groups(num_groups, group_size):
+def interleave_mlp(mlp_gate, mlp_up, tp_degree, dim=0):
+    """
+    Create a merged mlp up / gate Tensor with weights arranged for sharding.
+
+    Args:
+        mlp_gate(torch.Tensor): Weights/Bias for mlp gate proj
+        mlp_up(torch.Tensor): Weights/Bias for mlp up proj
+        tp_degree(int): tp_degree used for sharding
+        dim(int): Dimension to concatenate tensors
+    Returns:
+        tensor: Concatenated mlp tensor with interleaved weights
+    """
+    def get_slice_params(tensor, dim, tp_degree):
+        size = tensor.shape[dim]
+        shard_size = size // tp_degree
+        slices = [slice(None) for _ in tensor.shape]
+        return size, shard_size, slices
+
+    def get_shard_tensors(tensors, size, shard_size, slices, dim):
+        for idx, start in enumerate(range(0, size, shard_size)):
+            slices[dim] = slice(start, start+shard_size, 1)
+            shard_tensors = [t[tuple(slices)].contiguous() for t in tensors]
+            yield idx, shard_tensors
+
+    assert mlp_up.shape[dim] == mlp_gate.shape[dim], "mlp up and gate proj should have same size in interleave dim"
+    size, shard_size, slices = get_slice_params(mlp_up, dim, tp_degree)
+    is_single_dim = len(mlp_up.shape) == 1
+    if is_single_dim:
+        tensor = torch.zeros((size * 2), dtype=mlp_up.dtype)
+    else:
+        interleave_dim, hidden_dim = mlp_up.shape
+        tensor = torch.zeros((interleave_dim * 2, hidden_dim ), dtype=mlp_up.dtype)
+    for idx, shard_tensors in get_shard_tensors((mlp_gate, mlp_up), size, shard_size, slices, dim):
+        shard = torch.cat(shard_tensors, dim=dim).contiguous()
+        if is_single_dim:
+            tensor[(idx)*shard.shape[dim]:(idx+1)*shard.shape[dim]] = shard
+        else:
+            tensor[(idx)*shard.shape[dim]:(idx+1)*shard.shape[dim], :] = shard
+
+    return tensor
+
+
+def is_attn_node_interleaved(n_heads, n_kv_heads, tp_degree):
+    # return False if we are not in multi-node setup
+    if tp_degree <= TRN1_WORLD_SIZE:
+        return False
+    group_size = n_heads // n_kv_heads
+    n_nodes = tp_degree // TRN1_WORLD_SIZE
+    return bool(TRN1_WORLD_SIZE % group_size) and bool(n_nodes == group_size)
+
+def build_replica_groups(num_groups, group_size, interleave=False):
     """
     Construct replica_groups to handle "intra-group" reduce operations.
 
@@ -256,11 +307,18 @@ def build_replica_groups(num_groups, group_size):
         group_size = 3
         num_groups = 2
         replica_groups = [[0, 1, 2], [3, 4, 5]]
+
     """
-    replica_groups = [
-        [nc for nc in range(group_size * group, group_size * group + group_size)]
-        for group in range(num_groups)
-    ]
+    if interleave:
+        limit = num_groups*group_size
+        ncs = list(range(limit))
+        slices = [slice(i, limit, num_groups) for i in range(num_groups)]
+        replica_groups = [ncs[s] for s in slices]
+    else:
+        replica_groups = [
+            [nc for nc in range(group_size * group, group_size * group + group_size)]
+            for group in range(num_groups)
+        ]
     return replica_groups
 
 

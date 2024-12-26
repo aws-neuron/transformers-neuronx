@@ -20,7 +20,7 @@ from transformers_neuronx import ops
 from transformers_neuronx import parallel
 from transformers_neuronx import program
 from transformers_neuronx import utils
-from transformers_neuronx import NeuronConfig
+from transformers_neuronx.config import NeuronConfig, maybe_dump_config
 from transformers_neuronx.gptj import hlo
 from transformers_neuronx.gptj.config import GPTJConfig
 from transformers_neuronx.sampling import simple_sample
@@ -68,16 +68,17 @@ class GPTJForSampling(module.PretrainedModel):
         config = self.config
         n_positions_list = self.n_positions_list
         unroll = self.unroll
-        self.program = build_gptj_program(config, 1, n_positions_list, unroll)
-        init_n_active = self.init_n_active_tokens
-        if init_n_active is not None:
-            self.init_program = build_gptj_program(config, init_n_active, n_positions_list, unroll)
-        self.transformer.wte.materialize()
-        for idx, block in enumerate(self.transformer.h):
-            block.to_neuron(n_positions_list)
-        self.ln_lm_head.to_neuron()
-        self.program.setup(self.transformer.h, self.ln_lm_head)
-        self.init_program.setup(self.transformer.h, self.ln_lm_head)
+        with maybe_dump_config(self.config, self.neuron_config):
+            self.program = build_gptj_program(config, 1, n_positions_list, unroll)
+            init_n_active = self.init_n_active_tokens
+            if init_n_active is not None:
+                self.init_program = build_gptj_program(config, init_n_active, n_positions_list, unroll)
+            self.transformer.wte.materialize()
+            for idx, block in enumerate(self.transformer.h):
+                block.to_neuron(n_positions_list)
+            self.ln_lm_head.to_neuron()
+            self.program.setup(self.transformer.h, self.ln_lm_head)
+            self.init_program.setup(self.transformer.h, self.ln_lm_head)
 
     def reset(self):
         for block in self.transformer.h:

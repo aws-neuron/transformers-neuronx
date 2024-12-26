@@ -20,8 +20,9 @@ from transformers_neuronx.constants import FUSED_QKV_TP_FACTOR
 from transformers_neuronx.constants import LAYOUT_BSH
 from transformers_neuronx import constants
 from transformers_neuronx.config import NeuronConfig
-from transformers_neuronx.layers import attention_utils
+from transformers_neuronx.layers import attention, attention_utils
 from transformers_neuronx.nki.compile import nki_call
+from transformers_neuronx.hlo import quantize_kv_cache_direct_cast
 import logging
 
 
@@ -220,17 +221,28 @@ def query_key_projection(query, key, qk_weight):
     return query, key
 
 
-def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None, neuron_config=None):
+def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start_ids=None,
+                          neuron_config=None):
     """
     The fused K/V cache update is intended for reducing replicated index value calculation for both keys and values,
     since we are updating K/V with the same index offset.
 
     KeyCache[I], ValueCache[I] = Keys, Values
     """
+    if neuron_config and neuron_config.kv_cache_quant:
+        keys = quantize_kv_cache_direct_cast(keys, neuron_config)
+        vals = quantize_kv_cache_direct_cast(vals, neuron_config)
+
     # Check K/V cache layout
     bsh_cache_layout = False
+    use_1d_query = False
+    paged_attention = False
+    chunked_prefill = False
     if neuron_config is not None:
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+        use_1d_query = neuron_config and neuron_config.use_1d_query
+        paged_attention = neuron_config and neuron_config.paged_attention
+        chunked_prefill = neuron_config and neuron_config.enable_chunked_prefill
 
     dtype = cached_keys.dtype
     cache_ids_dtype = cache_ids.dtype
@@ -261,7 +273,7 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
     cached_keys_r = hlo.reshape(cached_keys, [n_positions * n_seqs, kv_hidden_size])
     cached_vals_r = hlo.reshape(cached_vals, [n_positions * n_seqs, kv_hidden_size])
 
-    if n_active_tokens == 1 and n_seqs == n_active_seqs:
+    if n_active_tokens == 1 and ((n_seqs == n_active_seqs) or (n_seqs >= n_active_seqs and paged_attention)):
         # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
         #        +---------3-4-----6-7------9-10-----------------
         # seq 0  |                [A,B]
@@ -273,11 +285,14 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         # seq 1          [3,4],                                   [C,D],
         # seq 2          [9,10]]                                  [E,F]]
         #
-        keys_r = hlo.reshape(keys, [n_seqs, kv_hidden_size])
-        vals_r = hlo.reshape(vals, [n_seqs, kv_hidden_size])
+        keys_r = hlo.reshape(keys, [n_active_seqs, kv_hidden_size])
+        vals_r = hlo.reshape(vals, [n_active_seqs, kv_hidden_size])
 
-        indices = attention_utils.update_indices_decode(cached_keys, cache_ids, neuron_config)
-        indices = hlo.transpose(indices, 0, 1)
+        if paged_attention:
+            indices = start_ids
+        else:
+            indices = attention_utils.update_indices_decode(cached_keys, cache_ids, neuron_config)
+            indices = hlo.transpose(indices, 0, 1)
 
         scatter_dims = dict(update_window_dims=[1],
                             inserted_window_dims=[0],
@@ -286,7 +301,14 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
         updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
 
-    elif n_active_tokens == n_positions and n_seqs > n_active_seqs:
+        if bsh_cache_layout:
+            updated_keys = hlo.reshape(updated_keys, [n_seqs, n_positions, n_kv_heads, d_head])
+            updated_vals = hlo.reshape(updated_vals, [n_seqs, n_positions, n_kv_heads, d_head])
+        else:
+            updated_keys = hlo.reshape(updated_keys, [n_positions, n_seqs, n_kv_heads, d_head])
+            updated_vals = hlo.reshape(updated_vals, [n_positions, n_seqs, n_kv_heads, d_head])
+
+    elif ((n_active_tokens == n_positions) or (paged_attention and (n_active_tokens >= n_positions)) or chunked_prefill) and n_seqs > n_active_seqs:
         # cache (2D): [n_positions * n_seqs, n_kv_heads * d_head]
         #        +-0-1-2-3-4-5-----------------------------------
         # seq 0  |[x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x]
@@ -295,20 +317,30 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         #        +-----------------------------------------------
         # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
         # seq 1         [[0,1,2,3,4,5]]                          [[A,B,C,D,E,F]]
-        keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
-        vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
+        if use_1d_query: # also covers chunked prefill case
+            updated_keys, updated_vals = hlo.reshape_and_cache(keys, vals, cached_keys, cached_vals, slot_mapping=start_ids)
+        else:
+            keys_r = hlo.reshape(keys, [n_active_tokens, kv_hidden_size])
+            vals_r = hlo.reshape(vals, [n_active_tokens, kv_hidden_size])
 
-        indices = attention_utils.update_indices_context(cached_keys, cache_ids, start_ids, neuron_config)
+            indices = attention_utils.update_indices_context(cached_keys, cache_ids, start_ids, neuron_config)
 
-        # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
-        assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
+            # For prefill, assuming n_active_seqs == 1, due to KV cache layout issue.
+            assert n_active_seqs == 1, "n_active_seqs is expected to be 1 for 2D cache_ids"
 
-        scatter_dims = dict(update_window_dims=[1],
-                            inserted_window_dims=[0],
-                            scatter_dims_to_operand_dims=[0],
-                            index_vector_dim=1)
-        updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
-        updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            scatter_dims = dict(update_window_dims=[1],
+                                inserted_window_dims=[0],
+                                scatter_dims_to_operand_dims=[0],
+                                index_vector_dim=1)
+            updated_keys = hlo.scatter(cached_keys_r, indices, keys_r, scatter_dims=scatter_dims, to_apply=assign_func)
+            updated_vals = hlo.scatter(cached_vals_r, indices, vals_r, scatter_dims=scatter_dims, to_apply=assign_func)
+
+            if bsh_cache_layout:
+                updated_keys = hlo.reshape(updated_keys, [n_seqs, n_positions, n_kv_heads, d_head])
+                updated_vals = hlo.reshape(updated_vals, [n_seqs, n_positions, n_kv_heads, d_head])
+            else:
+                updated_keys = hlo.reshape(updated_keys, [n_positions, n_seqs, n_kv_heads, d_head])
+                updated_vals = hlo.reshape(updated_vals, [n_positions, n_seqs, n_kv_heads, d_head])
 
     elif n_active_tokens > 1 and n_active_tokens < n_positions:
         # Speculative forward: n_active_tokens > 1 and < n_positions
@@ -322,8 +354,8 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
         # seq_ids:      cache_ids: (n_active_tokens, n_seqs)     values: (n_active_tokens, n_seqs, n_heads, d_head)
         # seq 1         [[45,46,47,48,49,50]]                    [[A,B,C,D,E,F]]
         n_active_tokens, batch_size, n_head, d_head = keys.sizes
-        keys_r = hlo.reshape(keys, [n_active_tokens * batch_size, n_head, d_head])
-        vals_r = hlo.reshape(vals, [n_active_tokens * batch_size, n_head, d_head])
+        keys_r = hlo.reshape(keys, [1, n_active_tokens * batch_size, n_head, d_head])
+        vals_r = hlo.reshape(vals, [1, n_active_tokens * batch_size, n_head, d_head])
 
         indices = attention_utils.update_indices_speculative(cached_keys, cache_ids, start_ids, neuron_config)
 
@@ -336,6 +368,46 @@ def fused_kv_update_cache(cached_keys, cached_vals, cache_ids, keys, vals, start
 
     return updated_keys, updated_vals
 
+
+def reorder_kv_cache(cached_keys, cached_values, priv_cache_ids, reorder_mapping, neuron_config=None):
+    """
+    Reordering of the KV cache is required for tree based attention. While speculating using a tree based
+    attention, the model decodes multiple tokens (flattened token tree) and updates the kv cache linearly 
+    based on the cache_ids. Post accceptance, the KV cache needs to be reordered as the cache might not have
+    accepted tokens in the very beginning of the previous cache_ids window. So this step brings those
+    accepted token index to the very beginning of the previous kv cache_ids window.
+    """
+
+    bsh_cache_layout = False
+    batch_dim = 1
+    seq_dim = 0
+    if neuron_config is not None:
+        bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
+    if bsh_cache_layout:
+        batch_dim = 0
+        seq_dim = 1
+
+    use_2d_cache_ids = len(priv_cache_ids.sizes) > 1
+    # For 1D caches
+    if not use_2d_cache_ids:
+        cache_start_id = hlo.reduce_min(priv_cache_ids, 0)
+        cache_size = priv_cache_ids.sizes[0]
+        # Dynamic Slice to get the previous KV cache window that needs to be updated.
+        keys_slice_to_update = hlo.dynamic_slice_along(cached_keys, seq_dim, cache_start_id, cache_size)
+        value_slice_to_update = hlo.dynamic_slice_along(cached_values, seq_dim, cache_start_id, cache_size)
+        # Broadcast the reorder mapping to the same size as the KV cache window.
+        gather_index = hlo.broadcast(reorder_mapping, keys_slice_to_update.sizes, [seq_dim])
+        # Gather is used to reorder the KV cache window based on the reorder mapping
+        #updated_key_slice = hlo.gather(keys_slice_to_update, seq_dim, gather_index)
+        #updated_value_slice = hlo.gather(value_slice_to_update, seq_dim, gather_index)
+        updated_key_slice = hlo.gather_select_reduce(keys_slice_to_update, seq_dim, gather_index)
+        updated_value_slice = hlo.gather_select_reduce(value_slice_to_update, seq_dim, gather_index)
+        # Scatter is used to update the KV cache with the updated window.
+        reordered_keys = update_cache(cached_keys, priv_cache_ids, updated_key_slice)
+        reordered_values = update_cache(cached_values, priv_cache_ids, updated_value_slice)
+        return reordered_keys, reordered_values
+
+    raise NotImplementedError("Token Tree based decoding is not available for 2D cache ids.")
 
 def update_cache(cache, cache_ids, values):
     """
@@ -365,7 +437,7 @@ def scale(query, d_head):
     return dtype[query.sizes].Divide(query, scale_br)
 
 
-def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
+def score(query, keys, tp_degree=None, n_kv_heads=0, block_to_seq=None, neuron_config=None):
     """
     Compute the attention score by combining scaled-query & keys.
 
@@ -394,7 +466,12 @@ def score(query, keys, tp_degree=None, n_kv_heads=0, neuron_config=None):
                     rhs_contracting_dimensions=[3],
                     rhs_batch_dimensions=batch_dimensions)
 
-    result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
+    n_active_q_tokens = query.sizes[1 if bsh_cache_layout else 0]
+    n_active_k_tokens = keys.sizes[1 if bsh_cache_layout else 0]
+    if (neuron_config and neuron_config.optimized_paged_attention) and (n_active_q_tokens < n_active_k_tokens) and (n_active_q_tokens == 1):
+        result_dot = attention_utils.blockwise_qk_matmul(query, keys, block_to_seq)
+    else:
+        result_dot = hlo.dot_general(query, keys, dimension_numbers=dot_dims)
 
     return result_dot
 
@@ -458,12 +535,13 @@ def mask(score, mask, tp_degree=None, shard_over_batch=False, constant_value=-30
             mask = hlo.dynamic_slice_along(mask, dim=0, start=zero, size=n_seqs_per_nc)
         # broadcast from [n_seqs, n_active_tokens, n_positions] to [n_seqs, n_heads, n_active_tokens, n_positions]
         mask_br = hlo.broadcast(mask, score_sizes, [0, 2, 3])
-    score = dtype[score_sizes].Select(mask_br, score, large_neg_br)
+    score = hlo.masked_select(mask_br, score, large_neg_br)
     return score
 
 
-def context(past_scores, active_score, past_values, active_values, sparse_mask=None,
-            n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None):
+def context(past_scores, active_score, past_values, active_values,
+            sparse_mask=None, past_mask=None, active_mask=None,
+            n_kv_heads=0, dtype=None, neuron_config=None, tp_degree=None, context_lens=None, num_active_blocks=None, block_to_seq=None):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -473,9 +551,14 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
 
     C = softmax(S) @ V
 
-    If n_kv_heads != 0, uses multi-query, multi-group attention.
-    If dtype is None, uses values datatype.
-    If sparse_mask or active_sparse_mask is not None, use sparse attention on the corresponding values.
+    Implementation details:
+        - If n_kv_heads != 0, uses multi-query, multi-group attention.
+        - If dtype is None, uses values datatype.
+        - If sparse_mask or active_sparse_mask is not None, use sparse attention
+            on the corresponding values.
+        - If past_mask or active_mask is provided, apply the mask to the result
+            of the softmax exp as an optimization to help with compiler
+            constant propagation.
     """
 
     if dtype == None:
@@ -490,7 +573,7 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
     n_seqs, n_heads, n_active_tokens, n_active_tokens = active_score_sizes = active_score.sizes
-    n_seqs, n_heads, n_active_tokens, n_positions = past_scores.sizes
+    _, _, _, n_positions = past_scores.sizes
     if shard_over_batch:
         n_positions, n_seqs_per_nc, n_kv_heads, d_head = past_values.sizes
         n_seqs = n_seqs_per_nc * tp_degree
@@ -498,9 +581,11 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
         reduce_sizes = n_seqs_per_nc, n_heads, n_active_tokens
     else:
         if bsh_cache_layout:
-            n_seqs, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+            _, n_positions, n_kv_heads_tp, d_head = past_values.sizes
+            n_seqs = active_values.sizes[0]
         else:
-            n_positions, n_seqs, n_kv_heads_tp, d_head = past_values.sizes
+            n_positions, _, n_kv_heads_tp, d_head = past_values.sizes
+            n_seqs = active_values.sizes[1]
         _, n_heads_tp, _, _ = active_score.sizes
         reduce_sizes = n_seqs, n_heads_tp, n_active_tokens
 
@@ -509,27 +594,55 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
     active_score = hlo.cast(active_score, f32)
 
     # Compute maximum of both past_scores and active_scores
-    minus_inf = f32.Constant(constant_value=float('-inf'))
-    max_func = hlo.gen_max_func(f32)
-    reduce_max = f32[reduce_sizes].Reduce(past_scores, minus_inf, dimensions=[3], to_apply=max_func)
-    active_reduce_max = f32[reduce_sizes].Reduce(active_score, minus_inf, dimensions=[3], to_apply=max_func)
-    reduce_max = f32[reduce_sizes].Maximum(reduce_max, active_reduce_max)
-    reduce_max_br = f32[past_scores.sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
+    reduce_max = hlo.reduce_max(past_scores, dim=3)
+    active_reduce_max = hlo.reduce_max(active_score, dim=3)
+
+    if neuron_config and neuron_config.optimized_paged_attention:
+        num_seqs = neuron_config.continuous_batching.max_num_seqs
+        block_size = neuron_config.continuous_batching.block_size
+        reduce_max = attention_utils.blockwise_reduce_max(reduce_max, block_to_seq, num_seqs)
+        active_reduce_max = hlo.unsqueeze(active_reduce_max, -1)
+        active_reduce_max = attention_utils.gather_blocks_active(active_reduce_max, block_to_seq)
+        active_reduce_max = hlo.squeeze(active_reduce_max, -1)
+
+    reduce_max = hlo.maximum(reduce_max, active_reduce_max)
+    reduce_max_br = hlo.broadcast(reduce_max, past_scores.sizes, broadcast_dimensions=[0, 1, 2])
 
     # Pa = softmax(Sa)
     # Pp = softmax(Sp)
-    score_shifted = f32[past_scores.sizes].Subtract(past_scores, reduce_max_br)
-    exp = f32[past_scores.sizes].Exp(score_shifted)
-    zero = f32.Constant(constant_value=0)
-    add_func = hlo.gen_add_func(f32)
-    denom = f32[reduce_sizes].Reduce(exp, zero, dimensions=[3], to_apply=add_func)
-    past_prob = dtype[exp.sizes].Convert(exp)
-    reduce_max_bra = f32[active_score_sizes].Broadcast(reduce_max, dimensions=[0, 1, 2])
-    active_score_shifted = f32[active_score_sizes].Subtract(active_score, reduce_max_bra)
-    active_prob = f32[active_score_sizes].Exp(active_score_shifted)
-    active_denom = f32[reduce_sizes].Reduce(active_prob, zero, dimensions=[3], to_apply=add_func)
-    denom = f32[reduce_sizes].Add(denom, active_denom)
-    active_prob = dtype[active_prob.sizes].Convert(active_prob)
+    score_shifted = hlo.subtract(past_scores, reduce_max_br)
+    exp = hlo.exp(score_shifted)
+    if past_mask is not None:
+        exp = attention.mask(
+            exp,
+            past_mask,
+            tp_degree=tp_degree,
+            shard_over_batch=shard_over_batch,
+            constant_value=0,
+        )
+    denom = hlo.reduce_sum(exp, dim=3)
+    past_prob = hlo.cast(exp, dtype)
+    reduce_max_bra = hlo.broadcast(reduce_max, list(reduce_max.sizes) + [n_active_tokens], broadcast_dimensions=[0, 1, 2])
+    if neuron_config and neuron_config.optimized_paged_attention:
+        active_score_bw = attention_utils.gather_blocks_active(active_score, block_to_seq)
+        active_score_shifted = hlo.subtract(active_score_bw, reduce_max_bra)
+    else:
+        active_score_shifted = hlo.subtract(active_score, reduce_max_bra)
+    active_prob = hlo.exp(active_score_shifted)
+    if active_mask is not None:
+        active_prob = attention.mask(
+            active_prob,
+            active_mask,
+            tp_degree=tp_degree,
+            shard_over_batch=shard_over_batch,
+            constant_value=0,
+        )
+    active_denom = hlo.reduce_sum(active_prob, dim=3)
+    if neuron_config and neuron_config.optimized_paged_attention:
+        denom = attention_utils.blockwise_reduce_sum(denom, block_to_seq, num_seqs)
+
+    denom = hlo.add(denom, active_denom)
+    active_prob = hlo.cast(active_prob, dtype)
 
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
@@ -569,6 +682,12 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
                 rhs_batch_dimensions=rhs_batch_dimensions)
 
     output_dot = hlo.dot_general(past_prob, past_values, dimension_numbers=dot_dims)
+    if neuron_config and neuron_config.optimized_paged_attention:
+        block_size = neuron_config.continuous_batching.block_size
+        selected_block_indices = attention_utils.sample_block_indices(context_lens, num_active_blocks, block_size)
+        output_dot = attention_utils.blockwise_tensor_contraction(output_dot, selected_block_indices)
+        active_prob = attention_utils.gather_blocks_active(active_prob, selected_block_indices)
+        denom = hlo.index_select(denom, dim=0, index=selected_block_indices)
     active_output_dot = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
     output = hlo.add(output_dot, active_output_dot)
 
@@ -578,14 +697,14 @@ def context(past_scores, active_score, past_values, active_values, sparse_mask=N
         denom = hlo.all_to_all(denom, split_dim=1, concat_dim=0, tp_degree=tp_degree)
 
     sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
-    denom_br = dtype[sizes].Broadcast(denom, dimensions=[0, 1, 2])
-    output = dtype[sizes].Divide(output, denom_br)
-    sizes = n_active_tokens, n_seqs, n_heads_tp, d_head
-    output = dtype[sizes].Transpose(output, dimensions=[2, 0, 1, 3])
+    denom_br = hlo.broadcast(denom, sizes, broadcast_dimensions=[0, 1, 2])
+    output = hlo.divide(output, denom_br)
+    # (n_seqs, n_heads_tp, n_active_tokens, d_head) -> (n_active_tokens, n_seqs, n_heads_tp, d_head)
+    output = hlo.permute(output, dimensions=[2, 0, 1, 3])
     return output
 
 
-def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, tp_degree=None, neuron_config=None):
+def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, tp_degree=None, neuron_config=None, skip_softmax=False):
     """
     Compute "context" output from the QK score and value projection.
 
@@ -608,7 +727,10 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
         shard_over_batch = neuron_config.group_query_attention == constants.GQA.SHARD_OVER_BATCH
         bsh_cache_layout = neuron_config.cache_layout == constants.LAYOUT_BSH
 
-    probs = hlo.softmax(score)
+    if skip_softmax:
+        probs = score
+    else:
+        probs = hlo.softmax(score)
     # Apply sparse masks after softmax to help compiler optimization
     if sparse_mask is not None:
         probs = sparse_attn_mask(probs, sparse_mask, constant_value=0)
@@ -644,7 +766,7 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
         rhs_contracting_dimensions=rhs_contracting_dimensions,
         rhs_batch_dimensions=rhs_batch_dimensions
     )
-    result = hlo.dot_general(probs, values, dimension_numbers=dot_dims)
+    result = hlo.dot_general(probs, values, dimension_numbers=dot_dims, dtype=dtype)
 
     if n_kv_heads != 0:
         if shard_over_batch:
@@ -781,7 +903,10 @@ def output(
         result = hlo.reshape(result, hidden_sizes)
 
     dtype, replica_groups = utils.parse_dtype_replica_groups(neuron_config, tp_degree)
-    result = hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
+    if neuron_config.is_sequence_parallel:
+        result = hlo.reduce_scatter_sum(result, tp_degree=tp_degree, dim=1, replica_groups=replica_groups, dtype=dtype)
+    else:
+        result = hlo.all_reduce_sum(result, tp_degree, dtype=dtype, replica_groups=replica_groups)
 
     # Transpose back to HSB if applicable
     if bsh_collective and not bsh_output:
@@ -815,13 +940,13 @@ def flash_attention(query, key, value):
     query_nki = hlo.reshape(hlo.permute(query, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
     key_nki = hlo.reshape(hlo.permute(key, [1, 2, 3, 0]), (batch_size*n_q_heads_tp, d_head, n_active_tokens))
     value_nki = hlo.reshape(hlo.permute(value, [1, 2, 0, 3]), (batch_size*n_q_heads_tp, n_active_tokens, d_head))
-    nki_output = nki_call(attention_utils.wrapper_flash_attention_bir, 
-                          query_nki, key_nki, value_nki, 
+    nki_output = nki_call(attention_utils.wrapper_flash_attention_bir,
+                          query_nki, key_nki, value_nki,
                           output_HloShapes=[query.dtype[batch_size*n_q_heads_tp, n_active_tokens, d_head]])
-    # kernel output (after separating batch and n heads dims) has shape: 
+    # kernel output (after separating batch and n heads dims) has shape:
     # (batch_size, n_q_heads_tp, n_active_tokens, d_head)
     # we permute it to (n_active_tokens, batch_size, n_q_heads_tp, d_head)
-    context = hlo.permute(hlo.reshape(nki_output, (batch_size, n_q_heads_tp, n_active_tokens, d_head)), 
+    context = hlo.permute(hlo.reshape(nki_output, (batch_size, n_q_heads_tp, n_active_tokens, d_head)),
                           [2, 0, 1, 3])
 
     return context

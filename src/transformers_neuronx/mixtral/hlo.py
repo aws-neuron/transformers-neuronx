@@ -40,7 +40,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
             # hidden in layer_builder (from decoder.py)
             hidden,
             # tensors in layer_builder (from decoder.py)
-            last_token_id, curr_window_start, pos_embed, cache_ids, start_ids, mask, active_mask,
+            last_token_id, pos_embed, cache_ids, start_ids, mask, active_mask,
             # in_caches in layer_builder (from decoder.py)
             attn_k_cache, attn_v_cache,
             # weights in layer_builder (from decoder.py)
@@ -66,7 +66,7 @@ class MixtralForSamplingNoEmbeddingHlo(MistralForSamplingNoEmbeddingHlo):
         is_bsh = self.neuron_config and self.neuron_config.attention_layout == LAYOUT_BSH
         ln_hidden = hlo.rms_norm(hidden, pre_attn_ln_weight, eps) if is_bsh else hlo.rms_norm(hidden, pre_attn_ln_weight, eps, dim=0)
         attn_output, out_attn_k_cache, out_attn_v_cache = self.attention(
-            ln_hidden, curr_window_start, cache_ids, start_ids, pos_embed, mask, active_mask,
+            ln_hidden, cache_ids, start_ids, pos_embed, mask, active_mask,
             attn_k_cache, attn_v_cache,
             attn_q_weight, attn_q_scales, attn_q_bias,
             attn_k_weight, attn_k_scales, attn_k_bias,

@@ -20,10 +20,23 @@ TILE_SIZE = 128
 # Size used to determine fused QKV operation.
 FUSED_QKV_TP_FACTOR = 3
 
+# KV sharding pad for flash decoding
+KV_SHARD_PAD = 128
+
+# Number of chips on Trn
+TRN1_WORLD_SIZE = 32
+
 # Layout for attention
 LAYOUT_BSH = 'BSH'
 LAYOUT_HSB = 'HSB'
 LAYOUT_SBH = 'SBH'
+
+
+# fp8 bounds
+class FpBounds:
+    min = -240.0
+    max = 240.0
+
 
 class Layout(enum.Enum):
     HSB = 'HSB'
@@ -36,7 +49,6 @@ class Layout(enum.Enum):
 
 # Group query attention sharding configurations
 class GQA(enum.Enum):
-
     # [Default] Sharding over the heads splits entire (complete) K/V heads
     # onto the NeuronCores where the corresponding Q heads reside. This is
     # similar to traditional MHA except that the Q and K/V heads do not need
