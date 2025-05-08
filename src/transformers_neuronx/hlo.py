@@ -560,10 +560,11 @@ def mlp(hidden, in_weight, in_bias, out_weight, out_bias,
 
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
     if is_bsh:
-        # (b * s, h) => (b, s, h)
-        hidden = reshape(hidden, (batch_size, n_active_tokens, hidden_size))
+        # (s * b, h) => (b, s, h)
+        hidden = reshape(hidden, (n_active_tokens, batch_size, hidden_size))
+        hidden = transpose(hidden, 0, 1)
     else:
-        # (b * s, h) = > (h, s, b)
+        # (s * b, h) = > (h, s, b)
         hidden = transpose(hidden, 0, 1)
         hidden = reshape(hidden, hidden_sizes)
 
@@ -837,10 +838,11 @@ def gated_mlp(
     is_bsh = neuron_config and neuron_config.collectives_layout == LAYOUT_BSH
 
     if is_bsh:
-        # (b * s, h) => (b, s, h)
-        result = reshape(result, (batch_size, n_active_tokens, hidden_size))
+        # (s * b, h) => (b, s, h)
+        result = reshape(result, (n_active_tokens, batch_size, hidden_size))
+        result = transpose(result, 0, 1)
     else:
-        # (b * s, h) = > (h, s, b)
+        # (s * b, h) = > (h, s, b)
         result = transpose(result, 0, 1)
         result = reshape(result, hidden_sizes)
 
