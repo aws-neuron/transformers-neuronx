@@ -24,7 +24,7 @@ from transformers_neuronx.layers import attention, attention_utils
 from transformers_neuronx.nki.compile import nki_call
 from transformers_neuronx.hlo import quantize_kv_cache_direct_cast
 import logging
-
+from transformers_neuronx import global_debugger
 
 def query_key_value(
     hidden,
@@ -143,9 +143,14 @@ def query_key_value(
         active_kv_sizes = n_active_tokens, n_seqs_per_nc, n_kv_heads, d_head
 
         # split along batch dimension, and concat along head dimension
-        active_q = hlo.all_to_all(active_q, split_dim=0, concat_dim=1, tp_degree=tp_degree)
-        active_k = hlo.all_to_all(active_k, split_dim=0, concat_dim=1, tp_degree=tp_degree)
-        active_v = hlo.all_to_all(active_v, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+        if active_q.instruction.name == "dot.53" and tp_degree == 1:
+            global_debugger.tap(active_q.instruction.name, active_q, 1)
+        if tp_degree > 1:
+            active_q = hlo.all_to_all(active_q, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+            if active_q.instruction.name == "reshape.60" or active_q.instruction.name == "transpose.59" and tp_degree > 1:
+                global_debugger.tap(active_q.instruction.name, active_q, 0)
+            active_k = hlo.all_to_all(active_k, split_dim=0, concat_dim=1, tp_degree=tp_degree)
+            active_v = hlo.all_to_all(active_v, split_dim=0, concat_dim=1, tp_degree=tp_degree)
 
         active_q = hlo.reshape(active_q, active_q_sizes)
         active_k = hlo.reshape(active_k, active_kv_sizes)
@@ -691,7 +696,7 @@ def context(past_scores, active_score, past_values, active_values,
     active_output_dot = hlo.dot_general(active_prob, active_values, dimension_numbers=dot_dims)
     output = hlo.add(output_dot, active_output_dot)
 
-    if shard_over_batch:
+    if shard_over_batch and tp_degree > 1:
         # concat along batch dimension and split along head dimension
         output = hlo.all_to_all(output, split_dim=1, concat_dim=0, tp_degree=tp_degree)
         denom = hlo.all_to_all(denom, split_dim=1, concat_dim=0, tp_degree=tp_degree)
@@ -778,7 +783,8 @@ def context_combined(score, values, sparse_mask=None, n_kv_heads=0, dtype=None, 
             result = hlo.reshape(result, result_sizes)
 
             # concat along batch dimension and split along head dimension
-            result = hlo.all_to_all(result, split_dim=1, concat_dim=0, tp_degree=tp_degree)
+            if tp_degree > 1:
+                result = hlo.all_to_all(result, split_dim=1, concat_dim=0, tp_degree=tp_degree)
         else:
             result_sizes = n_seqs, n_heads_tp, n_active_tokens, d_head
             result = hlo.reshape(result, result_sizes)
